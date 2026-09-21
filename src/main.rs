@@ -1,5 +1,6 @@
 //! noida: one tiny local binary standing in for Postgres, MySQL, Redis,
-//! Kafka, Elasticsearch and ClickHouse during development.
+//! Kafka, Elasticsearch, ClickHouse, Memcached, MongoDB and RabbitMQ during
+//! development.
 
 use noida::config;
 

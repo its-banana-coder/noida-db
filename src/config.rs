@@ -16,7 +16,8 @@ start options:
   --only <a,b,...>       enable only these services
   --<service>-port <n>   override a port, e.g. --redis-port 6380
 
-services: postgres, mysql, redis, kafka, elasticsearch, clickhouse";
+services: postgres, mysql, redis, kafka, elasticsearch, clickhouse, memcached,
+          mongodb, rabbitmq";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Service {
@@ -26,13 +27,16 @@ pub struct Service {
 
 /// Every service noida speaks, on the port its real counterpart uses,
 /// so existing clients work with their defaults.
-pub const DEFAULT_SERVICES: [Service; 6] = [
+pub const DEFAULT_SERVICES: [Service; 9] = [
     Service { name: "postgres", port: 5432 },
     Service { name: "mysql", port: 3306 },
     Service { name: "redis", port: 6379 },
     Service { name: "kafka", port: 9092 },
     Service { name: "elasticsearch", port: 9200 },
     Service { name: "clickhouse", port: 8123 },
+    Service { name: "memcached", port: 11211 },
+    Service { name: "mongodb", port: 27017 },
+    Service { name: "rabbitmq", port: 5672 },
 ];
 
 #[derive(Debug, PartialEq)]
