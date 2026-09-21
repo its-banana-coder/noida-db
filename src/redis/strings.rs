@@ -1,7 +1,8 @@
 //! String commands.
 
 use super::engine::{
-    Command, Ctx, Data, Entry, Reply, arity_error, eq_ic, int_arg, invalid_expire, not_int, syntax,
+    Command, Ctx, Data, Entry, Reply, arity_error, cmd, eq_ic, int_arg, invalid_expire, not_int,
+    syntax,
 };
 use super::num;
 use super::resp::Value;
@@ -10,28 +11,28 @@ use super::resp::Value;
 const MAX_STRING: usize = 512 * 1024 * 1024;
 
 pub static COMMANDS: &[Command] = &[
-    Command { name: "get", arity: 2, handler: get },
-    Command { name: "set", arity: -3, handler: set },
-    Command { name: "setnx", arity: 3, handler: setnx },
-    Command { name: "setex", arity: 4, handler: setex },
-    Command { name: "psetex", arity: 4, handler: psetex },
-    Command { name: "getset", arity: 3, handler: getset },
-    Command { name: "getdel", arity: 2, handler: getdel },
-    Command { name: "getex", arity: -2, handler: getex },
-    Command { name: "mget", arity: -2, handler: mget },
-    Command { name: "mset", arity: -3, handler: mset },
-    Command { name: "msetnx", arity: -3, handler: msetnx },
-    Command { name: "append", arity: 3, handler: append },
-    Command { name: "strlen", arity: 2, handler: strlen },
-    Command { name: "incr", arity: 2, handler: incr },
-    Command { name: "decr", arity: 2, handler: decr },
-    Command { name: "incrby", arity: 3, handler: incrby },
-    Command { name: "decrby", arity: 3, handler: decrby },
-    Command { name: "incrbyfloat", arity: 3, handler: incrbyfloat },
-    Command { name: "getrange", arity: 4, handler: getrange },
-    Command { name: "substr", arity: 4, handler: getrange },
-    Command { name: "setrange", arity: 4, handler: setrange },
-    Command { name: "lcs", arity: -3, handler: lcs },
+    cmd("get", get),
+    cmd("set", set),
+    cmd("setnx", setnx),
+    cmd("setex", setex),
+    cmd("psetex", psetex),
+    cmd("getset", getset),
+    cmd("getdel", getdel),
+    cmd("getex", getex),
+    cmd("mget", mget),
+    cmd("mset", mset),
+    cmd("msetnx", msetnx),
+    cmd("append", append),
+    cmd("strlen", strlen),
+    cmd("incr", incr),
+    cmd("decr", decr),
+    cmd("incrby", incrby),
+    cmd("decrby", decrby),
+    cmd("incrbyfloat", incrbyfloat),
+    cmd("getrange", getrange),
+    cmd("substr", getrange),
+    cmd("setrange", setrange),
+    cmd("lcs", lcs),
 ];
 
 fn opt_bulk(v: Option<&mut Vec<u8>>) -> Value {

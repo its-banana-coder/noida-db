@@ -128,3 +128,48 @@ fn protocol_error_closes_the_connection() {
     assert_eq!(c.read(), Some(Value::err("ERR Protocol error: invalid bulk length")));
     assert_eq!(c.read(), None);
 }
+
+#[test]
+fn resp3_clients_work() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    let mut con =
+        redis::Client::open(format!("redis://{addr}/?protocol=resp3"))?.get_connection()?;
+    let _: () = con.set("k", "v")?;
+    let v: String = con.get("k")?;
+    assert_eq!(v, "v");
+    let missing: Option<String> = con.get("nope")?;
+    assert_eq!(missing, None);
+    let info: String = redis::cmd("CLIENT").arg("INFO").query(&mut con)?;
+    assert!(info.contains(" resp=3 "), "{info}");
+    Ok(())
+}
+
+#[test]
+fn client_kill_closes_the_other_connection() {
+    use noida::redis::resp::Value;
+    let addr = common::start_noida_redis();
+    let mut victim = common::RawClient::connect(addr);
+    let Value::Integer(victim_id) = victim.run("CLIENT ID") else { panic!() };
+    let mut killer = common::RawClient::connect(addr);
+    assert_eq!(killer.run(&format!("CLIENT KILL ID {victim_id}")), Value::Integer(1));
+    // The victim's socket is closed: its next read hits EOF.
+    victim.send_raw(b"PING\r\n");
+    assert_eq!(victim.read(), None);
+}
+
+#[test]
+fn client_pause_holds_writes_from_other_clients() {
+    use noida::redis::resp::Value;
+    use std::time::{Duration, Instant};
+    let addr = common::start_noida_redis();
+    let mut admin = common::RawClient::connect(addr);
+    let mut writer = common::RawClient::connect(addr);
+    assert_eq!(admin.run("CLIENT PAUSE 300 WRITE"), Value::ok());
+    // Reads go straight through...
+    let start = Instant::now();
+    assert_eq!(writer.run("GET k"), Value::Null);
+    assert!(start.elapsed() < Duration::from_millis(200));
+    // ...writes wait for the pause to end.
+    assert_eq!(writer.run("SET k v"), Value::ok());
+    assert!(start.elapsed() >= Duration::from_millis(250), "{:?}", start.elapsed());
+}

@@ -18,6 +18,7 @@ use noida::redis::resp::Value;
 /// - `~` compares the reply as an unordered set (KEYS and similar).
 /// - `@X.Y ` compares only if the reference is at least X.Y (error wording
 ///   that changed since older Redis). The command still runs on both.
+/// - `!` runs the command on both but doesn't compare (ids, versions).
 const SCRIPTS: &[((u32, u32), &[&str])] = &[
     ((2, 0), &["PING", "PING hi", "ECHO x", "PING a b", "ECHO"]),
     ((2, 0), &["GET k", "SET k v", "GET k", "SET k w", "GET k", "GET", "SET k"]),
@@ -344,6 +345,78 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
         ],
     ),
     ((7, 0), &["FOO a b", "foo"]),
+    ((6, 0), &["!HELLO 3", "SET k v", "GET k", "MGET k nope", "GET nope", "!HELLO 2", "GET nope"]),
+    ((7, 0), &["HELLO 4", "HELLO x", "HELLO 3 FOO", "HELLO 3 SETNAME", "HELLO 3 AUTH bob pw"]),
+    ((6, 0), &["AUTH secret", "@6.2 AUTH default whatever", "@7.0 AUTH bob pw", "AUTH a b c"]),
+    (
+        (6, 0),
+        &[
+            "CLIENT GETNAME",
+            "CLIENT SETNAME app",
+            "CLIENT GETNAME",
+            "@7.0 CLIENT SETNAME",
+            "CLIENT",
+            "@7.0 CLIENT FOO",
+            "@7.2 CLIENT HELP",
+        ],
+    ),
+    (
+        (7, 2),
+        &[
+            "CLIENT SETINFO lib-name mylib",
+            "CLIENT SETINFO lib-ver 1.0",
+            "CLIENT SETINFO foo x",
+            "CLIENT NO-EVICT on",
+            "CLIENT NO-EVICT off",
+            "CLIENT NO-TOUCH maybe",
+            "CLIENT NO-EVICT maybe",
+        ],
+    ),
+    (
+        (6, 2),
+        &[
+            "CLIENT KILL 1.2.3.4:5",
+            "CLIENT KILL ID 0",
+            "CLIENT KILL ID 99999",
+            "CLIENT KILL TYPE foo",
+            "CLIENT KILL USER bob",
+            "CLIENT KILL SKIPME maybe",
+            "CLIENT LIST TYPE foo",
+            "CLIENT LIST FOO",
+            "CLIENT LIST ID x",
+        ],
+    ),
+    (
+        (6, 2),
+        &[
+            "CLIENT UNBLOCK 99999",
+            "CLIENT UNBLOCK 99999 FOO",
+            "CLIENT PAUSE 0 FOO",
+            "CLIENT PAUSE x",
+            "CLIENT PAUSE -1",
+            "CLIENT PAUSE 0",
+            "CLIENT UNPAUSE",
+        ],
+    ),
+    ((6, 2), &["SELECT 3", "RESET", "GET k"]),
+    (
+        (7, 0),
+        &[
+            "COMMAND HELP",
+            "COMMAND GETKEYS SET k v",
+            "COMMAND GETKEYS MSET a 1 b 2",
+            "COMMAND GETKEYS PING",
+            "COMMAND GETKEYS NOSUCH x",
+            "COMMAND GETKEYS GET",
+            "COMMAND GETKEYSANDFLAGS SET k v",
+            "COMMAND GETKEYSANDFLAGS SET k v GET",
+            "COMMAND GETKEYSANDFLAGS LCS a b",
+            "COMMAND INFO nosuch",
+            "COMMAND DOCS nosuch",
+            "COMMAND LIST FILTERBY FOO x",
+            "COMMAND LIST FILTERBY",
+        ],
+    ),
 ];
 
 fn parse_version(v: &str) -> (u32, u32) {
@@ -432,7 +505,7 @@ fn replies_match_real_redis() {
         }
         ran += 1;
         for c in [&mut real, &mut ours] {
-            c.run("SELECT 0");
+            c.run("RESET");
             c.run("FLUSHALL");
         }
         for line in *script {
@@ -442,6 +515,10 @@ fn replies_match_real_redis() {
                     (parse_version(v), rest)
                 }
                 None => ((0, 0), *line),
+            };
+            let (ignore, line) = match line.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, line),
             };
             let (is_set, line) = match line.strip_prefix('~') {
                 Some(rest) => (true, rest),
@@ -453,6 +530,9 @@ fn replies_match_real_redis() {
             if is_set {
                 want = unordered(want);
                 got = unordered(got);
+            }
+            if ignore {
+                continue;
             }
             if version < line_min {
                 lines_skipped += 1;
@@ -475,4 +555,75 @@ fn replies_match_real_redis() {
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+/// COMMAND INFO and COMMAND DOCS for every command and subcommand noida
+/// implements must match real Redis exactly. This checks the generated
+/// command table and the code that formats it.
+#[test]
+fn command_introspection_matches_real_redis() {
+    let Some(reference) = reference() else {
+        eprintln!("SKIPPED: no reference Redis (set NOIDA_REDIS_REF or install redis-server)");
+        return;
+    };
+    let mut real = RawClient::connect(reference.addr);
+    let mut ours = RawClient::connect(common::start_noida_redis());
+    if server_version(&mut real) < (7, 0) {
+        eprintln!("SKIPPED: COMMAND INFO/DOCS changed in Redis 7.0; reference is older");
+        return;
+    }
+    let Value::Array(names) = ours.run("COMMAND LIST") else { panic!("COMMAND LIST") };
+    let mut failures = Vec::new();
+    let mut compared = 0;
+    for name in names {
+        let Value::Bulk(name) = name else { panic!() };
+        let name = String::from_utf8(name).unwrap();
+        let has_subs = !name.contains('|') && {
+            let Value::Array(sub) = ours.run(&format!("COMMAND LIST FILTERBY PATTERN {name}|*"))
+            else {
+                panic!()
+            };
+            !sub.is_empty()
+        };
+        for sub in ["INFO", "DOCS"] {
+            let line = format!("COMMAND {sub} {name}");
+            let (want, got) = (real.run(&line), ours.run(&line));
+            // A container's subcommands come in hash order on real Redis;
+            // they are compared one by one instead.
+            let (want, got) = if has_subs {
+                (drop_subcommands(want), drop_subcommands(got))
+            } else {
+                (want, got)
+            };
+            compared += 1;
+            if want != got {
+                failures.push(format!("{line}\n    redis: {want:?}\n    noida: {got:?}"));
+            }
+        }
+    }
+    eprintln!("compared {compared} COMMAND INFO/DOCS replies");
+    assert!(failures.is_empty(), "{} mismatches:\n  {}", failures.len(), failures.join("\n  "));
+}
+
+/// Removes the trailing subcommand list from a COMMAND INFO or DOCS reply.
+fn drop_subcommands(v: Value) -> Value {
+    match v {
+        // INFO: [[name, arity, ..., subcommands]]
+        Value::Array(mut outer) if matches!(outer.first(), Some(Value::Array(_))) => {
+            if let Some(Value::Array(info)) = outer.first_mut() {
+                info.pop();
+            }
+            Value::Array(outer)
+        }
+        // DOCS: [name, [k, v, ..., "subcommands", {...}]]
+        Value::Array(mut outer) if outer.len() == 2 => {
+            if let Some(Value::Array(doc)) = outer.get_mut(1)
+                && let Some(i) = doc.iter().position(|x| *x == Value::bulk("subcommands"))
+            {
+                doc.truncate(i);
+            }
+            Value::Array(outer)
+        }
+        other => other,
+    }
 }

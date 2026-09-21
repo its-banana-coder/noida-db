@@ -2,37 +2,37 @@
 //! RENAME, COPY, MOVE, and database-level commands.
 
 use super::engine::{
-    Command, Ctx, NUM_DBS, Reply, db_arg, eq_ic, int_arg, invalid_expire, same_object, syntax,
+    Command, Ctx, NUM_DBS, Reply, cmd, db_arg, eq_ic, int_arg, invalid_expire, same_object, syntax,
 };
 use super::glob;
 use super::resp::Value;
 
 pub static COMMANDS: &[Command] = &[
-    Command { name: "del", arity: -2, handler: del },
-    Command { name: "unlink", arity: -2, handler: del },
-    Command { name: "exists", arity: -2, handler: exists },
-    Command { name: "touch", arity: -2, handler: exists },
-    Command { name: "type", arity: 2, handler: type_cmd },
-    Command { name: "expire", arity: -3, handler: expire },
-    Command { name: "pexpire", arity: -3, handler: pexpire },
-    Command { name: "expireat", arity: -3, handler: expireat },
-    Command { name: "pexpireat", arity: -3, handler: pexpireat },
-    Command { name: "ttl", arity: 2, handler: ttl },
-    Command { name: "pttl", arity: 2, handler: pttl },
-    Command { name: "expiretime", arity: 2, handler: expiretime },
-    Command { name: "pexpiretime", arity: 2, handler: pexpiretime },
-    Command { name: "persist", arity: 2, handler: persist },
-    Command { name: "keys", arity: 2, handler: keys },
-    Command { name: "scan", arity: -2, handler: scan },
-    Command { name: "randomkey", arity: 1, handler: randomkey },
-    Command { name: "rename", arity: 3, handler: rename },
-    Command { name: "renamenx", arity: 3, handler: renamenx },
-    Command { name: "copy", arity: -3, handler: copy },
-    Command { name: "move", arity: 3, handler: move_cmd },
-    Command { name: "dbsize", arity: 1, handler: dbsize },
-    Command { name: "flushdb", arity: -1, handler: flushdb },
-    Command { name: "flushall", arity: -1, handler: flushall },
-    Command { name: "swapdb", arity: 3, handler: swapdb },
+    cmd("del", del),
+    cmd("unlink", del),
+    cmd("exists", exists),
+    cmd("touch", exists),
+    cmd("type", type_cmd),
+    cmd("expire", expire),
+    cmd("pexpire", pexpire),
+    cmd("expireat", expireat),
+    cmd("pexpireat", pexpireat),
+    cmd("ttl", ttl),
+    cmd("pttl", pttl),
+    cmd("expiretime", expiretime),
+    cmd("pexpiretime", pexpiretime),
+    cmd("persist", persist),
+    cmd("keys", keys),
+    cmd("scan", scan),
+    cmd("randomkey", randomkey),
+    cmd("rename", rename),
+    cmd("renamenx", renamenx),
+    cmd("copy", copy),
+    cmd("move", move_cmd),
+    cmd("dbsize", dbsize),
+    cmd("flushdb", flushdb),
+    cmd("flushall", flushall),
+    cmd("swapdb", swapdb),
 ];
 
 fn del(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -266,7 +266,7 @@ fn renamenx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 fn copy(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let (src, dst) = (&a[1], &a[2]);
     let mut replace = false;
-    let mut dst_db = ctx.session.db;
+    let mut dst_db = ctx.db_index();
     let mut i = 3;
     while i < a.len() {
         if eq_ic(&a[i], "replace") {
@@ -279,7 +279,7 @@ fn copy(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
         i += 1;
     }
-    if dst_db == ctx.session.db && src == dst {
+    if dst_db == ctx.db_index() && src == dst {
         return Err(same_object());
     }
     let Some(entry) = ctx.lookup(src).cloned() else {
@@ -299,7 +299,7 @@ fn copy(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 
 fn move_cmd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let dst_db = db_arg(&a[2])?;
-    if dst_db == ctx.session.db {
+    if dst_db == ctx.db_index() {
         return Err(same_object());
     }
     let now = ctx.now;

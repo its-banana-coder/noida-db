@@ -22,6 +22,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Show how many replies were compared against real Redis 7.2.
+      - run: cargo test --test redis_diff -- --nocapture
       # Modularity: the binary must build with any service set, even none.
       - run: cargo build --no-default-features
       - run: scripts/check-size.sh

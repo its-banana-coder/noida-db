@@ -1,10 +1,11 @@
-//! The Redis keyspace and command dispatch.
+//! The Redis keyspace, connected clients, and command dispatch.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use super::command_meta::{self, CommandMeta};
 use super::resp::Value;
-use super::{connection, keys, strings};
+use super::{admin, connection, keys, strings};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -78,6 +79,12 @@ impl Db {
         self.map.len()
     }
 
+    /// (keys, keys with an expiry), for INFO keyspace.
+    pub fn counts(&mut self, now: u64) -> (usize, usize) {
+        self.purge_expired(now);
+        (self.map.len(), self.map.values().filter(|e| e.expires_at.is_some()).count())
+    }
+
     /// Live keys in a stable (sorted) order, which SCAN cursors rely on.
     pub fn keys(&mut self, now: u64) -> Vec<Vec<u8>> {
         self.purge_expired(now);
@@ -91,22 +98,56 @@ impl Db {
     }
 }
 
+/// How a server connection presents itself to the engine.
+pub struct ClientConn {
+    pub addr: String,
+    pub laddr: String,
+    pub fd: i64,
+    /// Closes the connection from another thread (CLIENT KILL).
+    pub kill: Option<Box<dyn Fn() + Send>>,
+}
+
+/// Per-connection state that other clients can see (CLIENT LIST).
+pub struct Client {
+    pub id: u64,
+    pub conn: ClientConn,
+    pub name: Option<Vec<u8>>,
+    pub lib_name: Option<Vec<u8>>,
+    pub lib_ver: Option<Vec<u8>>,
+    pub db: usize,
+    pub resp: u8,
+    pub created: u64,
+    pub last_interaction: u64,
+    pub last_cmd: Option<String>,
+    pub no_evict: bool,
+    pub no_touch: bool,
+    pub reply_off: bool,
+    reply_skip: bool,
+    pub reply_skip_next: bool,
+}
+
+/// The connection's handle, owned by its thread.
 pub struct Session {
     pub id: u64,
-    pub db: usize,
-    pub name: Option<Vec<u8>>,
-    /// Set by QUIT: the server closes the connection after replying.
+    /// RESP version for encoding replies.
+    pub resp: u8,
+    /// The server closes the connection after sending the current reply.
     pub closing: bool,
 }
 
-impl Session {
-    pub fn new(id: u64) -> Session {
-        Session { id, db: 0, name: None, closing: false }
-    }
+pub struct Pause {
+    /// Unix ms at which the pause ends.
+    pub until: u64,
+    /// Pause everything, not just writes.
+    pub all: bool,
 }
 
 pub struct Engine {
     pub dbs: Vec<Db>,
+    pub clients: BTreeMap<u64, Client>,
+    pub pause: Option<Pause>,
+    pub started: u64,
+    next_client_id: u64,
     clock: Clock,
     rng: u64,
 }
@@ -114,26 +155,50 @@ pub struct Engine {
 pub type Reply = Result<Value, Value>;
 pub type Handler = fn(&mut Ctx, &[Vec<u8>]) -> Reply;
 
+/// A command noida implements. Arity and every other property come from
+/// Redis's own command table (`command_meta`).
 pub struct Command {
     pub name: &'static str,
-    /// Redis arity: positive means exact, negative means at least |n|.
-    /// Includes the command name itself.
-    pub arity: i32,
     pub handler: Handler,
+    pub subs: &'static [Command],
+}
+
+pub const fn cmd(name: &'static str, handler: Handler) -> Command {
+    Command { name, handler, subs: &[] }
+}
+
+/// A command with subcommands, like CLIENT. `handler` runs when it is
+/// called without one (only COMMAND allows that).
+pub const fn container(name: &'static str, handler: Handler, subs: &'static [Command]) -> Command {
+    Command { name, handler, subs }
 }
 
 fn command_table() -> impl Iterator<Item = &'static Command> {
-    connection::COMMANDS.iter().chain(keys::COMMANDS).chain(strings::COMMANDS)
+    connection::COMMANDS
+        .iter()
+        .chain(admin::COMMANDS)
+        .chain(keys::COMMANDS)
+        .chain(strings::COMMANDS)
 }
 
-/// Names of every command noida implements.
+fn find(name: &str) -> Option<&'static Command> {
+    static INDEX: std::sync::OnceLock<HashMap<&'static str, &'static Command>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| command_table().map(|c| (c.name, c)).collect()).get(name).copied()
+}
+
+/// Names of every top-level command noida implements.
 pub fn command_names() -> impl Iterator<Item = &'static str> {
     command_table().map(|c| c.name)
 }
 
-/// Whether noida implements a (lowercase) top-level command.
-pub fn is_implemented(name: &str) -> bool {
-    command_table().any(|c| c.name == name)
+/// Whether noida implements a command, by full name ("get",
+/// "client|setname").
+pub fn is_implemented(fullname: &str) -> bool {
+    match fullname.split_once('|') {
+        None => find(fullname).is_some(),
+        Some((parent, sub)) => find(parent).is_some_and(|c| c.subs.iter().any(|s| s.name == sub)),
+    }
 }
 
 /// Everything a command handler can touch.
@@ -144,8 +209,17 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    pub fn client(&mut self) -> &mut Client {
+        self.engine.clients.get_mut(&self.session.id).expect("client is registered")
+    }
+
+    pub fn db_index(&self) -> usize {
+        self.engine.clients[&self.session.id].db
+    }
+
     pub fn db(&mut self) -> &mut Db {
-        &mut self.engine.dbs[self.session.db]
+        let i = self.db_index();
+        &mut self.engine.dbs[i]
     }
 
     pub fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry> {
@@ -191,8 +265,16 @@ impl Engine {
     }
 
     pub fn with_clock(clock: Clock) -> Engine {
-        let seed = clock() | 1;
-        Engine { dbs: (0..NUM_DBS).map(|_| Db::default()).collect(), clock, rng: seed }
+        let now = clock();
+        Engine {
+            dbs: (0..NUM_DBS).map(|_| Db::default()).collect(),
+            clients: BTreeMap::new(),
+            pause: None,
+            started: now,
+            next_client_id: 1,
+            clock,
+            rng: now | 1,
+        }
     }
 
     pub fn now(&self) -> u64 {
@@ -206,21 +288,117 @@ impl Engine {
         }
     }
 
-    pub fn execute(&mut self, session: &mut Session, args: &[Vec<u8>]) -> Value {
-        let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
-        let Some(cmd) = command_table().find(|c| c.name == name) else {
-            return unknown_command(args);
-        };
-        let n = args.len() as i32;
-        if (cmd.arity > 0 && n != cmd.arity) || n < -cmd.arity {
-            return arity_error(cmd.name);
-        }
+    pub fn connect(&mut self, conn: ClientConn) -> Session {
+        let id = self.next_client_id;
+        self.next_client_id += 1;
         let now = self.now();
-        let mut ctx = Ctx { engine: self, session, now };
-        match (cmd.handler)(&mut ctx, args) {
-            Ok(v) | Err(v) => v,
-        }
+        self.clients.insert(
+            id,
+            Client {
+                id,
+                conn,
+                name: None,
+                lib_name: None,
+                lib_ver: None,
+                db: 0,
+                resp: 2,
+                created: now,
+                last_interaction: now,
+                last_cmd: None,
+                no_evict: false,
+                no_touch: false,
+                reply_off: false,
+                reply_skip: false,
+                reply_skip_next: false,
+            },
+        );
+        Session { id, resp: 2, closing: false }
     }
+
+    pub fn disconnect(&mut self, session: &Session) {
+        self.clients.remove(&session.id);
+    }
+
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Whether CLIENT PAUSE holds back this command right now. The server
+    /// waits and retries until it doesn't.
+    pub fn is_paused_for(&mut self, args: &[Vec<u8>]) -> bool {
+        let Some(pause) = &self.pause else { return false };
+        if self.now() >= pause.until {
+            self.pause = None;
+            return false;
+        }
+        if pause.all {
+            return true;
+        }
+        let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+        command_meta::lookup(&name)
+            .is_some_and(|m| m.has_flag("write") || m.has_flag("may_replicate"))
+    }
+
+    pub fn execute(&mut self, session: &mut Session, args: &[Vec<u8>]) -> Value {
+        if !self.clients.contains_key(&session.id) {
+            // Killed by another client: the connection is going away.
+            session.closing = true;
+            return Value::NoReply;
+        }
+        let (handler, fullname) = match resolve(args) {
+            Ok(found) => found,
+            Err(e) => return e,
+        };
+        let now = self.now();
+        let client = self.clients.get_mut(&session.id).unwrap();
+        client.last_interaction = now;
+        client.last_cmd = Some(fullname);
+
+        let mut ctx = Ctx { engine: self, session, now };
+        let reply = match handler(&mut ctx, args) {
+            Ok(v) | Err(v) => v,
+        };
+
+        let Some(client) = self.clients.get_mut(&session.id) else {
+            session.closing = true;
+            return reply;
+        };
+        let suppressed = client.reply_off || client.reply_skip;
+        client.reply_skip = std::mem::take(&mut client.reply_skip_next);
+        session.resp = client.resp;
+        if suppressed { Value::NoReply } else { reply }
+    }
+}
+
+/// Finds the handler and full name for `args`, or the error Redis gives.
+fn resolve(args: &[Vec<u8>]) -> Result<(Handler, String), Value> {
+    let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+    let (Some(cmd), Some(meta)) = (find(&name), command_meta::lookup(&name)) else {
+        return Err(unknown_command(args));
+    };
+    if cmd.subs.is_empty() || args.len() == 1 {
+        check_arity(meta, args.len())?;
+        return Ok((cmd.handler, name));
+    }
+    let sub_name = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
+    let fullname = format!("{name}|{sub_name}");
+    let (Some(sub), Some(sub_meta)) =
+        (cmd.subs.iter().find(|s| s.name == sub_name), command_meta::lookup(&fullname))
+    else {
+        let shown: String = String::from_utf8_lossy(&args[1]).chars().take(128).collect();
+        let msg = format!("ERR unknown subcommand '{shown}'. Try {} HELP.", name.to_uppercase());
+        return Err(Value::Error(msg.replace(['\r', '\n'], " ")));
+    };
+    check_arity(sub_meta, args.len())?;
+    Ok((sub.handler, fullname))
+}
+
+fn check_arity(meta: &CommandMeta, argc: usize) -> Result<(), Value> {
+    let n = argc as i64;
+    if (meta.arity > 0 && n != meta.arity) || n < -meta.arity {
+        return Err(arity_error(meta.name));
+    }
+    Ok(())
 }
 
 fn unknown_command(args: &[Vec<u8>]) -> Value {
@@ -238,6 +416,19 @@ fn unknown_command(args: &[Vec<u8>]) -> Value {
     let msg = format!("ERR unknown command '{name}', with args beginning with: {shown}");
     // Redis never lets newlines into an error line.
     Value::Error(msg.replace(['\r', '\n'], " "))
+}
+
+/// The reply of a `HELP` subcommand, framed the way Redis's `addReplyHelp`
+/// does.
+pub fn help_reply(command: &str, lines: &[&str]) -> Value {
+    let mut out = vec![Value::Simple(format!(
+        "{} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        command.to_uppercase()
+    ))];
+    out.extend(lines.iter().map(|l| Value::Simple((*l).into())));
+    out.push(Value::Simple("HELP".into()));
+    out.push(Value::Simple("    Print this help.".into()));
+    Value::Array(out)
 }
 
 // ---- shared error replies ----
@@ -275,6 +466,11 @@ pub fn int_arg(b: &[u8]) -> Result<i64, Value> {
     super::num::parse_int(b).ok_or_else(not_int)
 }
 
+/// Parses an integer argument, failing with a custom message.
+pub fn int_arg_msg(b: &[u8], msg: &str) -> Result<i64, Value> {
+    super::num::parse_int(b).ok_or_else(|| Value::err(format!("ERR {msg}")))
+}
+
 /// Parses a DB index the way `getIntFromObjectOrReply` + `selectDb` do.
 pub fn db_arg(b: &[u8]) -> Result<usize, Value> {
     let n = int_arg(b)?;
@@ -285,6 +481,21 @@ pub fn db_arg(b: &[u8]) -> Result<usize, Value> {
         return Err(db_out_of_range());
     }
     Ok(n as usize)
+}
+
+/// A millisecond timeout as an absolute time (0 = none), like
+/// `getTimeoutFromObjectOrReply(.., UNIT_MILLISECONDS)`.
+pub fn timeout_ms_arg(b: &[u8], now: u64) -> Result<u64, Value> {
+    let t = int_arg_msg(b, "timeout is not an integer or out of range")?;
+    if t < 0 {
+        return Err(Value::err("ERR timeout is negative"));
+    }
+    if t == 0 {
+        return Ok(0);
+    }
+    t.checked_add(now as i64)
+        .map(|v| v as u64)
+        .ok_or_else(|| Value::err("ERR timeout is out of range"))
 }
 
 pub fn eq_ic(a: &[u8], b: &str) -> bool {

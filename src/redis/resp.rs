@@ -12,6 +12,14 @@ pub enum Value {
     Null,
     Array(Vec<Value>),
     NullArray,
+    /// RESP3 map; sent as a flat array on RESP2.
+    Map(Vec<(Value, Value)>),
+    /// RESP3 set; sent as an array on RESP2.
+    Set(Vec<Value>),
+    /// RESP3 verbatim string (format, text); sent as a bulk string on RESP2.
+    Verbatim(&'static str, Vec<u8>),
+    /// Nothing is sent (CLIENT REPLY OFF/SKIP).
+    NoReply,
 }
 
 impl Value {
@@ -49,24 +57,47 @@ fn protocol(msg: impl Into<String>) -> ReadError {
     ReadError::Protocol(ProtocolError(msg.into()))
 }
 
-pub fn encode(v: &Value, out: &mut Vec<u8>) {
+/// Encodes a reply for a client speaking RESP `proto` (2 or 3).
+pub fn encode(v: &Value, proto: u8, out: &mut Vec<u8>) {
+    let resp3 = proto >= 3;
     match v {
         Value::Simple(s) => line(out, b'+', s.as_bytes()),
         Value::Error(s) => line(out, b'-', s.as_bytes()),
         Value::Integer(n) => line(out, b':', n.to_string().as_bytes()),
-        Value::Bulk(b) => {
-            line(out, b'$', b.len().to_string().as_bytes());
-            out.extend_from_slice(b);
-            out.extend_from_slice(b"\r\n");
-        }
+        Value::Bulk(b) => bulk(out, b'$', b),
+        Value::Null | Value::NullArray if resp3 => out.extend_from_slice(b"_\r\n"),
         Value::Null => out.extend_from_slice(b"$-1\r\n"),
         Value::NullArray => out.extend_from_slice(b"*-1\r\n"),
-        Value::Array(items) => {
-            line(out, b'*', items.len().to_string().as_bytes());
-            for item in items {
-                encode(item, out);
+        Value::Array(items) => aggregate(out, b'*', items, proto),
+        Value::Set(items) => aggregate(out, if resp3 { b'~' } else { b'*' }, items, proto),
+        Value::Map(pairs) => {
+            let len = if resp3 { pairs.len() } else { pairs.len() * 2 };
+            line(out, if resp3 { b'%' } else { b'*' }, len.to_string().as_bytes());
+            for (k, v) in pairs {
+                encode(k, proto, out);
+                encode(v, proto, out);
             }
         }
+        Value::Verbatim(format, text) if resp3 => {
+            let mut body = format!("{format}:").into_bytes();
+            body.extend_from_slice(text);
+            bulk(out, b'=', &body);
+        }
+        Value::Verbatim(_, text) => bulk(out, b'$', text),
+        Value::NoReply => {}
+    }
+}
+
+fn bulk(out: &mut Vec<u8>, prefix: u8, b: &[u8]) {
+    line(out, prefix, b.len().to_string().as_bytes());
+    out.extend_from_slice(b);
+    out.extend_from_slice(b"\r\n");
+}
+
+fn aggregate(out: &mut Vec<u8>, prefix: u8, items: &[Value], proto: u8) {
+    line(out, prefix, items.len().to_string().as_bytes());
+    for item in items {
+        encode(item, proto, out);
     }
 }
 
@@ -218,7 +249,7 @@ pub(crate) fn split_inline(line: &[u8]) -> Result<Vec<Vec<u8>>, ReadError> {
     }
 }
 
-/// Reads any RESP2 value (used by clients and tests to read replies).
+/// Reads any RESP2 or RESP3 value (used by clients and tests to read replies).
 pub fn read_value<R: BufRead>(r: &mut R) -> Result<Option<Value>, ReadError> {
     let Some(line) = read_line(r)? else {
         return Ok(None);
@@ -248,6 +279,32 @@ pub fn read_value<R: BufRead>(r: &mut R) -> Result<Option<Value>, ReadError> {
                 Value::Array(items)
             }
         },
+        b'_' => Value::Null,
+        b'%' => {
+            let mut pairs = Vec::new();
+            for _ in 0..int()? {
+                let k = read_value(r)?.ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                let v = read_value(r)?.ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))?;
+                pairs.push((k, v));
+            }
+            Value::Map(pairs)
+        }
+        b'~' => {
+            let mut items = Vec::new();
+            for _ in 0..int()? {
+                items.push(read_value(r)?.ok_or(io::Error::from(io::ErrorKind::UnexpectedEof))?);
+            }
+            Value::Set(items)
+        }
+        b'=' => {
+            let body = read_exact_bulk(r, int()? as usize)?;
+            let format = match &body[..4.min(body.len())] {
+                b"txt:" => "txt",
+                b"mkd:" => "mkd",
+                _ => return Err(protocol("bad verbatim format")),
+            };
+            Value::Verbatim(format, body[4..].to_vec())
+        }
         c => return Err(protocol(format!("unknown reply type '{}'", c as char))),
     };
     Ok(Some(v))
@@ -258,8 +315,12 @@ mod tests {
     use super::*;
 
     fn enc(v: Value) -> String {
+        enc_proto(v, 2)
+    }
+
+    fn enc_proto(v: Value, proto: u8) -> String {
         let mut out = Vec::new();
-        encode(&v, &mut out);
+        encode(&v, proto, &mut out);
         String::from_utf8(out).unwrap()
     }
 
@@ -353,8 +414,36 @@ mod tests {
             Value::Array(vec![Value::bulk("")]),
         ]);
         let mut buf = Vec::new();
-        encode(&v, &mut buf);
+        encode(&v, 2, &mut buf);
         let mut r = buf.as_slice();
         assert_eq!(read_value(&mut r).unwrap(), Some(v));
+    }
+
+    #[test]
+    fn resp3_types_and_their_resp2_fallbacks() {
+        let m = Value::Map(vec![(Value::bulk("a"), Value::Integer(1))]);
+        assert_eq!(enc_proto(m.clone(), 3), "%1\r\n$1\r\na\r\n:1\r\n");
+        assert_eq!(enc_proto(m, 2), "*2\r\n$1\r\na\r\n:1\r\n");
+        let set = Value::Set(vec![Value::Simple("x".into())]);
+        assert_eq!(enc_proto(set.clone(), 3), "~1\r\n+x\r\n");
+        assert_eq!(enc_proto(set, 2), "*1\r\n+x\r\n");
+        let v = Value::Verbatim("txt", b"hi".to_vec());
+        assert_eq!(enc_proto(v.clone(), 3), "=6\r\ntxt:hi\r\n");
+        assert_eq!(enc_proto(v, 2), "$2\r\nhi\r\n");
+        assert_eq!(enc_proto(Value::Null, 3), "_\r\n");
+        assert_eq!(enc_proto(Value::NullArray, 3), "_\r\n");
+        assert_eq!(enc_proto(Value::NoReply, 3), "");
+    }
+
+    #[test]
+    fn read_value_understands_resp3() {
+        let v = Value::Map(vec![
+            (Value::bulk("s"), Value::Set(vec![Value::Integer(1)])),
+            (Value::bulk("v"), Value::Verbatim("txt", b"x".to_vec())),
+            (Value::bulk("n"), Value::Null),
+        ]);
+        let mut buf = Vec::new();
+        encode(&v, 3, &mut buf);
+        assert_eq!(read_value(&mut buf.as_slice()).unwrap(), Some(v));
     }
 }

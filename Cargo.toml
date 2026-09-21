@@ -22,3 +22,16 @@ strip = true
 
 [dev-dependencies]
 redis = { version = "1.7.0", default-features = false }
+
+# Service test suites only build when their service is compiled in.
+[[test]]
+name = "redis_client"
+required-features = ["redis"]
+
+[[test]]
+name = "redis_diff"
+required-features = ["redis"]
+
+[[test]]
+name = "redis_coverage"
+required-features = ["redis"]
