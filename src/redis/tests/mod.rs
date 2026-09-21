@@ -4,6 +4,7 @@
 mod connection;
 mod hashes;
 mod introspection;
+mod lists;
 mod strings_keys;
 
 use std::sync::Arc;

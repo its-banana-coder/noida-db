@@ -370,5 +370,13 @@ fn swapdb(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let x = index(&a[1], "first")?;
     let y = index(&a[2], "second")?;
     ctx.engine.dbs.swap(x, y);
+    // Clients stay blocked on their database index; the keys they wait for
+    // may exist now (Redis's `scanDatabaseForReadyKeys`).
+    for db in [x, y] {
+        let keys: Vec<Vec<u8>> = ctx.engine.waiting[db].keys().cloned().collect();
+        for k in keys {
+            ctx.engine.signal_ready(db, &k);
+        }
+    }
     Ok(Value::ok())
 }

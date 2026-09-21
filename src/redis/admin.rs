@@ -254,10 +254,13 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 f("maxclients", "10000".into()),
                 f("client_recent_max_input_buffer", "0".into()),
                 f("client_recent_max_output_buffer", "0".into()),
-                f("blocked_clients", "0".into()),
+                f("blocked_clients", ctx.engine.blocked_count().to_string()),
                 f("tracking_clients", "0".into()),
-                f("clients_in_timeout_table", "0".into()),
-                f("total_blocking_keys", "0".into()),
+                f("clients_in_timeout_table", ctx.engine.timeout_count().to_string()),
+                f(
+                    "total_blocking_keys",
+                    ctx.engine.waiting.iter().map(|w| w.len()).sum::<usize>().to_string(),
+                ),
                 f("total_blocking_keys_on_nokey", "0".into()),
             ],
         );

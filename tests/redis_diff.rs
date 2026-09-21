@@ -19,6 +19,10 @@ use noida::redis::resp::Value;
 /// - `@X.Y ` compares only if the reference is at least X.Y (error wording
 ///   that changed since older Redis). The command still runs on both.
 /// - `!` runs the command on both but doesn't compare (ids, versions).
+/// - `&N CMD` sends CMD on extra connection N (1-9) without reading the
+///   reply (a blocking command), then waits a moment so it is seen first.
+/// - `<N` reads the next reply on connection N and compares it.
+/// - `=N CMD` runs CMD on connection N and compares the reply.
 const SCRIPTS: &[((u32, u32), &[&str])] = &[
     ((2, 0), &["PING", "PING hi", "ECHO x", "PING a b", "ECHO"]),
     ((2, 0), &["GET k", "SET k v", "GET k", "SET k w", "GET k", "GET", "SET k"]),
@@ -542,6 +546,204 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "COMMAND LIST FILTERBY",
         ],
     ),
+    // ---- lists ----
+    (
+        (2, 0),
+        &[
+            "RPUSH l a b c",
+            "LPUSH l z y",
+            "LRANGE l 0 -1",
+            "LRANGE l 1 2",
+            "LRANGE l -2 100",
+            "LRANGE l 3 1",
+            "LRANGE l 10 20",
+            "LRANGE nokey 0 -1",
+            "LRANGE l x 1",
+            "LLEN l",
+            "LLEN nokey",
+            "LPOP l",
+            "RPOP l",
+            "LINDEX l 0",
+            "LINDEX l -1",
+            "LINDEX l 9",
+            "LINDEX l x",
+            "LINDEX nokey 0",
+            "LSET l 0 A",
+            "LSET l 9 x",
+            "LSET nokey 0 x",
+            "LRANGE l 0 -1",
+            "LPUSHX nokey a",
+            "RPUSHX l d e",
+            "LINSERT l BEFORE b B",
+            "LINSERT l AFTER e f",
+            "LINSERT l AFTER nope x",
+            "LINSERT nokey AFTER a x",
+            "LINSERT l MIDDLE a x",
+            "LRANGE l 0 -1",
+            "SET s v",
+            "LPUSH s a",
+            "LLEN s",
+            "LRANGE s 0 1",
+            "TYPE l",
+            "LPOP nokey",
+        ],
+    ),
+    (
+        (6, 2),
+        &[
+            "RPUSH l a b c d e",
+            "LPOP l 2",
+            "RPOP l 2",
+            "LPOP l 0",
+            "RPOP l 5",
+            "EXISTS l",
+            "LPOP l 2",
+            "@7.0 LPOP l -1",
+            "@7.0 LPOP l x",
+            "LPOP l 1 2",
+        ],
+    ),
+    (
+        (6, 0),
+        &[
+            "RPUSH l a b a c a d",
+            "LPOS l a",
+            "LPOS l a RANK 2",
+            "LPOS l a RANK -1",
+            "LPOS l a COUNT 0",
+            "LPOS l a COUNT 2 RANK -1",
+            "LPOS l a MAXLEN 1 COUNT 0",
+            "LPOS l z",
+            "LPOS l z COUNT 1",
+            "LPOS nokey a",
+            "LPOS nokey a COUNT 1",
+            "@7.0 LPOS l a RANK 0",
+            "LPOS l a COUNT -1",
+            "LPOS l a MAXLEN -1",
+            "LPOS l a FOO",
+            "LREM l -2 a",
+            "LRANGE l 0 -1",
+            "LREM l 0 z",
+            "LREM nokey 0 z",
+            "LREM l x a",
+            "LTRIM l 1 -2",
+            "LRANGE l 0 -1",
+            "LTRIM nokey 0 1",
+            "LTRIM l 5 1",
+            "EXISTS l",
+        ],
+    ),
+    (
+        (6, 2),
+        &[
+            "RPUSH src a b c",
+            "LMOVE src dst LEFT RIGHT",
+            "LMOVE src dst RIGHT LEFT",
+            "LRANGE dst 0 -1",
+            "RPOPLPUSH src dst",
+            "EXISTS src",
+            "RPOPLPUSH src dst",
+            "LMOVE dst dst LEFT RIGHT",
+            "LRANGE dst 0 -1",
+            "LMOVE dst dst UP RIGHT",
+            "SET s v",
+            "LMOVE dst s LEFT RIGHT",
+            "LMOVE s dst LEFT RIGHT",
+            "LRANGE dst 0 -1",
+        ],
+    ),
+    (
+        (7, 0),
+        &[
+            "RPUSH dst c a b",
+            "LMPOP 2 nokey dst LEFT",
+            "LMPOP 1 dst RIGHT COUNT 10",
+            "LMPOP 1 dst RIGHT",
+            "LMPOP 0 dst RIGHT",
+            "LMPOP 2 dst RIGHT",
+            "LMPOP 1 dst UP",
+            "LMPOP 1 dst LEFT COUNT 0",
+            "LMPOP 1 dst LEFT COUNT 1 COUNT 1",
+            "SET s v",
+            "LMPOP 1 s LEFT",
+            "RPUSH b x y",
+            "BLMPOP 0 2 a b RIGHT COUNT 5",
+            "BLMPOP 0 0 a LEFT",
+            "BLMPOP 0.01 1 a LEFT",
+        ],
+    ),
+    (
+        (6, 2),
+        &[
+            "RPUSH b x y",
+            "BLPOP a b 0",
+            "BRPOP a b 0",
+            "RPUSH b x",
+            "BLMOVE b c LEFT LEFT 0",
+            "BRPOPLPUSH c d 0",
+            "BLPOP a x",
+            "BLPOP a -1",
+            "BLPOP a 1e300",
+            "BLPOP a 0.01",
+            "BRPOPLPUSH a b 0.01",
+            "SET s v",
+            "BLPOP s 0",
+            "BLMOVE s x LEFT LEFT 0",
+            "BLMOVE b c UP LEFT 0",
+        ],
+    ),
+    // Waiters are served FIFO when data arrives, one element each.
+    (
+        (2, 0),
+        &[
+            "&1 BLPOP k 0",
+            "&2 BRPOP other k 0",
+            "&3 BLPOP k 0",
+            "RPUSH k 1 2",
+            "<1",
+            "<2",
+            "EXISTS k",
+            "LPUSH k 3",
+            "<3",
+            "EXISTS k",
+        ],
+    ),
+    (
+        (6, 2),
+        &[
+            "&1 BLMOVE src mid LEFT RIGHT 0",
+            "&2 BLPOP mid 0",
+            "RPUSH src v",
+            "<1",
+            "<2",
+            "EXISTS src mid",
+            "&3 BLPOP k 0",
+            "SET k s",
+            "DEL k",
+            "RPUSH tmp x y",
+            "RENAME tmp k",
+            "<3",
+            "LRANGE k 0 -1",
+        ],
+    ),
+    (
+        (7, 0),
+        &[
+            "&1 BLMPOP 0 2 a b RIGHT COUNT 3",
+            "SELECT 1",
+            "RPUSH b x y z w",
+            "MOVE b 0",
+            "<1",
+            "SELECT 0",
+            "LRANGE b 0 -1",
+            "=2 HELLO 3",
+            "&2 BLPOP q 0.05",
+            "<2",
+            "&2 BLPOP q 0",
+            "RPUSH q v",
+            "<2",
+        ],
+    ),
 ];
 
 fn parse_version(v: &str) -> (u32, u32) {
@@ -617,7 +819,8 @@ fn replies_match_real_redis() {
         return;
     };
     let mut real = RawClient::connect(reference.addr);
-    let mut ours = RawClient::connect(common::start_noida_redis());
+    let noida = common::start_noida_redis();
+    let mut ours = RawClient::connect(noida);
     let version = server_version(&mut real);
 
     let mut failures = Vec::new();
@@ -633,6 +836,7 @@ fn replies_match_real_redis() {
             c.run("RESET");
             c.run("FLUSHALL");
         }
+        let mut side: std::collections::HashMap<char, (RawClient, RawClient)> = Default::default();
         for line in *script {
             let (line_min, line) = match line.strip_prefix('@') {
                 Some(rest) => {
@@ -649,9 +853,31 @@ fn replies_match_real_redis() {
                 Some(rest) => (true, rest),
                 None => (false, line),
             };
+            let conn = match line.as_bytes() {
+                [op @ (b'&' | b'<' | b'='), n, ..] => Some((*op, *n as char)),
+                _ => None,
+            };
+            let line = if conn.is_some() { line[2..].trim_start() } else { line };
             let a = args(line);
             let refs: Vec<&[u8]> = a.iter().map(Vec::as_slice).collect();
-            let (mut want, mut got) = (real.cmd(&refs), ours.cmd(&refs));
+            let (mut want, mut got) = match conn {
+                None => (real.cmd(&refs), ours.cmd(&refs)),
+                Some((op, n)) => {
+                    let (r, o) = side.entry(n).or_insert_with(|| {
+                        (RawClient::connect(reference.addr), RawClient::connect(noida))
+                    });
+                    match op {
+                        b'&' => {
+                            r.send(&refs);
+                            o.send(&refs);
+                            std::thread::sleep(Duration::from_millis(50));
+                            continue;
+                        }
+                        b'<' => (r.read().expect("reply"), o.read().expect("reply")),
+                        _ => (r.cmd(&refs), o.cmd(&refs)),
+                    }
+                }
+            };
             if is_set {
                 want = unordered(want);
                 got = unordered(got);

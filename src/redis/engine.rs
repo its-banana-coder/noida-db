@@ -1,12 +1,13 @@
 //! The Redis keyspace, connected clients, and command dispatch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, strings};
+use super::{admin, connection, hashes, keys, lists, strings};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -17,6 +18,7 @@ pub const NUM_DBS: usize = 16;
 pub enum Data {
     Str(Vec<u8>),
     Hash(Hash),
+    List(VecDeque<Vec<u8>>),
 }
 
 impl Data {
@@ -24,6 +26,7 @@ impl Data {
         match self {
             Data::Str(_) => "string",
             Data::Hash(_) => "hash",
+            Data::List(_) => "list",
         }
     }
 }
@@ -76,6 +79,9 @@ impl Entry {
 #[derive(Default)]
 pub struct Db {
     map: HashMap<Vec<u8>, Entry>,
+    /// Keys added since the engine last looked, in order: they may wake
+    /// blocked clients (Redis's `signalKeyAsReady` from `dbAdd`).
+    pub(crate) added: Vec<Vec<u8>>,
 }
 
 impl Db {
@@ -95,6 +101,7 @@ impl Db {
     }
 
     pub fn insert(&mut self, key: Vec<u8>, entry: Entry) {
+        self.added.push(key.clone());
         self.map.insert(key, entry);
     }
 
@@ -152,6 +159,8 @@ pub struct Client {
     pub reply_off: bool,
     reply_skip: bool,
     pub reply_skip_next: bool,
+    /// Waiting in a blocking command (BLPOP and friends).
+    pub blocked: Option<BlockState>,
 }
 
 /// The connection's handle, owned by its thread.
@@ -161,6 +170,8 @@ pub struct Session {
     pub resp: u8,
     /// The server closes the connection after sending the current reply.
     pub closing: bool,
+    /// The last command blocked: the reply comes later, from `take_reply`.
+    pub blocked: bool,
 }
 
 pub struct Pause {
@@ -175,6 +186,10 @@ pub struct Engine {
     pub clients: BTreeMap<u64, Client>,
     pub pause: Option<Pause>,
     pub started: u64,
+    /// Per database: clients blocked on each key, in the order they blocked.
+    pub waiting: Vec<HashMap<Vec<u8>, VecDeque<u64>>>,
+    /// Replies for clients that were unblocked by other clients' commands.
+    pub(crate) replies: HashMap<u64, Value>,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -208,6 +223,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(keys::COMMANDS)
         .chain(strings::COMMANDS)
         .chain(hashes::COMMANDS)
+        .chain(lists::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -235,6 +251,12 @@ pub struct Ctx<'a> {
     pub engine: &'a mut Engine,
     pub session: &'a mut Session,
     pub now: u64,
+    /// Blocking commands must answer right away (inside MULTI, scripts).
+    pub deny_blocking: bool,
+    /// Set by `Ctx::block`: the command waits for keys.
+    pub(crate) block: Option<BlockRequest>,
+    /// When re-running a blocked command, its original deadline.
+    pub(crate) reprocess_deadline: Option<u64>,
 }
 
 impl Ctx<'_> {
@@ -282,10 +304,28 @@ impl Ctx<'_> {
         Ok(self.get_hash(key)?.expect("just created"))
     }
 
+    /// The list at `key`, `None` if missing, WRONGTYPE for other types.
+    pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&mut VecDeque<Vec<u8>>>, Value> {
+        match self.lookup(key) {
+            None => Ok(None),
+            Some(Entry { data: Data::List(l), .. }) => Ok(Some(l)),
+            Some(_) => Err(wrong_type()),
+        }
+    }
+
+    /// The list at `key`, created empty if missing.
+    pub fn list_or_create(&mut self, key: &[u8]) -> Result<&mut VecDeque<Vec<u8>>, Value> {
+        if self.get_list(key)?.is_none() {
+            self.db().insert(key.to_vec(), Entry::new(Data::List(VecDeque::new())));
+        }
+        Ok(self.get_list(key)?.expect("just created"))
+    }
+
     /// Deletes `key` if its collection became empty, as Redis does.
     pub fn drop_if_empty(&mut self, key: &[u8]) {
         let empty = match self.lookup(key) {
             Some(Entry { data: Data::Hash(h), .. }) => h.map.is_empty(),
+            Some(Entry { data: Data::List(l), .. }) => l.is_empty(),
             _ => false,
         };
         if empty {
@@ -333,6 +373,8 @@ impl Engine {
             clients: BTreeMap::new(),
             pause: None,
             started: now,
+            waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
+            replies: HashMap::new(),
             next_client_id: 1,
             clock,
             rng: now | 1,
@@ -372,13 +414,21 @@ impl Engine {
                 reply_off: false,
                 reply_skip: false,
                 reply_skip_next: false,
+                blocked: None,
             },
         );
-        Session { id, resp: 2, closing: false }
+        Session { id, resp: 2, closing: false, blocked: false }
     }
 
     pub fn disconnect(&mut self, session: &Session) {
-        self.clients.remove(&session.id);
+        self.remove_client(session.id);
+    }
+
+    /// Forgets a client and everything it was waiting for.
+    pub fn remove_client(&mut self, id: u64) -> Option<Client> {
+        self.unblock(id);
+        self.replies.remove(&id);
+        self.clients.remove(&id)
     }
 
     pub fn client_count(&self) -> usize {
@@ -416,10 +466,8 @@ impl Engine {
         client.last_interaction = now;
         client.last_cmd = Some(fullname);
 
-        let mut ctx = Ctx { engine: self, session, now };
-        let reply = match handler(&mut ctx, args) {
-            Ok(v) | Err(v) => v,
-        };
+        let reply = self.call(session, handler, args, false, None);
+        self.serve_blocked();
 
         let Some(client) = self.clients.get_mut(&session.id) else {
             session.closing = true;
@@ -430,10 +478,33 @@ impl Engine {
         session.resp = client.resp;
         if suppressed { Value::NoReply } else { reply }
     }
+
+    /// Runs one command handler. If it blocks, the client is registered as
+    /// waiting and `NoReply` comes back.
+    pub(crate) fn call(
+        &mut self,
+        session: &mut Session,
+        handler: Handler,
+        args: &[Vec<u8>],
+        deny_blocking: bool,
+        reprocess_deadline: Option<u64>,
+    ) -> Value {
+        let now = self.now();
+        let mut ctx =
+            Ctx { engine: self, session, now, deny_blocking, block: None, reprocess_deadline };
+        let reply = match handler(&mut ctx, args) {
+            Ok(v) | Err(v) => v,
+        };
+        if let Some(req) = ctx.block.take() {
+            self.block_client(session, req, args);
+            return Value::NoReply;
+        }
+        reply
+    }
 }
 
 /// Finds the handler and full name for `args`, or the error Redis gives.
-fn resolve(args: &[Vec<u8>]) -> Result<(Handler, String), Value> {
+pub(crate) fn resolve(args: &[Vec<u8>]) -> Result<(Handler, String), Value> {
     let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
     let (Some(cmd), Some(meta)) = (find(&name), command_meta::lookup(&name)) else {
         return Err(unknown_command(args));
@@ -526,6 +597,33 @@ pub fn same_object() -> Value {
 /// Parses an integer argument or fails with Redis's standard error.
 pub fn int_arg(b: &[u8]) -> Result<i64, Value> {
     super::num::parse_int(b).ok_or_else(not_int)
+}
+
+/// `getLongFromObjectOrReply` (a long is 64 bits here).
+pub fn long_arg(b: &[u8]) -> Result<i64, Value> {
+    int_arg(b)
+}
+
+/// `getRangeLongFromObjectOrReply`: an integer in `min..=max`, failing with
+/// `msg` (or Redis's default messages).
+pub fn range_long(b: &[u8], min: i64, max: i64, msg: Option<&str>) -> Result<i64, Value> {
+    let custom = |m: &str| Value::err(format!("ERR {m}"));
+    let n = match super::num::parse_int(b) {
+        Some(n) => n,
+        None => return Err(msg.map_or_else(not_int, custom)),
+    };
+    if n < min || n > max {
+        return Err(msg.map_or_else(
+            || custom(&format!("value is out of range, value must between {min} and {max}")),
+            custom,
+        ));
+    }
+    Ok(n)
+}
+
+/// `getPositiveLongFromObjectOrReply`.
+pub fn positive_long(b: &[u8], msg: Option<&str>) -> Result<i64, Value> {
+    range_long(b, 0, i64::MAX, Some(msg.unwrap_or("value is out of range, must be positive")))
 }
 
 /// Parses an integer argument, failing with a custom message.

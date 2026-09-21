@@ -1,12 +1,14 @@
 //! Redis 7.2 compatibility: RESP over TCP on port 6379.
 
 mod admin;
+mod blocking;
 mod command_meta;
 mod connection;
 mod engine;
 mod glob;
 mod hashes;
 mod keys;
+mod lists;
 pub mod longdouble;
 mod meta;
 mod num;

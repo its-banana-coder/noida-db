@@ -192,3 +192,83 @@ fn hashes_through_a_real_client() -> RedisResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn lists_through_a_real_client() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    for url in [format!("redis://{addr}/"), format!("redis://{addr}/?protocol=resp3")] {
+        let mut con = redis::Client::open(url)?.get_connection()?;
+        let _: () = con.del("jobs")?;
+        let n: i64 = con.rpush("jobs", &["a", "b", "c"])?;
+        assert_eq!(n, 3);
+        let _: i64 = con.lpush("jobs", "z")?;
+        let all: Vec<String> = con.lrange("jobs", 0, -1)?;
+        assert_eq!(all, ["z", "a", "b", "c"]);
+        let first: Option<String> = con.lpop("jobs", None)?;
+        assert_eq!(first.as_deref(), Some("z"));
+        let two: Vec<String> = con.rpop("jobs", std::num::NonZeroUsize::new(2))?;
+        assert_eq!(two, ["c", "b"]);
+        let popped: Option<(String, String)> = con.blpop("jobs", 0.0)?;
+        assert_eq!(popped, Some(("jobs".into(), "a".into())));
+        // Times out with a nil reply.
+        let none: Option<(String, String)> = con.brpop("jobs", 0.1)?;
+        assert_eq!(none, None);
+    }
+    Ok(())
+}
+
+/// Clients blocked on a key are served in the order they blocked, when the
+/// data arrives.
+#[test]
+fn blocked_clients_are_served_in_order() {
+    use noida::redis::resp::Value;
+    use std::time::Duration;
+    let addr = common::start_noida_redis();
+    let mut waiters = Vec::new();
+    for _ in 0..3 {
+        let mut c = common::RawClient::connect(addr);
+        c.send(&[b"BLPOP", b"queue", b"0"]);
+        // Let the server see each BLPOP before the next one.
+        std::thread::sleep(Duration::from_millis(50));
+        waiters.push(c);
+    }
+    let mut admin = common::RawClient::connect(addr);
+    let Value::Bulk(info) = admin.run("INFO clients") else { panic!() };
+    assert!(String::from_utf8(info).unwrap().contains("blocked_clients:3\r\n"));
+    assert_eq!(admin.run("RPUSH queue 1 2 3"), Value::Integer(3));
+    for (i, c) in waiters.iter_mut().enumerate() {
+        let want = Value::Array(vec![Value::bulk("queue"), Value::bulk((i + 1).to_string())]);
+        assert_eq!(c.read(), Some(want));
+    }
+}
+
+#[test]
+fn blocking_timeouts_unblock_and_disconnects() {
+    use noida::redis::resp::Value;
+    use std::time::{Duration, Instant};
+    let addr = common::start_noida_redis();
+    let mut c = common::RawClient::connect(addr);
+    let start = Instant::now();
+    assert_eq!(c.run("BRPOP nothing 0.2"), Value::NullArray);
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "{took:?}");
+
+    // A client that disconnects while blocked must not take the data.
+    let mut gone = common::RawClient::connect(addr);
+    gone.send(&[b"BLPOP", b"k", b"0"]);
+    std::thread::sleep(Duration::from_millis(50));
+    drop(gone);
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(c.run("RPUSH k v"), Value::Integer(1));
+    assert_eq!(c.run("LLEN k"), Value::Integer(1));
+
+    // CLIENT UNBLOCK wakes a waiter with a timeout reply.
+    let mut waiter = common::RawClient::connect(addr);
+    let Value::Integer(id) = waiter.run("CLIENT ID") else { panic!() };
+    waiter.send(&[b"BLPOP", b"empty", b"0"]);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(c.run(&format!("CLIENT UNBLOCK {id}")), Value::Integer(1));
+    assert_eq!(waiter.read(), Some(Value::NullArray));
+    // The connection keeps working afterwards.
+    assert_eq!(waiter.run("PING"), Value::Simple("PONG".into()));
+}

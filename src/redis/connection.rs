@@ -235,6 +235,9 @@ fn client_id(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 /// performance analysis.
 fn info_line(c: &Client, now: u64) -> String {
     let mut flags = String::new();
+    if c.blocked.is_some() {
+        flags.push('b');
+    }
     if c.no_evict {
         flags.push('e');
     }
@@ -374,7 +377,7 @@ fn client_kill(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         if *v == me {
             // Close after the reply goes out.
             ctx.session.closing = true;
-        } else if let Some(c) = ctx.engine.clients.remove(v)
+        } else if let Some(c) = ctx.engine.remove_client(*v)
             && let Some(kill) = &c.conn.kill
         {
             kill();
@@ -481,11 +484,16 @@ fn client_unpause(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
     Ok(Value::ok())
 }
 
-fn client_unblock(_: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    if a.len() == 4 && !eq_ic(&a[3], "timeout") && !eq_ic(&a[3], "error") {
+fn client_unblock(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let error = a.len() == 4 && eq_ic(&a[3], "error");
+    if a.len() == 4 && !error && !eq_ic(&a[3], "timeout") {
         return Err(Value::err("ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR"));
     }
-    int_arg(&a[2])?;
-    // No command blocks yet (BLPOP and friends arrive with lists).
-    Ok(Value::Integer(0))
+    let id = int_arg(&a[2])?;
+    let reply = if error {
+        Value::err("UNBLOCKED client unblocked via CLIENT UNBLOCK")
+    } else {
+        Value::NullArray
+    };
+    Ok(Value::Integer(ctx.engine.unblock_with(id as u64, reply) as i64))
 }
