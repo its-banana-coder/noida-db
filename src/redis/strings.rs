@@ -35,7 +35,7 @@ pub static COMMANDS: &[Command] = &[
 ];
 
 fn opt_bulk(v: Option<&mut Vec<u8>>) -> Value {
-    v.map_or(Value::Null, |s| Value::bulk(s))
+    v.map_or(Value::Null, Value::bulk)
 }
 
 fn get(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -205,7 +205,7 @@ fn mget(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn mset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    if a.len() % 2 == 0 {
+    if a.len().is_multiple_of(2) {
         return Err(arity_error("mset"));
     }
     for pair in a[1..].chunks(2) {
@@ -215,7 +215,7 @@ fn mset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn msetnx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    if a.len() % 2 == 0 {
+    if a.len().is_multiple_of(2) {
         return Err(arity_error("msetnx"));
     }
     if a[1..].chunks(2).any(|pair| ctx.lookup(&pair[0]).is_some()) {

@@ -24,7 +24,7 @@ impl RawClient {
     }
 
     pub fn send(&mut self, args: &[&[u8]]) {
-        let v = Value::Array(args.iter().map(|a| Value::bulk(a)).collect());
+        let v = Value::Array(args.iter().map(Value::bulk).collect());
         let mut out = Vec::new();
         resp::encode(&v, &mut out);
         self.writer.write_all(&out).unwrap();

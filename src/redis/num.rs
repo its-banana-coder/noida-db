@@ -106,10 +106,10 @@ pub fn add_human(a: &[u8], b: &[u8]) -> Result<String, &'static str> {
     if !sum.is_finite() {
         return Err("ERR increment would produce NaN or Infinity");
     }
-    if let (Some(sa), Some(sb)) = (parse_scaled(a), parse_scaled(b)) {
-        if let Some(total) = sa.checked_add(sb) {
-            return Ok(format_scaled(total));
-        }
+    if let (Some(sa), Some(sb)) = (parse_scaled(a), parse_scaled(b))
+        && let Some(total) = sa.checked_add(sb)
+    {
+        return Ok(format_scaled(total));
     }
     Ok(format_human(sum))
 }
