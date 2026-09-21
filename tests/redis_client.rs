@@ -173,3 +173,22 @@ fn client_pause_holds_writes_from_other_clients() {
     assert_eq!(writer.run("SET k v"), Value::ok());
     assert!(start.elapsed() >= Duration::from_millis(250), "{:?}", start.elapsed());
 }
+
+#[test]
+fn hashes_through_a_real_client() -> RedisResult<()> {
+    use std::collections::HashMap;
+    let addr = common::start_noida_redis();
+    for url in [format!("redis://{addr}/"), format!("redis://{addr}/?protocol=resp3")] {
+        let mut con = redis::Client::open(url)?.get_connection()?;
+        let _: () = con.del("user:1")?;
+        let _: () = con.hset_multiple("user:1", &[("name", "Ada"), ("lang", "rust")])?;
+        let n: i64 = con.hincr("user:1", "visits", 3)?;
+        assert_eq!(n, 3);
+        let all: HashMap<String, String> = con.hgetall("user:1")?;
+        assert_eq!(all.len(), 3);
+        assert_eq!(all["name"], "Ada");
+        let name: Option<String> = con.hget("user:1", "name")?;
+        assert_eq!(name.as_deref(), Some("Ada"));
+    }
+    Ok(())
+}

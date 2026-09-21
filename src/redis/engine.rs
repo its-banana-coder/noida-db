@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::command_meta::{self, CommandMeta};
+use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, keys, strings};
+use super::{admin, connection, hashes, keys, strings};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -15,13 +16,40 @@ pub const NUM_DBS: usize = 16;
 #[derive(Clone, Debug)]
 pub enum Data {
     Str(Vec<u8>),
+    Hash(Hash),
 }
 
 impl Data {
     pub fn type_name(&self) -> &'static str {
         match self {
             Data::Str(_) => "string",
+            Data::Hash(_) => "hash",
         }
+    }
+}
+
+/// Redis's `hash-max-listpack-entries` / `-value` defaults. Below both, a
+/// hash is "small": compact, ordered, and scanned in one go.
+pub const LISTPACK_MAX_ENTRIES: usize = 128;
+pub const LISTPACK_MAX_VALUE: usize = 64;
+
+#[derive(Clone, Debug, Default)]
+pub struct Hash {
+    pub map: OrderedMap,
+    /// Converted to Redis's hashtable encoding; like Redis, never goes back.
+    pub big: bool,
+}
+
+impl Hash {
+    pub fn insert(&mut self, k: &[u8], v: &[u8]) -> bool {
+        if k.len() > LISTPACK_MAX_VALUE || v.len() > LISTPACK_MAX_VALUE {
+            self.big = true;
+        }
+        let new = self.map.insert(k.to_vec(), v.to_vec());
+        if self.map.len() > LISTPACK_MAX_ENTRIES {
+            self.big = true;
+        }
+        new
     }
 }
 
@@ -179,6 +207,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(admin::COMMANDS)
         .chain(keys::COMMANDS)
         .chain(strings::COMMANDS)
+        .chain(hashes::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -232,9 +261,42 @@ impl Ctx<'_> {
         match self.lookup(key) {
             None => Ok(None),
             Some(Entry { data: Data::Str(s), .. }) => Ok(Some(s)),
-            #[allow(unreachable_patterns)]
             Some(_) => Err(wrong_type()),
         }
+    }
+
+    /// The hash at `key`, `None` if missing, WRONGTYPE for other types.
+    pub fn get_hash(&mut self, key: &[u8]) -> Result<Option<&mut Hash>, Value> {
+        match self.lookup(key) {
+            None => Ok(None),
+            Some(Entry { data: Data::Hash(h), .. }) => Ok(Some(h)),
+            Some(_) => Err(wrong_type()),
+        }
+    }
+
+    /// The hash at `key`, created empty if missing.
+    pub fn hash_or_create(&mut self, key: &[u8]) -> Result<&mut Hash, Value> {
+        if self.get_hash(key)?.is_none() {
+            self.db().insert(key.to_vec(), Entry::new(Data::Hash(Hash::default())));
+        }
+        Ok(self.get_hash(key)?.expect("just created"))
+    }
+
+    /// Deletes `key` if its collection became empty, as Redis does.
+    pub fn drop_if_empty(&mut self, key: &[u8]) {
+        let empty = match self.lookup(key) {
+            Some(Entry { data: Data::Hash(h), .. }) => h.map.is_empty(),
+            _ => false,
+        };
+        if empty {
+            let now = self.now;
+            self.db().remove(key, now);
+        }
+    }
+
+    /// The client's RESP version (some replies differ between 2 and 3).
+    pub fn resp(&self) -> u8 {
+        self.engine.clients[&self.session.id].resp
     }
 
     pub fn random(&mut self) -> u64 {

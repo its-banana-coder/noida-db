@@ -175,45 +175,63 @@ fn keys(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     Ok(Value::Array(found))
 }
 
-/// SCAN over the sorted keyspace; the cursor is an index into it. Keys that
-/// exist for the whole iteration are always returned, as Redis guarantees.
-fn scan(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    let cursor: usize = std::str::from_utf8(&a[1])
+/// Options shared by SCAN, HSCAN, SSCAN and ZSCAN.
+pub struct ScanArgs<'a> {
+    pub cursor: usize,
+    pub count: usize,
+    pub pattern: Option<&'a [u8]>,
+    pub type_filter: Option<Vec<u8>>,
+}
+
+impl ScanArgs<'_> {
+    pub fn matches(&self, item: &[u8]) -> bool {
+        self.pattern.is_none_or(|p| glob::matches_key(p, item))
+    }
+}
+
+/// Parses `cursor [MATCH p] [COUNT n] [TYPE t]` starting at `a[i]`. TYPE is
+/// only valid for SCAN itself, as in Redis's `scanGenericCommand`.
+pub fn parse_scan(a: &[Vec<u8>], i: usize, allow_type: bool) -> Result<ScanArgs<'_>, Value> {
+    let cursor: usize = std::str::from_utf8(&a[i])
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| Value::err("ERR invalid cursor"))?;
-    let mut count = 10usize;
-    let mut pattern: Option<&[u8]> = None;
-    let mut type_filter: Option<Vec<u8>> = None;
-    let mut i = 2;
-    while i < a.len() {
-        let has_value = i + 1 < a.len();
-        if eq_ic(&a[i], "count") && has_value {
-            let n = int_arg(&a[i + 1])?;
+    let mut args = ScanArgs { cursor, count: 10, pattern: None, type_filter: None };
+    let mut j = i + 1;
+    while j < a.len() {
+        let has_value = j + 1 < a.len();
+        if eq_ic(&a[j], "count") && has_value {
+            let n = int_arg(&a[j + 1])?;
             if n < 1 {
                 return Err(syntax());
             }
-            count = n as usize;
-        } else if eq_ic(&a[i], "match") && has_value {
-            pattern = Some(&a[i + 1]);
-        } else if eq_ic(&a[i], "type") && has_value {
-            type_filter = Some(a[i + 1].to_ascii_lowercase());
+            args.count = n as usize;
+        } else if eq_ic(&a[j], "match") && has_value {
+            args.pattern = Some(&a[j + 1]);
+        } else if eq_ic(&a[j], "type") && has_value && allow_type {
+            args.type_filter = Some(a[j + 1].to_ascii_lowercase());
         } else {
             return Err(syntax());
         }
-        i += 2;
+        j += 2;
     }
+    Ok(args)
+}
 
+/// SCAN over the sorted keyspace; the cursor is an index into it. Keys that
+/// exist for the whole iteration are always returned, as Redis guarantees.
+fn scan(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let args = parse_scan(a, 1, true)?;
     let now = ctx.now;
     let all = ctx.db().keys(now);
-    let end = (cursor + count).min(all.len());
-    let start = cursor.min(end);
+    let end = (args.cursor + args.count).min(all.len());
+    let start = args.cursor.min(end);
     let mut out = Vec::new();
     for key in &all[start..end] {
-        if pattern.is_some_and(|p| !glob::matches_key(p, key)) {
+        if !args.matches(key) {
             continue;
         }
-        if let Some(t) = &type_filter {
+        if let Some(t) = &args.type_filter {
             let ty = ctx.lookup(key).map(|e| e.data.type_name());
             if ty.map(str::as_bytes) != Some(t.as_slice()) {
                 continue;

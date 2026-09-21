@@ -2,6 +2,7 @@
 //! error strings are Redis 7.2's, byte for byte.
 
 mod connection;
+mod hashes;
 mod introspection;
 mod strings_keys;
 

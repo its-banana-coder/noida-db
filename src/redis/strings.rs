@@ -198,7 +198,6 @@ fn mget(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         .map(|k| match ctx.lookup(k) {
             Some(Entry { data: Data::Str(s), .. }) => Value::bulk(s),
             // MGET never errors: other types read as nil.
-            #[allow(unreachable_patterns)]
             _ => Value::Null,
         })
         .collect();
