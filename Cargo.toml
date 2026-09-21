@@ -1,0 +1,16 @@
+[package]
+name = "noida"
+version = "0.1.0"
+edition = "2024"
+description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
+license = "MIT"
+
+[dependencies]
+
+# The whole point of noida is a small footprint: tune release builds for size.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
