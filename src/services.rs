@@ -9,6 +9,12 @@ pub fn start(name: &str, addr: &str) -> Option<io::Result<SocketAddr>> {
     match name {
         #[cfg(feature = "redis")]
         "redis" => Some(crate::redis::server::spawn(addr)),
+        #[cfg(feature = "postgres")]
+        "postgres" => Some(crate::postgres::spawn(addr)),
+        #[cfg(feature = "kafka")]
+        "kafka" => Some(crate::kafka::spawn(addr)),
+        #[cfg(feature = "memcached")]
+        "memcached" => Some(crate::memcached::spawn(addr)),
         _ => {
             let _ = addr;
             None

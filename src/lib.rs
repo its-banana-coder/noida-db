@@ -9,3 +9,12 @@ pub mod services;
 
 #[cfg(feature = "redis")]
 pub mod redis;
+
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+#[cfg(feature = "kafka")]
+pub mod kafka;
+
+#[cfg(feature = "memcached")]
+pub mod memcached;
