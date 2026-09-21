@@ -1,7 +1,7 @@
 //! noida: one tiny local binary standing in for Postgres, MySQL, Redis,
 //! Kafka, Elasticsearch and ClickHouse during development.
 
-mod config;
+use noida::config;
 
 use std::process::ExitCode;
 
@@ -32,20 +32,22 @@ fn main() -> ExitCode {
 
 fn start(cfg: &Config) -> std::io::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    println!(
-        "noida {} | data dir: {}",
-        env!("CARGO_PKG_VERSION"),
-        cfg.data_dir.display()
-    );
+    println!("noida {} | data dir: {}", env!("CARGO_PKG_VERSION"), cfg.data_dir.display());
     for svc in &cfg.services {
-        println!(
-            "  {:<14} {}:{}  (not implemented yet)",
-            svc.name, cfg.host, svc.port
-        );
+        let addr = format!("{}:{}", cfg.host, svc.port);
+        match noida::services::start(svc.name, &addr) {
+            Some(Ok(bound)) => println!("  {:<14} {bound}", svc.name),
+            Some(Err(e)) => return Err(io_context(e, svc.name, &addr)),
+            None => println!("  {:<14} {addr}  (not in this build)", svc.name),
+        }
     }
     println!("press Ctrl-C to stop");
-    // No listeners exist yet; park so `noida start` behaves like a server.
+    // Services run on background threads; keep the process alive.
     loop {
         std::thread::park();
     }
+}
+
+fn io_context(e: std::io::Error, service: &str, addr: &str) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{service}: cannot listen on {addr}: {e}"))
 }

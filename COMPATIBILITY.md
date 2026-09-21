@@ -16,7 +16,7 @@ real system's own "not supported" error, never a silently wrong result.
 | | Target |
 |---|---|
 | Binary on disk | ≤ 40MB (CI enforced) |
-| Idle RAM, all six services on, empty data | ≤ 30MB |
+| Idle RAM, all services on, empty data | ≤ 30MB |
 | Typical dev workload (≈100MB data, dozens of connections) | ≤ 150MB |
 | Hard cap | `--max-memory`, default 512MB |
 
@@ -30,24 +30,40 @@ How we stay inside the targets:
 - **Redis data is in memory, as it is in real Redis.** It counts toward
   `--max-memory`, and when the cap is hit noida follows Redis's `maxmemory`
   rules (eviction policies, then the OOM error).
-- **One async runtime** with a small thread pool, so connections cost KBs of
-  RAM, not MBs.
+- **A thread per connection,** with small stacks. Only the stack memory a
+  connection actually touches counts, so an idle one costs KBs, not MBs.
 - **Services start lazily.** A service that no one has connected to allocates
   nothing beyond its listener.
 
-## Not in scope for any system
+## Modular
 
-Clustering, replication, high availability, sharding, performance tuning,
-plugins and extensions, and the exact output of internal tools such as
-`EXPLAIN`.
+Every service is its own module:
+- **Build time:** each service is a Cargo feature (`redis`, `postgres`, ...),
+  all on by default. `cargo build --no-default-features --features redis,postgres`
+  leaves the other services out of the binary entirely.
+- **Run time:** `noida start --only redis,postgres` starts only those. A
+  service that is off opens no port and allocates no memory.
+
+## Rules for every system
+
+- **Every command and API works.** Where a feature makes no sense on one local
+  node (clustering, replication, sharding), noida replies exactly as a
+  standalone real server would. That counts as compatible.
+- **No performance analysis.** noida never implements EXPLAIN ANALYZE,
+  SLOWLOG, LATENCY, profilers or query statistics. Where clients or tools may
+  send these, noida accepts them and returns an empty or minimal reply so
+  nothing breaks.
+- **Not in scope:** real clustering, replication, high availability,
+  performance tuning, plugins and extensions.
 
 ## Per system
 
-### Redis (port 6379)
-- **In scope:** RESP2/RESP3; strings, hashes, lists, sets, sorted sets,
-  streams, TTLs, pub/sub, MULTI/EXEC, bitmaps, HyperLogLog, Lua scripting.
-- **Out of scope:** Cluster mode, Sentinel, modules (RedisJSON, RediSearch),
-  replication commands.
+### Redis (port 6379), target Redis 7.2
+- **In scope:** all 242 commands and their subcommands
+  (`tests/data/redis-7.2-commands.txt`, tracked by a coverage test), RESP2
+  and RESP3, Lua scripting and functions. Cluster, replication and Sentinel
+  commands reply as a standalone Redis does.
+- **Out of scope:** modules (RedisJSON, RediSearch).
 
 ### Postgres (port 5432)
 - **In scope:**
@@ -63,15 +79,14 @@ plugins and extensions, and the exact output of internal tools such as
 - **Out of scope (for now):** PL/pgSQL and stored procedures, extensions,
   logical replication. Concurrency is one writer at a time.
 
-### Kafka (port 9092)
+### Kafka (port 9092, native binary protocol)
 - **In scope:**
-  - A single broker with Metadata, Produce, Fetch, ListOffsets and
-    CreateTopics/DeleteTopics.
+  - Every API key a single-node KRaft broker advertises in ApiVersions:
+    produce, fetch, offsets, topic and config admin, ACLs.
   - Full consumer groups: join, sync, heartbeat, offset commit and fetch.
-  - Idempotent producers.
-  - Spring Kafka and Kafka Streams in at-least-once mode.
-- **Out of scope (for now):** transactions and exactly-once, multiple brokers,
-  KRaft/ZooKeeper APIs, Kafka Connect, Schema Registry.
+  - Idempotent producers, transactions and exactly-once.
+  - Spring Kafka and Kafka Streams.
+- **Out of scope:** multiple brokers, Kafka Connect, Schema Registry.
 
 ### MySQL (port 3306)
 - **In scope:**
@@ -107,6 +122,29 @@ plugins and extensions, and the exact output of internal tools such as
 - **Out of scope (for now):** distributed tables, dictionaries, the native TCP
   protocol, the long tail of functions.
 
+### Memcached (port 11211)
+- **In scope:** the text and binary protocols, every command, including
+  `meta` commands; `stats` returns minimal counters.
+
+### MongoDB (port 27017)
+- **In scope:**
+  - The OP_MSG wire protocol and handshake (`hello`), SCRAM auth.
+  - CRUD, the query and update operators, indexes (unique, TTL), the
+    aggregation pipeline, change streams, transactions and GridFS.
+  - The official drivers, Spring Data MongoDB and Mongoose working.
+- **Out of scope:** sharding, replica sets (noida replies as a single-node
+  replica set so transactions and change streams work), `$where` and
+  server-side JavaScript.
+
+### RabbitMQ (port 5672, management HTTP 15672)
+- **In scope:**
+  - AMQP 0-9-1 in full: exchanges (direct, fanout, topic, headers),
+    queues, bindings, acks and nacks, prefetch, TTLs, dead-lettering,
+    publisher confirms.
+  - The parts of the management HTTP API that tools and Spring AMQP use.
+- **Out of scope:** clustering, federation and shovel, plugins, streams,
+  MQTT and STOMP.
+
 ## Build order
 
 1. Redis
@@ -115,3 +153,6 @@ plugins and extensions, and the exact output of internal tools such as
 4. MySQL
 5. Elasticsearch
 6. ClickHouse
+7. Memcached (small; can come earlier since it reuses Redis storage)
+8. MongoDB
+9. RabbitMQ

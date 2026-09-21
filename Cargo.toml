@@ -5,6 +5,11 @@ edition = "2024"
 description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
 license = "MIT"
 
+# One feature per service, so people can build only what they use.
+[features]
+default = ["redis"]
+redis = []
+
 [dependencies]
 
 # The whole point of noida is a small footprint: tune release builds for size.
@@ -14,3 +19,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+redis = { version = "1.7.0", default-features = false }

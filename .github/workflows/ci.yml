@@ -8,6 +8,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      # Reference server for the differential tests (tests/redis_diff.rs).
+      redis:
+        image: redis:7.2
+        ports: ["6379:6379"]
+    env:
+      NOIDA_REDIS_REF: 127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -16,4 +23,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Modularity: the binary must build with any service set, even none.
+      - run: cargo build --no-default-features
       - run: scripts/check-size.sh

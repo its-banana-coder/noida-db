@@ -27,30 +27,12 @@ pub struct Service {
 /// Every service noida speaks, on the port its real counterpart uses,
 /// so existing clients work with their defaults.
 pub const DEFAULT_SERVICES: [Service; 6] = [
-    Service {
-        name: "postgres",
-        port: 5432,
-    },
-    Service {
-        name: "mysql",
-        port: 3306,
-    },
-    Service {
-        name: "redis",
-        port: 6379,
-    },
-    Service {
-        name: "kafka",
-        port: 9092,
-    },
-    Service {
-        name: "elasticsearch",
-        port: 9200,
-    },
-    Service {
-        name: "clickhouse",
-        port: 8123,
-    },
+    Service { name: "postgres", port: 5432 },
+    Service { name: "mysql", port: 3306 },
+    Service { name: "redis", port: 6379 },
+    Service { name: "kafka", port: 9092 },
+    Service { name: "elasticsearch", port: 9200 },
+    Service { name: "clickhouse", port: 8123 },
 ];
 
 #[derive(Debug, PartialEq)]
@@ -111,9 +93,7 @@ fn parse_start(args: &[String]) -> Result<Config, String> {
                     .strip_prefix("--")
                     .and_then(|f| f.strip_suffix("-port"))
                     .ok_or_else(|| format!("unknown option '{f}'"))?;
-                let port: u16 = value()?
-                    .parse()
-                    .map_err(|_| format!("{flag}: invalid port"))?;
+                let port: u16 = value()?.parse().map_err(|_| format!("{flag}: invalid port"))?;
                 let svc = cfg
                     .services
                     .iter_mut()
