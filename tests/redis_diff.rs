@@ -131,6 +131,11 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "INCRBYFLOAT s 1",
             "INCRBYFLOAT f x",
             "INCRBYFLOAT f inf",
+            "SET t 1000",
+            "INCRBYFLOAT t 0.1",
+            "INCRBYFLOAT t 1e300",
+            "SET u 0.1",
+            "INCRBYFLOAT u 0.2",
         ],
     ),
     (
@@ -408,7 +413,16 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
     ),
     (
         (7, 0),
-        &["HSET h f 1", "HINCRBYFLOAT h f inf", "HSET h huge 1e308", "HINCRBYFLOAT h huge 1e308"],
+        &[
+            "HSET h f 1",
+            "HINCRBYFLOAT h f inf",
+            "HSET h huge 1e308",
+            "HINCRBYFLOAT h huge 1e308",
+            "HSET h max 1e4932",
+            "HINCRBYFLOAT h max 1e4932",
+            "SET s 1000",
+            "INCRBYFLOAT s 0.1",
+        ],
     ),
     (
         (4, 0),

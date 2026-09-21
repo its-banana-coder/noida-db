@@ -2,8 +2,8 @@
 
 use super::engine::{Command, Ctx, Reply, arity_error, cmd, eq_ic, int_arg, syntax};
 use super::keys::parse_scan;
-use super::num;
 use super::resp::Value;
+use super::{longdouble, num};
 
 pub static COMMANDS: &[Command] = &[
     cmd("hset", hset),
@@ -123,13 +123,13 @@ fn hincrby(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn hincrbyfloat(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    let by = num::parse_float(&a[3]).ok_or_else(|| Value::err("ERR value is not a valid float"))?;
+    let by = longdouble::parse(&a[3]).map_err(|_| Value::err("ERR value is not a valid float"))?;
     if !by.is_finite() {
         return Err(Value::err("ERR value is NaN or Infinity"));
     }
     let h = ctx.hash_or_create(&a[1])?;
     let current = h.map.get(&a[2]).cloned().unwrap_or_else(|| b"0".to_vec());
-    if num::parse_float(&current).is_none() {
+    if longdouble::parse(&current).is_err() {
         return Err(Value::err("ERR hash value is not a float"));
     }
     let next = num::add_human(&current, &a[3]).map_err(Value::err)?;

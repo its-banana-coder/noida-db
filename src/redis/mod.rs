@@ -7,6 +7,7 @@ mod engine;
 mod glob;
 mod hashes;
 mod keys;
+pub mod longdouble;
 mod meta;
 mod num;
 mod ordered;

@@ -74,9 +74,12 @@ fn hincrby_and_hincrbyfloat() {
     assert_eq!(t.run("HINCRBYFLOAT h f x"), err("ERR value is not a valid float"));
     assert_eq!(t.run("HINCRBYFLOAT h f inf"), err("ERR value is NaN or Infinity"));
     assert_eq!(t.run("HINCRBYFLOAT h s 1"), err("ERR hash value is not a float"));
+    // long double: 1e308 + 1e308 doesn't overflow, 1e4932 + 1e4932 does.
     t.run("HSET h huge 1e308");
+    assert!(text(&t.run("HINCRBYFLOAT h huge 1e308")).starts_with("19999999999999999999"));
+    t.run("HSET h max 1e4932");
     assert_eq!(
-        t.run("HINCRBYFLOAT h huge 1e308"),
+        t.run("HINCRBYFLOAT h max 1e4932"),
         err("ERR increment would produce NaN or Infinity")
     );
 }
