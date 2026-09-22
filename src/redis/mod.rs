@@ -15,6 +15,7 @@ mod num;
 mod ordered;
 pub mod resp;
 pub mod server;
+mod sets;
 mod strings;
 #[cfg(test)]
 mod tests;

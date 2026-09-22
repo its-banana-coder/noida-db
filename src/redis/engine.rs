@@ -7,7 +7,7 @@ use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, lists, strings};
+use super::{admin, connection, hashes, keys, lists, sets, strings};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -19,6 +19,7 @@ pub enum Data {
     Str(Vec<u8>),
     Hash(Hash),
     List(VecDeque<Vec<u8>>),
+    Set(super::sets::Set),
 }
 
 impl Data {
@@ -27,6 +28,7 @@ impl Data {
             Data::Str(_) => "string",
             Data::Hash(_) => "hash",
             Data::List(_) => "list",
+            Data::Set(_) => "set",
         }
     }
 }
@@ -224,6 +226,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(strings::COMMANDS)
         .chain(hashes::COMMANDS)
         .chain(lists::COMMANDS)
+        .chain(sets::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -326,6 +329,7 @@ impl Ctx<'_> {
         let empty = match self.lookup(key) {
             Some(Entry { data: Data::Hash(h), .. }) => h.map.is_empty(),
             Some(Entry { data: Data::List(l), .. }) => l.is_empty(),
+            Some(Entry { data: Data::Set(s), .. }) => s.is_empty(),
             _ => false,
         };
         if empty {

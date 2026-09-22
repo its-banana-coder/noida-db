@@ -222,19 +222,16 @@ fn lists_through_a_real_client() -> RedisResult<()> {
 #[test]
 fn blocked_clients_are_served_in_order() {
     use noida::redis::resp::Value;
-    use std::time::Duration;
     let addr = common::start_noida_redis();
+    let mut admin = common::RawClient::connect(addr);
     let mut waiters = Vec::new();
-    for _ in 0..3 {
+    for i in 1..=3 {
         let mut c = common::RawClient::connect(addr);
         c.send(&[b"BLPOP", b"queue", b"0"]);
         // Let the server see each BLPOP before the next one.
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for_blocked(&mut admin, i);
         waiters.push(c);
     }
-    let mut admin = common::RawClient::connect(addr);
-    let Value::Bulk(info) = admin.run("INFO clients") else { panic!() };
-    assert!(String::from_utf8(info).unwrap().contains("blocked_clients:3\r\n"));
     assert_eq!(admin.run("RPUSH queue 1 2 3"), Value::Integer(3));
     for (i, c) in waiters.iter_mut().enumerate() {
         let want = Value::Array(vec![Value::bulk("queue"), Value::bulk((i + 1).to_string())]);
@@ -256,9 +253,9 @@ fn blocking_timeouts_unblock_and_disconnects() {
     // A client that disconnects while blocked must not take the data.
     let mut gone = common::RawClient::connect(addr);
     gone.send(&[b"BLPOP", b"k", b"0"]);
-    std::thread::sleep(Duration::from_millis(50));
+    wait_for_blocked(&mut c, 1);
     drop(gone);
-    std::thread::sleep(Duration::from_millis(250));
+    wait_for_blocked(&mut c, 0);
     assert_eq!(c.run("RPUSH k v"), Value::Integer(1));
     assert_eq!(c.run("LLEN k"), Value::Integer(1));
 
@@ -266,9 +263,49 @@ fn blocking_timeouts_unblock_and_disconnects() {
     let mut waiter = common::RawClient::connect(addr);
     let Value::Integer(id) = waiter.run("CLIENT ID") else { panic!() };
     waiter.send(&[b"BLPOP", b"empty", b"0"]);
-    std::thread::sleep(Duration::from_millis(50));
+    wait_for_blocked(&mut c, 1);
     assert_eq!(c.run(&format!("CLIENT UNBLOCK {id}")), Value::Integer(1));
     assert_eq!(waiter.read(), Some(Value::NullArray));
     // The connection keeps working afterwards.
     assert_eq!(waiter.run("PING"), Value::Simple("PONG".into()));
+}
+
+/// Polls INFO until exactly `n` clients are blocked.
+fn wait_for_blocked(c: &mut common::RawClient, n: usize) {
+    use noida::redis::resp::Value;
+    let want = format!("blocked_clients:{n}\r\n");
+    for _ in 0..500 {
+        let Value::Bulk(info) = c.run("INFO clients") else { panic!() };
+        if String::from_utf8(info).unwrap().contains(&want) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("never saw {want:?}");
+}
+
+#[test]
+fn sets_through_a_real_client() -> RedisResult<()> {
+    use std::collections::HashSet;
+    let addr = common::start_noida_redis();
+    for url in [format!("redis://{addr}/"), format!("redis://{addr}/?protocol=resp3")] {
+        let mut con = redis::Client::open(url)?.get_connection()?;
+        let _: () = con.del(&["tags", "other"])?;
+        let n: i64 = con.sadd("tags", &["rust", "redis", "db"])?;
+        assert_eq!(n, 3);
+        let _: i64 = con.sadd("other", &["db", "sql"])?;
+        let all: HashSet<String> = con.smembers("tags")?;
+        assert_eq!(all.len(), 3);
+        let yes: bool = con.sismember("tags", "rust")?;
+        assert!(yes);
+        let inter: Vec<String> = con.sinter(&["tags", "other"])?;
+        assert_eq!(inter, ["db"]);
+        let ordered: Vec<i64> = {
+            let _: i64 = con.sadd("nums", &[3, 1, 2])?;
+            con.smembers("nums")?
+        };
+        assert_eq!(ordered, [1, 2, 3]);
+        let _: () = con.del("nums")?;
+    }
+    Ok(())
 }

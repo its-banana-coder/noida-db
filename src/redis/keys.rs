@@ -2,7 +2,8 @@
 //! RENAME, COPY, MOVE, and database-level commands.
 
 use super::engine::{
-    Command, Ctx, NUM_DBS, Reply, cmd, db_arg, eq_ic, int_arg, invalid_expire, same_object, syntax,
+    Command, Ctx, Data, NUM_DBS, Reply, cmd, container, db_arg, eq_ic, help_reply, int_arg,
+    invalid_expire, same_object, syntax,
 };
 use super::glob;
 use super::resp::Value;
@@ -33,6 +34,15 @@ pub static COMMANDS: &[Command] = &[
     cmd("flushdb", flushdb),
     cmd("flushall", flushall),
     cmd("swapdb", swapdb),
+    container("object", object_help, OBJECT),
+];
+
+static OBJECT: &[Command] = &[
+    cmd("help", object_help),
+    cmd("encoding", object_encoding),
+    cmd("refcount", object_refcount),
+    cmd("idletime", object_idletime),
+    cmd("freq", object_freq),
 ];
 
 fn del(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -379,4 +389,88 @@ fn swapdb(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
     }
     Ok(Value::ok())
+}
+
+// ---- OBJECT ----
+
+fn object_help(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    Ok(help_reply(
+        "object",
+        &[
+            "ENCODING <key>",
+            "    Return the kind of internal representation used in order to store the value",
+            "    associated with a <key>.",
+            "FREQ <key>",
+            "    Return the access frequency index of the <key>. The returned integer is",
+            "    proportional to the logarithm of the recent access frequency of the key.",
+            "IDLETIME <key>",
+            "    Return the idle time of the <key>, that is the approximated number of",
+            "    seconds elapsed since the last access to the key.",
+            "REFCOUNT <key>",
+            "    Return the number of references of the value associated with the specified",
+            "    <key>.",
+        ],
+    ))
+}
+
+/// Bytes a value takes in a listpack, to tell when Redis would switch a
+/// list to a quicklist (`list-max-listpack-size -2`: 8KB).
+fn listpack_entry_size(v: &[u8]) -> usize {
+    let body = match super::num::parse_int(v) {
+        Some(n) if (0..=127).contains(&n) => 1,
+        Some(n) if (-4096..4096).contains(&n) => 2,
+        Some(n) if i16::try_from(n).is_ok() => 3,
+        Some(n) if (-(1 << 23)..(1 << 23)).contains(&n) => 4,
+        Some(n) if i32::try_from(n).is_ok() => 5,
+        Some(_) => 9,
+        None if v.len() < 64 => 1 + v.len(),
+        None if v.len() < 4096 => 2 + v.len(),
+        None => 5 + v.len(),
+    };
+    body + if body < 128 {
+        1
+    } else if body < 16384 {
+        2
+    } else {
+        3
+    }
+}
+
+/// The name Redis's OBJECT ENCODING gives a value's representation.
+pub fn encoding(data: &Data) -> &'static str {
+    match data {
+        Data::Str(s) if s.len() <= 20 && super::num::parse_int(s).is_some() => "int",
+        Data::Str(s) if s.len() <= 44 => "embstr",
+        Data::Str(_) => "raw",
+        Data::Hash(h) if h.big => "hashtable",
+        Data::Hash(_) => "listpack",
+        Data::List(l) => {
+            let bytes: usize = 7 + l.iter().map(|v| listpack_entry_size(v)).sum::<usize>();
+            if bytes <= 8192 { "listpack" } else { "quicklist" }
+        }
+        Data::Set(s) => s.encoding(),
+    }
+}
+
+fn object_encoding(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    Ok(ctx.lookup(&a[2]).map_or(Value::Null, |e| Value::bulk(encoding(&e.data))))
+}
+
+fn object_refcount(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    Ok(ctx.lookup(&a[2]).map_or(Value::Null, |_| Value::Integer(1)))
+}
+
+fn object_idletime(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    Ok(ctx.lookup(&a[2]).map_or(Value::Null, |_| Value::Integer(0)))
+}
+
+const NO_LFU: &str = "ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
+Please note that when switching between policies at runtime LRU and LFU data will take some time \
+to adjust.";
+
+fn object_freq(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    if ctx.lookup(&a[2]).is_none() {
+        return Ok(Value::Null);
+    }
+    Err(Value::err(NO_LFU))
 }
