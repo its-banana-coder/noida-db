@@ -1,4 +1,9 @@
-//! Postgres compatibility. Not implemented yet; see docs/SERVICE_GUIDE.md.
+//! Postgres compatibility. Work in progress; see docs/SERVICE_GUIDE.md.
+
+pub mod datetime;
+pub mod json;
+pub mod numeric;
+pub mod tz;
 
 use std::io;
 use std::net::SocketAddr;
