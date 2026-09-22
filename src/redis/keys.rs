@@ -449,6 +449,7 @@ pub fn encoding(data: &Data) -> &'static str {
             if bytes <= 8192 { "listpack" } else { "quicklist" }
         }
         Data::Set(s) => s.encoding(),
+        Data::Zset(z) => z.encoding(),
     }
 }
 

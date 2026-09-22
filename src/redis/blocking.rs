@@ -23,7 +23,7 @@ pub enum BlockKind {
 
 impl BlockKind {
     fn satisfied_by(self, data: &Data) -> bool {
-        matches!((self, data), (BlockKind::List, Data::List(_)))
+        matches!((self, data), (BlockKind::List, Data::List(_)) | (BlockKind::Zset, Data::Zset(_)))
     }
 }
 

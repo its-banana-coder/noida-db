@@ -4,6 +4,7 @@ mod admin;
 mod blocking;
 mod command_meta;
 mod connection;
+mod double;
 mod engine;
 mod glob;
 mod hashes;
@@ -19,6 +20,7 @@ mod sets;
 mod strings;
 #[cfg(test)]
 mod tests;
+mod zsets;
 
 pub use engine::{ClientConn, Engine, Session, command_names, is_implemented};
 

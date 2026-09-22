@@ -7,6 +7,7 @@ mod introspection;
 mod lists;
 mod sets;
 mod strings_keys;
+mod zsets;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

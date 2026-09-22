@@ -18,6 +18,9 @@ pub enum Value {
     Set(Vec<Value>),
     /// RESP3 verbatim string (format, text); sent as a bulk string on RESP2.
     Verbatim(&'static str, Vec<u8>),
+    /// RESP3 double (`,`); a bulk string on RESP2. Formatted like Redis's
+    /// `d2string`.
+    Double(f64),
     /// Nothing is sent (CLIENT REPLY OFF/SKIP).
     NoReply,
 }
@@ -84,6 +87,8 @@ pub fn encode(v: &Value, proto: u8, out: &mut Vec<u8>) {
             bulk(out, b'=', &body);
         }
         Value::Verbatim(_, text) => bulk(out, b'$', text),
+        Value::Double(d) if resp3 => line(out, b',', super::double::d2string(*d).as_bytes()),
+        Value::Double(d) => bulk(out, b'$', super::double::d2string(*d).as_bytes()),
         Value::NoReply => {}
     }
 }
@@ -280,6 +285,9 @@ pub fn read_value<R: BufRead>(r: &mut R) -> Result<Option<Value>, ReadError> {
             }
         },
         b'_' => Value::Null,
+        b',' => Value::Double(
+            super::double::parse_double(rest).ok_or_else(|| protocol("invalid double"))?,
+        ),
         b'%' => {
             let mut pairs = Vec::new();
             for _ in 0..int()? {

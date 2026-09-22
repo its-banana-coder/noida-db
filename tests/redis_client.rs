@@ -309,3 +309,25 @@ fn sets_through_a_real_client() -> RedisResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn sorted_sets_through_a_real_client() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    for url in [format!("redis://{addr}/"), format!("redis://{addr}/?protocol=resp3")] {
+        let mut con = redis::Client::open(url)?.get_connection()?;
+        let _: () = con.del("board")?;
+        let n: i64 = con.zadd_multiple("board", &[(10.5, "ada"), (3.0, "bob"), (7.0, "cy")])?;
+        assert_eq!(n, 3);
+        let top: Vec<(String, f64)> = con.zrevrange_withscores("board", 0, 1)?;
+        assert_eq!(top, [("ada".to_string(), 10.5), ("cy".to_string(), 7.0)]);
+        let score: Option<f64> = con.zscore("board", "bob")?;
+        assert_eq!(score, Some(3.0));
+        let s: f64 = con.zincr("board", "bob", 0.25)?;
+        assert_eq!(s, 3.25);
+        let rank: Option<i64> = con.zrank("board", "cy")?;
+        assert_eq!(rank, Some(1));
+        let low: Vec<String> = con.zrangebyscore("board", "-inf", 8)?;
+        assert_eq!(low, ["bob", "cy"]);
+    }
+    Ok(())
+}

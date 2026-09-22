@@ -7,7 +7,7 @@ use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, lists, sets, strings};
+use super::{admin, connection, hashes, keys, lists, sets, strings, zsets};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -20,6 +20,7 @@ pub enum Data {
     Hash(Hash),
     List(VecDeque<Vec<u8>>),
     Set(super::sets::Set),
+    Zset(super::zsets::Zset),
 }
 
 impl Data {
@@ -29,6 +30,7 @@ impl Data {
             Data::Hash(_) => "hash",
             Data::List(_) => "list",
             Data::Set(_) => "set",
+            Data::Zset(_) => "zset",
         }
     }
 }
@@ -227,6 +229,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(hashes::COMMANDS)
         .chain(lists::COMMANDS)
         .chain(sets::COMMANDS)
+        .chain(zsets::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -330,6 +333,7 @@ impl Ctx<'_> {
             Some(Entry { data: Data::Hash(h), .. }) => h.map.is_empty(),
             Some(Entry { data: Data::List(l), .. }) => l.is_empty(),
             Some(Entry { data: Data::Set(s), .. }) => s.is_empty(),
+            Some(Entry { data: Data::Zset(z), .. }) => z.is_empty(),
             _ => false,
         };
         if empty {
