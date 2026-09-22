@@ -7,7 +7,7 @@ use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, lists, sets, strings, zsets};
+use super::{admin, connection, hashes, keys, lists, multi, sets, strings, zsets};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -109,6 +109,11 @@ impl Db {
         self.map.insert(key, entry);
     }
 
+    /// The key's expiry even if it has passed (the key isn't removed).
+    pub fn raw_expiry(&self, key: &[u8]) -> Option<u64> {
+        self.map.get(key).and_then(|e| e.expires_at)
+    }
+
     pub fn purge_expired(&mut self, now: u64) {
         self.map.retain(|_, e| !e.is_expired(now));
     }
@@ -165,6 +170,13 @@ pub struct Client {
     pub reply_skip_next: bool,
     /// Waiting in a blocking command (BLPOP and friends).
     pub blocked: Option<BlockState>,
+    /// Commands queued since MULTI.
+    pub multi: Option<Vec<Vec<Vec<u8>>>>,
+    /// A command failed to queue: EXEC will abort (CLIENT_DIRTY_EXEC).
+    pub multi_error: bool,
+    /// A watched key changed: EXEC will fail (CLIENT_DIRTY_CAS).
+    pub dirty_cas: bool,
+    pub watched: Vec<super::multi::Watched>,
 }
 
 /// The connection's handle, owned by its thread.
@@ -190,10 +202,14 @@ pub struct Engine {
     pub clients: BTreeMap<u64, Client>,
     pub pause: Option<Pause>,
     pub started: u64,
+    /// Unix seconds of the last SAVE/BGSAVE (LASTSAVE).
+    pub last_save: u64,
     /// Per database: clients blocked on each key, in the order they blocked.
     pub waiting: Vec<HashMap<Vec<u8>, VecDeque<u64>>>,
     /// Replies for clients that were unblocked by other clients' commands.
     pub(crate) replies: HashMap<u64, Value>,
+    /// Clients WATCHing each (db, key).
+    pub(crate) watchers: HashMap<(usize, Vec<u8>), Vec<u64>>,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -230,6 +246,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(lists::COMMANDS)
         .chain(sets::COMMANDS)
         .chain(zsets::COMMANDS)
+        .chain(multi::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -381,8 +398,10 @@ impl Engine {
             clients: BTreeMap::new(),
             pause: None,
             started: now,
+            last_save: now / 1000,
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
+            watchers: HashMap::new(),
             next_client_id: 1,
             clock,
             rng: now | 1,
@@ -423,6 +442,10 @@ impl Engine {
                 reply_skip: false,
                 reply_skip_next: false,
                 blocked: None,
+                multi: None,
+                multi_error: false,
+                dirty_cas: false,
+                watched: Vec::new(),
             },
         );
         Session { id, resp: 2, closing: false, blocked: false }
@@ -435,6 +458,7 @@ impl Engine {
     /// Forgets a client and everything it was waiting for.
     pub fn remove_client(&mut self, id: u64) -> Option<Client> {
         self.unblock(id);
+        self.unwatch_all(id);
         self.replies.remove(&id);
         self.clients.remove(&id)
     }
@@ -465,14 +489,20 @@ impl Engine {
             session.closing = true;
             return Value::NoReply;
         }
+        let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+        let in_multi = self.clients[&session.id].multi.is_some();
         let (handler, fullname) = match resolve(args) {
             Ok(found) => found,
+            Err(e) if in_multi => return self.multi_reject(session.id, &name, e),
             Err(e) => return e,
         };
         let now = self.now();
         let client = self.clients.get_mut(&session.id).unwrap();
         client.last_interaction = now;
         client.last_cmd = Some(fullname);
+        if in_multi && !super::multi::runs_in_multi(&name) {
+            return self.queue(session.id, &name, args);
+        }
 
         let reply = self.call(session, handler, args, false, None);
         self.serve_blocked();
@@ -498,6 +528,8 @@ impl Engine {
         reprocess_deadline: Option<u64>,
     ) -> Value {
         let now = self.now();
+        let db = self.clients.get(&session.id).map_or(0, |c| c.db);
+        let before = self.watch_snapshot(args, db);
         let mut ctx =
             Ctx { engine: self, session, now, deny_blocking, block: None, reprocess_deadline };
         let reply = match handler(&mut ctx, args) {
@@ -506,6 +538,9 @@ impl Engine {
         if let Some(req) = ctx.block.take() {
             self.block_client(session, req, args);
             return Value::NoReply;
+        }
+        if !matches!(reply, Value::Error(_)) {
+            self.touch_written(args, db, before);
         }
         reply
     }

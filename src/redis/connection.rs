@@ -155,7 +155,12 @@ fn hello(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 
 /// RESET: back to the state of a fresh connection.
 fn reset(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    let id = ctx.session.id;
+    ctx.engine.unwatch_all(id);
     let c = ctx.client();
+    c.multi = None;
+    c.multi_error = false;
+    c.dirty_cas = false;
     c.db = 0;
     c.resp = 2;
     c.name = None;
@@ -235,8 +240,14 @@ fn client_id(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 /// performance analysis.
 fn info_line(c: &Client, now: u64) -> String {
     let mut flags = String::new();
+    if c.multi.is_some() {
+        flags.push('x');
+    }
     if c.blocked.is_some() {
         flags.push('b');
+    }
+    if c.dirty_cas {
+        flags.push('d');
     }
     if c.no_evict {
         flags.push('e');
@@ -252,7 +263,7 @@ fn info_line(c: &Client, now: u64) -> String {
     };
     format!(
         "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 \
-         multi=-1 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 \
+         multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 \
          tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={}",
         c.id,
         c.conn.addr,
@@ -263,6 +274,7 @@ fn info_line(c: &Client, now: u64) -> String {
         now.saturating_sub(c.last_interaction) / 1000,
         flags,
         c.db,
+        c.multi.as_ref().map_or(-1, |q| q.len() as i64),
         c.last_cmd.as_deref().unwrap_or("NULL"),
         c.resp,
         s(&c.lib_name),

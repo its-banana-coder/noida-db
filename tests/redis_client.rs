@@ -331,3 +331,30 @@ fn sorted_sets_through_a_real_client() -> RedisResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn transactions_through_a_real_client() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    for url in [format!("redis://{addr}/"), format!("redis://{addr}/?protocol=resp3")] {
+        let client = redis::Client::open(url)?;
+        let mut con = client.get_connection()?;
+        let mut other = client.get_connection()?;
+        let _: () = con.set("balance", 10)?;
+        // MULTI/EXEC through an atomic pipeline.
+        let (a, b): (i64, i64) =
+            redis::pipe().atomic().incr("balance", 5).decr("balance", 3).query(&mut con)?;
+        assert_eq!((a, b), (15, 12));
+        // WATCH: a concurrent write makes EXEC return nil.
+        let _: () = redis::cmd("WATCH").arg("balance").query(&mut con)?;
+        let _: () = other.set("balance", 100)?;
+        let r: Option<(i64,)> = redis::pipe().atomic().incr("balance", 1).query(&mut con)?;
+        assert_eq!(r, None);
+        // The optimistic-locking helper retries and succeeds.
+        let (n,): (i64,) = redis::transaction(&mut con, &["balance"], |con, pipe| {
+            let v: i64 = con.get("balance")?;
+            pipe.set("balance", v * 2).ignore().get("balance").query(con)
+        })?;
+        assert_eq!(n, 200);
+    }
+    Ok(())
+}

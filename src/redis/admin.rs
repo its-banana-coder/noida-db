@@ -7,7 +7,51 @@ use super::engine::{
 };
 use super::resp::Value;
 
-pub static COMMANDS: &[Command] = &[container("command", command_all, COMMAND), cmd("info", info)];
+pub static COMMANDS: &[Command] = &[
+    container("command", command_all, COMMAND),
+    cmd("info", info),
+    cmd("save", save),
+    cmd("bgsave", bgsave),
+    cmd("bgrewriteaof", bgrewriteaof),
+    cmd("lastsave", lastsave),
+    cmd("time", time),
+];
+
+// ---- persistence ----
+// noida keeps Redis data in memory only, so saving is instant and writes
+// nothing; the replies are Redis's.
+
+fn save(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    ctx.engine.last_save = ctx.now / 1000;
+    Ok(Value::ok())
+}
+
+fn bgsave(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    if a.len() > 1 && !(a.len() == 2 && eq_ic(&a[1], "schedule")) {
+        return Err(syntax());
+    }
+    ctx.engine.last_save = ctx.now / 1000;
+    Ok(Value::Simple("Background saving started".into()))
+}
+
+fn bgrewriteaof(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    Ok(Value::Simple("Background append only file rewriting started".into()))
+}
+
+fn lastsave(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    Ok(Value::Integer(ctx.engine.last_save as i64))
+}
+
+fn time(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    let us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(ctx.now * 1000);
+    Ok(Value::Array(vec![
+        Value::bulk((us / 1_000_000).to_string()),
+        Value::bulk((us % 1_000_000).to_string()),
+    ]))
+}
 
 static COMMAND: &[Command] = &[
     cmd("count", command_count),
@@ -286,7 +330,7 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 f("async_loading", "0".into()),
                 f("rdb_changes_since_last_save", "0".into()),
                 f("rdb_bgsave_in_progress", "0".into()),
-                f("rdb_last_save_time", (ctx.engine.started / 1000).to_string()),
+                f("rdb_last_save_time", ctx.engine.last_save.to_string()),
                 f("rdb_last_bgsave_status", "ok".into()),
                 f("aof_enabled", "0".into()),
                 f("aof_rewrite_in_progress", "0".into()),
