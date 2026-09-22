@@ -358,3 +358,51 @@ fn transactions_through_a_real_client() -> RedisResult<()> {
     }
     Ok(())
 }
+
+#[test]
+fn pubsub_through_a_real_client() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    let publisher_client = redis::Client::open(format!("redis://{addr}/"))?;
+    let mut publisher = publisher_client.get_connection()?;
+    // RESP2: a dedicated subscriber connection.
+    let client = redis::Client::open(format!("redis://{addr}/"))?;
+    let mut con = client.get_connection()?;
+    let mut pubsub = con.as_pubsub();
+    pubsub.subscribe("news")?;
+    pubsub.psubscribe("sport.*")?;
+    let n: i64 = publisher.publish("news", "hello")?;
+    assert_eq!(n, 1);
+    let _: i64 = publisher.publish("sport.f1", "fast")?;
+    let msg = pubsub.get_message()?;
+    assert_eq!(msg.get_channel_name(), "news");
+    assert_eq!(msg.get_payload::<String>()?, "hello");
+    let msg = pubsub.get_message()?;
+    assert_eq!(msg.get_channel_name(), "sport.f1");
+    assert_eq!(msg.get_pattern::<String>()?, "sport.*");
+    assert_eq!(msg.get_payload::<String>()?, "fast");
+    pubsub.unsubscribe("news")?;
+    pubsub.punsubscribe("sport.*")?;
+    drop(pubsub);
+    // Back to normal commands once unsubscribed.
+    let _: () = con.set("k", "v")?;
+
+    // RESP3: pushes arrive on a connection that keeps running commands.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let client3 = redis::Client::open(format!("redis://{addr}/?protocol=resp3"))?;
+    let mut con3 = client3.get_connection()?;
+    con3.set_push_sender(tx);
+    con3.subscribe_resp3("alerts")?;
+    let _: i64 = publisher.publish("alerts", "fire")?;
+    let v: String = con3.set("x", "1").and_then(|()| con3.get("x"))?;
+    assert_eq!(v, "1");
+    let mut seen = false;
+    while let Ok(push) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        if push.kind == redis::PushKind::Message {
+            assert_eq!(push.data[1], redis::Value::BulkString(b"fire".to_vec()));
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "no RESP3 push message");
+    Ok(())
+}

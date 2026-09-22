@@ -7,7 +7,7 @@ use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, lists, multi, sets, strings, zsets};
+use super::{admin, connection, hashes, keys, lists, multi, pubsub, sets, strings, zsets};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -149,6 +149,9 @@ pub struct ClientConn {
     pub fd: i64,
     /// Closes the connection from another thread (CLIENT KILL).
     pub kill: Option<Box<dyn Fn() + Send>>,
+    /// Queues bytes on the connection's output, in order with its replies
+    /// (pub/sub messages).
+    pub push: Option<Box<dyn Fn(Vec<u8>) + Send>>,
 }
 
 /// Per-connection state that other clients can see (CLIENT LIST).
@@ -177,6 +180,9 @@ pub struct Client {
     /// A watched key changed: EXEC will fail (CLIENT_DIRTY_CAS).
     pub dirty_cas: bool,
     pub watched: Vec<super::multi::Watched>,
+    pub subs: super::pubsub::Subscriptions,
+    /// Pushes for a connection without a socket (tests).
+    pub pushed: Vec<Value>,
 }
 
 /// The connection's handle, owned by its thread.
@@ -210,6 +216,7 @@ pub struct Engine {
     pub(crate) replies: HashMap<u64, Value>,
     /// Clients WATCHing each (db, key).
     pub(crate) watchers: HashMap<(usize, Vec<u8>), Vec<u64>>,
+    pub(crate) pubsub: super::pubsub::PubSub,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -247,6 +254,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(sets::COMMANDS)
         .chain(zsets::COMMANDS)
         .chain(multi::COMMANDS)
+        .chain(pubsub::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -276,6 +284,8 @@ pub struct Ctx<'a> {
     pub now: u64,
     /// Blocking commands must answer right away (inside MULTI, scripts).
     pub deny_blocking: bool,
+    /// Running inside EXEC.
+    pub in_exec: bool,
     /// Set by `Ctx::block`: the command waits for keys.
     pub(crate) block: Option<BlockRequest>,
     /// When re-running a blocked command, its original deadline.
@@ -402,6 +412,7 @@ impl Engine {
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
             watchers: HashMap::new(),
+            pubsub: Default::default(),
             next_client_id: 1,
             clock,
             rng: now | 1,
@@ -446,6 +457,8 @@ impl Engine {
                 multi_error: false,
                 dirty_cas: false,
                 watched: Vec::new(),
+                subs: Default::default(),
+                pushed: Vec::new(),
             },
         );
         Session { id, resp: 2, closing: false, blocked: false }
@@ -459,6 +472,7 @@ impl Engine {
     pub fn remove_client(&mut self, id: u64) -> Option<Client> {
         self.unblock(id);
         self.unwatch_all(id);
+        self.unsubscribe_everything(id);
         self.replies.remove(&id);
         self.clients.remove(&id)
     }
@@ -500,6 +514,15 @@ impl Engine {
         let client = self.clients.get_mut(&session.id).unwrap();
         client.last_interaction = now;
         client.last_cmd = Some(fullname);
+        let c = &self.clients[&session.id];
+        if c.subs.active() && c.resp == 2 && !super::pubsub::allowed_while_subscribed(&name) {
+            let shown = self.clients[&session.id].last_cmd.clone().unwrap_or_default();
+            let e = Value::err(format!(
+                "ERR Can't execute '{shown}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT \
+                 / RESET are allowed in this context"
+            ));
+            return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
+        }
         if in_multi && !super::multi::runs_in_multi(&name) {
             return self.queue(session.id, &name, args);
         }
@@ -530,8 +553,15 @@ impl Engine {
         let now = self.now();
         let db = self.clients.get(&session.id).map_or(0, |c| c.db);
         let before = self.watch_snapshot(args, db);
-        let mut ctx =
-            Ctx { engine: self, session, now, deny_blocking, block: None, reprocess_deadline };
+        let mut ctx = Ctx {
+            engine: self,
+            session,
+            now,
+            deny_blocking,
+            in_exec: deny_blocking,
+            block: None,
+            reprocess_deadline,
+        };
         let reply = match handler(&mut ctx, args) {
             Ok(v) | Err(v) => v,
         };

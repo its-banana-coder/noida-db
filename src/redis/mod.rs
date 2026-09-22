@@ -15,6 +15,7 @@ mod meta;
 mod multi;
 mod num;
 mod ordered;
+mod pubsub;
 pub mod resp;
 pub mod server;
 mod sets;

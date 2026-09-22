@@ -41,7 +41,12 @@ fn no_subcommand(_: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     Err(arity_error(&String::from_utf8_lossy(&a[0]).to_ascii_lowercase()))
 }
 
-fn ping(_: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+fn ping(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let c = ctx.client();
+    if c.subs.active() && c.resp == 2 && a.len() <= 2 {
+        let arg = a.get(1).cloned().unwrap_or_default();
+        return Ok(Value::Array(vec![Value::bulk("pong"), Value::Bulk(arg)]));
+    }
     match a.len() {
         1 => Ok(Value::Simple("PONG".into())),
         2 => Ok(Value::bulk(&a[1])),
@@ -157,6 +162,7 @@ fn hello(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 fn reset(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
     let id = ctx.session.id;
     ctx.engine.unwatch_all(id);
+    ctx.engine.unsubscribe_everything(id);
     let c = ctx.client();
     c.multi = None;
     c.multi_error = false;
@@ -240,6 +246,9 @@ fn client_id(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 /// performance analysis.
 fn info_line(c: &Client, now: u64) -> String {
     let mut flags = String::new();
+    if c.subs.active() {
+        flags.push('P');
+    }
     if c.multi.is_some() {
         flags.push('x');
     }
@@ -262,7 +271,7 @@ fn info_line(c: &Client, now: u64) -> String {
         v.as_deref().map(|b| String::from_utf8_lossy(b).into_owned()).unwrap_or_default()
     };
     format!(
-        "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub=0 psub=0 ssub=0 \
+        "id={} addr={} laddr={} fd={} name={} age={} idle={} flags={} db={} sub={} psub={} ssub={} \
          multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 \
          tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} lib-ver={}",
         c.id,
@@ -274,6 +283,9 @@ fn info_line(c: &Client, now: u64) -> String {
         now.saturating_sub(c.last_interaction) / 1000,
         flags,
         c.db,
+        c.subs.channels.len(),
+        c.subs.patterns.len(),
+        c.subs.shard.len(),
         c.multi.as_ref().map_or(-1, |q| q.len() as i64),
         c.last_cmd.as_deref().unwrap_or("NULL"),
         c.resp,
@@ -291,8 +303,12 @@ fn client_info(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
     Ok(txt(info_line(ctx.client(), now) + "\n"))
 }
 
-/// Client types for LIST/KILL TYPE. noida's clients are all "normal"
-/// (pub/sub subscribers will report "pubsub").
+/// A client's type for LIST/KILL TYPE (`getClientType`).
+fn type_of(c: &Client) -> &'static str {
+    if c.subs.active() { "pubsub" } else { "normal" }
+}
+
+/// Parses a client type name for LIST/KILL TYPE.
 fn client_type(name: &[u8]) -> Result<&'static str, Value> {
     match name.to_ascii_lowercase().as_slice() {
         b"normal" => Ok("normal"),
@@ -309,10 +325,9 @@ fn client_list(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let now = ctx.now;
     let mut out = String::new();
     if a.len() == 4 && eq_ic(&a[2], "type") {
-        if client_type(&a[3])? == "normal" {
-            for c in ctx.engine.clients.values() {
-                out += &(info_line(c, now) + "\n");
-            }
+        let ty = client_type(&a[3])?;
+        for c in ctx.engine.clients.values().filter(|c| type_of(c) == ty) {
+            out += &(info_line(c, now) + "\n");
         }
     } else if a.len() > 3 && eq_ic(&a[2], "id") {
         for raw in &a[3..] {
@@ -380,7 +395,7 @@ fn client_kill(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         .values()
         .filter(|c| addr.as_ref().is_none_or(|x| c.conn.addr.as_bytes() == x.as_slice()))
         .filter(|c| laddr.as_ref().is_none_or(|x| c.conn.laddr.as_bytes() == x.as_slice()))
-        .filter(|_| ty.is_none_or(|t| t == "normal"))
+        .filter(|c| ty.is_none_or(|t| t == type_of(c)))
         .filter(|c| id.is_none_or(|i| c.id == i))
         .filter(|c| !(skipme && c.id == me))
         .map(|c| c.id)

@@ -351,9 +351,9 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 f("evicted_keys", "0".into()),
                 f("keyspace_hits", "0".into()),
                 f("keyspace_misses", "0".into()),
-                f("pubsub_channels", "0".into()),
-                f("pubsub_patterns", "0".into()),
-                f("pubsubshard_channels", "0".into()),
+                f("pubsub_channels", ctx.engine.pubsub.counts().0.to_string()),
+                f("pubsub_patterns", ctx.engine.pubsub.counts().1.to_string()),
+                f("pubsubshard_channels", ctx.engine.pubsub.counts().2.to_string()),
                 f("total_error_replies", "0".into()),
             ],
         );
