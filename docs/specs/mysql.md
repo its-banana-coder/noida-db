@@ -50,9 +50,11 @@ split into 0xFFFFFF chunks. Consider `opensrv-mysql` for the protocol layer;
 justify it against binary size.
 
 Packet sequence ids start at 0 for the initial handshake, then reset to 0
-for every new command-response exchange. Enforce `max_allowed_packet` with
-MySQL-compatible errors and consume/discard the rest of an oversized command
-exactly as real MySQL does.
+for every new command-response exchange. Enforce `max_allowed_packet` as
+real MySQL does: an oversized packet gets error 1153 `08S01` ("Got a packet
+bigger than 'max_allowed_packet' bytes") and the connection is closed;
+out-of-order sequence ids get 1156 ("Got packets out of order"). Confirm the
+exact behaviour with the raw-protocol differential tests (section 8).
 
 ### 3.1 Connection phase (P0)
 - Initial Handshake v10: protocol version 10, server version, connection id,
@@ -171,8 +173,9 @@ SQL (needed before MySQL enters default features).
   output), user variables `@x`, `:=`.
 - **MySQL semantics that differ from Postgres** (these are the point of the
   dialect switch and must be exact): case-insensitive comparisons under the
-  default collation (`'a' = 'A'` is true, trailing spaces ignored for
-  PAD SPACE collations), implicit type conversion (`'1abc' + 1 = 2` with a
+  default collation (`'a' = 'A'` is true; the default
+  `utf8mb4_0900_ai_ci` is a NO PAD collation, so trailing spaces are
+  significant, unlike the older PAD SPACE collations), implicit type conversion (`'1abc' + 1 = 2` with a
   warning), integer division rules (`/` returns DECIMAL, `DIV` integer),
   NULL-safe `<=>`, `||` as OR by default, zero dates and `sql_mode`
   effects (strict mode default: `ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,
@@ -256,9 +259,9 @@ optimizer trace are out of scope (performance analysis).
 - Single writer, statements atomic; transactions roll back fully.
 - In-memory is acceptable for the first milestone; persistence to the data
   dir follows the project-wide storage work.
-- Time functions use an injectable clock in tests. `NOW()` is stable within
-  one statement; `SYSDATE()` may be unsupported until P1 if it returns the
-  real MySQL unsupported/disabled behaviour chosen by the spec owner.
+- Time functions use an injectable clock in tests. `NOW()` (and
+  `CURRENT_TIMESTAMP`) is fixed for the whole statement; `SYSDATE()` returns
+  the time at the moment it executes, as in real MySQL.
 
 ## 7. Client matrix (each must run its scenario against noida)
 
@@ -324,7 +327,7 @@ statistics.
    skipped diff test that can find `NOIDA_MYSQL_REF` or local `mysqld`.
 2. Handshake + both auth plugins + COM_QUERY/COM_PING/COM_INIT_DB; the
    `mysql` CLI connects and runs `SELECT 1`, `SELECT @@version`,
-   `SHOW DATABASES`, and `USE noida_ref`.
+   `SHOW DATABASES`, `CREATE DATABASE app` and `USE app`.
 3. Connection-time queries of Connector/J, mysql2 and PyMySQL work, including
    session variables, minimal schemas and `information_schema` probes.
 4. Prepared statements work for scalar parameters and binary rows; Connector/J
