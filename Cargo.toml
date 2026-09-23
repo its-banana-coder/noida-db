@@ -5,6 +5,10 @@ edition = "2024"
 description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
 license = "MIT"
 
+# Its own workspace root, so cargo never reads the manifest of an enclosing
+# checkout (as when this repo is a worktree nested inside another).
+[workspace]
+
 # One feature per service, so people can build only what they use.
 [features]
 default = ["redis"]

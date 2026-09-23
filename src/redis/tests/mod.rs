@@ -4,7 +4,12 @@
 mod connection;
 mod hashes;
 mod introspection;
+mod lists;
+mod multi;
+mod pubsub;
+mod sets;
 mod strings_keys;
+mod zsets;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +62,7 @@ fn test_conn(n: u16) -> ClientConn {
         laddr: "127.0.0.1:6379".into(),
         fd: 7 + n as i64,
         kill: None,
+        push: None,
     }
 }
 
