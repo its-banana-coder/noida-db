@@ -1,12 +1,13 @@
 //! The Redis keyspace, connected clients, and command dispatch.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, strings};
+use super::{admin, connection, hashes, keys, lists, multi, pubsub, sets, strings, zsets};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -17,6 +18,9 @@ pub const NUM_DBS: usize = 16;
 pub enum Data {
     Str(Vec<u8>),
     Hash(Hash),
+    List(VecDeque<Vec<u8>>),
+    Set(super::sets::Set),
+    Zset(super::zsets::Zset),
 }
 
 impl Data {
@@ -24,6 +28,9 @@ impl Data {
         match self {
             Data::Str(_) => "string",
             Data::Hash(_) => "hash",
+            Data::List(_) => "list",
+            Data::Set(_) => "set",
+            Data::Zset(_) => "zset",
         }
     }
 }
@@ -76,6 +83,9 @@ impl Entry {
 #[derive(Default)]
 pub struct Db {
     map: HashMap<Vec<u8>, Entry>,
+    /// Keys added since the engine last looked, in order: they may wake
+    /// blocked clients (Redis's `signalKeyAsReady` from `dbAdd`).
+    pub(crate) added: Vec<Vec<u8>>,
 }
 
 impl Db {
@@ -95,7 +105,13 @@ impl Db {
     }
 
     pub fn insert(&mut self, key: Vec<u8>, entry: Entry) {
+        self.added.push(key.clone());
         self.map.insert(key, entry);
+    }
+
+    /// The key's expiry even if it has passed (the key isn't removed).
+    pub fn raw_expiry(&self, key: &[u8]) -> Option<u64> {
+        self.map.get(key).and_then(|e| e.expires_at)
     }
 
     pub fn purge_expired(&mut self, now: u64) {
@@ -133,6 +149,9 @@ pub struct ClientConn {
     pub fd: i64,
     /// Closes the connection from another thread (CLIENT KILL).
     pub kill: Option<Box<dyn Fn() + Send>>,
+    /// Queues bytes on the connection's output, in order with its replies
+    /// (pub/sub messages).
+    pub push: Option<Box<dyn Fn(Vec<u8>) + Send>>,
 }
 
 /// Per-connection state that other clients can see (CLIENT LIST).
@@ -152,6 +171,18 @@ pub struct Client {
     pub reply_off: bool,
     reply_skip: bool,
     pub reply_skip_next: bool,
+    /// Waiting in a blocking command (BLPOP and friends).
+    pub blocked: Option<BlockState>,
+    /// Commands queued since MULTI.
+    pub multi: Option<Vec<Vec<Vec<u8>>>>,
+    /// A command failed to queue: EXEC will abort (CLIENT_DIRTY_EXEC).
+    pub multi_error: bool,
+    /// A watched key changed: EXEC will fail (CLIENT_DIRTY_CAS).
+    pub dirty_cas: bool,
+    pub watched: Vec<super::multi::Watched>,
+    pub subs: super::pubsub::Subscriptions,
+    /// Pushes for a connection without a socket (tests).
+    pub pushed: Vec<Value>,
 }
 
 /// The connection's handle, owned by its thread.
@@ -161,6 +192,8 @@ pub struct Session {
     pub resp: u8,
     /// The server closes the connection after sending the current reply.
     pub closing: bool,
+    /// The last command blocked: the reply comes later, from `take_reply`.
+    pub blocked: bool,
 }
 
 pub struct Pause {
@@ -175,6 +208,15 @@ pub struct Engine {
     pub clients: BTreeMap<u64, Client>,
     pub pause: Option<Pause>,
     pub started: u64,
+    /// Unix seconds of the last SAVE/BGSAVE (LASTSAVE).
+    pub last_save: u64,
+    /// Per database: clients blocked on each key, in the order they blocked.
+    pub waiting: Vec<HashMap<Vec<u8>, VecDeque<u64>>>,
+    /// Replies for clients that were unblocked by other clients' commands.
+    pub(crate) replies: HashMap<u64, Value>,
+    /// Clients WATCHing each (db, key).
+    pub(crate) watchers: HashMap<(usize, Vec<u8>), Vec<u64>>,
+    pub(crate) pubsub: super::pubsub::PubSub,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -208,6 +250,11 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(keys::COMMANDS)
         .chain(strings::COMMANDS)
         .chain(hashes::COMMANDS)
+        .chain(lists::COMMANDS)
+        .chain(sets::COMMANDS)
+        .chain(zsets::COMMANDS)
+        .chain(multi::COMMANDS)
+        .chain(pubsub::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -235,6 +282,14 @@ pub struct Ctx<'a> {
     pub engine: &'a mut Engine,
     pub session: &'a mut Session,
     pub now: u64,
+    /// Blocking commands must answer right away (inside MULTI, scripts).
+    pub deny_blocking: bool,
+    /// Running inside EXEC.
+    pub in_exec: bool,
+    /// Set by `Ctx::block`: the command waits for keys.
+    pub(crate) block: Option<BlockRequest>,
+    /// When re-running a blocked command, its original deadline.
+    pub(crate) reprocess_deadline: Option<u64>,
 }
 
 impl Ctx<'_> {
@@ -282,10 +337,30 @@ impl Ctx<'_> {
         Ok(self.get_hash(key)?.expect("just created"))
     }
 
+    /// The list at `key`, `None` if missing, WRONGTYPE for other types.
+    pub fn get_list(&mut self, key: &[u8]) -> Result<Option<&mut VecDeque<Vec<u8>>>, Value> {
+        match self.lookup(key) {
+            None => Ok(None),
+            Some(Entry { data: Data::List(l), .. }) => Ok(Some(l)),
+            Some(_) => Err(wrong_type()),
+        }
+    }
+
+    /// The list at `key`, created empty if missing.
+    pub fn list_or_create(&mut self, key: &[u8]) -> Result<&mut VecDeque<Vec<u8>>, Value> {
+        if self.get_list(key)?.is_none() {
+            self.db().insert(key.to_vec(), Entry::new(Data::List(VecDeque::new())));
+        }
+        Ok(self.get_list(key)?.expect("just created"))
+    }
+
     /// Deletes `key` if its collection became empty, as Redis does.
     pub fn drop_if_empty(&mut self, key: &[u8]) {
         let empty = match self.lookup(key) {
             Some(Entry { data: Data::Hash(h), .. }) => h.map.is_empty(),
+            Some(Entry { data: Data::List(l), .. }) => l.is_empty(),
+            Some(Entry { data: Data::Set(s), .. }) => s.is_empty(),
+            Some(Entry { data: Data::Zset(z), .. }) => z.is_empty(),
             _ => false,
         };
         if empty {
@@ -333,6 +408,11 @@ impl Engine {
             clients: BTreeMap::new(),
             pause: None,
             started: now,
+            last_save: now / 1000,
+            waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
+            replies: HashMap::new(),
+            watchers: HashMap::new(),
+            pubsub: Default::default(),
             next_client_id: 1,
             clock,
             rng: now | 1,
@@ -372,13 +452,29 @@ impl Engine {
                 reply_off: false,
                 reply_skip: false,
                 reply_skip_next: false,
+                blocked: None,
+                multi: None,
+                multi_error: false,
+                dirty_cas: false,
+                watched: Vec::new(),
+                subs: Default::default(),
+                pushed: Vec::new(),
             },
         );
-        Session { id, resp: 2, closing: false }
+        Session { id, resp: 2, closing: false, blocked: false }
     }
 
     pub fn disconnect(&mut self, session: &Session) {
-        self.clients.remove(&session.id);
+        self.remove_client(session.id);
+    }
+
+    /// Forgets a client and everything it was waiting for.
+    pub fn remove_client(&mut self, id: u64) -> Option<Client> {
+        self.unblock(id);
+        self.unwatch_all(id);
+        self.unsubscribe_everything(id);
+        self.replies.remove(&id);
+        self.clients.remove(&id)
     }
 
     pub fn client_count(&self) -> usize {
@@ -407,19 +503,32 @@ impl Engine {
             session.closing = true;
             return Value::NoReply;
         }
+        let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+        let in_multi = self.clients[&session.id].multi.is_some();
         let (handler, fullname) = match resolve(args) {
             Ok(found) => found,
+            Err(e) if in_multi => return self.multi_reject(session.id, &name, e),
             Err(e) => return e,
         };
         let now = self.now();
         let client = self.clients.get_mut(&session.id).unwrap();
         client.last_interaction = now;
         client.last_cmd = Some(fullname);
+        let c = &self.clients[&session.id];
+        if c.subs.active() && c.resp == 2 && !super::pubsub::allowed_while_subscribed(&name) {
+            let shown = self.clients[&session.id].last_cmd.clone().unwrap_or_default();
+            let e = Value::err(format!(
+                "ERR Can't execute '{shown}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT \
+                 / RESET are allowed in this context"
+            ));
+            return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
+        }
+        if in_multi && !super::multi::runs_in_multi(&name) {
+            return self.queue(session.id, &name, args);
+        }
 
-        let mut ctx = Ctx { engine: self, session, now };
-        let reply = match handler(&mut ctx, args) {
-            Ok(v) | Err(v) => v,
-        };
+        let reply = self.call(session, handler, args, false, None);
+        self.serve_blocked();
 
         let Some(client) = self.clients.get_mut(&session.id) else {
             session.closing = true;
@@ -430,10 +539,45 @@ impl Engine {
         session.resp = client.resp;
         if suppressed { Value::NoReply } else { reply }
     }
+
+    /// Runs one command handler. If it blocks, the client is registered as
+    /// waiting and `NoReply` comes back.
+    pub(crate) fn call(
+        &mut self,
+        session: &mut Session,
+        handler: Handler,
+        args: &[Vec<u8>],
+        deny_blocking: bool,
+        reprocess_deadline: Option<u64>,
+    ) -> Value {
+        let now = self.now();
+        let db = self.clients.get(&session.id).map_or(0, |c| c.db);
+        let before = self.watch_snapshot(args, db);
+        let mut ctx = Ctx {
+            engine: self,
+            session,
+            now,
+            deny_blocking,
+            in_exec: deny_blocking,
+            block: None,
+            reprocess_deadline,
+        };
+        let reply = match handler(&mut ctx, args) {
+            Ok(v) | Err(v) => v,
+        };
+        if let Some(req) = ctx.block.take() {
+            self.block_client(session, req, args);
+            return Value::NoReply;
+        }
+        if !matches!(reply, Value::Error(_)) {
+            self.touch_written(args, db, before);
+        }
+        reply
+    }
 }
 
 /// Finds the handler and full name for `args`, or the error Redis gives.
-fn resolve(args: &[Vec<u8>]) -> Result<(Handler, String), Value> {
+pub(crate) fn resolve(args: &[Vec<u8>]) -> Result<(Handler, String), Value> {
     let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
     let (Some(cmd), Some(meta)) = (find(&name), command_meta::lookup(&name)) else {
         return Err(unknown_command(args));
@@ -526,6 +670,33 @@ pub fn same_object() -> Value {
 /// Parses an integer argument or fails with Redis's standard error.
 pub fn int_arg(b: &[u8]) -> Result<i64, Value> {
     super::num::parse_int(b).ok_or_else(not_int)
+}
+
+/// `getLongFromObjectOrReply` (a long is 64 bits here).
+pub fn long_arg(b: &[u8]) -> Result<i64, Value> {
+    int_arg(b)
+}
+
+/// `getRangeLongFromObjectOrReply`: an integer in `min..=max`, failing with
+/// `msg` (or Redis's default messages).
+pub fn range_long(b: &[u8], min: i64, max: i64, msg: Option<&str>) -> Result<i64, Value> {
+    let custom = |m: &str| Value::err(format!("ERR {m}"));
+    let n = match super::num::parse_int(b) {
+        Some(n) => n,
+        None => return Err(msg.map_or_else(not_int, custom)),
+    };
+    if n < min || n > max {
+        return Err(msg.map_or_else(
+            || custom(&format!("value is out of range, value must between {min} and {max}")),
+            custom,
+        ));
+    }
+    Ok(n)
+}
+
+/// `getPositiveLongFromObjectOrReply`.
+pub fn positive_long(b: &[u8], msg: Option<&str>) -> Result<i64, Value> {
+    range_long(b, 0, i64::MAX, Some(msg.unwrap_or("value is out of range, must be positive")))
 }
 
 /// Parses an integer argument, failing with a custom message.
