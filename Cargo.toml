@@ -9,7 +9,7 @@ license = "MIT"
 [features]
 default = ["redis"]
 redis = []
-postgres = ["dep:pgwire", "dep:sqlparser", "dep:bytes"]
+postgres = ["dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = []
 memcached = []
 
@@ -17,6 +17,8 @@ memcached = []
 # Postgres: wire-protocol message codecs only (no tokio server API).
 pgwire = { version = "0.41", default-features = false, optional = true }
 bytes = { version = "1", optional = true }
+# Postgres: regular expressions (already a pgwire dependency).
+regex-lite = { version = "0.1", optional = true }
 # Postgres: SQL parsing.
 sqlparser = { version = "0.63", default-features = false, features = ["std"], optional = true }
 
