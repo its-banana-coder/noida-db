@@ -3,6 +3,8 @@
 mod admin;
 mod blocking;
 mod command_meta;
+mod config;
+mod config_table;
 mod connection;
 mod double;
 mod engine;

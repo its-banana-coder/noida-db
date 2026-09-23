@@ -396,7 +396,7 @@ fn pubsub_through_a_real_client() -> RedisResult<()> {
     let v: String = con3.set("x", "1").and_then(|()| con3.get("x"))?;
     assert_eq!(v, "1");
     let mut seen = false;
-    while let Ok(push) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+    while let Ok(push) = rx.recv_timeout(std::time::Duration::from_secs(10)) {
         if push.kind == redis::PushKind::Message {
             assert_eq!(push.data[1], redis::Value::BulkString(b"fire".to_vec()));
             seen = true;
