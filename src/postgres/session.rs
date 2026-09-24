@@ -377,6 +377,7 @@ impl Settings {
             zone: self.zone.clone(),
             interval_iso: self.values.get("IntervalStyle").is_some_and(|v| v == "iso_8601"),
             bytea_escape: self.values.get("bytea_output").is_some_and(|v| v == "escape"),
+            reg_names: None,
             extra_float_digits: self
                 .values
                 .get("extra_float_digits")

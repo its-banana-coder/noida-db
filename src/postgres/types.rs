@@ -560,11 +560,37 @@ pub struct FmtCtx {
     pub interval_iso: bool,
     pub bytea_escape: bool,
     pub extra_float_digits: i32,
+    /// Names for reg* values, filled in when a result has such columns.
+    pub reg_names: Option<std::sync::Arc<RegNames>>,
+}
+
+/// Object names a `regclass`/`regtype`/... value prints as.
+#[derive(Clone, Default, Debug)]
+pub struct RegNames {
+    pub class: std::collections::HashMap<u32, String>,
+    pub types: std::collections::HashMap<u32, String>,
+    pub procs: std::collections::HashMap<u32, String>,
+    pub namespaces: std::collections::HashMap<u32, String>,
+    pub roles: std::collections::HashMap<u32, String>,
+}
+
+impl RegNames {
+    pub fn lookup(&self, base: Base, oid: u32) -> Option<&String> {
+        match base {
+            Base::Regclass => self.class.get(&oid),
+            Base::Regtype => self.types.get(&oid),
+            Base::Regproc | Base::Regprocedure => self.procs.get(&oid),
+            Base::Regnamespace => self.namespaces.get(&oid),
+            Base::Regrole => self.roles.get(&oid),
+            _ => None,
+        }
+    }
 }
 
 impl Default for FmtCtx {
     fn default() -> Self {
         FmtCtx {
+            reg_names: None,
             zone: Zone::utc(),
             interval_iso: false,
             bytea_escape: false,
@@ -665,6 +691,10 @@ pub fn to_text(v: &Value, ty: Type, f: &FmtCtx) -> String {
         Value::Bool(b) => if *b { "t" } else { "f" }.into(),
         Value::Int(i) => match ty.base {
             Base::Bool => if *i != 0 { "t" } else { "f" }.into(),
+            b if ty.is_reg() => match f.reg_names.as_ref().and_then(|r| r.lookup(b, *i as u32)) {
+                Some(n) => n.clone(),
+                None => i.to_string(),
+            },
             _ => i.to_string(),
         },
         Value::Float(x) => format_float(*x, ty.base == Base::Float4, f.extra_float_digits),
