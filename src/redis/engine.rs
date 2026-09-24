@@ -7,7 +7,10 @@ use super::blocking::{BlockRequest, BlockState};
 use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
-use super::{admin, connection, hashes, keys, lists, multi, pubsub, sets, strings, zsets};
+use super::{
+    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, sets, streams,
+    strings, zsets,
+};
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
 pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
@@ -21,6 +24,7 @@ pub enum Data {
     List(VecDeque<Vec<u8>>),
     Set(super::sets::Set),
     Zset(super::zsets::Zset),
+    Stream(super::streams::Stream),
 }
 
 impl Data {
@@ -31,14 +35,19 @@ impl Data {
             Data::List(_) => "list",
             Data::Set(_) => "set",
             Data::Zset(_) => "zset",
+            Data::Stream(_) => "stream",
         }
     }
 }
 
-/// Redis's `hash-max-listpack-entries` / `-value` defaults. Below both, a
-/// hash is "small": compact, ordered, and scanned in one go.
-pub const LISTPACK_MAX_ENTRIES: usize = 128;
-pub const LISTPACK_MAX_VALUE: usize = 64;
+/// What the compact encodings hold before Redis converts them, from the
+/// matching `*-max-listpack-*` / `set-max-intset-entries` parameters.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    pub entries: usize,
+    pub value: usize,
+    pub intset: usize,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Hash {
@@ -48,12 +57,12 @@ pub struct Hash {
 }
 
 impl Hash {
-    pub fn insert(&mut self, k: &[u8], v: &[u8]) -> bool {
-        if k.len() > LISTPACK_MAX_VALUE || v.len() > LISTPACK_MAX_VALUE {
+    pub fn insert(&mut self, k: &[u8], v: &[u8], lim: Limits) -> bool {
+        if k.len() > lim.value || v.len() > lim.value {
             self.big = true;
         }
         let new = self.map.insert(k.to_vec(), v.to_vec());
-        if self.map.len() > LISTPACK_MAX_ENTRIES {
+        if self.map.len() > lim.entries {
             self.big = true;
         }
         new
@@ -217,6 +226,7 @@ pub struct Engine {
     /// Clients WATCHing each (db, key).
     pub(crate) watchers: HashMap<(usize, Vec<u8>), Vec<u64>>,
     pub(crate) pubsub: super::pubsub::PubSub,
+    pub(crate) config: super::config::Config,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -255,6 +265,10 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(zsets::COMMANDS)
         .chain(multi::COMMANDS)
         .chain(pubsub::COMMANDS)
+        .chain(config::COMMANDS)
+        .chain(bitops::COMMANDS)
+        .chain(geo::COMMANDS)
+        .chain(streams::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
@@ -293,6 +307,16 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The encoding limits configured for `kind` ("hash", "set", "zset").
+    pub fn limits(&self, kind: &str) -> Limits {
+        let num = |name: String| self.engine.config_num(&name).max(0) as usize;
+        Limits {
+            entries: num(format!("{kind}-max-listpack-entries")),
+            value: num(format!("{kind}-max-listpack-value")),
+            intset: num("set-max-intset-entries".into()),
+        }
+    }
+
     pub fn client(&mut self) -> &mut Client {
         self.engine.clients.get_mut(&self.session.id).expect("client is registered")
     }
@@ -413,6 +437,7 @@ impl Engine {
             replies: HashMap::new(),
             watchers: HashMap::new(),
             pubsub: Default::default(),
+            config: Default::default(),
             next_client_id: 1,
             clock,
             rng: now | 1,

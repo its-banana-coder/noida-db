@@ -23,7 +23,12 @@ pub enum BlockKind {
 
 impl BlockKind {
     fn satisfied_by(self, data: &Data) -> bool {
-        matches!((self, data), (BlockKind::List, Data::List(_)) | (BlockKind::Zset, Data::Zset(_)))
+        matches!(
+            (self, data),
+            (BlockKind::List, Data::List(_))
+                | (BlockKind::Zset, Data::Zset(_))
+                | (BlockKind::Stream, Data::Stream(_))
+        )
     }
 }
 
@@ -32,6 +37,9 @@ pub struct BlockRequest {
     kind: BlockKind,
     keys: Vec<Vec<u8>>,
     deadline: u64,
+    /// The command to re-run, when it isn't the one that blocked (XREAD
+    /// rewrites `$` into the ID it resolved to).
+    args: Option<Vec<Vec<u8>>>,
 }
 
 /// A blocked client's state.
@@ -51,9 +59,35 @@ impl Ctx<'_> {
     /// deadline it first blocked with.
     pub fn block(&mut self, kind: BlockKind, keys: &[Vec<u8>], deadline: u64) -> Reply {
         let deadline = self.reprocess_deadline.unwrap_or(deadline);
-        self.block = Some(BlockRequest { kind, keys: keys.to_vec(), deadline });
+        self.block = Some(BlockRequest { kind, keys: keys.to_vec(), deadline, args: None });
         Ok(Value::NoReply)
     }
+
+    /// Blocks, but re-runs `args` instead of the command as typed.
+    pub fn block_with_args(
+        &mut self,
+        kind: BlockKind,
+        keys: &[Vec<u8>],
+        deadline: u64,
+        args: Vec<Vec<u8>>,
+    ) -> Reply {
+        let deadline = self.reprocess_deadline.unwrap_or(deadline);
+        self.block = Some(BlockRequest { kind, keys: keys.to_vec(), deadline, args: Some(args) });
+        Ok(Value::NoReply)
+    }
+}
+
+/// A timeout already in milliseconds (XREAD's BLOCK).
+pub fn timeout_ms_arg(ms: i64, now: u64) -> Result<u64, Value> {
+    if ms < 0 {
+        return Err(Value::err("ERR timeout is negative"));
+    }
+    if ms == 0 {
+        return Ok(0);
+    }
+    ms.checked_add(now as i64)
+        .map(|t| t as u64)
+        .ok_or_else(|| Value::err("ERR timeout is out of range"))
 }
 
 /// A timeout in seconds, possibly fractional, as an absolute unix ms time
@@ -103,7 +137,7 @@ impl Engine {
             keys,
             db,
             deadline: req.deadline,
-            args: args.to_vec(),
+            args: req.args.unwrap_or_else(|| args.to_vec()),
         });
         session.blocked = true;
     }

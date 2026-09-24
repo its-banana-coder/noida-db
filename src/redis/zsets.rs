@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use super::blocking::{BlockKind, timeout_secs_arg};
 use super::double::parse_double;
 use super::engine::{
-    Command, Ctx, Data, Entry, Reply, arity_error, cmd, eq_ic, long_arg, positive_long, range_long,
-    syntax, wrong_type,
+    Command, Ctx, Data, Entry, Limits, Reply, arity_error, cmd, eq_ic, long_arg, positive_long,
+    range_long, syntax, wrong_type,
 };
 use super::keys::parse_scan;
 use super::resp::Value;
 
 pub static COMMANDS: &[Command] = &[
-    cmd("zadd", zadd),
+    cmd("zadd", zadd_command),
     cmd("zincrby", zincrby),
     cmd("zrem", zrem),
     cmd("zcard", zcard),
@@ -54,10 +54,6 @@ pub static COMMANDS: &[Command] = &[
     cmd("zintercard", zintercard),
 ];
 
-/// `zset-max-listpack-entries` / `zset-max-listpack-value` defaults.
-const MAX_LISTPACK: usize = 128;
-const MAX_LISTPACK_VALUE: usize = 64;
-
 #[derive(Clone, Debug, Default)]
 pub struct Zset {
     /// Sorted by (score, member).
@@ -73,8 +69,8 @@ fn cmp(a: (f64, &[u8]), b: (f64, &[u8])) -> Ordering {
 
 impl Zset {
     /// `zsetTypeCreate`.
-    fn create(size_hint: usize, value_len: usize) -> Zset {
-        Zset { big: size_hint > MAX_LISTPACK || value_len > MAX_LISTPACK_VALUE, ..Zset::default() }
+    fn create(size_hint: usize, value_len: usize, lim: Limits) -> Zset {
+        Zset { big: size_hint > lim.entries || value_len > lim.value, ..Zset::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -89,6 +85,11 @@ impl Zset {
         if self.big { "skiplist" } else { "listpack" }
     }
 
+    /// The members in (score, member) order.
+    pub fn iter(&self) -> impl Iterator<Item = &(f64, Vec<u8>)> {
+        self.items.iter()
+    }
+
     pub fn score(&self, m: &[u8]) -> Option<f64> {
         self.scores.get(m).copied()
     }
@@ -98,7 +99,7 @@ impl Zset {
     }
 
     /// Inserts or moves `m` to `score`. Returns true if `m` was new.
-    pub fn insert(&mut self, m: &[u8], score: f64) -> bool {
+    pub fn insert(&mut self, m: &[u8], score: f64, lim: Limits) -> bool {
         let new = match self.scores.get(m) {
             Some(&old) => {
                 if old == score {
@@ -110,7 +111,7 @@ impl Zset {
             }
             None => true,
         };
-        if new && (self.items.len() + 1 > MAX_LISTPACK || m.len() > MAX_LISTPACK_VALUE) {
+        if new && (self.items.len() + 1 > lim.entries || m.len() > lim.value) {
             self.big = true;
         }
         // A listpack stores the score as text, and "-0" comes back as the
@@ -135,9 +136,9 @@ impl Zset {
     }
 
     /// `zsetConvertToListpackIfNeeded` for stored results.
-    fn shrink_if_small(&mut self) {
+    fn shrink_if_small(&mut self, lim: Limits) {
         let max_len = self.items.iter().map(|(_, m)| m.len()).max().unwrap_or(0);
-        if self.big && self.len() <= MAX_LISTPACK && max_len <= MAX_LISTPACK_VALUE {
+        if self.big && self.len() <= lim.entries && max_len <= lim.value {
             self.big = false;
         }
     }
@@ -197,6 +198,7 @@ struct AddFlags {
 }
 
 fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
+    let lim = ctx.limits("zset");
     let mut ch = false;
     let mut i = 2;
     while i < a.len() {
@@ -235,13 +237,13 @@ fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
     let mut last = 0.0;
     match ctx.get_zset(&a[1])? {
         Some(z) => {
-            if pairs.len() > MAX_LISTPACK {
+            if pairs.len() > lim.entries {
                 z.big = true;
             }
         }
         None if f.xx => {}
         None => {
-            let z = Zset::create(pairs.len(), pairs[0].1.len());
+            let z = Zset::create(pairs.len(), pairs[0].1.len(), lim);
             ctx.db().insert(a[1].clone(), Entry::new(Data::Zset(z)));
         }
     }
@@ -263,13 +265,13 @@ fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
                         continue;
                     }
                     if score != cur {
-                        z.insert(m, score);
+                        z.insert(m, score, lim);
                         updated += 1;
                     }
                 }
                 None if f.xx => continue,
                 None => {
-                    z.insert(m, score);
+                    z.insert(m, score, lim);
                     added += 1;
                 }
             }
@@ -283,7 +285,8 @@ fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
     Ok(Value::Integer(if ch { added + updated } else { added }))
 }
 
-fn zadd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+/// ZADD, also used by GEOADD once it has computed the scores.
+pub(crate) fn zadd_command(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     zadd_generic(ctx, a, AddFlags::default())
 }
 
@@ -552,6 +555,7 @@ fn zrange_generic(
         _ => Spec::Rank(long_arg(lo)?, long_arg(hi)?),
     };
     let resp3 = ctx.resp() >= 3;
+    let lim = ctx.limits("zset");
     let selected: Vec<(f64, Vec<u8>)> = match ctx.get_zset(&a[start])? {
         None => vec![],
         Some(z) => {
@@ -576,9 +580,9 @@ fn zrange_generic(
     };
     match store {
         Some(dst) => {
-            let mut z = Zset::create(selected.len(), 0);
+            let mut z = Zset::create(selected.len(), 0, lim);
             for (s, m) in &selected {
-                z.insert(m, *s);
+                z.insert(m, *s, lim);
             }
             ctx.store_zset(dst, z)
         }
@@ -916,6 +920,7 @@ fn zsetop(
     card_only: bool,
     name: &str,
 ) -> Reply {
+    let lim = ctx.limits("zset");
     let setnum = long_arg(&a[numkeys_idx])?;
     if setnum < 1 {
         return Err(Value::err(format!("ERR at least 1 input key is needed for '{name}' command")));
@@ -938,7 +943,7 @@ fn zsetop(
     let mut weights = vec![1.0; setnum];
     let mut agg = Aggregate::Sum;
     let mut withscores = false;
-    let mut lim = 0usize;
+    let mut card_limit = 0usize;
     let mut j = numkeys_idx + 1 + setnum;
     while j < a.len() {
         let remaining = a.len() - j;
@@ -962,7 +967,7 @@ fn zsetop(
         } else if dst.is_none() && !card_only && eq_ic(&a[j], "withscores") {
             withscores = true;
         } else if card_only && remaining >= 2 && eq_ic(&a[j], "limit") {
-            lim = positive_long(&a[j + 1], Some("LIMIT can't be negative"))? as usize;
+            card_limit = positive_long(&a[j + 1], Some("LIMIT can't be negative"))? as usize;
             j += 1;
         } else {
             return Err(syntax());
@@ -998,12 +1003,12 @@ fn zsetop(
                     }
                     card += 1;
                     if card_only {
-                        if lim != 0 && card >= lim {
+                        if card_limit != 0 && card >= card_limit {
                             break;
                         }
                         continue;
                     }
-                    result.insert(m, score);
+                    result.insert(m, score, lim);
                 }
             }
             if card_only {
@@ -1027,14 +1032,14 @@ fn zsetop(
                 }
             }
             for (m, s) in acc {
-                result.insert(&m, s);
+                result.insert(&m, s, lim);
             }
         }
         SetOp::Diff => {
             if let Some(first) = &srcs[0] {
                 for (sc, m) in first {
                     if !lookup[1..].iter().flatten().any(|l| l.contains_key(m.as_slice())) {
-                        result.insert(m, *sc);
+                        result.insert(m, *sc, lim);
                     }
                 }
             }
@@ -1042,7 +1047,7 @@ fn zsetop(
     }
     match dst {
         Some(dst) => {
-            result.shrink_if_small();
+            result.shrink_if_small(lim);
             ctx.store_zset(dst, result)
         }
         None => {

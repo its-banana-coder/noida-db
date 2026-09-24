@@ -1,13 +1,17 @@
 //! Command-level tests against the in-process engine. Expected replies and
 //! error strings are Redis 7.2's, byte for byte.
 
+mod bitops;
+mod config;
 mod connection;
+mod geo;
 mod hashes;
 mod introspection;
 mod lists;
 mod multi;
 mod pubsub;
 mod sets;
+mod streams;
 mod strings_keys;
 mod zsets;
 
@@ -116,3 +120,4 @@ pub fn text(v: &Value) -> String {
 
 pub const NOT_INT: &str = "ERR value is not an integer or out of range";
 pub const SYNTAX: &str = "ERR syntax error";
+pub const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";

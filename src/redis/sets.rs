@@ -5,7 +5,8 @@
 //! has no defined order.
 
 use super::engine::{
-    Command, Ctx, Data, Entry, Reply, cmd, eq_ic, positive_long, range_long, syntax, wrong_type,
+    Command, Ctx, Data, Entry, Limits, Reply, cmd, eq_ic, positive_long, range_long, syntax,
+    wrong_type,
 };
 use super::keys::parse_scan;
 use super::num::parse_int;
@@ -32,12 +33,6 @@ pub static COMMANDS: &[Command] = &[
     cmd("sscan", sscan),
 ];
 
-/// `set-max-intset-entries`, `set-max-listpack-entries` and
-/// `set-max-listpack-value` defaults.
-const MAX_INTSET: usize = 512;
-const MAX_LISTPACK: usize = 128;
-const MAX_LISTPACK_VALUE: usize = 64;
-
 #[derive(Clone, Debug)]
 pub enum Set {
     /// Sorted integers.
@@ -51,10 +46,10 @@ pub enum Set {
 impl Set {
     /// `setTypeCreate`: the encoding for a new set whose first member is
     /// `first`, expecting about `size_hint` members.
-    pub fn create(first: &[u8], size_hint: usize) -> Set {
-        if parse_int(first).is_some() && size_hint <= MAX_INTSET {
+    pub fn create(first: &[u8], size_hint: usize, lim: Limits) -> Set {
+        if parse_int(first).is_some() && size_hint <= lim.intset {
             Set::Int(Vec::new())
-        } else if size_hint <= MAX_LISTPACK {
+        } else if size_hint <= lim.entries {
             Set::Pack(OrderedSet::default())
         } else {
             Set::Hash(OrderedSet::default())
@@ -71,10 +66,10 @@ impl Set {
 
     /// `setTypeMaybeConvert`: go straight to a hashtable if `size_hint`
     /// members won't fit the compact encoding.
-    fn maybe_convert(&mut self, size_hint: usize) {
+    fn maybe_convert(&mut self, size_hint: usize, lim: Limits) {
         let too_big = match self {
-            Set::Int(_) => size_hint > MAX_INTSET,
-            Set::Pack(_) => size_hint > MAX_LISTPACK,
+            Set::Int(_) => size_hint > lim.intset,
+            Set::Pack(_) => size_hint > lim.entries,
             Set::Hash(_) => false,
         };
         if too_big {
@@ -124,13 +119,13 @@ impl Set {
     }
 
     /// `setTypeAdd`. Returns true if `m` was new.
-    pub fn add(&mut self, m: &[u8]) -> bool {
+    pub fn add(&mut self, m: &[u8], lim: Limits) -> bool {
         match self {
             Set::Int(v) => {
                 if let Some(n) = parse_int(m) {
                     let Err(i) = v.binary_search(&n) else { return false };
                     v.insert(i, n);
-                    if v.len() > MAX_INTSET {
+                    if v.len() > lim.intset {
                         self.convert_to_hash();
                     }
                     return true;
@@ -141,7 +136,7 @@ impl Set {
                     s.insert(x);
                 }
                 s.insert(m);
-                *self = if members.len() < MAX_LISTPACK && m.len() <= MAX_LISTPACK_VALUE {
+                *self = if members.len() < lim.entries && m.len() <= lim.value {
                     Set::Pack(s)
                 } else {
                     Set::Hash(s)
@@ -152,11 +147,11 @@ impl Set {
                 if s.contains(m) {
                     return false;
                 }
-                if s.len() < MAX_LISTPACK && m.len() <= MAX_LISTPACK_VALUE {
+                if s.len() < lim.entries && m.len() <= lim.value {
                     s.insert(m);
                 } else {
                     self.convert_to_hash();
-                    self.add(m);
+                    self.add(m, lim);
                 }
                 true
             }
@@ -180,8 +175,8 @@ impl Set {
     }
 
     /// `maybeConvertToIntset`, used when a stored result is all integers.
-    fn maybe_convert_to_intset(&mut self) {
-        if matches!(self, Set::Int(_)) || self.len() > MAX_INTSET {
+    fn maybe_convert_to_intset(&mut self, lim: Limits) {
+        if matches!(self, Set::Int(_)) || self.len() > lim.intset {
             return;
         }
         let mut v: Vec<i64> = self.members().iter().filter_map(|m| parse_int(m)).collect();
@@ -213,16 +208,17 @@ impl Ctx<'_> {
 }
 
 fn sadd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("set");
     let hint = a.len() - 2;
     match ctx.get_set(&a[1])? {
-        Some(s) => s.maybe_convert(hint),
+        Some(s) => s.maybe_convert(hint, lim),
         None => {
-            let s = Set::create(&a[2], hint);
+            let s = Set::create(&a[2], hint, lim);
             ctx.db().insert(a[1].clone(), Entry::new(Data::Set(s)));
         }
     }
     let s = ctx.get_set(&a[1])?.expect("exists");
-    let added = a[2..].iter().filter(|m| s.add(m)).count();
+    let added = a[2..].iter().filter(|m| s.add(m, lim)).count();
     Ok(Value::Integer(added as i64))
 }
 
@@ -242,6 +238,7 @@ fn srem(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn smove(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("set");
     let (src, dst, m) = (&a[1], &a[2], &a[3]);
     if ctx.lookup(src).is_none() {
         return Ok(Value::Integer(0));
@@ -256,9 +253,9 @@ fn smove(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     ctx.drop_if_empty(src);
     if ctx.get_set(dst)?.is_none() {
-        ctx.db().insert(dst.clone(), Entry::new(Data::Set(Set::create(m, 1))));
+        ctx.db().insert(dst.clone(), Entry::new(Data::Set(Set::create(m, 1, lim))));
     }
-    ctx.get_set(dst)?.expect("exists").add(m);
+    ctx.get_set(dst)?.expect("exists").add(m, lim);
     Ok(Value::Integer(1))
 }
 
@@ -294,6 +291,7 @@ fn pop_random(ctx: &mut Ctx, key: &[u8]) -> Vec<u8> {
 }
 
 fn spop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("set");
     if a.len() > 3 {
         return Err(syntax());
     }
@@ -317,7 +315,7 @@ fn spop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         let s = ctx.set_copy(&a[1])?;
         let now = ctx.now;
         ctx.db().remove(&a[1], now);
-        return Ok(bulk_set(union_diff(&[s], false, false).members()));
+        return Ok(bulk_set(union_diff(&[s], false, false, lim).members()));
     }
     let remaining = size - count;
     let s = ctx.get_set(&a[1])?.expect("exists").clone();
@@ -351,7 +349,7 @@ fn spop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         let mut old = s.clone();
         for &i in &keep {
             let m = s.get(i);
-            new.add(&m);
+            new.add(&m, lim);
             old.remove(&m);
         }
         *ctx.get_set(&a[1])?.expect("exists") = new;
@@ -468,6 +466,7 @@ fn store_result(ctx: &mut Ctx, dst: &[u8], set: Set) -> Reply {
 }
 
 fn sinterstore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("set");
     let sets = load_sets(ctx, &a[2..])?;
     let Some(mut sets) = sets.into_iter().collect::<Option<Vec<Set>>>() else {
         return store_result(ctx, &a[1], Set::Int(vec![]));
@@ -479,22 +478,22 @@ fn sinterstore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         _ => Set::Pack(OrderedSet::default()),
     };
     for m in &members {
-        dst.add(m);
+        dst.add(m, lim);
     }
     if !dst.is_empty() && members.iter().all(|m| parse_int(m).is_some()) {
-        dst.maybe_convert_to_intset();
+        dst.maybe_convert_to_intset(lim);
     }
     store_result(ctx, &a[1], dst)
 }
 
 /// `sunionDiffGenericCommand`: builds the result the way Redis does,
 /// starting from an intset, so its encoding and order match.
-fn union_diff(sets: &[Option<Set>], diff: bool, sameset: bool) -> Set {
+fn union_diff(sets: &[Option<Set>], diff: bool, sameset: bool, lim: Limits) -> Set {
     let mut dst = Set::Int(vec![]);
     if !diff {
         for s in sets.iter().flatten() {
             for m in s.members() {
-                dst.add(&m);
+                dst.add(&m, lim);
             }
         }
         return dst;
@@ -509,12 +508,12 @@ fn union_diff(sets: &[Option<Set>], diff: bool, sameset: bool) -> Set {
     if algo_one <= algo_two {
         for m in first.members() {
             if !others.iter().any(|s| s.contains(&m)) {
-                dst.add(&m);
+                dst.add(&m, lim);
             }
         }
     } else {
         for m in first.members() {
-            dst.add(&m);
+            dst.add(&m, lim);
         }
         for s in others {
             if dst.is_empty() {
@@ -530,9 +529,10 @@ fn union_diff(sets: &[Option<Set>], diff: bool, sameset: bool) -> Set {
 
 /// SUNION/SDIFF over `keys`; the first key repeated makes a diff empty.
 fn union_diff_keys(ctx: &mut Ctx, keys: &[Vec<u8>], diff: bool) -> Result<Set, Value> {
+    let lim = ctx.limits("set");
     let sets = load_sets(ctx, keys)?;
     let sameset = keys[1..].contains(&keys[0]);
-    Ok(union_diff(&sets, diff, sameset))
+    Ok(union_diff(&sets, diff, sameset, lim))
 }
 
 fn sunion(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
