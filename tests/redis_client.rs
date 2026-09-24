@@ -411,3 +411,43 @@ fn pubsub_through_a_real_client() -> RedisResult<()> {
     assert!(seen, "no RESP3 push message");
     Ok(())
 }
+
+/// A worker loop the way a job queue uses streams: read new entries for a
+/// consumer, ack them, and take over a dead worker's pending entry.
+#[test]
+fn stream_consumer_groups_through_a_real_client() -> RedisResult<()> {
+    use redis::streams::{StreamAutoClaimOptions, StreamAutoClaimReply, StreamReadOptions};
+    let addr = common::start_noida_redis();
+    let mut con = redis::Client::open(format!("redis://{addr}/"))?.get_connection()?;
+    let _: String = con.xadd("jobs", "1-1", &[("task", "a")])?;
+    let _: String = con.xadd("jobs", "2-1", &[("task", "b")])?;
+    let _: () = con.xgroup_create("jobs", "workers", "0")?;
+
+    let opts = StreamReadOptions::default().group("workers", "worker-1").count(1);
+    let reply: redis::streams::StreamReadReply = con.xread_options(&["jobs"], &[">"], &opts)?;
+    assert_eq!(reply.keys.len(), 1);
+    assert_eq!(reply.keys[0].ids.len(), 1);
+    assert_eq!(reply.keys[0].ids[0].id, "1-1");
+    let acked: i64 = con.xack("jobs", "workers", &["1-1"])?;
+    assert_eq!(acked, 1);
+
+    // worker-2 takes the entry worker-1 left pending.
+    let opts = StreamReadOptions::default().group("workers", "worker-2").count(1);
+    let _: redis::streams::StreamReadReply = con.xread_options(&["jobs"], &[">"], &opts)?;
+    let pending: redis::streams::StreamPendingReply = con.xpending("jobs", "workers")?;
+    assert_eq!(pending.count(), 1);
+    let claimed: StreamAutoClaimReply = con.xautoclaim_options(
+        "jobs",
+        "workers",
+        "worker-3",
+        0,
+        "0",
+        StreamAutoClaimOptions::default(),
+    )?;
+    assert_eq!(claimed.claimed.len(), 1);
+    assert_eq!(claimed.claimed[0].id, "2-1");
+    let info: redis::streams::StreamInfoConsumersReply = con.xinfo_consumers("jobs", "workers")?;
+    let names: Vec<&str> = info.consumers.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["worker-1", "worker-2", "worker-3"]);
+    Ok(())
+}
