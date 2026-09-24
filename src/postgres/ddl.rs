@@ -105,6 +105,7 @@ impl Ddl<'_, '_> {
             return Ok(format!("SELECT {}", self.ctx.db.table(oid).unwrap().rows.len()));
         }
         let mut pending: Vec<(String, Vec<String>, PendingConstraint)> = vec![];
+        let mut serial_cols: Vec<usize> = vec![];
         for col in &ct.columns {
             let cname = ident(&col.name);
             let (ty, typmod, serial) = self.column_type(&col.data_type)?;
@@ -161,8 +162,10 @@ impl Ddl<'_, '_> {
                 }
             }
             if serial {
+                // Marked here, turned into a nextval() default below.
                 c.identity = Some((false, 0));
                 c.not_null = true;
+                serial_cols.push(table.columns.len());
             }
             table.columns.push(c);
         }
@@ -187,7 +190,12 @@ impl Ddl<'_, '_> {
                 self.ctx.db.unique_rel_name(schema, &make_object_name(&name, Some(&cname), "seq"));
             let seq_oid = self.create_sequence_object(schema, &seq_name, ty, Some((oid, i)))?;
             let t = self.ctx.db.table_mut(oid).unwrap();
-            t.columns[i].identity = Some((t.columns[i].identity.unwrap().0, seq_oid));
+            if serial_cols.contains(&i) {
+                t.columns[i].identity = None;
+                t.columns[i].default = Some(format!("nextval('{seq_name}'::regclass)"));
+            } else {
+                t.columns[i].identity = Some((t.columns[i].identity.unwrap().0, seq_oid));
+            }
         }
         for (cname, cols, kind) in pending {
             self.add_constraint(oid, &cname, &cols, kind)?;

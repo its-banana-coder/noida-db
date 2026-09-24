@@ -131,6 +131,36 @@ active bool, active_pid int4, xmin xid, catalog_xmin xid, restart_lsn pg_lsn, co
 pg_stat_replication: pid int4, usesysid oid, usename name, application_name text, client_addr inet, state text
 pg_timezone_names: name text, abbrev text, utc_offset interval, is_dst bool
 pg_timezone_abbrevs: abbrev text, utc_offset interval, is_dst bool
+pg_publication_rel: oid oid, prpubid oid, prrelid oid
+pg_publication_namespace: oid oid, pnpubid oid, pnnspid oid
+pg_subscription: oid oid, subdbid oid, subname name, subowner oid, subenabled bool, subconninfo text, subslotname name, subsynccommit text, subpublications _text
+pg_subscription_rel: srsubid oid, srrelid oid, srsubstate char, srsublsn pg_lsn
+pg_statistic: starelid oid, staattnum int2, stainherit bool, stanullfrac float4, stawidth int4, stadistinct float4
+pg_stats: schemaname name, tablename name, attname name, inherited bool, null_frac float4, avg_width int4, n_distinct float4, most_common_vals _text, most_common_freqs _float4, histogram_bounds _text, correlation float4
+pg_user_mapping: oid oid, umuser oid, umserver oid, umoptions _text
+pg_default_acl: oid oid, defaclrole oid, defaclnamespace oid, defaclobjtype char, defaclacl _aclitem
+pg_init_privs: objoid oid, classoid oid, objsubid int4, privtype char, initprivs _aclitem
+pg_largeobject: loid oid, pageno int4, data bytea
+pg_largeobject_metadata: oid oid, lomowner oid, lomacl _aclitem
+pg_seclabel: objoid oid, classoid oid, objsubid int4, provider text, label text
+pg_shseclabel: objoid oid, classoid oid, provider text, label text
+pg_ts_config: oid oid, cfgname name, cfgnamespace oid, cfgowner oid, cfgparser oid
+pg_ts_dict: oid oid, dictname name, dictnamespace oid, dictowner oid, dicttemplate oid, dictinitoption text
+pg_ts_parser: oid oid, prsname name, prsnamespace oid, prsstart regproc, prstoken regproc, prsend regproc, prsheadline regproc, prslextype regproc
+pg_ts_template: oid oid, tmplname name, tmplnamespace oid, tmplinit regproc, tmpllexize regproc
+pg_transform: oid oid, trftype oid, trflang oid, trffromsql regproc, trftosql regproc
+pg_aggregate: aggfnoid regproc, aggkind char, aggnumdirectargs int2, aggtransfn regproc, aggfinalfn regproc, aggcombinefn regproc, aggtranstype oid, agginitval text
+pg_amop: oid oid, amopfamily oid, amoplefttype oid, amoprighttype oid, amopstrategy int2, amoppurpose char, amopopr oid, amopmethod oid, amopsortfamily oid
+pg_amproc: oid oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2, amproc regproc
+pg_opfamily: oid oid, opfmethod oid, opfname name, opfnamespace oid, opfowner oid
+pg_auth_members: oid oid, roleid oid, member oid, grantor oid, admin_option bool, inherit_option bool, set_option bool
+pg_db_role_setting: setdatabase oid, setrole oid, setconfig _text
+pg_stat_database: datid oid, datname name, numbackends int4, xact_commit int8, xact_rollback int8, blks_read int8, blks_hit int8, tup_returned int8, tup_fetched int8, tup_inserted int8, tup_updated int8, tup_deleted int8, conflicts int8, temp_files int8, temp_bytes int8, deadlocks int8, stats_reset timestamptz
+pg_stat_gssapi: pid int4, gss_authenticated bool, principal text, encrypted bool
+pg_file_settings: sourcefile text, sourceline int4, seqno int4, name text, setting text, applied bool, error text
+pg_hba_file_rules: line_number int4, type text, database _text, user_name _text, address text, netmask text, auth_method text, options _text, error text
+pg_config: name text, setting text
+pg_cursors: name text, statement text, is_holdable bool, is_binary bool, is_scrollable bool, creation_time timestamptz
 information_schema.schemata: catalog_name name, schema_name name, schema_owner name, \
 default_character_set_catalog name, default_character_set_schema name, default_character_set_name name, \
 sql_path varchar
@@ -1330,7 +1360,12 @@ fn pg_type_row(
         n(0),
         n(-1),
         n(0),
-        n(0),
+        // Collatable types use the default collation (100).
+        n(if matches!(_ty.base, Base::Text | Base::Varchar | Base::Bpchar | Base::Name) {
+            100
+        } else {
+            0
+        }),
         NULL,
         NULL,
         NULL,
@@ -1393,6 +1428,10 @@ pub fn resolve_reg(
     name: &str,
 ) -> Option<i64> {
     let n = name.trim();
+    // A numeric literal is an OID, the way Postgres's regclassin reads it.
+    if let Ok(oid) = n.parse::<u32>() {
+        return Some(oid as i64);
+    }
     let (schema, base_name) = match n.rsplit_once('.') {
         Some((s, b)) => (Some(s.trim_matches('"').to_string()), b.trim_matches('"').to_string()),
         None => (None, n.trim_matches('"').to_string()),

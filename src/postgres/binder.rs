@@ -2222,6 +2222,22 @@ impl<'a> Binder<'a> {
             B::PGNotLikeMatch => "!~~",
             B::PGNotILikeMatch => "!~~*",
             B::PGStartsWith => "^@",
+            // `x OPERATOR(pg_catalog.~) y` names an operator by schema.
+            B::PGCustomBinaryOperator(parts) => match parts.last().map(String::as_str) {
+                Some("=") => return Ok(TE::new(self.compare(l, r, CmpOp::Eq)?, Type::BOOL)),
+                Some("<>") | Some("!=") => {
+                    return Ok(TE::new(self.compare(l, r, CmpOp::Ne)?, Type::BOOL));
+                }
+                Some("<") => return Ok(TE::new(self.compare(l, r, CmpOp::Lt)?, Type::BOOL)),
+                Some("<=") => return Ok(TE::new(self.compare(l, r, CmpOp::Le)?, Type::BOOL)),
+                Some(">") => return Ok(TE::new(self.compare(l, r, CmpOp::Gt)?, Type::BOOL)),
+                Some(">=") => return Ok(TE::new(self.compare(l, r, CmpOp::Ge)?, Type::BOOL)),
+                Some(op) => match known_operator(op) {
+                    Some(name) => name,
+                    None => return Err(unsupported(&format!("operator {op}"))),
+                },
+                None => return Err(unsupported("operator")),
+            },
             other => return Err(unsupported(&format!("operator {other}"))),
         };
         self.binop_te(name, l, r)
@@ -2480,6 +2496,15 @@ impl<'a> Binder<'a> {
         // Zero-argument SQL keywords.
         if matches!(f.args, a::FunctionArguments::None) {
             return self.bind_keyword_function(&name);
+        }
+        if let a::FunctionArguments::Subquery(q) = &f.args {
+            // ARRAY(SELECT ...) collects a subquery's rows into an array.
+            if name == "array" {
+                let (plan, cols) = self.bind_query(q)?;
+                let ty = cols.first().map(|c| c.ty).unwrap_or(Type::TEXT).to_array();
+                return Ok(TE::new(Expr::Sub { kind: SubKind::Array, query: Box::new(plan) }, ty));
+            }
+            return Err(unsupported("function with subquery arguments"));
         }
         let a::FunctionArguments::List(list) = &f.args else {
             return Err(unsupported("function with subquery arguments"));
@@ -3059,6 +3084,31 @@ impl<'a> Binder<'a> {
     fn named_type(&self, parts: &[String], name: &str, args: &[i64]) -> PgResult<(Type, i32)> {
         // Built-in type names sqlparser hands through as Custom.
         let base = match name {
+            "text" => Some(Base::Text),
+            "numeric" | "decimal" => Some(Base::Numeric),
+            "date" => Some(Base::Date),
+            "time" => Some(Base::Time),
+            "timestamp" => Some(Base::Timestamp),
+            "boolean" => Some(Base::Bool),
+            "real" => Some(Base::Float4),
+            "double precision" => Some(Base::Float8),
+            "character" => Some(Base::Bpchar),
+            "character varying" => Some(Base::Varchar),
+            "bytea" if false => None,
+            "cstring" => Some(Base::Cstring),
+            "unknown" => Some(Base::Unknown),
+            "refcursor" => Some(Base::Refcursor),
+            "tid" => Some(Base::Tid),
+            "cid" => Some(Base::Cid),
+            "regprocedure" => Some(Base::Regprocedure),
+            "regoper" => Some(Base::Regoper),
+            "regoperator" => Some(Base::Regoperator),
+            "regconfig" => Some(Base::Regconfig),
+            "trigger" => Some(Base::Trigger),
+            "internal" => Some(Base::Internal),
+            "anynonarray" => Some(Base::AnyNonArray),
+            "anyenum" => Some(Base::AnyEnum),
+            "any" => Some(Base::Any),
             "int2" | "smallint" => Some(Base::Int2),
             "int4" | "int" | "integer" => Some(Base::Int4),
             "int8" | "bigint" => Some(Base::Int8),
@@ -3316,10 +3366,7 @@ impl<'a> Binder<'a> {
             E::Exists { .. } => "exists".into(),
             E::Array(_) => "array".into(),
             E::Tuple(_) => "row".into(),
-            E::Value(v) => match &v.value {
-                a::Value::Boolean(_) => "bool".into(),
-                _ => "?column?".into(),
-            },
+            E::Value(_) => "?column?".into(),
             E::TypedString(ts) => self
                 .data_type(&ts.data_type)
                 .map(|(t, _)| t.elem().name())
@@ -4191,6 +4238,16 @@ fn promote(a: Type, b: Type) -> Option<Type> {
 /// The type an unknown literal takes from the other operand.
 fn guess_unknown(other: Type, _op: &str) -> Type {
     if other.is_unknown() { Type::NUMERIC } else { other }
+}
+
+/// Operator names noida implements, for `OPERATOR(schema.op)` syntax.
+fn known_operator(op: &str) -> Option<&'static str> {
+    const OPS: &[&str] = &[
+        "+", "-", "*", "/", "%", "^", "||", "&", "|", "#", "<<", ">>", "->", "->>", "#>", "#>>",
+        "@>", "<@", "?", "?|", "?&", "#-", "&&", "~~", "!~~", "~~*", "!~~*", "~", "!~", "~*",
+        "!~*", "^@",
+    ];
+    OPS.iter().find(|o| **o == op).copied()
 }
 
 fn cmp_op(op: &a::BinaryOperator) -> Option<CmpOp> {
