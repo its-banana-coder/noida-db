@@ -450,6 +450,7 @@ pub fn encoding(data: &Data) -> &'static str {
         }
         Data::Set(s) => s.encoding(),
         Data::Zset(z) => z.encoding(),
+        Data::Stream(_) => "stream",
     }
 }
 

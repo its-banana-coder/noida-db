@@ -11,6 +11,7 @@ mod lists;
 mod multi;
 mod pubsub;
 mod sets;
+mod streams;
 mod strings_keys;
 mod zsets;
 

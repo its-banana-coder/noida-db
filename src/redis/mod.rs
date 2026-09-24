@@ -23,6 +23,7 @@ mod pubsub;
 pub mod resp;
 pub mod server;
 mod sets;
+mod streams;
 mod strings;
 #[cfg(test)]
 mod tests;

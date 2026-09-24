@@ -8,8 +8,8 @@ use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
 use super::{
-    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, sets, strings,
-    zsets,
+    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, sets, streams,
+    strings, zsets,
 };
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
@@ -24,6 +24,7 @@ pub enum Data {
     List(VecDeque<Vec<u8>>),
     Set(super::sets::Set),
     Zset(super::zsets::Zset),
+    Stream(super::streams::Stream),
 }
 
 impl Data {
@@ -34,6 +35,7 @@ impl Data {
             Data::List(_) => "list",
             Data::Set(_) => "set",
             Data::Zset(_) => "zset",
+            Data::Stream(_) => "stream",
         }
     }
 }
@@ -266,6 +268,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(config::COMMANDS)
         .chain(bitops::COMMANDS)
         .chain(geo::COMMANDS)
+        .chain(streams::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
