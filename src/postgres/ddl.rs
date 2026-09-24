@@ -366,14 +366,18 @@ impl Ddl<'_, '_> {
                 )
             }
         };
-        let colname =
-            idxs.first().map(|&i| self.ctx.db.table(table).unwrap().columns[i].name.clone());
+        // Postgres names constraints t_pkey, t_a_b_key, t_a_fkey, t_a_check.
+        let colnames: Vec<String> = idxs
+            .iter()
+            .map(|&i| self.ctx.db.table(table).unwrap().columns[i].name.clone())
+            .collect();
+        let addition = match label {
+            "pkey" => None,
+            "key" => Some(colnames.join("_")),
+            _ => colnames.first().cloned(),
+        };
         let name = if name.is_empty() {
-            let base = make_object_name(
-                &tname,
-                colname.as_deref().filter(|_| label != "check" || cols.len() == 1),
-                label,
-            );
+            let base = make_object_name(&tname, addition.as_deref(), label);
             let mut candidate = base.clone();
             let mut i = 1;
             while self.ctx.db.constraint_name_taken(table, &candidate)
@@ -1082,7 +1086,26 @@ impl Ddl<'_, '_> {
                         format!("column \"{new}\" of relation \"{}\" already exists", t.name),
                     ));
                 }
-                self.ctx.db.table_mut(oid).unwrap().columns[idx].name = new;
+                let t = self.ctx.db.table_mut(oid).unwrap();
+                t.columns[idx].name = new.clone();
+                // Stored expressions refer to columns by name.
+                for c in t.columns.iter_mut() {
+                    if let Some(d) = &c.default {
+                        c.default = Some(rename_ident(d, &old, &new));
+                    }
+                    if let Some(g) = &c.generated {
+                        c.generated = Some(rename_ident(g, &old, &new));
+                    }
+                }
+                for cons in t.constraints.iter_mut() {
+                    if let ConstraintKind::Check(sql) = &cons.kind {
+                        cons.kind = ConstraintKind::Check(rename_ident(sql, &old, &new));
+                    }
+                }
+                for i in t.indexes.iter_mut() {
+                    i.exprs = i.exprs.iter().map(|e| rename_ident(e, &old, &new)).collect();
+                    i.predicate = i.predicate.as_ref().map(|p| rename_ident(p, &old, &new));
+                }
             }
             Op::RenameTable { table_name } => {
                 let obj = match table_name {
@@ -1312,6 +1335,44 @@ pub struct CreateSequenceStmt<'a> {
     pub if_not_exists: bool,
     pub sequence_options: &'a [a::SequenceOptions],
     pub owned_by: Option<&'a a::ObjectName>,
+}
+
+/// Renames a bare identifier in stored SQL, leaving strings and quoted
+/// identifiers alone.
+fn rename_ident(sql: &str, old: &str, new: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let b = sql.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let quote = b[i];
+                out.push(quote as char);
+                i += 1;
+                while i < b.len() {
+                    out.push(b[i] as char);
+                    if b[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            c if c.is_ascii_alphanumeric() || c == b'_' => {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if word.eq_ignore_ascii_case(old) { out.push_str(new) } else { out.push_str(word) }
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 enum PendingConstraint {

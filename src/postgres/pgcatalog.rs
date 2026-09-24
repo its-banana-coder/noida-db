@@ -133,27 +133,27 @@ pg_timezone_names: name text, abbrev text, utc_offset interval, is_dst bool
 pg_timezone_abbrevs: abbrev text, utc_offset interval, is_dst bool
 information_schema.schemata: catalog_name name, schema_name name, schema_owner name, \
 default_character_set_catalog name, default_character_set_schema name, default_character_set_name name, \
-sql_path text
-information_schema.tables: table_catalog name, table_schema name, table_name name, table_type text, \
-self_referencing_column_name name, reference_generation text, user_defined_type_catalog name, \
-user_defined_type_schema name, user_defined_type_name name, is_insertable_into text, is_typed text, \
-commit_action text
+sql_path varchar
+information_schema.tables: table_catalog name, table_schema name, table_name name, table_type varchar, \
+self_referencing_column_name name, reference_generation varchar, user_defined_type_catalog name, \
+user_defined_type_schema name, user_defined_type_name name, is_insertable_into varchar, is_typed varchar, \
+commit_action varchar
 information_schema.columns: table_catalog name, table_schema name, table_name name, column_name name, \
-ordinal_position int4, column_default text, is_nullable text, data_type text, character_maximum_length int4, \
+ordinal_position int4, column_default text, is_nullable varchar, data_type varchar, character_maximum_length int4, \
 character_octet_length int4, numeric_precision int4, numeric_precision_radix int4, numeric_scale int4, \
-datetime_precision int4, interval_type text, interval_precision int4, character_set_catalog name, \
+datetime_precision int4, interval_type varchar, interval_precision int4, character_set_catalog name, \
 character_set_schema name, character_set_name name, collation_catalog name, collation_schema name, \
 collation_name name, domain_catalog name, domain_schema name, domain_name name, udt_catalog name, \
 udt_schema name, udt_name name, scope_catalog name, scope_schema name, scope_name name, \
-maximum_cardinality int4, dtd_identifier name, is_self_referencing text, is_identity text, \
-identity_generation text, identity_start text, identity_increment text, identity_maximum text, \
-identity_minimum text, identity_cycle text, is_generated text, generation_expression text, is_updatable text
-information_schema.views: table_catalog name, table_schema name, table_name name, view_definition text, \
-check_option text, is_updatable text, is_insertable_into text, is_trigger_updatable text, \
-is_trigger_deletable text, is_trigger_insertable_into text
+maximum_cardinality int4, dtd_identifier name, is_self_referencing varchar, is_identity varchar, \
+identity_generation varchar, identity_start varchar, identity_increment varchar, identity_maximum varchar, \
+identity_minimum varchar, identity_cycle varchar, is_generated varchar, generation_expression varchar, is_updatable varchar
+information_schema.views: table_catalog name, table_schema name, table_name name, view_definition varchar, \
+check_option varchar, is_updatable varchar, is_insertable_into varchar, is_trigger_updatable varchar, \
+is_trigger_deletable varchar, is_trigger_insertable_into varchar
 information_schema.table_constraints: constraint_catalog name, constraint_schema name, constraint_name name, \
-table_catalog name, table_schema name, table_name name, constraint_type text, is_deferrable text, \
-initially_deferred text, enforced text, nulls_distinct text
+table_catalog name, table_schema name, table_name name, constraint_type varchar, is_deferrable varchar, \
+initially_deferred varchar, enforced varchar, nulls_distinct varchar
 information_schema.key_column_usage: constraint_catalog name, constraint_schema name, constraint_name name, \
 table_catalog name, table_schema name, table_name name, column_name name, ordinal_position int4, \
 position_in_unique_constraint int4
@@ -161,31 +161,31 @@ information_schema.constraint_column_usage: table_catalog name, table_schema nam
 column_name name, constraint_catalog name, constraint_schema name, constraint_name name
 information_schema.referential_constraints: constraint_catalog name, constraint_schema name, \
 constraint_name name, unique_constraint_catalog name, unique_constraint_schema name, unique_constraint_name name, \
-match_option text, update_rule text, delete_rule text
+match_option varchar, update_rule varchar, delete_rule varchar
 information_schema.check_constraints: constraint_catalog name, constraint_schema name, constraint_name name, \
-check_clause text
-information_schema.sequences: sequence_catalog name, sequence_schema name, sequence_name name, data_type text, \
-numeric_precision int4, numeric_precision_radix int4, numeric_scale int4, start_value text, minimum_value text, \
-maximum_value text, increment text, cycle_option text
+check_clause varchar
+information_schema.sequences: sequence_catalog name, sequence_schema name, sequence_name name, data_type varchar, \
+numeric_precision int4, numeric_precision_radix int4, numeric_scale int4, start_value varchar, minimum_value varchar, \
+maximum_value varchar, increment varchar, cycle_option varchar
 information_schema.routines: specific_catalog name, specific_schema name, specific_name name, \
-routine_catalog name, routine_schema name, routine_name name, routine_type text, data_type text, \
-routine_body text, routine_definition text, external_language text, is_deterministic text
+routine_catalog name, routine_schema name, routine_name name, routine_type varchar, data_type varchar, \
+routine_body varchar, routine_definition varchar, external_language varchar, is_deterministic varchar
 information_schema.parameters: specific_catalog name, specific_schema name, specific_name name, \
-ordinal_position int4, parameter_mode text, parameter_name name, data_type text
-information_schema.domains: domain_catalog name, domain_schema name, domain_name name, data_type text
+ordinal_position int4, parameter_mode varchar, parameter_name name, data_type varchar
+information_schema.domains: domain_catalog name, domain_schema name, domain_name name, data_type varchar
 information_schema.table_privileges: grantor name, grantee name, table_catalog name, table_schema name, \
-table_name name, privilege_type text, is_grantable text, with_hierarchy text
+table_name name, privilege_type varchar, is_grantable varchar, with_hierarchy varchar
 information_schema.column_privileges: grantor name, grantee name, table_catalog name, table_schema name, \
-table_name name, column_name name, privilege_type text, is_grantable text
+table_name name, column_name name, privilege_type varchar, is_grantable varchar
 information_schema.role_table_grants: grantor name, grantee name, table_catalog name, table_schema name, \
-table_name name, privilege_type text, is_grantable text, with_hierarchy text
+table_name name, privilege_type varchar, is_grantable varchar, with_hierarchy varchar
 information_schema.enabled_roles: role_name name
-information_schema.applicable_roles: grantee name, role_name name, is_grantable text
+information_schema.applicable_roles: grantee name, role_name name, is_grantable varchar
 information_schema.character_sets: character_set_catalog name, character_set_schema name, \
 character_set_name name, character_repertoire name, form_of_use name, default_collate_catalog name, \
 default_collate_schema name, default_collate_name name
-information_schema.element_types: object_catalog name, object_schema name, object_name name, object_type text, \
-collection_type_identifier name, data_type text, udt_catalog name, udt_schema name, udt_name name
+information_schema.element_types: object_catalog name, object_schema name, object_name name, object_type varchar, \
+collection_type_identifier name, data_type varchar, udt_catalog name, udt_schema name, udt_name name
 ";
 
 struct Rel {

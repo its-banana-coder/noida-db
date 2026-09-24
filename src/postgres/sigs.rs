@@ -82,12 +82,13 @@ to_char(timestamp,text)text to_char(timestamptz,text)text to_char(interval,text)
 to_date(text,text)date to_timestamp(text,text)timestamptz to_timestamp(float8)timestamptz to_number(text,text)numeric
 make_date(int4,int4,int4)date make_time(int4,int4,float8)time make_timestamp(int4,int4,int4,int4,int4,float8)timestamp
 make_timestamptz(int4,int4,int4,int4,int4,float8)timestamptz make_timestamptz(int4,int4,int4,int4,int4,float8,text)timestamptz
-make_interval()interval make_interval(int4)interval make_interval(int4,int4)interval make_interval(int4,int4,int4)interval make_interval(int4,int4,int4,int4)interval make_interval(int4,int4,int4,int4,int4)interval make_interval(int4,int4,int4,int4,int4,int4)interval make_interval(int4,int4,int4,int4,int4,int4,float8)interval
+make_interval(int4,int4,int4,int4,int4,int4,float8)interval make_interval()interval make_interval(int4)interval make_interval(int4,int4)interval make_interval(int4,int4,int4)interval make_interval(int4,int4,int4,int4)interval make_interval(int4,int4,int4,int4,int4)interval make_interval(int4,int4,int4,int4,int4,int4)interval make_interval(int4,int4,int4,int4,int4,int4,float8)interval
 justify_days(interval)interval justify_hours(interval)interval justify_interval(interval)interval
 isfinite(date)bool isfinite(timestamp)bool isfinite(timestamptz)bool isfinite(interval)bool
 timezone(text,timestamptz)timestamp timezone(text,timestamp)timestamptz timezone(interval,timestamptz)timestamp
 date_bin(interval,timestamp,timestamp)timestamp date_bin(interval,timestamptz,timestamptz)timestamptz
 !to_json(anyelement)json !to_jsonb(anyelement)jsonb !array_to_json(anyarray)json !row_to_json(record)json
+!row_to_json(record,_text)json !to_jsonb(record,_text)jsonb
 !json_build_object(...any)json !jsonb_build_object(...any)jsonb !json_build_array(...any)json !jsonb_build_array(...any)jsonb
 !json_build_object()json !jsonb_build_object()jsonb !json_build_array()json !jsonb_build_array()jsonb
 json_object(_text)json jsonb_object(_text)jsonb json_object(_text,_text)json jsonb_object(_text,_text)jsonb
@@ -361,7 +362,7 @@ pub fn resolve(name: &str, args: &[Type]) -> PgResult<Resolved> {
         let mut arg_tys = vec![];
         for (a, p) in args.iter().zip(&params) {
             let target = if p.base == Base::Any { *a } else { concrete(*p) };
-            arg_tys.push(if p.base == Base::Any && a.is_unknown() { Type::TEXT } else { target });
+            arg_tys.push(target);
             if a.is_unknown() {
                 if target.category() == b'S' {
                     preferred += 1;

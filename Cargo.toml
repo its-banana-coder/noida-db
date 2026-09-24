@@ -11,7 +11,7 @@ license = "MIT"
 
 # One feature per service, so people can build only what they use.
 [features]
-default = ["redis"]
+default = ["redis", "postgres"]
 redis = []
 postgres = ["dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = []

@@ -8,22 +8,34 @@ jobs:
   build:
     runs-on: ubuntu-latest
     services:
-      # Reference server for the differential tests (tests/redis_diff.rs).
+      # Reference servers for the differential tests.
       redis:
         image: redis:7.2
         ports: ["6379:6379"]
+      postgres:
+        image: postgres:16
+        ports: ["5432:5432"]
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       NOIDA_REDIS_REF: 127.0.0.1:6379
+      NOIDA_POSTGRES_REF: 127.0.0.1:5432
+      NOIDA_POSTGRES_REF_PASSWORD: postgres
+      PGTZ: UTC
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
-      # Show how many replies were compared against real Redis 7.2.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
+      # Show how many replies were compared against the real servers.
       - run: cargo test --test redis_diff -- --nocapture
+      - run: cargo test --features postgres --test postgres_diff -- --nocapture
       # Modularity: the binary must build with any service set, even none.
       - run: cargo build --no-default-features
       - run: scripts/check-size.sh

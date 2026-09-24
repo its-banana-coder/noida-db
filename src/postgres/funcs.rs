@@ -1977,6 +1977,25 @@ pub fn call(
             Ts(origin + diff.div_euclid(stride) * stride)
         }
         // --- JSON
+        "row_to_json" | "to_jsonb" if a.len() == 2 && matches!(&a[0], Value::Record(_)) => {
+            let Value::Record(fields) = &a[0] else { return Ok(Some(Null)) };
+            let names = arr_items(&a[1]);
+            let mut members = vec![];
+            for (i, v) in fields.iter().enumerate() {
+                let key = names
+                    .get(i)
+                    .and_then(|n| n.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("f{}", i + 1));
+                members.push((key, to_json_value(v, types::value_type_guess(v), env)));
+            }
+            let j = Json::Object(members);
+            if name == "to_jsonb" {
+                Jsonb(Box::new(j.normalize()))
+            } else {
+                Text(j.to_compact_string())
+            }
+        }
         "to_json" | "array_to_json" | "row_to_json" => {
             if a[0].is_null() {
                 Null

@@ -85,6 +85,17 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
                     .ok_or_else(|| pgcatalog::undefined_reg(to.base, s))?;
                 return Ok(Value::Int(oid));
             }
+            if from.is_reg()
+                && (to.is_string() || to.base == Base::Text)
+                && let Value::Int(oid) = &v
+            {
+                let names = reg_names(ctx);
+                let text = names
+                    .lookup(from.base, *oid as u32)
+                    .cloned()
+                    .unwrap_or_else(|| oid.to_string());
+                return Ok(Value::Text(text));
+            }
             let (fmt, now, _) = env!(ctx);
             casts::cast(v, *from, *to, *typmod, *explicit, &fmt, now)?
         }
@@ -377,6 +388,37 @@ fn run_subquery(q: &Query, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     ctx.outer.push(row.to_vec());
     let r = run_query(q, ctx);
     ctx.outer.pop();
+    r
+}
+
+/// Names for reg* values, built from the live catalog.
+fn reg_names(ctx: &Ctx) -> types::RegNames {
+    let mut r = types::RegNames::default();
+    for t in ctx.db.tables.values() {
+        r.class.insert(t.oid, t.name.clone());
+        for i in &t.indexes {
+            r.class.insert(i.oid, i.name.clone());
+        }
+    }
+    for s in ctx.db.sequences.values() {
+        r.class.insert(s.oid, s.name.clone());
+    }
+    for ti in types::TYPES {
+        r.types.insert(ti.oid, Type::of(ti.base).display(-1));
+        if ti.array_oid != 0 {
+            r.types.insert(ti.array_oid, Type::array_of(ti.base).display(-1));
+        }
+    }
+    for e in ctx.db.enums.values() {
+        r.types.insert(e.oid, e.name.clone());
+    }
+    for sig in super::sigs::all_sigs() {
+        r.procs.insert(sig.oid, sig.name.to_string());
+    }
+    for s in ctx.db.schemas.values() {
+        r.namespaces.insert(s.oid, s.name.clone());
+    }
+    r.roles.insert(10, ctx.rt.user.clone());
     r
 }
 

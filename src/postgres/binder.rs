@@ -139,7 +139,8 @@ impl<'a> Binder<'a> {
     pub fn bind_statement(&mut self, stmt: &a::Statement) -> PgResult<Planned> {
         match stmt {
             a::Statement::Query(q) => {
-                let (query, cols) = self.bind_query(q)?;
+                let (mut query, mut cols) = self.bind_query(q)?;
+                resolve_unknown_output(&mut query, &mut cols);
                 Ok(Planned {
                     query,
                     cols,
@@ -171,7 +172,8 @@ impl<'a> Binder<'a> {
                     let plan = self.bind_recursive_cte(cte, slot, &name)?;
                     cte_plans.push(plan);
                 } else {
-                    let (query, mut cols) = self.bind_query(&cte.query)?;
+                    let (mut query, mut cols) = self.bind_query(&cte.query)?;
+                    resolve_unknown_output(&mut query, &mut cols);
                     rename_cols(&mut cols, &cte.alias.columns, &name)?;
                     self.ctes.push(CteDef { name, slot, cols });
                     cte_plans.push(CtePlan { slot, query, recursive: false });
@@ -1185,7 +1187,8 @@ impl<'a> Binder<'a> {
                 self.scopes.push(placeholder);
                 let bound = self.bind_query(subquery);
                 self.scopes.pop();
-                let (query, mut cols) = bound?;
+                let (mut query, mut cols) = bound?;
+                resolve_unknown_output(&mut query, &mut cols);
                 let rel = match alias {
                     Some(al) => ident(&al.name),
                     None => String::new(),
@@ -1374,18 +1377,13 @@ impl<'a> Binder<'a> {
             None => name.to_string(),
         };
         match schema {
-            Some(s) => {
-                let sid = self.db.schema_by_name(s).ok_or_else(|| {
-                    PgError::new(
-                        code::INVALID_SCHEMA_NAME,
-                        format!("schema \"{s}\" does not exist"),
-                    )
-                })?;
-                self.db
-                    .find_table(sid, name)
-                    .map(|t| t.oid)
-                    .ok_or_else(|| super::catalog::undefined_table(&full))
-            }
+            // A missing schema reads as a missing relation, as in Postgres.
+            Some(s) => self
+                .db
+                .schema_by_name(s)
+                .and_then(|sid| self.db.find_table(sid, name))
+                .map(|t| t.oid)
+                .ok_or_else(|| super::catalog::undefined_table(&full)),
             None => {
                 for s in &self.sess.search_path {
                     if let Some(sid) = self.db.schema_by_name(s)
@@ -1664,7 +1662,8 @@ impl<'a> Binder<'a> {
                 Ok(TE::new(if *negated { Expr::Not(Box::new(e)) } else { e }, Type::BOOL))
             }
             E::Subquery(q) => {
-                let (plan, cols) = self.bind_query(q)?;
+                let (mut plan, mut cols) = self.bind_query(q)?;
+                resolve_unknown_output(&mut plan, &mut cols);
                 if cols.len() != 1 {
                     return Err(PgError::new(
                         code::SYNTAX_ERROR,
@@ -1723,7 +1722,8 @@ impl<'a> Binder<'a> {
                 let s = self.bind_expr(r#in)?;
                 self.call("position", vec![s, sub])
             }
-            E::Substring { expr, substring_from, substring_for, .. } => {
+            E::Substring { expr, substring_from, substring_for, shorthand, .. } => {
+                let fname = if *shorthand { "substr" } else { "substring" };
                 let mut args = vec![self.bind_expr(expr)?];
                 if let Some(f) = substring_from {
                     args.push(self.bind_expr(f)?);
@@ -1731,7 +1731,7 @@ impl<'a> Binder<'a> {
                 if let Some(l) = substring_for {
                     args.push(self.bind_expr(l)?);
                 }
-                self.call("substring", args)
+                self.call(fname, args)
             }
             E::Trim { trim_where, trim_what, expr, trim_characters } => {
                 let name = match trim_where {
@@ -2487,16 +2487,26 @@ impl<'a> Binder<'a> {
         let distinct = matches!(list.duplicate_treatment, Some(a::DuplicateTreatment::Distinct));
         let mut star = false;
         let mut args = vec![];
+        let mut named: Vec<(String, a::Expr)> = vec![];
         for arg in &list.args {
             match arg {
                 a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(e)) => args.push(e.clone()),
                 a::FunctionArg::Unnamed(a::FunctionArgExpr::Wildcard) => star = true,
                 a::FunctionArg::Named { name: n, arg: a::FunctionArgExpr::Expr(e), .. } => {
-                    let _ = n;
-                    args.push(e.clone());
+                    named.push((ident(n), e.clone()));
+                }
+                a::FunctionArg::ExprNamed {
+                    name: a::Expr::Identifier(n),
+                    arg: a::FunctionArgExpr::Expr(e),
+                    ..
+                } => {
+                    named.push((ident(n), e.clone()));
                 }
                 _ => return Err(unsupported("function argument")),
             }
+        }
+        if !named.is_empty() {
+            args = place_named_args(&name, args, named)?;
         }
         let mut order_by = vec![];
         let mut sep: Option<a::Expr> = None;
@@ -2512,6 +2522,32 @@ impl<'a> Binder<'a> {
             args.push(s);
         }
         // Special forms.
+        if name == "row" {
+            let mut out = vec![];
+            for x in &args {
+                out.push(self.bind_expr(x)?.e);
+            }
+            return Ok(TE::new(Expr::Row(out), Type::RECORD));
+        }
+        if matches!(name.as_str(), "row_to_json" | "to_json" | "to_jsonb") && args.len() == 1 {
+            let te = self.bind_expr(&args[0])?;
+            if te.ty.base == Base::Record {
+                let names = self.record_field_names(&args[0]);
+                let ty = if name == "to_jsonb" { Type::JSONB } else { Type::JSON };
+                let name: &'static str =
+                    if name == "to_jsonb" { "to_jsonb" } else { "row_to_json" };
+                return Ok(TE::new(
+                    Expr::Call {
+                        name,
+                        args: vec![te.e, Expr::Const(names)],
+                        ty,
+                        arg_tys: vec![Type::RECORD, Type::array_of(Base::Text)],
+                    },
+                    ty,
+                ));
+            }
+            return self.call(&name, vec![te]);
+        }
         match name.as_str() {
             "coalesce" | "nullif" | "greatest" | "least" if f.over.is_none() => {
                 let mut tes = vec![];
@@ -2573,6 +2609,39 @@ impl<'a> Binder<'a> {
             tes.push(self.bind_expr(x)?);
         }
         self.call(&name, tes)
+    }
+
+    /// Field names of a record expression: a table's columns, else f1, f2...
+    fn record_field_names(&self, e: &a::Expr) -> Value {
+        let names: Vec<String> = match e {
+            a::Expr::Identifier(id) => {
+                let rel = ident(id);
+                let cols: Vec<String> = self
+                    .scopes
+                    .last()
+                    .map(|s| {
+                        s.cols
+                            .iter()
+                            .filter(|c| c.rel.as_deref() == Some(rel.as_str()))
+                            .map(|c| c.name.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                cols
+            }
+            a::Expr::Tuple(items) => (1..=items.len()).map(|i| format!("f{i}")).collect(),
+            a::Expr::Function(f) => {
+                let n = match &f.args {
+                    a::FunctionArguments::List(l) => l.args.len(),
+                    _ => 0,
+                };
+                (1..=n).map(|i| format!("f{i}")).collect()
+            }
+            _ => vec![],
+        };
+        Value::Array(Box::new(super::types::Array::new(
+            names.into_iter().map(Value::Text).collect(),
+        )))
     }
 
     fn bind_keyword_function(&mut self, name: &str) -> PgResult<TE> {
@@ -3100,7 +3169,10 @@ impl<'a> Binder<'a> {
         ctx: CastCtx,
         what: &str,
     ) -> PgResult<Expr> {
-        if target.base == Base::Any || (target.base == Base::AnyElement && !target.array) {
+        if target.base == Base::Any {
+            return Ok(te.e);
+        }
+        if target.base == Base::AnyElement && !target.array {
             if te.ty.is_unknown() {
                 return self.coerce(te, Type::TEXT, typmod, ctx, what);
             }
@@ -3197,25 +3269,50 @@ impl<'a> Binder<'a> {
 
     /// Postgres's FigureColname.
     fn column_name(&self, e: &a::Expr, te: &TE) -> String {
+        let (name, _) = self.colname_strength(e, te);
+        name
+    }
+
+    /// (name, strength): 2 is a name of its own, 1 a fallback from a cast or
+    /// CASE, 0 none at all.
+    fn colname_strength(&self, e: &a::Expr, te: &TE) -> (String, u8) {
+        let named = |n: &str| (n.to_string(), 2u8);
+        match e {
+            a::Expr::Identifier(id) => named(&ident(id)),
+            a::Expr::CompoundIdentifier(ids) => named(&ids.last().map(ident).unwrap_or_default()),
+            a::Expr::Nested(x) => self.colname_strength(x, te),
+            a::Expr::Collate { expr, .. } => self.colname_strength(expr, te),
+            a::Expr::Cast { expr, data_type, .. } => {
+                let (inner, strength) = self.colname_strength(expr, te);
+                if strength <= 1 {
+                    let n = self
+                        .data_type(data_type)
+                        .map(|(t, _)| t.elem().name())
+                        .unwrap_or_else(|_| "?column?".into());
+                    (n, 1)
+                } else {
+                    (inner, strength)
+                }
+            }
+            a::Expr::Case { else_result, .. } => match else_result {
+                Some(x) => {
+                    let (inner, strength) = self.colname_strength(x, te);
+                    if strength <= 1 { ("case".into(), 1) } else { (inner, strength) }
+                }
+                None => ("case".into(), 1),
+            },
+            other => {
+                let n = self.column_name_basic(other, te);
+                if n == "?column?" { (n, 0) } else { (n, 2) }
+            }
+        }
+    }
+
+    fn column_name_basic(&self, e: &a::Expr, te: &TE) -> String {
         let _ = te;
         use a::Expr as E;
         match e {
-            E::Identifier(id) => ident(id),
-            E::CompoundIdentifier(ids) => ids.last().map(ident).unwrap_or_default(),
-            E::Nested(x) => self.column_name(x, te),
-            E::Collate { expr, .. } => self.column_name(expr, te),
-            E::Cast { expr, data_type, .. } => {
-                let inner = self.column_name(expr, te);
-                if inner == "?column?" {
-                    self.data_type(data_type)
-                        .map(|(t, _)| t.name())
-                        .unwrap_or_else(|_| "?column?".into())
-                } else {
-                    inner
-                }
-            }
             E::Function(f) => object_name(&f.name).pop().unwrap_or_default(),
-            E::Case { .. } => "case".into(),
             E::Exists { .. } => "exists".into(),
             E::Array(_) => "array".into(),
             E::Tuple(_) => "row".into(),
@@ -3225,11 +3322,13 @@ impl<'a> Binder<'a> {
             },
             E::TypedString(ts) => self
                 .data_type(&ts.data_type)
-                .map(|(t, _)| t.name())
+                .map(|(t, _)| t.elem().name())
                 .unwrap_or_else(|_| "?column?".into()),
             E::Interval(_) => "interval".into(),
             E::Extract { .. } => "extract".into(),
-            E::Substring { .. } => "substring".into(),
+            E::Substring { shorthand, .. } => {
+                if *shorthand { "substr" } else { "substring" }.into()
+            }
             E::Trim { trim_where, .. } => match trim_where {
                 Some(a::TrimWhereField::Leading) => "ltrim".into(),
                 Some(a::TrimWhereField::Trailing) => "rtrim".into(),
@@ -3260,7 +3359,7 @@ impl<'a> Binder<'a> {
                     "?column?".into()
                 }
             }
-            E::AtTimeZone { timestamp, .. } => self.column_name(timestamp, te),
+            E::AtTimeZone { .. } => "timezone".into(),
             _ => "?column?".into(),
         }
     }
@@ -3805,6 +3904,105 @@ impl<'a> Binder<'a> {
 
 /// Bound SET assignments and an optional WHERE clause.
 type Assignments = (Vec<(usize, Expr)>, Option<Expr>);
+
+/// Parameter names of the functions that accept named arguments.
+fn param_names(func: &str) -> Option<&'static [&'static str]> {
+    match func {
+        "make_interval" => Some(&["years", "months", "weeks", "days", "hours", "mins", "secs"]),
+        "make_timestamp" => Some(&["year", "month", "mday", "hour", "min", "sec"]),
+        "make_timestamptz" => Some(&["year", "month", "mday", "hour", "min", "sec", "timezone"]),
+        "make_date" => Some(&["year", "month", "mday"]),
+        "make_time" => Some(&["hour", "min", "sec"]),
+        _ => None,
+    }
+}
+
+/// Expands `f(a, name => b)` into positional arguments.
+fn place_named_args(
+    func: &str,
+    positional: Vec<a::Expr>,
+    named: Vec<(String, a::Expr)>,
+) -> PgResult<Vec<a::Expr>> {
+    let Some(names) = param_names(func) else {
+        return Err(PgError::new(
+            code::UNDEFINED_FUNCTION,
+            format!("function {func} does not exist"),
+        )
+        .hint("No function matches the given name and argument types. You might need to add explicit type casts."));
+    };
+    let zero = a::Expr::Value(a::Value::Number("0".into(), false).into());
+    let mut out: Vec<a::Expr> = names.iter().map(|_| zero.clone()).collect();
+    for (i, e) in positional.into_iter().enumerate() {
+        if i >= out.len() {
+            return Err(PgError::new(code::SYNTAX_ERROR, format!("too many arguments for {func}")));
+        }
+        out[i] = e;
+    }
+    for (n, e) in named {
+        let idx = names.iter().position(|p| *p == n).ok_or_else(|| {
+            PgError::new(
+                code::UNDEFINED_FUNCTION,
+                format!("function {func} has no parameter \"{n}\""),
+            )
+        })?;
+        out[idx] = e;
+    }
+    Ok(out)
+}
+
+/// Rewrites unknown-typed output columns to text, as Postgres does when a
+/// query's result type is finalized.
+fn resolve_unknown_output(q: &mut Query, cols: &mut [OutCol]) {
+    for (i, c) in cols.iter_mut().enumerate() {
+        if c.ty.is_unknown() {
+            c.ty = Type::TEXT;
+            force_text(q, i);
+        }
+    }
+}
+
+fn force_text(q: &mut Query, col: usize) {
+    match q {
+        Query::Select(s) => {
+            if let Some(e) = s.proj.get_mut(col) {
+                let old = std::mem::replace(e, Expr::Const(Value::Null));
+                *e = to_text_expr(old);
+            }
+        }
+        Query::Values { rows, .. } => {
+            for r in rows {
+                if let Some(e) = r.get_mut(col) {
+                    let old = std::mem::replace(e, Expr::Const(Value::Null));
+                    *e = to_text_expr(old);
+                }
+            }
+        }
+        Query::SetOp { left, right, .. } => {
+            force_text(left, col);
+            force_text(right, col);
+        }
+        Query::With { body, .. } => force_text(body, col),
+        Query::Recursive { seed, step, .. } => {
+            force_text(seed, col);
+            force_text(step, col);
+        }
+        Query::Dml(_) => {}
+    }
+}
+
+fn to_text_expr(e: Expr) -> Expr {
+    match e {
+        Expr::Const(Value::Text(s)) => Expr::Const(Value::Text(s)),
+        Expr::Const(Value::Null) => Expr::Const(Value::Null),
+        other => Expr::Cast {
+            expr: Box::new(other),
+            from: Type::UNKNOWN,
+            to: Type::TEXT,
+            typmod: -1,
+            explicit: false,
+        },
+    }
+}
 
 /// A bound expression with its type.
 #[derive(Clone, Debug)]
