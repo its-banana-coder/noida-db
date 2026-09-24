@@ -1855,8 +1855,11 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "XADD nosuchkey NOMKSTREAM 1-1 a 1",
             "EXISTS nosuchkey",
             "XSETID s 100-0",
-            "XADD s * z 1",
-            "XRANGE s 100 +",
+            // The generated id is the wall clock, so the two servers
+            // differ by a millisecond now and then: compare the count.
+            "!XADD s * z 1",
+            "!XRANGE s 100 +",
+            "XLEN s",
             "XSETID s 1-1",
             "XSETID s 200-0 ENTRIESADDED 7 MAXDELETEDID 150-0",
             "XSETID nokey 5-5",
