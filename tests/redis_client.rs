@@ -391,10 +391,15 @@ fn pubsub_through_a_real_client() -> RedisResult<()> {
     let client3 = redis::Client::open(format!("redis://{addr}/?protocol=resp3"))?;
     let mut con3 = client3.get_connection()?;
     con3.set_push_sender(tx);
+    // SUBSCRIBE over RESP3 doesn't wait for a reply, and this client only
+    // dispatches pushes while it reads one, so run a command to make sure
+    // the subscription is in place before publishing, and another to pick
+    // the message up.
     con3.subscribe_resp3("alerts")?;
-    let _: i64 = publisher.publish("alerts", "fire")?;
     let v: String = con3.set("x", "1").and_then(|()| con3.get("x"))?;
     assert_eq!(v, "1");
+    let _: i64 = publisher.publish("alerts", "fire")?;
+    let _: String = con3.get("x")?;
     let mut seen = false;
     while let Ok(push) = rx.recv_timeout(std::time::Duration::from_secs(10)) {
         if push.kind == redis::PushKind::Message {

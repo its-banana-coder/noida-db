@@ -9,6 +9,7 @@ mod config_table;
 mod connection;
 mod double;
 mod engine;
+mod geo;
 mod glob;
 mod hashes;
 mod keys;

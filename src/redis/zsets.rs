@@ -17,7 +17,7 @@ use super::keys::parse_scan;
 use super::resp::Value;
 
 pub static COMMANDS: &[Command] = &[
-    cmd("zadd", zadd),
+    cmd("zadd", zadd_command),
     cmd("zincrby", zincrby),
     cmd("zrem", zrem),
     cmd("zcard", zcard),
@@ -83,6 +83,11 @@ impl Zset {
 
     pub fn encoding(&self) -> &'static str {
         if self.big { "skiplist" } else { "listpack" }
+    }
+
+    /// The members in (score, member) order.
+    pub fn iter(&self) -> impl Iterator<Item = &(f64, Vec<u8>)> {
+        self.items.iter()
     }
 
     pub fn score(&self, m: &[u8]) -> Option<f64> {
@@ -280,7 +285,8 @@ fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
     Ok(Value::Integer(if ch { added + updated } else { added }))
 }
 
-fn zadd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+/// ZADD, also used by GEOADD once it has computed the scores.
+pub(crate) fn zadd_command(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     zadd_generic(ctx, a, AddFlags::default())
 }
 

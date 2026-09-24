@@ -8,7 +8,8 @@ use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
 use super::{
-    admin, bitops, config, connection, hashes, keys, lists, multi, pubsub, sets, strings, zsets,
+    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, sets, strings,
+    zsets,
 };
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
@@ -264,6 +265,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(pubsub::COMMANDS)
         .chain(config::COMMANDS)
         .chain(bitops::COMMANDS)
+        .chain(geo::COMMANDS)
 }
 
 fn find(name: &str) -> Option<&'static Command> {
