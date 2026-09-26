@@ -32,6 +32,8 @@ struct SCol {
     attnum: i16,
     /// USING/NATURAL hides the underlying columns behind a merged one.
     hidden: bool,
+    /// Field names of a record-typed column.
+    rec: Option<Vec<(String, Type)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -288,6 +290,7 @@ impl<'a> Binder<'a> {
                         typmod: if l.typmod == r.typmod { l.typmod } else { -1 },
                         table_oid: 0,
                         attnum: 0,
+                        rec: None,
                     });
                 }
                 lq = self.cast_query_columns(lq, &lcols, &lcast)?;
@@ -822,6 +825,7 @@ impl<'a> Binder<'a> {
                         typmod: te.typmod,
                         table_oid: te.table_oid,
                         attnum: te.attnum,
+                        rec: te.rec.clone(),
                     });
                     proj.push(te);
                     asts.push(e.clone());
@@ -834,6 +838,7 @@ impl<'a> Binder<'a> {
                         typmod: te.typmod,
                         table_oid: 0,
                         attnum: 0,
+                        rec: te.rec.clone(),
                     });
                     proj.push(te);
                     asts.push(expr.clone());
@@ -850,6 +855,7 @@ impl<'a> Binder<'a> {
                             typmod: m.typmod,
                             table_oid: 0,
                             attnum: 0,
+                            rec: None,
                         });
                         proj.push(TE {
                             e: m.expr.clone(),
@@ -857,6 +863,7 @@ impl<'a> Binder<'a> {
                             typmod: m.typmod,
                             table_oid: 0,
                             attnum: 0,
+                            rec: None,
                         });
                         asts.push(a::Expr::Identifier(a::Ident::new(m.name.clone())));
                     }
@@ -867,6 +874,7 @@ impl<'a> Binder<'a> {
                             typmod: c.typmod,
                             table_oid: c.table_oid,
                             attnum: c.attnum,
+                            rec: None,
                         });
                         proj.push(TE {
                             e: Expr::Col(c.idx),
@@ -874,6 +882,7 @@ impl<'a> Binder<'a> {
                             typmod: c.typmod,
                             table_oid: c.table_oid,
                             attnum: c.attnum,
+                            rec: None,
                         });
                         asts.push(a::Expr::Identifier(a::Ident::new(c.name.clone())));
                     }
@@ -898,6 +907,7 @@ impl<'a> Binder<'a> {
                             typmod: c.typmod,
                             table_oid: c.table_oid,
                             attnum: c.attnum,
+                            rec: None,
                         });
                         proj.push(TE {
                             e: Expr::Col(c.idx),
@@ -905,6 +915,7 @@ impl<'a> Binder<'a> {
                             typmod: c.typmod,
                             table_oid: c.table_oid,
                             attnum: c.attnum,
+                            rec: None,
                         });
                         asts.push(a::Expr::Identifier(a::Ident::new(c.name.clone())));
                     }
@@ -1174,6 +1185,7 @@ impl<'a> Binder<'a> {
                         table_oid: c.table_oid,
                         attnum: c.attnum,
                         hidden: false,
+                        rec: None,
                     });
                 }
                 scope.rels.push(rel);
@@ -1207,6 +1219,7 @@ impl<'a> Binder<'a> {
                         table_oid: 0,
                         attnum: 0,
                         hidden: false,
+                        rec: c.rec.clone(),
                     });
                 }
                 if !rel.is_empty() {
@@ -1302,6 +1315,7 @@ impl<'a> Binder<'a> {
                 table_oid: 0,
                 attnum: 0,
                 hidden: false,
+                rec: None,
             });
         }
         scope.rels.push(rel);
@@ -1363,6 +1377,7 @@ impl<'a> Binder<'a> {
                     typmod: c.typmod,
                     table_oid: oid,
                     attnum: i as i16 + 1,
+                    rec: None,
                 })
                 .collect();
             return Ok((From::Sub(Box::new(query)), cols, name));
@@ -1408,7 +1423,7 @@ impl<'a> Binder<'a> {
                 let e = if depth == 0 { m.expr.clone() } else { outerize(m.expr.clone(), depth) };
                 return Some((
                     depth,
-                    TE { e, ty: m.ty, typmod: m.typmod, table_oid: 0, attnum: 0 },
+                    TE { e, ty: m.ty, typmod: m.typmod, table_oid: 0, attnum: 0, rec: None },
                 ));
             }
             let hits: Vec<&SCol> = scope
@@ -1424,7 +1439,14 @@ impl<'a> Binder<'a> {
                 let e = if depth == 0 { Expr::Col(c.idx) } else { Expr::Outer(depth, c.idx) };
                 return Some((
                     depth,
-                    TE { e, ty: c.ty, typmod: c.typmod, table_oid: c.table_oid, attnum: c.attnum },
+                    TE {
+                        e,
+                        ty: c.ty,
+                        typmod: c.typmod,
+                        table_oid: c.table_oid,
+                        attnum: c.attnum,
+                        rec: c.rec.clone(),
+                    },
                 ));
             }
         }
@@ -1676,6 +1698,7 @@ impl<'a> Binder<'a> {
                     typmod: cols[0].typmod,
                     table_oid: 0,
                     attnum: 0,
+                    rec: cols[0].rec.clone(),
                 })
             }
             E::AnyOp { left, compare_op, right, .. } | E::AllOp { left, compare_op, right } => {
@@ -1699,10 +1722,19 @@ impl<'a> Binder<'a> {
                     ));
                 }
                 let rt = self.bind_expr(right)?;
-                let elem = if rt.ty.array { rt.ty.elem() } else { rt.ty };
+                let elem = match rt.ty.base {
+                    Base::Int2Vector if !rt.ty.array => Type::INT2,
+                    Base::OidVector if !rt.ty.array => Type::OID,
+                    _ if rt.ty.array => rt.ty.elem(),
+                    _ => rt.ty,
+                };
                 let ty = self.common_type(&[lt.ty, elem], "ANY", 0)?;
                 let le = self.coerce(lt, ty, -1, CastCtx::Implicit, "ANY")?;
-                let re = self.coerce(rt, ty.to_array(), -1, CastCtx::Implicit, "ANY")?;
+                let re = if matches!(rt.ty.base, Base::Int2Vector | Base::OidVector) {
+                    rt.e
+                } else {
+                    self.coerce(rt, ty.to_array(), -1, CastCtx::Implicit, "ANY")?
+                };
                 Ok(TE::new(
                     Expr::AnyAll { left: Box::new(le), op, right: Box::new(re), all },
                     Type::BOOL,
@@ -1998,13 +2030,31 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_access(&mut self, root: &a::Expr, chain: &[a::AccessExpr]) -> PgResult<TE> {
-        let mut te = self.bind_expr(root)?;
+        // `t.col[1]` parses as a Dot on the relation name: resolve the column
+        // first, then apply the rest of the chain.
+        let mut chain = chain;
+        let mut te = match (root, chain.first()) {
+            (a::Expr::Identifier(rel), Some(a::AccessExpr::Dot(a::Expr::Identifier(col))))
+                if self.lookup_column(&ident(rel), None).is_none()
+                    && self.rel_in_scope(&ident(rel)) =>
+            {
+                let te = self.bind_column(&ident(col), Some(&ident(rel)))?;
+                chain = &chain[1..];
+                te
+            }
+            _ => self.bind_expr(root)?,
+        };
         for acc in chain {
             match acc {
                 a::AccessExpr::Subscript(a::Subscript::Index { index }) => {
                     let idx = self.bind_expr(index)?;
                     let idx = self.coerce(idx, Type::INT4, -1, CastCtx::Assignment, "subscript")?;
-                    if !te.ty.array && te.ty.base != Base::Jsonb && te.ty.base != Base::Json {
+                    let vector_elem = casts::vector_as_array(te.ty).map(|a| a.elem());
+                    if !te.ty.array
+                        && vector_elem.is_none()
+                        && te.ty.base != Base::Jsonb
+                        && te.ty.base != Base::Json
+                    {
                         return Err(PgError::new(
                             code::DATATYPE_MISMATCH,
                             format!(
@@ -2013,7 +2063,11 @@ impl<'a> Binder<'a> {
                             ),
                         ));
                     }
-                    let ret = if te.ty.array { te.ty.elem() } else { te.ty };
+                    let ret = match vector_elem {
+                        Some(e) => e,
+                        None if te.ty.array => te.ty.elem(),
+                        None => te.ty,
+                    };
                     te = TE::new(
                         Expr::Call {
                             name: "subscript",
@@ -2058,8 +2112,30 @@ impl<'a> Binder<'a> {
                     );
                 }
                 a::AccessExpr::Dot(field) => {
-                    let _ = field;
-                    return Err(unsupported("field selection from a composite value"));
+                    let a::Expr::Identifier(id) = field else {
+                        return Err(unsupported("field selection from a composite value"));
+                    };
+                    let fname = ident(id);
+                    let fields = te
+                        .rec
+                        .clone()
+                        .ok_or_else(|| unsupported("field selection from a composite value"))?;
+                    let idx = fields.iter().position(|(n, _)| *n == fname).ok_or_else(|| {
+                        PgError::new(
+                            code::UNDEFINED_COLUMN,
+                            format!("column \"{fname}\" not found in data type record"),
+                        )
+                    })?;
+                    let ty = fields[idx].1;
+                    te = TE::new(
+                        Expr::Call {
+                            name: "record_field",
+                            args: vec![te.e, Expr::Const(Value::Int(idx as i64))],
+                            ty,
+                            arg_tys: vec![Type::RECORD, Type::INT4],
+                        },
+                        ty,
+                    );
                 }
             }
         }
@@ -2738,7 +2814,20 @@ impl<'a> Binder<'a> {
             out.push(self.coerce(te, *target, -1, CastCtx::Implicit, name)?);
         }
         let e = Expr::Call { name: r.sig.name, args: out, ty: r.ret, arg_tys: r.arg_tys.clone() };
-        Ok(TE::new(self.fold_call(e)?, r.ret))
+        let mut te = TE::new(self.fold_call(e)?, r.ret);
+        if !r.sig.cols.is_empty() {
+            let elem = r.arg_tys.first().map(|t| t.elem()).unwrap_or(Type::TEXT);
+            te.rec = Some(
+                r.sig
+                    .cols
+                    .iter()
+                    .map(|(n, t)| {
+                        (n.to_string(), if t.base == Base::AnyElement { elem } else { *t })
+                    })
+                    .collect(),
+            );
+        }
+        Ok(te)
     }
 
     fn fold_call(&self, e: Expr) -> PgResult<Expr> {
@@ -3707,6 +3796,7 @@ impl<'a> Binder<'a> {
                         table_oid: oid,
                         attnum: i as i16 + 1,
                         hidden: false,
+                        rec: None,
                     });
                 }
                 let width = table.columns.len();
@@ -3720,6 +3810,7 @@ impl<'a> Binder<'a> {
                         table_oid: 0,
                         attnum: i as i16 + 1,
                         hidden: true,
+                        rec: None,
                     });
                 }
                 scope.rels.push(table.name.clone());
@@ -3789,6 +3880,7 @@ impl<'a> Binder<'a> {
                 table_oid: oid,
                 attnum: i as i16 + 1,
                 hidden: false,
+                rec: None,
             });
         }
         scope.rels.push(table.name.clone());
@@ -4059,11 +4151,12 @@ pub struct TE {
     pub typmod: i32,
     pub table_oid: u32,
     pub attnum: i16,
+    pub rec: Option<Vec<(String, Type)>>,
 }
 
 impl TE {
     pub fn new(e: Expr, ty: Type) -> TE {
-        TE { e, ty, typmod: -1, table_oid: 0, attnum: 0 }
+        TE { e, ty, typmod: -1, table_oid: 0, attnum: 0, rec: None }
     }
     fn with_typmod(mut self, m: i32) -> TE {
         self.typmod = m;
@@ -4079,6 +4172,7 @@ pub fn table_out_cols(t: &Table) -> Vec<OutCol> {
             typmod: c.typmod,
             table_oid: t.oid,
             attnum: i as i16 + 1,
+            rec: None,
         })
         .collect()
 }
@@ -4095,6 +4189,7 @@ fn table_scope(t: &Table, oid: u32, rel: &str, base: usize) -> Scope {
             table_oid: oid,
             attnum: i as i16 + 1,
             hidden: false,
+            rec: None,
         });
     }
     scope.rels.push(rel.to_string());
@@ -4202,7 +4297,17 @@ fn promote(a: Type, b: Type) -> Option<Type> {
     }
     let implicit = |from: Type, to: Type| casts::cast_context(from, to) == Some(CastCtx::Implicit);
     if a.category() != b.category() {
-        // Only string types accept anything else implicitly.
+        // Types from different categories still match when one converts to
+        // the other implicitly, or when both convert to text ("char" = varchar).
+        if implicit(a, b) && !implicit(b, a) {
+            return Some(b);
+        }
+        if implicit(b, a) && !implicit(a, b) {
+            return Some(a);
+        }
+        if implicit(a, Type::TEXT) && implicit(b, Type::TEXT) {
+            return Some(Type::TEXT);
+        }
         return None;
     }
     if implicit(a, b) && !implicit(b, a) {

@@ -50,9 +50,21 @@ fn builtin_cast(from: Base, to: Base) -> Option<CastCtx> {
     None
 }
 
+/// int2vector and oidvector are stored as arrays and convert to them.
+pub fn vector_as_array(t: Type) -> Option<Type> {
+    match t.base {
+        Base::Int2Vector if !t.array => Some(Type::array_of(Base::Int2)),
+        Base::OidVector if !t.array => Some(Type::array_of(Base::Oid)),
+        _ => None,
+    }
+}
+
 /// The weakest context in which `from` converts to `to`, or None.
 pub fn cast_context(from: Type, to: Type) -> Option<CastCtx> {
     if from == to {
+        return Some(CastCtx::Implicit);
+    }
+    if vector_as_array(from) == Some(to) {
         return Some(CastCtx::Implicit);
     }
     if from.is_unknown() {
@@ -135,6 +147,10 @@ fn convert(v: Value, from: Type, to: Type, fmt: &FmtCtx, now: i64) -> PgResult<V
         || to.base == Base::AnyElement
         || to.base == Base::AnyArray
     {
+        return Ok(v);
+    }
+    // int2vector and oidvector are already stored as arrays.
+    if vector_as_array(from) == Some(to) {
         return Ok(v);
     }
     let dctx = datetime::Ctx { now, zone: &fmt.zone };

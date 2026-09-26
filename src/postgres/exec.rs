@@ -444,16 +444,14 @@ fn call_function(
     }
     let (fmt, now, stmt_now) = env!(ctx);
     let env = Env { fmt: &fmt, now, stmt_now };
-    // Operators: two operands, non-alphabetic name.
-    if !name.chars().next().is_some_and(|c| c.is_alphabetic()) {
-        if let Some(u) = name.strip_suffix('u') {
-            if vals[0].is_null() {
-                return Ok(Value::Null);
-            }
-            return funcs::unop(u, &vals[0], ret);
-        }
+    // Operators are punctuation; function names start with a letter or _.
+    if !name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') {
         if vals.iter().any(Value::is_null) {
             return Ok(Value::Null);
+        }
+        // A trailing `u` marks the prefix form, e.g. `-u` for unary minus.
+        if vals.len() == 1 {
+            return funcs::unop(name.strip_suffix('u').unwrap_or(name), &vals[0], ret);
         }
         return funcs::binop(name, &vals[0], &vals[1], ret, arg_tys, &env);
     }
@@ -713,6 +711,55 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             ctx.rt.lastval = Some(oid);
             Value::Int(v)
         }
+        "record_field" => {
+            let idx = a[1].as_int().unwrap_or(0) as usize;
+            match &a[0] {
+                Value::Record(fields) => fields.get(idx).cloned().unwrap_or(Value::Null),
+                other if idx == 0 => other.clone(),
+                _ => Value::Null,
+            }
+        }
+        "_pg_char_max_length"
+        | "_pg_numeric_precision"
+        | "_pg_numeric_scale"
+        | "_pg_datetime_precision" => {
+            let oid = a[0].as_int().unwrap_or(0) as u32;
+            let typmod = a[1].as_int().unwrap_or(-1) as i32;
+            let Some(ty) = Type::from_oid(oid) else { return Ok(Value::Null) };
+            match name {
+                "_pg_char_max_length" => match (ty.base, super::types::typmod_len(typmod)) {
+                    (Base::Varchar | Base::Bpchar, Some(l)) => Value::Int(l as i64),
+                    _ => Value::Null,
+                },
+                "_pg_numeric_precision" => match ty.base {
+                    Base::Int2 => Value::Int(16),
+                    Base::Int4 => Value::Int(32),
+                    Base::Int8 => Value::Int(64),
+                    Base::Float4 => Value::Int(24),
+                    Base::Float8 => Value::Int(53),
+                    Base::Numeric if typmod >= 4 => {
+                        Value::Int((((typmod - 4) >> 16) & 0xffff) as i64)
+                    }
+                    _ => Value::Null,
+                },
+                "_pg_numeric_scale" => match ty.base {
+                    Base::Int2 | Base::Int4 | Base::Int8 => Value::Int(0),
+                    Base::Numeric if typmod >= 4 => Value::Int(((typmod - 4) & 0xffff) as i64),
+                    _ => Value::Null,
+                },
+                _ => match ty.base {
+                    Base::Date => Value::Int(0),
+                    Base::Time
+                    | Base::Timetz
+                    | Base::Timestamp
+                    | Base::Timestamptz
+                    | Base::Interval => Value::Int(if typmod >= 0 { typmod as i64 } else { 6 }),
+                    _ => Value::Null,
+                },
+            }
+        }
+        "_pg_truetypid" => a[1].clone(),
+        "_pg_truetypmod" => Value::Int(-1),
         "subscript" => {
             let idx = a[1].as_int();
             match (&a[0], idx) {
@@ -1165,6 +1212,21 @@ fn expand_srfs(proj: &[Expr], rows: &[Row], ctx: &mut Ctx) -> PgResult<Vec<Row>>
 
 /// Evaluates an expression that may be a set-returning call.
 fn eval_multi(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Value>> {
+    // `(srf(...)).field` expands the function, then takes one field.
+    if let Expr::Call { name: "record_field", args, .. } = e
+        && let [inner, Expr::Const(Value::Int(idx))] = args.as_slice()
+        && matches!(inner, Expr::Call { name, .. } if super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf))
+    {
+        let idx = *idx as usize;
+        return Ok(eval_multi(inner, row, ctx)?
+            .into_iter()
+            .map(|v| match v {
+                Value::Record(fields) => fields.get(idx).cloned().unwrap_or(Value::Null),
+                other if idx == 0 => other,
+                _ => Value::Null,
+            })
+            .collect());
+    }
     if let Expr::Call { name, args, arg_tys, ty } = e
         && super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf)
     {
@@ -1387,6 +1449,15 @@ fn srf_rows(
                 _ => vec![],
             }
         }
+        "_pg_expandarray" => match &a[0] {
+            Value::Array(arr) => arr
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| vec![v.clone(), Value::Int(i as i64 + 1)])
+                .collect(),
+            _ => vec![],
+        },
         "generate_subscripts" => {
             let dim = a[1].as_int().unwrap_or(1) as usize;
             match &a[0] {

@@ -36,6 +36,8 @@ jobs:
       # Show how many replies were compared against the real servers.
       - run: cargo test --test redis_diff -- --nocapture
       - run: cargo test --features postgres --test postgres_diff -- --nocapture
+      # Real drivers and ORMs: psycopg, SQLAlchemy, node-postgres, JDBC.
+      - run: tests/clients/postgres/run.sh
       # Modularity: the binary must build with any service set, even none.
       - run: cargo build --no-default-features
       - run: scripts/check-size.sh

@@ -686,6 +686,12 @@ pub fn to_text(v: &Value, ty: Type, f: &FmtCtx) -> String {
             other => to_text(other, ty.elem(), f),
         };
     }
+    if let (Value::Array(a), Base::Int2Vector) = (v, ty.base) {
+        return vector_to_text(a, Type::INT2, f);
+    }
+    if let (Value::Array(a), Base::OidVector) = (v, ty.base) {
+        return vector_to_text(a, Type::OID, f);
+    }
     match v {
         Value::Null => String::new(),
         Value::Bool(b) => if *b { "t" } else { "f" }.into(),
@@ -793,6 +799,11 @@ fn quote_array_elem(s: &str) -> String {
     }
     o.push('"');
     o
+}
+
+/// int2vector and oidvector print as space-separated numbers.
+fn vector_to_text(a: &Array, elem: Type, f: &FmtCtx) -> String {
+    a.items.iter().map(|v| to_text(v, elem, f)).collect::<Vec<_>>().join(" ")
 }
 
 pub fn array_to_text(a: &Array, elem: Type, f: &FmtCtx) -> String {
@@ -1085,6 +1096,14 @@ pub fn from_text(s: &str, ty: Type, ctx: &Ctx) -> PgResult<Value> {
         })?)),
         Base::Char => Value::Text(s.chars().next().map(String::from).unwrap_or_default()),
         Base::Name => Value::Text(truncate_name(s)),
+        Base::Int2Vector | Base::OidVector => {
+            let elem = if ty.base == Base::Int2Vector { Type::INT2 } else { Type::OID };
+            let mut items = vec![];
+            for part in s.split_ascii_whitespace() {
+                items.push(from_text(part, elem, ctx)?);
+            }
+            Value::Array(Box::new(Array::new(items)))
+        }
         Base::Record => {
             return Err(PgError::new(
                 code::FEATURE_NOT_SUPPORTED,

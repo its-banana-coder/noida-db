@@ -103,6 +103,10 @@ s:jsonb_each(jsonb)(key text,value jsonb) s:json_each(json)(key text,value json)
 s:jsonb_each_text(jsonb)(key text,value text) s:json_each_text(json)(key text,value text)
 s:jsonb_object_keys(jsonb)text s:json_object_keys(json)text
 s:jsonb_path_query(jsonb,text)jsonb
+s:_pg_expandarray(anyarray)(x anyelement,n int4)
+_pg_char_max_length(oid,int4)int4 _pg_numeric_precision(oid,int4)int4 _pg_numeric_scale(oid,int4)int4
+_pg_datetime_precision(oid,int4)int4 _pg_truetypid(pg_node_tree,oid)oid _pg_truetypmod(pg_node_tree,oid)int4
+record_field(record,int4)anyelement
 array_length(anyarray,int4)int4 array_upper(anyarray,int4)int4 array_lower(anyarray,int4)int4 cardinality(anyarray)int4
 array_ndims(anyarray)int4 array_dims(anyarray)text
 !array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
@@ -335,13 +339,11 @@ pub fn resolve(name: &str, args: &[Type]) -> PgResult<Resolved> {
                     }
                     elem = Some(merge_poly(elem, *a));
                 }
-                Base::AnyArray => {
-                    if !a.array {
-                        ok = false;
-                    } else {
-                        elem = Some(merge_poly(elem, a.elem()));
-                    }
-                }
+                Base::AnyArray => match super::casts::vector_as_array(*a) {
+                    Some(arr) => elem = Some(merge_poly(elem, arr.elem())),
+                    None if a.array => elem = Some(merge_poly(elem, a.elem())),
+                    None => ok = false,
+                },
                 _ => {}
             }
         }

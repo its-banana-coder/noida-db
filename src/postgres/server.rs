@@ -27,8 +27,10 @@ use super::error::{PgError, PgResult, code};
 use super::plan::OutCol;
 use super::types::{self, Type, Value};
 
-/// Connection threads touch little stack; keep reservations small.
-const STACK_SIZE: usize = 1024 * 1024;
+/// Binding and running a query recurses over the expression tree, and
+/// drivers send deeply nested catalog queries. Reserve room for them: only
+/// the pages a connection touches cost anything.
+const STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// How noida asks clients to authenticate, and the password it expects.
 #[derive(Clone)]
@@ -464,12 +466,21 @@ fn params_changed(conn: &mut Conn, changed: &[(String, String)]) -> io::Result<(
 // ---------------------------------------------------------------------------
 // Simple query
 
+/// `NOIDA_POSTGRES_LOG=1` logs every statement, for debugging drivers.
+fn log_query(sql: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("NOIDA_POSTGRES_LOG").is_ok_and(|v| v != "0")) {
+        eprintln!("[postgres] {sql}");
+    }
+}
+
 fn simple_query(
     conn: &mut Conn,
     engine: &Engine,
     session: &mut Session,
     sql: &str,
 ) -> io::Result<()> {
+    log_query(sql);
     let stmts = match engine.parse_sql(sql) {
         Ok(s) => s,
         Err(e) => return error(conn, session, e),
@@ -533,6 +544,7 @@ fn do_parse(
     sql: &str,
     oids: &[u32],
 ) -> PgResult<()> {
+    log_query(sql);
     if !name.is_empty() && session.prepared.contains_key(name) {
         return Err(PgError::new(
             code::DUPLICATE_PSTATEMENT,

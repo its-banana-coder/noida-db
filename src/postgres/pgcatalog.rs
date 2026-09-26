@@ -3,7 +3,7 @@
 
 use std::sync::OnceLock;
 
-use super::catalog::{ConstraintKind, DbState, PG_CATALOG_NS, Row};
+use super::catalog::{ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, Row};
 use super::error::PgResult;
 use super::exec::Ctx;
 use super::plan::OutCol;
@@ -11,164 +11,164 @@ use super::types::{Array, Base, Type, Value};
 
 /// `relation: col type, col type, ...`
 const RELATIONS: &str = "
-pg_namespace: oid oid, nspname name, nspowner oid, nspacl _aclitem
-pg_class: oid oid, relname name, relnamespace oid, reltype oid, reloftype oid, relowner oid, relam oid, \
+pg_namespace/2615/r: oid oid, nspname name, nspowner oid, nspacl _aclitem
+pg_class/1259/r: oid oid, relname name, relnamespace oid, reltype oid, reloftype oid, relowner oid, relam oid, \
 relfilenode oid, reltablespace oid, relpages int4, reltuples float4, relallvisible int4, reltoastrelid oid, \
 relhasindex bool, relisshared bool, relpersistence char, relkind char, relnatts int2, relchecks int2, \
 relhasrules bool, relhastriggers bool, relhassubclass bool, relrowsecurity bool, relforcerowsecurity bool, \
 relispopulated bool, relreplident char, relispartition bool, relrewrite oid, relfrozenxid xid, relminmxid xid, \
 relacl _aclitem, reloptions _text, relpartbound pg_node_tree
-pg_attribute: attrelid oid, attname name, atttypid oid, attstattarget int4, attlen int2, attnum int2, \
+pg_attribute/1249/r: attrelid oid, attname name, atttypid oid, attstattarget int4, attlen int2, attnum int2, \
 attndims int4, attcacheoff int4, atttypmod int4, attbyval bool, attalign char, attstorage char, \
 attcompression char, attnotnull bool, atthasdef bool, atthasmissing bool, attidentity char, attgenerated char, \
 attisdropped bool, attislocal bool, attinhcount int4, attcollation oid, attacl _aclitem, attoptions _text, \
 attfdwoptions _text, attmissingval anyarray
-pg_type: oid oid, typname name, typnamespace oid, typowner oid, typlen int2, typbyval bool, typtype char, \
+pg_type/1247/r: oid oid, typname name, typnamespace oid, typowner oid, typlen int2, typbyval bool, typtype char, \
 typcategory char, typispreferred bool, typisdefined bool, typdelim char, typrelid oid, typsubscript regproc, \
 typelem oid, typarray oid, typinput regproc, typoutput regproc, typreceive regproc, typsend regproc, \
 typmodin regproc, typmodout regproc, typanalyze regproc, typalign char, typstorage char, typnotnull bool, \
 typbasetype oid, typtypmod int4, typndims int4, typcollation oid, typdefaultbin pg_node_tree, typdefault text, \
 typacl _aclitem
-pg_index: indexrelid oid, indrelid oid, indnatts int2, indnkeyatts int2, indisunique bool, \
+pg_index/2610/r: indexrelid oid, indrelid oid, indnatts int2, indnkeyatts int2, indisunique bool, \
 indnullsnotdistinct bool, indisprimary bool, indisexclusion bool, indimmediate bool, indisclustered bool, \
 indisvalid bool, indcheckxmin bool, indisready bool, indislive bool, indisreplident bool, indkey int2vector, \
 indcollation oidvector, indclass oidvector, indoption int2vector, indexprs pg_node_tree, indpred pg_node_tree
-pg_constraint: oid oid, conname name, connamespace oid, contype char, condeferrable bool, condeferred bool, \
+pg_constraint/2606/r: oid oid, conname name, connamespace oid, contype char, condeferrable bool, condeferred bool, \
 convalidated bool, conrelid oid, contypid oid, conindid oid, conparentid oid, confrelid oid, confupdtype char, \
 confdeltype char, confmatchtype char, conislocal bool, coninhcount int4, connoinherit bool, conkey _int2, \
 confkey _int2, conpfeqop _oid, conppeqop _oid, conffeqop _oid, confdelsetcols _int2, conexclop _oid, \
 conbin pg_node_tree
-pg_attrdef: oid oid, adrelid oid, adnum int2, adbin pg_node_tree
-pg_database: oid oid, datname name, datdba oid, encoding int4, datlocprovider char, datistemplate bool, \
+pg_attrdef/2604/r: oid oid, adrelid oid, adnum int2, adbin pg_node_tree
+pg_database/1262/r: oid oid, datname name, datdba oid, encoding int4, datlocprovider char, datistemplate bool, \
 datallowconn bool, datconnlimit int4, datfrozenxid xid, datminmxid xid, dattablespace oid, datcollate name, \
 datctype name, daticulocale text, daticurules text, datcollversion text, datacl _aclitem
-pg_proc: oid oid, proname name, pronamespace oid, proowner oid, prolang oid, procost float4, prorows float4, \
+pg_proc/1255/r: oid oid, proname name, pronamespace oid, proowner oid, prolang oid, procost float4, prorows float4, \
 provariadic oid, prosupport regproc, prokind char, prosecdef bool, proleakproof bool, proisstrict bool, \
 proretset bool, provolatile char, proparallel char, pronargs int2, pronargdefaults int2, prorettype oid, \
 proargtypes oidvector, proallargtypes _oid, proargmodes _char, proargnames _text, proargdefaults pg_node_tree, \
 protrftypes _oid, prosrc text, probin text, prosqlbody pg_node_tree, proconfig _text, proacl _aclitem
-pg_enum: oid oid, enumtypid oid, enumsortorder float4, enumlabel name
-pg_description: objoid oid, classoid oid, objsubid int4, description text
-pg_shdescription: objoid oid, classoid oid, description text
-pg_am: oid oid, amname name, amhandler regproc, amtype char
-pg_roles: rolname name, rolsuper bool, rolinherit bool, rolcreaterole bool, rolcreatedb bool, rolcanlogin bool, \
+pg_enum/3501/r: oid oid, enumtypid oid, enumsortorder float4, enumlabel name
+pg_description/2609/r: objoid oid, classoid oid, objsubid int4, description text
+pg_shdescription/2396/r: objoid oid, classoid oid, description text
+pg_am/2601/r: oid oid, amname name, amhandler regproc, amtype char
+pg_roles/12217/v: rolname name, rolsuper bool, rolinherit bool, rolcreaterole bool, rolcreatedb bool, rolcanlogin bool, \
 rolreplication bool, rolconnlimit int4, rolpassword text, rolvaliduntil timestamptz, rolbypassrls bool, \
 rolconfig _text, oid oid
-pg_authid: oid oid, rolname name, rolsuper bool, rolinherit bool, rolcreaterole bool, rolcreatedb bool, \
+pg_authid/1260/r: oid oid, rolname name, rolsuper bool, rolinherit bool, rolcreaterole bool, rolcreatedb bool, \
 rolcanlogin bool, rolreplication bool, rolbypassrls bool, rolconnlimit int4, rolpassword text, \
 rolvaliduntil timestamptz
-pg_user: usename name, usesysid oid, usecreatedb bool, usesuper bool, userepl bool, usebypassrls bool, \
+pg_user/12231/v: usename name, usesysid oid, usecreatedb bool, usesuper bool, userepl bool, usebypassrls bool, \
 passwd text, valuntil timestamptz, useconfig _text
-pg_settings: name text, setting text, unit text, category text, short_desc text, extra_desc text, \
+pg_settings/12321/v: name text, setting text, unit text, category text, short_desc text, extra_desc text, \
 context text, vartype text, source text, min_val text, max_val text, enumvals _text, boot_val text, \
 reset_val text, sourcefile text, sourceline int4, pending_restart bool
-pg_tables: schemaname name, tablename name, tableowner name, tablespace name, hasindexes bool, hasrules bool, \
+pg_tables/12250/v: schemaname name, tablename name, tableowner name, tablespace name, hasindexes bool, hasrules bool, \
 hastriggers bool, rowsecurity bool
-pg_views: schemaname name, viewname name, viewowner name, definition text
-pg_matviews: schemaname name, matviewname name, matviewowner name, tablespace name, hasindexes bool, \
+pg_views/12245/v: schemaname name, viewname name, viewowner name, definition text
+pg_matviews/12255/v: schemaname name, matviewname name, matviewowner name, tablespace name, hasindexes bool, \
 ispopulated bool, definition text
-pg_indexes: schemaname name, tablename name, indexname name, tablespace name, indexdef text
-pg_sequences: schemaname name, sequencename name, sequenceowner name, data_type regtype, start_value int8, \
+pg_indexes/12260/v: schemaname name, tablename name, indexname name, tablespace name, indexdef text
+pg_sequences/12265/v: schemaname name, sequencename name, sequenceowner name, data_type regtype, start_value int8, \
 min_value int8, max_value int8, increment_by int8, cycle bool, cache_size int8, last_value int8
-pg_sequence: seqrelid oid, seqtypid oid, seqstart int8, seqincrement int8, seqmax int8, seqmin int8, \
+pg_sequence/2224/r: seqrelid oid, seqtypid oid, seqstart int8, seqincrement int8, seqmax int8, seqmin int8, \
 seqcache int8, seqcycle bool
-pg_collation: oid oid, collname name, collnamespace oid, collowner oid, collprovider char, collisdeterministic bool, \
+pg_collation/3456/r: oid oid, collname name, collnamespace oid, collowner oid, collprovider char, collisdeterministic bool, \
 collencoding int4, collcollate name, collctype name, colliculocale text, collicurules text, collversion text
-pg_depend: classid oid, objid oid, objsubid int4, refclassid oid, refobjid oid, refobjsubid int4, deptype char
-pg_inherits: inhrelid oid, inhparent oid, inhseqno int4, inhdetachpending bool
-pg_extension: oid oid, extname name, extowner oid, extnamespace oid, extrelocatable bool, extversion text, \
+pg_depend/2608/r: classid oid, objid oid, objsubid int4, refclassid oid, refobjid oid, refobjsubid int4, deptype char
+pg_inherits/2611/r: inhrelid oid, inhparent oid, inhseqno int4, inhdetachpending bool
+pg_extension/3079/r: oid oid, extname name, extowner oid, extnamespace oid, extrelocatable bool, extversion text, \
 extconfig _oid, extcondition _text
-pg_available_extensions: name name, default_version text, installed_version text, comment text
-pg_tablespace: oid oid, spcname name, spcowner oid, spcacl _aclitem, spcoptions _text
-pg_trigger: oid oid, tgrelid oid, tgparentid oid, tgname name, tgfoid oid, tgtype int2, tgenabled char, \
+pg_available_extensions/12298/v: name name, default_version text, installed_version text, comment text
+pg_tablespace/1213/r: oid oid, spcname name, spcowner oid, spcacl _aclitem, spcoptions _text
+pg_trigger/2620/r: oid oid, tgrelid oid, tgparentid oid, tgname name, tgfoid oid, tgtype int2, tgenabled char, \
 tgisinternal bool, tgconstrrelid oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool, tginitdeferred bool, \
 tgnargs int2, tgattr int2vector, tgargs bytea, tgqual pg_node_tree, tgoldtable name, tgnewtable name
-pg_rewrite: oid oid, rulename name, ev_class oid, ev_type char, ev_enabled char, is_instead bool, \
+pg_rewrite/2618/r: oid oid, rulename name, ev_class oid, ev_type char, ev_enabled char, is_instead bool, \
 ev_qual pg_node_tree, ev_action pg_node_tree
-pg_locks: locktype text, database oid, relation oid, page int4, tuple int2, virtualxid text, \
+pg_locks/12290/v: locktype text, database oid, relation oid, page int4, tuple int2, virtualxid text, \
 transactionid xid, classid oid, objid oid, objsubid int2, virtualtransaction text, pid int4, mode text, \
 granted bool, fastpath bool
-pg_stat_activity: datid oid, datname name, pid int4, leader_pid int4, usesysid oid, usename name, \
+pg_stat_activity/12435/v: datid oid, datname name, pid int4, leader_pid int4, usesysid oid, usename name, \
 application_name text, client_addr inet, client_hostname text, client_port int4, backend_start timestamptz, \
 xact_start timestamptz, query_start timestamptz, state_change timestamptz, wait_event_type text, \
 wait_event text, state text, backend_xid xid, backend_xmin xid, query_id int8, query text, backend_type text
-pg_stat_user_tables: relid oid, schemaname name, relname name, seq_scan int8, seq_tup_read int8, \
+pg_stat_user_tables/12374/v: relid oid, schemaname name, relname name, seq_scan int8, seq_tup_read int8, \
 idx_scan int8, idx_tup_fetch int8, n_tup_ins int8, n_tup_upd int8, n_tup_del int8, n_tup_hot_upd int8, \
 n_live_tup int8, n_dead_tup int8, n_mod_since_analyze int8, n_ins_since_vacuum int8, last_vacuum timestamptz, \
 last_autovacuum timestamptz, last_analyze timestamptz, last_autoanalyze timestamptz, vacuum_count int8, \
 autovacuum_count int8, analyze_count int8, autoanalyze_count int8
-pg_stat_all_tables: relid oid, schemaname name, relname name, seq_scan int8, n_live_tup int8
-pg_statio_user_tables: relid oid, schemaname name, relname name, heap_blks_read int8, heap_blks_hit int8
-pg_language: oid oid, lanname name, lanowner oid, lanispl bool, lanpltrusted bool, lanplcallfoid oid, \
+pg_stat_all_tables/12355/v: relid oid, schemaname name, relname name, seq_scan int8, n_live_tup int8
+pg_statio_user_tables/12392/v: relid oid, schemaname name, relname name, heap_blks_read int8, heap_blks_hit int8
+pg_language/2612/r: oid oid, lanname name, lanowner oid, lanispl bool, lanpltrusted bool, lanplcallfoid oid, \
 laninline oid, lanvalidator oid, lanacl _aclitem
-pg_operator: oid oid, oprname name, oprnamespace oid, oprowner oid, oprkind char, oprcanmerge bool, \
+pg_operator/2617/r: oid oid, oprname name, oprnamespace oid, oprowner oid, oprkind char, oprcanmerge bool, \
 oprcanhash bool, oprleft oid, oprright oid, oprresult oid, oprcom oid, oprnegate oid, oprcode regproc, \
 oprrest regproc, oprjoin regproc
-pg_opclass: oid oid, opcmethod oid, opcname name, opcnamespace oid, opcowner oid, opcfamily oid, \
+pg_opclass/2616/r: oid oid, opcmethod oid, opcname name, opcnamespace oid, opcowner oid, opcfamily oid, \
 opcintype oid, opcdefault bool, opckeytype oid
-pg_range: rngtypid oid, rngsubtype oid, rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc, \
+pg_range/3541/r: rngtypid oid, rngsubtype oid, rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc, \
 rngsubdiff regproc
-pg_partitioned_table: partrelid oid, partstrat char, partnatts int2, partdefid oid, partattrs int2vector, \
+pg_partitioned_table/3350/r: partrelid oid, partstrat char, partnatts int2, partdefid oid, partattrs int2vector, \
 partclass oidvector, partcollation oidvector, partexprs pg_node_tree
-pg_publication: oid oid, pubname name, pubowner oid, puballtables bool, pubinsert bool, pubupdate bool, \
+pg_publication/6104/r: oid oid, pubname name, pubowner oid, puballtables bool, pubinsert bool, pubupdate bool, \
 pubdelete bool, pubtruncate bool, pubviaroot bool
-pg_foreign_table: ftrelid oid, ftserver oid, ftoptions _text
-pg_foreign_server: oid oid, srvname name, srvowner oid, srvfdw oid, srvtype text, srvversion text, \
+pg_foreign_table/3118/r: ftrelid oid, ftserver oid, ftoptions _text
+pg_foreign_server/1417/r: oid oid, srvname name, srvowner oid, srvfdw oid, srvtype text, srvversion text, \
 srvacl _aclitem, srvoptions _text
-pg_event_trigger: oid oid, evtname name, evtevent name, evtowner oid, evtfoid oid, evtenabled char, evttags _text
-pg_policy: oid oid, polname name, polrelid oid, polcmd char, polpermissive bool, polroles _oid, \
+pg_event_trigger/3466/r: oid oid, evtname name, evtevent name, evtowner oid, evtfoid oid, evtenabled char, evttags _text
+pg_policy/3256/r: oid oid, polname name, polrelid oid, polcmd char, polpermissive bool, polroles _oid, \
 polqual pg_node_tree, polwithcheck pg_node_tree
-pg_cast: oid oid, castsource oid, casttarget oid, castfunc oid, castcontext char, castmethod char
-pg_conversion: oid oid, conname name, connamespace oid, conowner oid, conforencoding int4, \
+pg_cast/2605/r: oid oid, castsource oid, casttarget oid, castfunc oid, castcontext char, castmethod char
+pg_conversion/2607/r: oid oid, conname name, connamespace oid, conowner oid, conforencoding int4, \
 contoencoding int4, conproc regproc, condefault bool
-pg_statistic_ext: oid oid, stxrelid oid, stxname name, stxnamespace oid, stxowner oid, stxstattarget int4, \
+pg_statistic_ext/3381/r: oid oid, stxrelid oid, stxname name, stxnamespace oid, stxowner oid, stxstattarget int4, \
 stxkeys int2vector, stxkind _char
-pg_prepared_statements: name text, statement text, prepare_time timestamptz, parameter_types _regtype, \
+pg_prepared_statements/12312/v: name text, statement text, prepare_time timestamptz, parameter_types _regtype, \
 result_types _regtype, from_sql bool, generic_plans int8, custom_plans int8
-pg_prepared_xacts: transaction xid, gid text, prepared timestamptz, owner name, database name
-pg_replication_slots: slot_name name, plugin name, slot_type text, datoid oid, database name, temporary bool, \
+pg_prepared_xacts/12307/v: transaction xid, gid text, prepared timestamptz, owner name, database name
+pg_replication_slots/12466/v: slot_name name, plugin name, slot_type text, datoid oid, database name, temporary bool, \
 active bool, active_pid int4, xmin xid, catalog_xmin xid, restart_lsn pg_lsn, confirmed_flush_lsn pg_lsn
-pg_stat_replication: pid int4, usesysid oid, usename name, application_name text, client_addr inet, state text
-pg_timezone_names: name text, abbrev text, utc_offset interval, is_dst bool
-pg_timezone_abbrevs: abbrev text, utc_offset interval, is_dst bool
-pg_publication_rel: oid oid, prpubid oid, prrelid oid
-pg_publication_namespace: oid oid, pnpubid oid, pnnspid oid
-pg_subscription: oid oid, subdbid oid, subname name, subowner oid, subenabled bool, subconninfo text, subslotname name, subsynccommit text, subpublications _text
-pg_subscription_rel: srsubid oid, srrelid oid, srsubstate char, srsublsn pg_lsn
-pg_statistic: starelid oid, staattnum int2, stainherit bool, stanullfrac float4, stawidth int4, stadistinct float4
-pg_stats: schemaname name, tablename name, attname name, inherited bool, null_frac float4, avg_width int4, n_distinct float4, most_common_vals _text, most_common_freqs _float4, histogram_bounds _text, correlation float4
-pg_user_mapping: oid oid, umuser oid, umserver oid, umoptions _text
-pg_default_acl: oid oid, defaclrole oid, defaclnamespace oid, defaclobjtype char, defaclacl _aclitem
-pg_init_privs: objoid oid, classoid oid, objsubid int4, privtype char, initprivs _aclitem
-pg_largeobject: loid oid, pageno int4, data bytea
-pg_largeobject_metadata: oid oid, lomowner oid, lomacl _aclitem
-pg_seclabel: objoid oid, classoid oid, objsubid int4, provider text, label text
-pg_shseclabel: objoid oid, classoid oid, provider text, label text
-pg_ts_config: oid oid, cfgname name, cfgnamespace oid, cfgowner oid, cfgparser oid
-pg_ts_dict: oid oid, dictname name, dictnamespace oid, dictowner oid, dicttemplate oid, dictinitoption text
-pg_ts_parser: oid oid, prsname name, prsnamespace oid, prsstart regproc, prstoken regproc, prsend regproc, prsheadline regproc, prslextype regproc
-pg_ts_template: oid oid, tmplname name, tmplnamespace oid, tmplinit regproc, tmpllexize regproc
-pg_transform: oid oid, trftype oid, trflang oid, trffromsql regproc, trftosql regproc
-pg_aggregate: aggfnoid regproc, aggkind char, aggnumdirectargs int2, aggtransfn regproc, aggfinalfn regproc, aggcombinefn regproc, aggtranstype oid, agginitval text
-pg_amop: oid oid, amopfamily oid, amoplefttype oid, amoprighttype oid, amopstrategy int2, amoppurpose char, amopopr oid, amopmethod oid, amopsortfamily oid
-pg_amproc: oid oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2, amproc regproc
-pg_opfamily: oid oid, opfmethod oid, opfname name, opfnamespace oid, opfowner oid
-pg_auth_members: oid oid, roleid oid, member oid, grantor oid, admin_option bool, inherit_option bool, set_option bool
-pg_db_role_setting: setdatabase oid, setrole oid, setconfig _text
-pg_stat_database: datid oid, datname name, numbackends int4, xact_commit int8, xact_rollback int8, blks_read int8, blks_hit int8, tup_returned int8, tup_fetched int8, tup_inserted int8, tup_updated int8, tup_deleted int8, conflicts int8, temp_files int8, temp_bytes int8, deadlocks int8, stats_reset timestamptz
-pg_stat_gssapi: pid int4, gss_authenticated bool, principal text, encrypted bool
-pg_file_settings: sourcefile text, sourceline int4, seqno int4, name text, setting text, applied bool, error text
-pg_hba_file_rules: line_number int4, type text, database _text, user_name _text, address text, netmask text, auth_method text, options _text, error text
-pg_config: name text, setting text
-pg_cursors: name text, statement text, is_holdable bool, is_binary bool, is_scrollable bool, creation_time timestamptz
-information_schema.schemata: catalog_name name, schema_name name, schema_owner name, \
+pg_stat_replication/12440/v: pid int4, usesysid oid, usename name, application_name text, client_addr inet, state text
+pg_timezone_names/12339/v: name text, abbrev text, utc_offset interval, is_dst bool
+pg_timezone_abbrevs/12335/v: abbrev text, utc_offset interval, is_dst bool
+pg_publication_rel/6106/r: oid oid, prpubid oid, prrelid oid
+pg_publication_namespace/6237/r: oid oid, pnpubid oid, pnnspid oid
+pg_subscription/6100/r: oid oid, subdbid oid, subname name, subowner oid, subenabled bool, subconninfo text, subslotname name, subsynccommit text, subpublications _text
+pg_subscription_rel/6102/r: srsubid oid, srrelid oid, srsubstate char, srsublsn pg_lsn
+pg_statistic/2619/r: starelid oid, staattnum int2, stainherit bool, stanullfrac float4, stawidth int4, stadistinct float4
+pg_stats/12270/v: schemaname name, tablename name, attname name, inherited bool, null_frac float4, avg_width int4, n_distinct float4, most_common_vals _text, most_common_freqs _float4, histogram_bounds _text, correlation float4
+pg_user_mapping/1418/r: oid oid, umuser oid, umserver oid, umoptions _text
+pg_default_acl/826/r: oid oid, defaclrole oid, defaclnamespace oid, defaclobjtype char, defaclacl _aclitem
+pg_init_privs/3394/r: objoid oid, classoid oid, objsubid int4, privtype char, initprivs _aclitem
+pg_largeobject/2613/r: loid oid, pageno int4, data bytea
+pg_largeobject_metadata/2995/r: oid oid, lomowner oid, lomacl _aclitem
+pg_seclabel/3596/r: objoid oid, classoid oid, objsubid int4, provider text, label text
+pg_shseclabel/3592/r: objoid oid, classoid oid, provider text, label text
+pg_ts_config/3602/r: oid oid, cfgname name, cfgnamespace oid, cfgowner oid, cfgparser oid
+pg_ts_dict/3600/r: oid oid, dictname name, dictnamespace oid, dictowner oid, dicttemplate oid, dictinitoption text
+pg_ts_parser/3601/r: oid oid, prsname name, prsnamespace oid, prsstart regproc, prstoken regproc, prsend regproc, prsheadline regproc, prslextype regproc
+pg_ts_template/3764/r: oid oid, tmplname name, tmplnamespace oid, tmplinit regproc, tmpllexize regproc
+pg_transform/3576/r: oid oid, trftype oid, trflang oid, trffromsql regproc, trftosql regproc
+pg_aggregate/2600/r: aggfnoid regproc, aggkind char, aggnumdirectargs int2, aggtransfn regproc, aggfinalfn regproc, aggcombinefn regproc, aggtranstype oid, agginitval text
+pg_amop/2602/r: oid oid, amopfamily oid, amoplefttype oid, amoprighttype oid, amopstrategy int2, amoppurpose char, amopopr oid, amopmethod oid, amopsortfamily oid
+pg_amproc/2603/r: oid oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2, amproc regproc
+pg_opfamily/2753/r: oid oid, opfmethod oid, opfname name, opfnamespace oid, opfowner oid
+pg_auth_members/1261/r: oid oid, roleid oid, member oid, grantor oid, admin_option bool, inherit_option bool, set_option bool
+pg_db_role_setting/2964/r: setdatabase oid, setrole oid, setconfig _text
+pg_stat_database/12475/v: datid oid, datname name, numbackends int4, xact_commit int8, xact_rollback int8, blks_read int8, blks_hit int8, tup_returned int8, tup_fetched int8, tup_inserted int8, tup_updated int8, tup_deleted int8, conflicts int8, temp_files int8, temp_bytes int8, deadlocks int8, stats_reset timestamptz
+pg_stat_gssapi/12462/v: pid int4, gss_authenticated bool, principal text, encrypted bool
+pg_file_settings/12327/v: sourcefile text, sourceline int4, seqno int4, name text, setting text, applied bool, error text
+pg_hba_file_rules/12331/v: line_number int4, type text, database _text, user_name _text, address text, netmask text, auth_method text, options _text, error text
+pg_config/12343/v: name text, setting text
+pg_cursors/12294/v: name text, statement text, is_holdable bool, is_binary bool, is_scrollable bool, creation_time timestamptz
+information_schema.schemata/13568/v: catalog_name name, schema_name name, schema_owner name, \
 default_character_set_catalog name, default_character_set_schema name, default_character_set_name name, \
 sql_path varchar
-information_schema.tables: table_catalog name, table_schema name, table_name name, table_type varchar, \
+information_schema.tables/13611/v: table_catalog name, table_schema name, table_name name, table_type varchar, \
 self_referencing_column_name name, reference_generation varchar, user_defined_type_catalog name, \
 user_defined_type_schema name, user_defined_type_name name, is_insertable_into varchar, is_typed varchar, \
 commit_action varchar
-information_schema.columns: table_catalog name, table_schema name, table_name name, column_name name, \
+information_schema.columns/13481/v: table_catalog name, table_schema name, table_name name, column_name name, \
 ordinal_position int4, column_default text, is_nullable varchar, data_type varchar, character_maximum_length int4, \
 character_octet_length int4, numeric_precision int4, numeric_precision_radix int4, numeric_scale int4, \
 datetime_precision int4, interval_type varchar, interval_precision int4, character_set_catalog name, \
@@ -178,48 +178,51 @@ udt_schema name, udt_name name, scope_catalog name, scope_schema name, scope_nam
 maximum_cardinality int4, dtd_identifier name, is_self_referencing varchar, is_identity varchar, \
 identity_generation varchar, identity_start varchar, identity_increment varchar, identity_maximum varchar, \
 identity_minimum varchar, identity_cycle varchar, is_generated varchar, generation_expression varchar, is_updatable varchar
-information_schema.views: table_catalog name, table_schema name, table_name name, view_definition varchar, \
+information_schema.views/13669/v: table_catalog name, table_schema name, table_name name, view_definition varchar, \
 check_option varchar, is_updatable varchar, is_insertable_into varchar, is_trigger_updatable varchar, \
 is_trigger_deletable varchar, is_trigger_insertable_into varchar
-information_schema.table_constraints: constraint_catalog name, constraint_schema name, constraint_name name, \
+information_schema.table_constraints/13597/v: constraint_catalog name, constraint_schema name, constraint_name name, \
 table_catalog name, table_schema name, table_name name, constraint_type varchar, is_deferrable varchar, \
 initially_deferred varchar, enforced varchar, nulls_distinct varchar
-information_schema.key_column_usage: constraint_catalog name, constraint_schema name, constraint_name name, \
+information_schema.key_column_usage/13515/v: constraint_catalog name, constraint_schema name, constraint_name name, \
 table_catalog name, table_schema name, table_name name, column_name name, ordinal_position int4, \
 position_in_unique_constraint int4
-information_schema.constraint_column_usage: table_catalog name, table_schema name, table_name name, \
+information_schema.constraint_column_usage/13486/v: table_catalog name, table_schema name, table_name name, \
 column_name name, constraint_catalog name, constraint_schema name, constraint_name name
-information_schema.referential_constraints: constraint_catalog name, constraint_schema name, \
+information_schema.referential_constraints/13525/v: constraint_catalog name, constraint_schema name, \
 constraint_name name, unique_constraint_catalog name, unique_constraint_schema name, unique_constraint_name name, \
 match_option varchar, update_rule varchar, delete_rule varchar
-information_schema.check_constraints: constraint_catalog name, constraint_schema name, constraint_name name, \
+information_schema.check_constraints/13446/v: constraint_catalog name, constraint_schema name, constraint_name name, \
 check_clause varchar
-information_schema.sequences: sequence_catalog name, sequence_schema name, sequence_name name, data_type varchar, \
+information_schema.sequences/13572/v: sequence_catalog name, sequence_schema name, sequence_name name, data_type varchar, \
 numeric_precision int4, numeric_precision_radix int4, numeric_scale int4, start_value varchar, minimum_value varchar, \
 maximum_value varchar, increment varchar, cycle_option varchar
-information_schema.routines: specific_catalog name, specific_schema name, specific_name name, \
+information_schema.routines/13563/v: specific_catalog name, specific_schema name, specific_name name, \
 routine_catalog name, routine_schema name, routine_name name, routine_type varchar, data_type varchar, \
 routine_body varchar, routine_definition varchar, external_language varchar, is_deterministic varchar
-information_schema.parameters: specific_catalog name, specific_schema name, specific_name name, \
+information_schema.parameters/13520/v: specific_catalog name, specific_schema name, specific_name name, \
 ordinal_position int4, parameter_mode varchar, parameter_name name, data_type varchar
-information_schema.domains: domain_catalog name, domain_schema name, domain_name name, data_type varchar
-information_schema.table_privileges: grantor name, grantee name, table_catalog name, table_schema name, \
+information_schema.domains/13506/v: domain_catalog name, domain_schema name, domain_name name, data_type varchar
+information_schema.table_privileges/13602/v: grantor name, grantee name, table_catalog name, table_schema name, \
 table_name name, privilege_type varchar, is_grantable varchar, with_hierarchy varchar
-information_schema.column_privileges: grantor name, grantee name, table_catalog name, table_schema name, \
+information_schema.column_privileges/13471/v: grantor name, grantee name, table_catalog name, table_schema name, \
 table_name name, column_name name, privilege_type varchar, is_grantable varchar
-information_schema.role_table_grants: grantor name, grantee name, table_catalog name, table_schema name, \
+information_schema.role_table_grants/13607/v: grantor name, grantee name, table_catalog name, table_schema name, \
 table_name name, privilege_type varchar, is_grantable varchar, with_hierarchy varchar
-information_schema.enabled_roles: role_name name
-information_schema.applicable_roles: grantee name, role_name name, is_grantable varchar
-information_schema.character_sets: character_set_catalog name, character_set_schema name, \
+information_schema.enabled_roles/13511/v: role_name name
+information_schema.applicable_roles/13422/v: grantee name, role_name name, is_grantable varchar
+information_schema.character_sets/13436/v: character_set_catalog name, character_set_schema name, \
 character_set_name name, character_repertoire name, form_of_use name, default_collate_catalog name, \
 default_collate_schema name, default_collate_name name
-information_schema.element_types: object_catalog name, object_schema name, object_name name, object_type varchar, \
+information_schema.element_types/13679/v: object_catalog name, object_schema name, object_name name, object_type varchar, \
 collection_type_identifier name, data_type varchar, udt_catalog name, udt_schema name, udt_name name
 ";
 
 struct Rel {
     name: &'static str,
+    /// The OID and relkind real Postgres gives this relation.
+    oid: u32,
+    kind: char,
     cols: Vec<OutCol>,
 }
 
@@ -233,6 +236,10 @@ fn rels() -> &'static Vec<Rel> {
                 continue;
             }
             let (name, cols) = line.split_once(':').expect("catalog relation");
+            let mut parts = name.split('/');
+            let name = parts.next().unwrap();
+            let oid: u32 = parts.next().and_then(|o| o.parse().ok()).unwrap_or(0);
+            let kind = parts.next().and_then(|k| k.chars().next()).unwrap_or('v');
             let cols = cols
                 .split(',')
                 .map(|c| {
@@ -240,7 +247,7 @@ fn rels() -> &'static Vec<Rel> {
                     OutCol::new(n.trim().to_string(), parse_type(t.trim()))
                 })
                 .collect();
-            out.push(Rel { name: name.trim(), cols });
+            out.push(Rel { name: name.trim(), oid, kind, cols });
         }
         out
     })
@@ -283,6 +290,45 @@ pub fn is_catalog_relation(schema: Option<&str>, name: &str) -> bool {
             rels().iter().any(|r| r.name == name.to_ascii_lowercase()) && name.starts_with("pg_")
         }
     }
+}
+
+/// Type I/O functions drivers compare against, with their Postgres OIDs.
+/// JDBC detects array types with `typinput = 'array_in'::regproc`.
+pub const IO_PROCS: &[(&str, u32)] = &[
+    ("array_in", 750),
+    ("array_out", 751),
+    ("array_recv", 2400),
+    ("array_send", 2401),
+    ("record_in", 2290),
+    ("record_out", 2291),
+    ("byteain", 1244),
+    ("textin", 46),
+    ("int4in", 42),
+];
+
+/// The OID Postgres gives a system relation.
+pub fn relation_oid(schema: Option<&str>, name: &str) -> Option<u32> {
+    let key = qualified(schema, name);
+    let direct = rels().iter().find(|r| r.name == key && r.oid != 0);
+    let found = direct.or_else(|| {
+        // Unqualified names resolve in pg_catalog.
+        schema
+            .is_none()
+            .then(|| rels().iter().find(|r| r.name == key.to_ascii_lowercase() && r.oid != 0))
+            .flatten()
+    });
+    found.map(|r| r.oid)
+}
+
+/// Every system relation, for pg_class.
+fn system_relations() -> impl Iterator<Item = (&'static str, u32, char, u32)> {
+    rels().iter().filter(|r| r.oid != 0).map(|r| {
+        let (schema, name) = match r.name.split_once('.') {
+            Some((_, n)) => (INFORMATION_SCHEMA_NS, n),
+            None => (PG_CATALOG_NS, r.name),
+        };
+        (name, r.oid, r.kind, schema)
+    })
 }
 
 /// Resolves the relation a FROM item refers to, qualified or not.
@@ -336,6 +382,10 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
         }
         "pg_class" => {
+            for (name, oid, kind, schema) in system_relations() {
+                let ncols = columns(name).len() as i64;
+                out.push(pg_class_row(oid, name, schema, kind, ncols, 0, false, 0, 0));
+            }
             for tb in db.tables.values() {
                 out.push(pg_class_row(
                     tb.oid,
@@ -390,12 +440,12 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         b(c.not_null),
                         b(c.default.is_some()),
                         b(false),
-                        ch(match c.identity {
-                            Some((true, _)) => 'a',
-                            Some((false, _)) => 'd',
-                            None => '\0',
-                        }),
-                        ch(if c.generated.is_some() { 's' } else { '\0' }),
+                        match c.identity {
+                            Some((true, _)) => ch('a'),
+                            Some((false, _)) => ch('d'),
+                            None => t(""),
+                        },
+                        if c.generated.is_some() { ch('s') } else { t("") },
                         b(c.dropped),
                         b(true),
                         n(0),
@@ -1317,6 +1367,11 @@ fn pg_class_row(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn io_proc(name: &str) -> i64 {
+    IO_PROCS.iter().find(|(n, _)| *n == name).map(|(_, o)| *o as i64).unwrap_or(0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pg_type_row(
     oid: u32,
     name: &str,
@@ -1347,10 +1402,11 @@ fn pg_type_row(
         n(0),
         n(elem as i64),
         n(array as i64),
-        n(0),
-        n(0),
-        n(0),
-        n(0),
+        // Array types are recognised by their I/O functions.
+        n(if category == 'A' { io_proc("array_in") } else { 0 }),
+        n(if category == 'A' { io_proc("array_out") } else { 0 }),
+        n(if category == 'A' { io_proc("array_recv") } else { 0 }),
+        n(if category == 'A' { io_proc("array_send") } else { 0 }),
         n(0),
         n(0),
         n(0),
@@ -1444,9 +1500,16 @@ pub fn resolve_reg(
             .or_else(|| db.enums.values().find(|e| e.name == base_name).map(|e| e.oid as i64)),
         Base::Regnamespace => db.schema_by_name(&base_name).map(|o| o as i64),
         Base::Regproc | Base::Regprocedure => {
-            super::sigs::all_sigs().iter().find(|s| s.name == base_name).map(|s| s.oid as i64)
+            IO_PROCS.iter().find(|(n, _)| *n == base_name).map(|(_, o)| *o as i64).or_else(|| {
+                super::sigs::all_sigs().iter().find(|s| s.name == base_name).map(|s| s.oid as i64)
+            })
         }
         Base::Regrole => (base_name == "postgres" || base_name == user).then_some(10),
+        Base::Regclass | Base::Regoper | Base::Regoperator | Base::Regconfig | Base::Oid
+            if relation_oid(schema.as_deref(), &base_name).is_some() =>
+        {
+            relation_oid(schema.as_deref(), &base_name).map(|o| o as i64)
+        }
         _ => {
             let schemas: Vec<u32> = match &schema {
                 Some(s) => db.schema_by_name(s).into_iter().collect(),

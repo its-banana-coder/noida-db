@@ -10,11 +10,13 @@ pub struct OutCol {
     pub typmod: i32,
     pub table_oid: u32,
     pub attnum: i16,
+    /// Field names of a record-typed column, so `(col).field` resolves.
+    pub rec: Option<Vec<(String, Type)>>,
 }
 
 impl OutCol {
     pub fn new(name: impl Into<String>, ty: Type) -> OutCol {
-        OutCol { name: name.into(), ty, typmod: -1, table_oid: 0, attnum: 0 }
+        OutCol { name: name.into(), ty, typmod: -1, table_oid: 0, attnum: 0, rec: None }
     }
 }
 

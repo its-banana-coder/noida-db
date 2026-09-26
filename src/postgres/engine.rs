@@ -377,7 +377,7 @@ impl Engine {
             S::Set(set) => self.run_set(s, set),
             S::Reset { .. } => self.run_reset(s, stmt),
             S::ShowVariable { variable } => {
-                let name = variable.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("_");
+                let name = show_variable_name(variable);
                 if name.eq_ignore_ascii_case("all") {
                     let mut rows = vec![];
                     for (k, v) in s.rt.settings.all() {
@@ -890,6 +890,23 @@ fn statement_returns_rows(stmt: &a::Statement) -> bool {
     matches!(stmt, a::Statement::ShowVariable { .. } | a::Statement::Explain { .. })
 }
 
+/// `SHOW TRANSACTION ISOLATION LEVEL` and `SHOW TIME ZONE` name settings in
+/// words; everything else joins the words with underscores.
+fn show_variable_name(variable: &[a::Ident]) -> String {
+    let phrase = variable.iter().map(|i| i.value.to_lowercase()).collect::<Vec<_>>().join(" ");
+    match phrase.as_str() {
+        "transaction isolation level" => "transaction_isolation".into(),
+        "transaction read only" => "transaction_read_only".into(),
+        "transaction deferrable" => "transaction_deferrable".into(),
+        "time zone" => "TimeZone".into(),
+        "session authorization" => "session_authorization".into(),
+        "server version" => "server_version".into(),
+        "server encoding" => "server_encoding".into(),
+        "client encoding" => "client_encoding".into(),
+        _ => variable.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("_"),
+    }
+}
+
 fn describe_other(
     stmt: &a::Statement,
     _db: &DbState,
@@ -897,7 +914,7 @@ fn describe_other(
 ) -> PgResult<Vec<OutCol>> {
     Ok(match stmt {
         a::Statement::ShowVariable { variable } => {
-            let name = variable.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join("_");
+            let name = show_variable_name(variable);
             if name.eq_ignore_ascii_case("all") {
                 vec![
                     OutCol::new("name", Type::TEXT),
