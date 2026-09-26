@@ -557,6 +557,7 @@ dependencies = [
  "pgwire",
  "postgres",
  "redis",
+ "regex-lite",
  "serde_json",
  "sqlparser",
  "uuid",
