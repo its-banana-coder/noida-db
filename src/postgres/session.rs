@@ -34,6 +34,7 @@ const DEFAULTS: &[(&str, &str, bool)] = &[
     ("idle_in_transaction_session_timeout", "0", false),
     ("client_min_messages", "notice", false),
     ("default_transaction_isolation", "read committed", false),
+    ("default_table_access_method", "heap", false),
     ("transaction_isolation", "read committed", false),
     ("transaction_read_only", "off", false),
     ("default_transaction_deferrable", "off", false),
