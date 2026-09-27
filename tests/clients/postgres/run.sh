@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the committed Postgres client apps (psycopg, SQLAlchemy, node-postgres,
-# JDBC) against a server.
+# Runs the committed Postgres client apps (psycopg, SQLAlchemy, Django,
+# node-postgres, JDBC) against a server.
 #
 #   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
@@ -52,9 +52,9 @@ run_client() {
 # --- Python: psycopg 3 and SQLAlchemy -------------------------------------
 pylibs="$cache/pylibs"
 if [ ! -d "$pylibs/psycopg" ]; then
-  echo "== installing psycopg and SQLAlchemy"
+  echo "== installing psycopg, SQLAlchemy and Django"
   pip install --quiet --disable-pip-version-check --target "$pylibs" \
-    "psycopg[binary]" sqlalchemy >/dev/null 2>&1
+    "psycopg[binary]" sqlalchemy django >/dev/null 2>&1
 fi
 if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import psycopg" 2>/dev/null; then
   export PYTHONPATH="$pylibs"
@@ -63,6 +63,11 @@ if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import psycopg" 2>/dev
     run_client "sqlalchemy" python3 "$here/python/sqlalchemy_test.py"
   else
     echo "-- sqlalchemy SKIPPED (not installed)"
+  fi
+  if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import django" 2>/dev/null; then
+    run_client "django" python3 "$here/python/django_test.py"
+  else
+    echo "-- django SKIPPED (not installed)"
   fi
 else
   echo "-- psycopg SKIPPED (not installed)"

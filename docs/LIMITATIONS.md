@@ -86,9 +86,14 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 455 results) and by psycopg,
-SQLAlchemy, node-postgres and JDBC (`tests/clients/postgres/run.sh`). The
-introspection queries Django, Prisma and Hibernate send are in the diff tests.
+servers by `tests/postgres_diff.rs` (about 520 results) and by psycopg,
+SQLAlchemy, Django, node-postgres and JDBC (`tests/clients/postgres/run.sh`).
+Django's own management commands (`migrate`, including the built-in
+`auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a schema
+change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M, transactions and
+savepoints, introspection) pass end to end. The introspection queries Prisma
+and Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
+similar were compared by hand against a real server.
 
 **By design**
 
@@ -111,6 +116,10 @@ introspection queries Django, Prisma and Hibernate send are in the diff tests.
   `ORDER BY`, `min`/`max`).
 - `pg_attribute` has no system columns (`ctid`, `xmin`, ...).
 - `server_version` reports 16.4.
+- `pg_class`/`pg_index`/`pg_attribute` and friends list only user relations,
+  not the indexes and columns of the system catalogs themselves (a query that
+  scans all of `pg_index` sees fewer rows than on a real server; one that
+  names a user table works the same).
 
 ## MySQL and Kafka
 

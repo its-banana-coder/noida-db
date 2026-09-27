@@ -1298,7 +1298,13 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 )
             })?;
             let _ = ncols;
-            t.rows.clone()
+            // The binder numbers a table's columns without the dropped ones.
+            if t.columns.iter().any(|c| c.dropped) {
+                let live: Vec<usize> = t.live_columns().map(|(i, _)| i).collect();
+                t.rows.iter().map(|r| live.iter().map(|&i| r[i].clone()).collect()).collect()
+            } else {
+                t.rows.clone()
+            }
         }
         From::Virtual { name, .. } => pgcatalog::rows(name, ctx)?,
         From::Cte(slot) => ctx.ctes.get(*slot).cloned().flatten().unwrap_or_default(),
@@ -1308,27 +1314,21 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             ctx.outer.pop();
             r?
         }
-        From::Func { name, args, arg_tys, ncols, ordinality, .. } => {
-            let mut vals = vec![];
-            for a in args {
-                vals.push(eval(a, &[], ctx)?);
-            }
-            let mut rows = srf_rows(name, &vals, arg_tys, Type::TEXT, ctx)?;
-            if *ordinality {
-                for (i, r) in rows.iter_mut().enumerate() {
-                    r.push(Value::Int(i as i64 + 1));
-                }
-            }
-            let _ = ncols;
-            rows
-        }
+        From::Func { .. } => exec_func(f, &[], ctx)?,
         From::Join { left, right, kind, on, lateral, left_cols, right_cols } => {
             let lrows = exec_from(left, ctx)?;
             let mut out = vec![];
             if *lateral {
                 for l in &lrows {
                     ctx.outer.push(l.clone());
-                    let rrows = exec_from(right, ctx);
+                    // The left row is the innermost outer row: a lateral
+                    // subquery reads it as such, and a function's arguments
+                    // are evaluated against it.
+                    let rrows = match &**right {
+                        From::Sub(q) => run_query(q, ctx),
+                        f @ From::Func { .. } => exec_func(f, l, ctx),
+                        other => exec_from(other, ctx),
+                    };
                     ctx.outer.pop();
                     let rrows = rrows?;
                     let mut matched = false;
@@ -1379,6 +1379,23 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             out
         }
     })
+}
+
+/// A set-returning function in FROM; `row` is the left-hand row a LATERAL
+/// function's arguments refer to.
+fn exec_func(f: &From, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
+    let From::Func { name, args, arg_tys, ordinality, .. } = f else { return Ok(vec![]) };
+    let mut vals = vec![];
+    for a in args {
+        vals.push(eval(a, row, ctx)?);
+    }
+    let mut rows = srf_rows(name, &vals, arg_tys, Type::TEXT, ctx)?;
+    if *ordinality {
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.push(Value::Int(i as i64 + 1));
+        }
+    }
+    Ok(rows)
 }
 
 fn join_ok(on: &Option<Expr>, row: &[Value], ctx: &mut Ctx) -> PgResult<bool> {
@@ -1513,6 +1530,19 @@ fn srf_rows(
                 }
                 _ => vec![],
             }
+        }
+        "unnest" if a.len() > 1 => {
+            let lists: Vec<&[Value]> = a
+                .iter()
+                .map(|v| match v {
+                    Value::Array(arr) => arr.items.as_slice(),
+                    _ => &[],
+                })
+                .collect();
+            let n = lists.iter().map(|l| l.len()).max().unwrap_or(0);
+            (0..n)
+                .map(|i| lists.iter().map(|l| l.get(i).cloned().unwrap_or(Value::Null)).collect())
+                .collect()
         }
         "unnest" => match &a[0] {
             Value::Array(arr) => one(arr.items.clone()),

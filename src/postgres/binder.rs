@@ -803,8 +803,36 @@ impl<'a> Binder<'a> {
     }
 
     /// Adds columns functionally dependent on grouped primary keys.
-    fn expand_group_keys(&self, _keys: &mut [Expr]) -> usize {
-        0
+    fn expand_group_keys(&self, keys: &mut Vec<Expr>) -> usize {
+        let Some(scope) = self.scopes.last() else { return 0 };
+        let before = keys.len();
+        for rel in &scope.rels {
+            let cols: Vec<&SCol> =
+                scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel.as_str())).collect();
+            let Some(oid) = cols.first().map(|c| c.table_oid).filter(|&o| o != 0) else {
+                continue;
+            };
+            let Some(pk) = self.db.table(oid).and_then(|t| t.primary_key()) else { continue };
+            if pk.cols.is_empty() {
+                continue;
+            }
+            // Every primary-key column must be a group key itself.
+            let covered = pk.cols.iter().all(|&k| {
+                cols.iter()
+                    .find(|c| c.attnum as usize == k + 1)
+                    .is_some_and(|c| keys[..before].contains(&Expr::Col(c.idx)))
+            });
+            if !covered {
+                continue;
+            }
+            for c in cols {
+                let e = Expr::Col(c.idx);
+                if !keys.contains(&e) {
+                    keys.push(e);
+                }
+            }
+        }
+        keys.len() - before
     }
 
     fn bind_projection(
@@ -994,7 +1022,7 @@ impl<'a> Binder<'a> {
         }
         let (mut from, mut scope) = self.bind_table_with_joins(&items[0])?;
         for item in &items[1..] {
-            let (rhs, rscope) = self.bind_table_with_joins_at(item, scope.width())?;
+            let (rhs, rscope) = self.bind_table_with_joins_at(item, scope.width(), Some(&scope))?;
             let left_cols = scope.width();
             let right_cols = rscope.width();
             merge_scopes(&mut scope, rscope)?;
@@ -1003,7 +1031,7 @@ impl<'a> Binder<'a> {
                 right: Box::new(rhs),
                 kind: JoinKind::Cross,
                 on: None,
-                lateral: false,
+                lateral: is_lateral_item(&item.relation),
                 left_cols,
                 right_cols,
             };
@@ -1012,15 +1040,18 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_table_with_joins(&mut self, t: &a::TableWithJoins) -> PgResult<(From, Scope)> {
-        self.bind_table_with_joins_at(t, 0)
+        self.bind_table_with_joins_at(t, 0, None)
     }
 
+    /// `outer` is the FROM items to the left of a comma, which a function or
+    /// LATERAL item may refer to.
     fn bind_table_with_joins_at(
         &mut self,
         t: &a::TableWithJoins,
         base: usize,
+        outer: Option<&Scope>,
     ) -> PgResult<(From, Scope)> {
-        let (mut from, mut scope) = self.bind_factor(&t.relation, base, None)?;
+        let (mut from, mut scope) = self.bind_factor(&t.relation, base, outer)?;
         for join in &t.joins {
             let left_cols = scope.width();
             let (rhs, rscope) = self.bind_factor(&join.relation, base + left_cols, Some(&scope))?;
@@ -1073,11 +1104,7 @@ impl<'a> Binder<'a> {
                 right: Box::new(rhs),
                 kind,
                 on,
-                lateral: matches!(
-                    &join.relation,
-                    a::TableFactor::Derived { lateral: true, .. }
-                        | a::TableFactor::Function { lateral: true, .. }
-                ) || matches!(&join.relation, a::TableFactor::Table { args: Some(_), .. }),
+                lateral: is_lateral_item(&join.relation),
                 left_cols,
                 right_cols,
             };
@@ -1238,7 +1265,7 @@ impl<'a> Binder<'a> {
                 if alias.is_some() {
                     return Err(unsupported("aliased join"));
                 }
-                self.bind_table_with_joins_at(table_with_joins, base)
+                self.bind_table_with_joins_at(table_with_joins, base, None)
             }
             a::TableFactor::Function { lateral: _, name, args, alias, with_ordinality } => {
                 let fname = object_name(name).pop().unwrap_or_default();
@@ -1285,17 +1312,49 @@ impl<'a> Binder<'a> {
         let bound: PgResult<Vec<TE>> = args.iter().map(|e| self.bind_expr(e)).collect();
         self.frames.pop();
         self.scopes.pop();
-        let bound = bound?;
-        let arg_tys: Vec<Type> = bound.iter().map(|t| t.ty).collect();
-        let r = sigs::resolve(fname, &arg_tys)?;
-        let mut arg_exprs = vec![];
-        for (te, target) in bound.into_iter().zip(r.arg_tys.iter()) {
-            arg_exprs.push(self.coerce(te, *target, -1, CastCtx::Implicit, fname)?);
+        let mut bound = bound?;
+        // A lateral function's arguments are evaluated against the left-hand
+        // row, whose columns start at zero.
+        if let Some(l) = left {
+            let first = l.cols.iter().map(|c| c.idx).min().unwrap_or(0);
+            if first > 0 {
+                for t in &mut bound {
+                    rebase_cols(&mut t.e, first);
+                }
+            }
         }
-        let mut cols: Vec<OutCol> = if r.sig.cols.is_empty() {
-            vec![OutCol::new(fname.to_string(), r.ret)]
+        let arg_tys: Vec<Type> = bound.iter().map(|t| t.ty).collect();
+        // `unnest(a, b, ...)` in FROM: one column per array, padded with NULLs.
+        let multi_unnest = fname == "unnest" && bound.len() > 1;
+        let (sig_name, arg_exprs, arg_tys, mut cols) = if multi_unnest {
+            let mut cols = vec![];
+            for t in &arg_tys {
+                let elem = match t.base {
+                    _ if t.array => t.elem(),
+                    Base::Int2Vector => Type::INT2,
+                    Base::OidVector => Type::OID,
+                    _ => {
+                        // Reports "function unnest(...) does not exist".
+                        sigs::resolve("unnest", &[*t])?;
+                        return Err(PgError::new(code::UNDEFINED_FUNCTION, "unnest needs arrays"));
+                    }
+                };
+                cols.push(OutCol::new("unnest".to_string(), elem));
+            }
+            let exprs = bound.into_iter().map(|t| t.e).collect();
+            ("unnest", exprs, arg_tys, cols)
         } else {
-            r.sig.cols.iter().map(|(n, t)| OutCol::new(n.to_string(), *t)).collect()
+            let r = sigs::resolve(fname, &arg_tys)?;
+            let mut arg_exprs = vec![];
+            for (te, target) in bound.into_iter().zip(r.arg_tys.iter()) {
+                arg_exprs.push(self.coerce(te, *target, -1, CastCtx::Implicit, fname)?);
+            }
+            let cols: Vec<OutCol> = if r.sig.cols.is_empty() {
+                vec![OutCol::new(fname.to_string(), r.ret)]
+            } else {
+                r.sig.cols.iter().map(|(n, t)| OutCol::new(n.to_string(), *t)).collect()
+            };
+            (r.sig.name, arg_exprs, r.arg_tys, cols)
         };
         if ordinality {
             cols.push(OutCol::new("ordinality", Type::INT8));
@@ -1329,9 +1388,9 @@ impl<'a> Binder<'a> {
         let ncols = cols.len();
         Ok((
             From::Func {
-                name: r.sig.name,
+                name: sig_name,
                 args: arg_exprs,
-                arg_tys: r.arg_tys,
+                arg_tys,
                 ncols,
                 ordinality,
                 lateral: left.is_some(),
@@ -1990,8 +2049,9 @@ impl<'a> Binder<'a> {
             | a::Value::TripleDoubleQuotedString(s) => {
                 TE::new(Expr::Const(Value::text(s.clone())), Type::UNKNOWN)
             }
+            // sqlparser has already decoded the backslash escapes.
             a::Value::EscapedStringLiteral(s) => {
-                TE::new(Expr::Const(Value::text(unescape_c(s))), Type::UNKNOWN)
+                TE::new(Expr::Const(Value::text(s.clone())), Type::UNKNOWN)
             }
             a::Value::DollarQuotedString(s) => {
                 TE::new(Expr::Const(Value::text(s.value.clone())), Type::UNKNOWN)
@@ -4026,9 +4086,10 @@ impl<'a> Binder<'a> {
         items: &[a::TableWithJoins],
         base: usize,
     ) -> PgResult<(From, Scope)> {
-        let (mut from, mut scope) = self.bind_table_with_joins_at(&items[0], base)?;
+        let (mut from, mut scope) = self.bind_table_with_joins_at(&items[0], base, None)?;
         for item in &items[1..] {
-            let (rhs, rscope) = self.bind_table_with_joins_at(item, base + scope.width())?;
+            let (rhs, rscope) =
+                self.bind_table_with_joins_at(item, base + scope.width(), Some(&scope))?;
             let left_cols = scope.width();
             let right_cols = rscope.width();
             merge_scopes(&mut scope, rscope)?;
@@ -4037,7 +4098,7 @@ impl<'a> Binder<'a> {
                 right: Box::new(rhs),
                 kind: JoinKind::Cross,
                 on: None,
-                lateral: false,
+                lateral: is_lateral_item(&item.relation),
                 left_cols,
                 right_cols,
             };
@@ -4471,6 +4532,16 @@ fn outerize(mut e: Expr, depth: usize) -> Expr {
     e
 }
 
+/// Whether a FROM item may refer to the items before it.
+fn is_lateral_item(f: &a::TableFactor) -> bool {
+    matches!(
+        f,
+        a::TableFactor::Derived { lateral: true, .. }
+            | a::TableFactor::Function { lateral: true, .. }
+            | a::TableFactor::UNNEST { .. }
+    ) || matches!(f, a::TableFactor::Table { args: Some(_), .. })
+}
+
 /// Renumbers columns so that the ones at `base` and beyond start at zero.
 fn rebase_cols(e: &mut Expr, base: usize) {
     if let Expr::Col(i) = e {
@@ -4584,28 +4655,4 @@ fn query_references(q: &a::Query, name: &str) -> bool {
 
 fn first_words(s: &str) -> String {
     s.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
-}
-
-/// C-style escapes in E'...' strings.
-fn unescape_c(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut it = s.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match it.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            Some('b') => out.push('\u{8}'),
-            Some('f') => out.push('\u{c}'),
-            Some('\\') => out.push('\\'),
-            Some('\'') => out.push('\''),
-            Some(o) => out.push(o),
-            None => {}
-        }
-    }
-    out
 }
