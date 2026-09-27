@@ -20,6 +20,7 @@ pub mod funcs;
 pub mod keywords;
 pub mod pgcatalog;
 pub mod plan;
+pub mod ranges;
 pub mod refresh;
 pub mod seqddl;
 pub mod server;

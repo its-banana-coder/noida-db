@@ -6,6 +6,7 @@ use super::error::{PgError, PgResult, code};
 use super::fts;
 use super::json::{self, Json};
 use super::numeric::{NumError, Numeric};
+use super::ranges;
 use super::types::{self, Array, Base, FmtCtx, Type, Value};
 
 /// What pure functions may read from the session.
@@ -73,6 +74,18 @@ pub fn as_f64(v: &Value) -> f64 {
 fn int_result(v: Option<i64>, ty: Type) -> PgResult<Value> {
     let v = v.ok_or_else(|| err(code::NUMERIC_VALUE_OUT_OF_RANGE, types::int_range_msg(ty)))?;
     types::check_int_range(v, ty).map(Value::Int)
+}
+
+/// The `Base` a range constructor function's own name builds.
+fn range_name_base(name: &str) -> Base {
+    match name {
+        "int4range" => Base::Int4Range,
+        "int8range" => Base::Int8Range,
+        "numrange" => Base::NumRange,
+        "daterange" => Base::DateRange,
+        "tsrange" => Base::TsRange,
+        _ => Base::TstzRange,
+    }
 }
 
 /// `(config, text)` for `to_tsvector`/`to_tsquery`/`plainto_tsquery`/
@@ -286,6 +299,29 @@ pub fn binop(
             Jsonb(Box::new(j))
         }
         ("#-", Jsonb(x), Array(p)) => Jsonb(Box::new(jsonb_delete_path(x, &text_items(p))?)),
+        // Ranges: `range @> range`, `range @> element`, `element <@ range`,
+        // `range && range`.
+        ("@>" | "<@" | "&&", _, _) if tys[0].is_range() || tys[1].is_range() => {
+            let dctx = env.dctx();
+            let range_base = if tys[0].is_range() { tys[0].base } else { tys[1].base };
+            let both_ranges = tys[0].is_range() && tys[1].is_range();
+            if both_ranges {
+                let ra = ranges::parse(text(a), range_base, &dctx)?;
+                let rb = ranges::parse(text(b), range_base, &dctx)?;
+                match op {
+                    "@>" => Bool(ranges::contains_range(&ra, &rb)),
+                    "<@" => Bool(ranges::contains_range(&rb, &ra)),
+                    _ => Bool(ranges::overlaps(&ra, &rb)),
+                }
+            } else if op == "@>" {
+                let r = ranges::parse(text(a), range_base, &dctx)?;
+                Bool(ranges::contains_elem(&r, b))
+            } else {
+                // <@: element <@ range.
+                let r = ranges::parse(text(b), range_base, &dctx)?;
+                Bool(ranges::contains_elem(&r, a))
+            }
+        }
         // Full-text search: whichever operand resolved to tsquery names
         // the query side, the other is the tsvector side (Postgres allows
         // either order, `tsvector @@ tsquery` and `tsquery @@ tsvector`).
@@ -1477,6 +1513,10 @@ pub fn call(
             })
         }
         // --- strings
+        "lower" | "upper" if tys[0].is_range() => {
+            let r = ranges::parse(text(&a[0]), tys[0].base, &env.dctx())?;
+            return Ok(Some(if name == "lower" { r.lower_value() } else { r.upper_value() }));
+        }
         "lower" => Text(text(&a[0]).to_lowercase()),
         "upper" => Text(text(&a[0]).to_uppercase()),
         "initcap" => Text(initcap(text(&a[0]))),
@@ -1682,6 +1722,15 @@ pub fn call(
             let q = fts::parse_query_text(text(&a[1]))?
                 .unwrap_or(fts::Query::Lexeme(String::new(), false));
             return Ok(Some(Float(fts::rank(&vec, &q) as f64)));
+        }
+        "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
+            let base = range_name_base(name);
+            let bounds = a.get(2).map_or("[)", |v| text(v));
+            return Ok(Some(Text(ranges::construct(a[0].clone(), a[1].clone(), bounds, base)?)));
+        }
+        "isempty" => {
+            let r = ranges::parse(text(&a[0]), tys[0].base, &env.dctx())?;
+            return Ok(Some(Bool(r.empty)));
         }
         "quote_nullable" => {
             if a[0].is_null() {

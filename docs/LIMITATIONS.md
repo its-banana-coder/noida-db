@@ -86,7 +86,7 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 585 results) and by psycopg,
+servers by `tests/postgres_diff.rs` (about 615 results) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx,
 GORM and JDBC (`tests/clients/postgres/run.sh`). Django's own management
 commands (`migrate`, including the built-in `auth`/`admin`/`sessions`/
@@ -129,6 +129,18 @@ error and hint a real server does. `pg_matviews.ispopulated` reflects this.
 `CONCURRENTLY` is accepted and has no effect (no locking to avoid; nothing
 here blocks readers while refreshing anyway).
 
+Range types (`int4range`/`int8range`/`numrange`/`daterange`/`tsrange`/
+`tstzrange`) work: canonical text (discrete ranges always canonicalize to
+`[lower,upper)`, continuous ones keep whatever bounds were given; a
+lower bound greater than the upper is a real error, equal bounds are
+`empty` unless both are inclusive, in which case it's a genuine
+single-point range — all matching a real server exactly), the
+constructor functions, `@>`/`<@`/`&&`, and `lower`/`upper`/`isempty`.
+Not implemented: `lower_inc`/`upper_inc`, the union/difference/
+intersection operators (`+`/`-`/`*`), the adjacency and positional
+operators (`-|-`, `<<`, `>>`, `&<`, `&>`), multiranges, and exclusion
+constraints.
+
 **By design**
 
 - Replication of any kind (streaming, logical, master/slave, primary/replica
@@ -143,7 +155,7 @@ here blocks readers while refreshing anyway).
 **Not yet**
 
 - PL/pgSQL and stored procedures (so no triggers either), extensions.
-- Range types, `CREATE PROCEDURE`/`CALL`.
+- `CREATE PROCEDURE`/`CALL`.
 - Full-text search: GIN/GiST indexes, `ts_headline`, `websearch_to_tsquery`,
   any text search config other than `'english'`/`'simple'`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.

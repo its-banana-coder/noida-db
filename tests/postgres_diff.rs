@@ -466,6 +466,29 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT * FROM mv",
         "REFRESH MATERIALIZED VIEW nosuchview",
     ],
+    // Range types: canonical text (discrete canonicalization, unbounded
+    // sides, quoting), constructors, @>/<@/&&, lower/upper/isempty, and the
+    // lower>upper / lower==upper (empty vs single-point) edge cases.
+    &[
+        "SELECT '[1,10)'::int4range, '[1,10]'::int4range, '(,10)'::int4range, '(1,)'::int4range",
+        "SELECT 'empty'::int4range, '[5,5)'::int4range, '[5,5]'::numrange, '(5,5]'::numrange",
+        "SELECT '(1.5,10.5]'::numrange, '[2020-01-01,2020-02-01)'::daterange",
+        "SELECT '[2020-01-01 10:00:00,2020-01-01 12:00:00)'::tsrange",
+        "SELECT '[10,5)'::int4range",
+        "SELECT '(10,5]'::numrange",
+        "SELECT int4range(1, 10), int4range(1, 10, '[]'), int8range(1, 10)",
+        "SELECT numrange(1.5, 10.5), daterange('2020-01-01', '2020-02-01')",
+        "SELECT '[1,10)'::int4range @> 5, '[1,10)'::int4range @> 15, 5 <@ '[1,10)'::int4range",
+        "SELECT '[1,5)'::int4range @> '[2,4)'::int4range, '[1,5)'::int4range @> '[0,4)'::int4range",
+        "SELECT '[1,5)'::int4range && '[3,8)'::int4range, '[1,5)'::int4range && '[8,10)'::int4range",
+        "SELECT '[1,5)'::int4range && '[5,8)'::int4range",
+        "SELECT lower('[1,10)'::int4range), upper('[1,10)'::int4range), isempty('[1,10)'::int4range)",
+        "SELECT isempty('empty'::int4range)",
+        "CREATE TABLE bookings (id int, span daterange)",
+        "INSERT INTO bookings VALUES (1, '[2024-01-01,2024-01-10)'), (2, '[2024-02-01,2024-02-05)')",
+        "SELECT id FROM bookings WHERE span @> '2024-01-05'::date ORDER BY id",
+        "SELECT id FROM bookings WHERE span && '[2024-01-05,2024-01-15)'::daterange ORDER BY id",
+    ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).
     &[

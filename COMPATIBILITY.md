@@ -87,13 +87,15 @@ Every service is its own module:
     (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`, `@@`,
     `ts_rank`; verified against Django's `django.contrib.postgres.search`),
     `REFRESH MATERIALIZED VIEW`.
-  - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz
-    and numeric.
+  - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz,
+    numeric and the range types (`int4range`/`int8range`/`numrange`/
+    `daterange`/`tsrange`/`tstzrange`: canonical text, `@>`/`<@`/`&&`,
+    `lower`/`upper`/`isempty`).
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
     Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
 - **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
-  extensions, range types, logical replication, `COPY` to/from a
-  server-side file or program, `FORMAT BINARY`, full-text search GIN/GiST
+  extensions, logical replication, `COPY` to/from a server-side file or
+  program, `FORMAT BINARY`, full-text search GIN/GiST
   indexes and `ts_headline`. Concurrency is one writer at a time.
 - **Known gap:** enum values order and compare by label text, not by the
   order they were declared in (`<`, `ORDER BY`, `min`/`max`).

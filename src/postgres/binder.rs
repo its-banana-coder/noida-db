@@ -2500,7 +2500,17 @@ impl<'a> Binder<'a> {
                 (container, Type::array_of(Base::Text), ret)
             }
             "@>" | "<@" => {
-                if lt.array || rt.array {
+                if lt.is_range() || rt.is_range() {
+                    let range = if lt.is_range() { lt } else { rt };
+                    if lt.base == rt.base {
+                        (range, range, Type::BOOL)
+                    } else {
+                        // range @> element / element <@ range: the other
+                        // side is a value of the range's own element type.
+                        let elem = super::ranges::elem_type(range.base);
+                        if lt.is_range() { (lt, elem, Type::BOOL) } else { (elem, rt, Type::BOOL) }
+                    }
+                } else if lt.array || rt.array {
                     let elem = if lt.array { lt } else { rt };
                     (elem, elem, Type::BOOL)
                 } else {
@@ -2508,8 +2518,13 @@ impl<'a> Binder<'a> {
                 }
             }
             "&&" => {
-                let elem = if lt.array { lt } else { rt };
-                (elem, elem, Type::BOOL)
+                if lt.is_range() || rt.is_range() {
+                    let range = if lt.is_range() { lt } else { rt };
+                    (range, range, Type::BOOL)
+                } else {
+                    let elem = if lt.array { lt } else { rt };
+                    (elem, elem, Type::BOOL)
+                }
             }
             "?" => (Type::JSONB, Type::TEXT, Type::BOOL),
             "?|" | "?&" => (Type::JSONB, Type::array_of(Base::Text), Type::BOOL),
@@ -3347,6 +3362,12 @@ impl<'a> Binder<'a> {
             "regrole" => Some(Base::Regrole),
             "tsvector" => Some(Base::Tsvector),
             "tsquery" => Some(Base::Tsquery),
+            "int4range" => Some(Base::Int4Range),
+            "int8range" => Some(Base::Int8Range),
+            "numrange" => Some(Base::NumRange),
+            "daterange" => Some(Base::DateRange),
+            "tsrange" => Some(Base::TsRange),
+            "tstzrange" => Some(Base::TstzRange),
             "pg_lsn" => Some(Base::PgLsn),
             "jsonb" => Some(Base::Jsonb),
             "json" => Some(Base::Json),
