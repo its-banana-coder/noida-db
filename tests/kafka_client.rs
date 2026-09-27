@@ -316,4 +316,71 @@ fn test_kafka_milestone_1_and_2() {
         &desc_cluster_req,
     );
     assert_eq!(desc_cluster_resp.error_code, 0);
+
+    // 16. Transactions (AddPartitionsToTxn, AddOffsetsToTxn, TxnOffsetCommit, EndTxn)
+    let mut add_parts_txn_req = kafka_protocol::messages::AddPartitionsToTxnRequest::default();
+    add_parts_txn_req.v3_and_below_transactional_id = kafka_protocol::messages::TransactionalId(StrBytes::from_string("tx-1".to_string()));
+    let mut txn_topic = kafka_protocol::messages::add_partitions_to_txn_request::AddPartitionsToTxnTopic::default();
+    txn_topic.name = topic_name.clone();
+    txn_topic.partitions.push(0);
+    add_parts_txn_req.v3_and_below_topics = vec![txn_topic];
+
+    let add_parts_txn_resp: kafka_protocol::messages::AddPartitionsToTxnResponse = send_request(
+        &mut stream,
+        ApiKey::AddPartitionsToTxn,
+        1,
+        19,
+        Some("test-client"),
+        &add_parts_txn_req,
+    );
+    assert_eq!(add_parts_txn_resp.results_by_topic_v3_and_below[0].results_by_partition[0].partition_error_code, 0);
+
+    let mut add_offs_txn_req = kafka_protocol::messages::AddOffsetsToTxnRequest::default();
+    add_offs_txn_req.transactional_id = kafka_protocol::messages::TransactionalId(StrBytes::from_string("tx-1".to_string()));
+    add_offs_txn_req.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
+
+    let add_offs_txn_resp: kafka_protocol::messages::AddOffsetsToTxnResponse = send_request(
+        &mut stream,
+        ApiKey::AddOffsetsToTxn,
+        1,
+        20,
+        Some("test-client"),
+        &add_offs_txn_req,
+    );
+    assert_eq!(add_offs_txn_resp.error_code, 0);
+
+    let mut txn_commit_req = kafka_protocol::messages::TxnOffsetCommitRequest::default();
+    txn_commit_req.transactional_id = kafka_protocol::messages::TransactionalId(StrBytes::from_string("tx-1".to_string()));
+    txn_commit_req.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
+    let mut toc_topic = kafka_protocol::messages::txn_offset_commit_request::TxnOffsetCommitRequestTopic::default();
+    toc_topic.name = topic_name.clone();
+    let mut toc_part = kafka_protocol::messages::txn_offset_commit_request::TxnOffsetCommitRequestPartition::default();
+    toc_part.partition_index = 0;
+    toc_part.committed_offset = 100;
+    toc_topic.partitions.push(toc_part);
+    txn_commit_req.topics.push(toc_topic);
+
+    let txn_commit_resp: kafka_protocol::messages::TxnOffsetCommitResponse = send_request(
+        &mut stream,
+        ApiKey::TxnOffsetCommit,
+        1,
+        21,
+        Some("test-client"),
+        &txn_commit_req,
+    );
+    assert_eq!(txn_commit_resp.topics[0].partitions[0].error_code, 0);
+
+    let mut end_txn_req = kafka_protocol::messages::EndTxnRequest::default();
+    end_txn_req.transactional_id = kafka_protocol::messages::TransactionalId(StrBytes::from_string("tx-1".to_string()));
+    end_txn_req.committed = true;
+
+    let end_txn_resp: kafka_protocol::messages::EndTxnResponse = send_request(
+        &mut stream,
+        ApiKey::EndTxn,
+        1,
+        22,
+        Some("test-client"),
+        &end_txn_req,
+    );
+    assert_eq!(end_txn_resp.error_code, 0);
 }

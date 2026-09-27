@@ -97,6 +97,10 @@ impl EngineState {
             (ApiKey::DescribeConfigs, 0, 4),
             (ApiKey::DescribeCluster, 0, 0),
             (ApiKey::OffsetForLeaderEpoch, 0, 4),
+            (ApiKey::AddPartitionsToTxn, 0, 3),
+            (ApiKey::AddOffsetsToTxn, 0, 3),
+            (ApiKey::EndTxn, 0, 3),
+            (ApiKey::TxnOffsetCommit, 0, 3),
             (ApiKey::ApiVersions, 0, 3),
             (ApiKey::CreateTopics, 0, 7),
             (ApiKey::DeleteTopics, 0, 6),
@@ -752,6 +756,88 @@ impl EngineState {
 
         res
     }
+
+    pub fn handle_add_partitions_to_txn(
+        &self,
+        req: &kafka_protocol::messages::AddPartitionsToTxnRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::AddPartitionsToTxnResponse {
+        use kafka_protocol::messages::add_partitions_to_txn_response::{
+            AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
+        };
+        let mut res = kafka_protocol::messages::AddPartitionsToTxnResponse::default();
+
+        for topic in &req.v3_and_below_topics {
+            let mut topic_res = AddPartitionsToTxnTopicResult::default();
+            topic_res.name = topic.name.clone();
+
+            for &p_id in &topic.partitions {
+                let mut part_res = AddPartitionsToTxnPartitionResult::default();
+                part_res.partition_index = p_id;
+                part_res.partition_error_code = 0;
+                topic_res.results_by_partition.push(part_res);
+            }
+
+            res.results_by_topic_v3_and_below.push(topic_res);
+        }
+
+        res
+    }
+
+    pub fn handle_add_offsets_to_txn(
+        &self,
+        _req: &kafka_protocol::messages::AddOffsetsToTxnRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::AddOffsetsToTxnResponse {
+        let mut res = kafka_protocol::messages::AddOffsetsToTxnResponse::default();
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_end_txn(
+        &self,
+        _req: &kafka_protocol::messages::EndTxnRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::EndTxnResponse {
+        let mut res = kafka_protocol::messages::EndTxnResponse::default();
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_txn_offset_commit(
+        &mut self,
+        req: &kafka_protocol::messages::TxnOffsetCommitRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::TxnOffsetCommitResponse {
+        use kafka_protocol::messages::txn_offset_commit_response::{
+            TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic,
+        };
+        let mut res = kafka_protocol::messages::TxnOffsetCommitResponse::default();
+        let group_id = req.group_id.as_str().to_string();
+
+        for topic in &req.topics {
+            let mut topic_res = TxnOffsetCommitResponseTopic::default();
+            topic_res.name = topic.name.clone();
+            let topic_name = topic.name.as_str().to_string();
+
+            for part in &topic.partitions {
+                let mut part_res = TxnOffsetCommitResponsePartition::default();
+                part_res.partition_index = part.partition_index;
+
+                self.committed_offsets.insert(
+                    (group_id.clone(), topic_name.clone(), part.partition_index),
+                    part.committed_offset,
+                );
+
+                part_res.error_code = 0;
+                topic_res.partitions.push(part_res);
+            }
+
+            res.topics.push(topic_res);
+        }
+
+        res
+    }
 }
 
 fn uuid_simple() -> u128 {
@@ -927,5 +1013,37 @@ impl Engine {
         version: i16,
     ) -> kafka_protocol::messages::OffsetForLeaderEpochResponse {
         self.state.lock().unwrap().handle_offset_for_leader_epoch(req, version)
+    }
+
+    pub fn handle_add_partitions_to_txn(
+        &self,
+        req: &kafka_protocol::messages::AddPartitionsToTxnRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::AddPartitionsToTxnResponse {
+        self.state.lock().unwrap().handle_add_partitions_to_txn(req, version)
+    }
+
+    pub fn handle_add_offsets_to_txn(
+        &self,
+        req: &kafka_protocol::messages::AddOffsetsToTxnRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::AddOffsetsToTxnResponse {
+        self.state.lock().unwrap().handle_add_offsets_to_txn(req, version)
+    }
+
+    pub fn handle_end_txn(
+        &self,
+        req: &kafka_protocol::messages::EndTxnRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::EndTxnResponse {
+        self.state.lock().unwrap().handle_end_txn(req, version)
+    }
+
+    pub fn handle_txn_offset_commit(
+        &self,
+        req: &kafka_protocol::messages::TxnOffsetCommitRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::TxnOffsetCommitResponse {
+        self.state.lock().unwrap().handle_txn_offset_commit(req, version)
     }
 }

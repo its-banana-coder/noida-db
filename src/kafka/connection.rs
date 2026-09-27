@@ -342,6 +342,58 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     header.request_api_version,
                 )
             }
+            ApiKey::AddPartitionsToTxn => {
+                let req = match kafka_protocol::messages::AddPartitionsToTxnRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_add_partitions_to_txn(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::AddOffsetsToTxn => {
+                let req = match kafka_protocol::messages::AddOffsetsToTxnRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_add_offsets_to_txn(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::EndTxn => {
+                let req = match kafka_protocol::messages::EndTxnRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_end_txn(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::TxnOffsetCommit => {
+                let req = match kafka_protocol::messages::TxnOffsetCommitRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_txn_offset_commit(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
             _ => break,
         };
 
