@@ -19,8 +19,10 @@ implementation; read it before starting.
 - **No performance analysis:** don't build EXPLAIN ANALYZE, slow logs or
   stats. If clients may send such commands, accept them and return a minimal
   valid reply.
-- **Single node:** no clustering or replication. Where a feature needs a
-  cluster, reply as a standalone real server would.
+- **Local development only:** no replication, clustering, sharding,
+  sentinel/HA/failover, backup/restore/migration, or multi-user security
+  management: not even stubs. Those commands and APIs behave as unknown. See
+  "Scope filter" in `docs/specs/README.md`.
 
 ## Layout
 

@@ -336,3 +336,16 @@ statistics.
    Hibernate schema validation, SQLAlchemy and Prisma scenarios pass.
 6. Differential suite for all P0 protocol, bootstrap and engine SQL is green
    in CI; add `mysql` to default features and update `COMPATIBILITY.md`.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Replication and binlog, `COM_BINLOG_DUMP`, Group Replication.
+- Users, grants and roles management (`CREATE USER`, `GRANT`, `SHOW GRANTS`):
+  statements that appear in ordinary migrations are accepted and stored but
+  never enforced; no privilege tables beyond `mysql.user` for the default
+  account.
+- `XA` transactions, events scheduler behaviour, partitioning management.

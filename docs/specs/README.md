@@ -47,6 +47,37 @@ agent (or person) can pick one up without other context.
   setup are part of the deliverable. They are how the project owner trusts
   the work.
 
+## Scope filter: local development only
+
+noida is a development tool. Build what a developer on a laptop uses while
+building or debugging an app. **Do not implement, not even as stubs or cheap
+error replies**, anything whose purpose is running or operating production:
+
+- **Replication, clustering, sharding, sentinel, HA, failover, leader
+  election**, and the commands that manage or inspect such topologies.
+- **Backup, restore, snapshot, migration and bulk-transfer machinery**
+  (Redis DUMP/RESTORE/MIGRATE, Elasticsearch snapshots, ClickHouse
+  BACKUP/RESTORE, MongoDB replica-set management, MirrorMaker...).
+- **Security hardening beyond one default login**: multi-user ACL/RBAC
+  management, TLS, auditing, quotas, encryption at rest. (SQL statements that
+  ordinary schema migrations contain, such as `GRANT`, may be accepted and
+  stored but never enforced; say so in the service's docs.)
+- **Operational performance analysis and tuning** (already forbidden). Empty,
+  minimal replies for inspection commands that developer GUIs probe on connect
+  (for example Redis `SLOWLOG GET`) are fine.
+- **Storage-engine internals and maintenance** (compaction tuning, vacuum
+  statistics, rebalancing).
+
+Excluded commands and APIs behave as *unknown* (unknown command, unsupported
+API key, 404). List them in the service's non-goals and in its coverage test.
+
+A *facade* that clients need in order to connect and work is allowed, with no
+commands to manage it: MongoDB reports itself as a one-node replica set so
+transactions and change streams work; Kafka advertises one broker.
+
+Litmus test: *would a developer on a laptop use this while building or
+debugging an app?* If not, skip it.
+
 ## Working agreement
 
 - Branch `svc/<service>` from the latest `main`. Push often; CI runs on
