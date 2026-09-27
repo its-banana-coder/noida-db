@@ -2093,6 +2093,9 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
     (
         (6, 0),
         &[
+            // A real server logs any command over 10ms, so a busy machine can
+            // leave entries behind; turn the log off to keep this deterministic.
+            "CONFIG SET slowlog-log-slower-than -1",
             "SLOWLOG RESET",
             "SLOWLOG LEN",
             "SLOWLOG GET",
