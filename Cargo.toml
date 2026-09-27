@@ -5,15 +5,19 @@ edition = "2024"
 description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
 license = "MIT"
 
+[workspace]
+
 # One feature per service, so people can build only what they use.
 [features]
 default = ["redis"]
 redis = []
 postgres = []
-kafka = []
+kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
 
 [dependencies]
+bytes = { version = "1.12.1", optional = true }
+kafka-protocol = { version = "0.18.0", optional = true }
 
 # The whole point of noida is a small footprint: tune release builds for size.
 [profile.release]
@@ -42,3 +46,11 @@ required-features = ["redis"]
 [[test]]
 name = "longdouble_oracle"
 required-features = ["redis"]
+
+[[test]]
+name = "kafka_client"
+required-features = ["kafka"]
+
+[[test]]
+name = "kafka_diff"
+required-features = ["kafka"]
