@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the committed Postgres client apps (psycopg, SQLAlchemy, Django,
-# asyncpg, node-postgres, Knex, TypeORM, JDBC) against a server.
+# asyncpg, node-postgres, Knex, TypeORM, pgx, GORM, JDBC) against a server.
 #
 #   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
@@ -101,6 +101,14 @@ if command -v node >/dev/null && command -v npm >/dev/null; then
   fi
 else
   echo "-- node-postgres, knex, typeorm SKIPPED (no node)"
+fi
+
+# --- Go: pgx and GORM -------------------------------------------------------
+if command -v go >/dev/null; then
+  run_client "pgx" env -C "$here/go" go run ./pgx
+  run_client "gorm" env -C "$here/go" go run ./gorm
+else
+  echo "-- pgx, gorm SKIPPED (no go)"
 fi
 
 # --- Java: the PostgreSQL JDBC driver --------------------------------------

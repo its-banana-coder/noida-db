@@ -87,8 +87,9 @@ current count).
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
 servers by `tests/postgres_diff.rs` (about 535 results) and by psycopg,
-SQLAlchemy, Django, asyncpg, node-postgres, Knex, TypeORM and JDBC
-(`tests/clients/postgres/run.sh`).
+SQLAlchemy, Django, asyncpg, node-postgres, Knex, TypeORM, pgx, GORM and
+JDBC (`tests/clients/postgres/run.sh`). `COPY` (used by pgx's `CopyFrom`)
+is a documented gap, reported as such rather than a failure.
 Django's own management commands (`migrate`, including the built-in
 `auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a schema
 change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M, transactions and
