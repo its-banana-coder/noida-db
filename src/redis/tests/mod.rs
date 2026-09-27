@@ -10,6 +10,7 @@ mod introspection;
 mod lists;
 mod multi;
 mod pubsub;
+mod scripting;
 mod sets;
 mod streams;
 mod strings_keys;

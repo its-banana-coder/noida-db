@@ -21,6 +21,10 @@ pub enum Value {
     /// RESP3 double (`,`); a bulk string on RESP2. Formatted like Redis's
     /// `d2string`.
     Double(f64),
+    /// RESP3 boolean (`#`); `:1` or a null bulk string on RESP2.
+    Bool(bool),
+    /// RESP3 big number (`(`); a bulk string on RESP2.
+    BigNumber(String),
     /// RESP3 push (`>`); an array on RESP2 (pub/sub messages).
     Push(Vec<Value>),
     /// Several replies sent back to back (SUBSCRIBE to many channels).
@@ -95,6 +99,11 @@ pub fn encode(v: &Value, proto: u8, out: &mut Vec<u8>) {
         Value::Double(d) => bulk(out, b'$', super::double::d2string(*d).as_bytes()),
         Value::Push(items) => aggregate(out, if resp3 { b'>' } else { b'*' }, items, proto),
         Value::Many(items) => items.iter().for_each(|v| encode(v, proto, out)),
+        Value::Bool(b) if resp3 => line(out, b'#', if *b { b"t" } else { b"f" }),
+        Value::Bool(true) => line(out, b':', b"1"),
+        Value::Bool(false) => out.extend_from_slice(b"$-1\r\n"),
+        Value::BigNumber(n) if resp3 => line(out, b'(', n.as_bytes()),
+        Value::BigNumber(n) => bulk(out, b'$', n.as_bytes()),
         Value::NoReply => {}
     }
 }

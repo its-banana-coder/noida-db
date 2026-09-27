@@ -3,6 +3,7 @@
 mod admin;
 mod bitops;
 mod blocking;
+mod cjson;
 mod command_meta;
 mod config;
 mod config_table;
@@ -21,8 +22,10 @@ mod num;
 mod ordered;
 mod pubsub;
 pub mod resp;
+pub(crate) mod scripting;
 pub mod server;
 mod sets;
+mod sha1;
 mod streams;
 mod strings;
 #[cfg(test)]

@@ -8,8 +8,8 @@ use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
 use super::{
-    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, sets, streams,
-    strings, zsets,
+    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, scripting, sets,
+    streams, strings, zsets,
 };
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
@@ -219,6 +219,8 @@ pub struct Engine {
     pub started: u64,
     /// Unix seconds of the last SAVE/BGSAVE (LASTSAVE).
     pub last_save: u64,
+    /// The Lua script cache (EVAL, SCRIPT LOAD).
+    pub scripts: super::scripting::Scripts,
     /// Per database: clients blocked on each key, in the order they blocked.
     pub waiting: Vec<HashMap<Vec<u8>, VecDeque<u64>>>,
     /// Replies for clients that were unblocked by other clients' commands.
@@ -262,6 +264,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(hashes::COMMANDS)
         .chain(lists::COMMANDS)
         .chain(sets::COMMANDS)
+        .chain(scripting::COMMANDS)
         .chain(zsets::COMMANDS)
         .chain(multi::COMMANDS)
         .chain(pubsub::COMMANDS)
@@ -433,6 +436,7 @@ impl Engine {
             pause: None,
             started: now,
             last_save: now / 1000,
+            scripts: Default::default(),
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
             watchers: HashMap::new(),
