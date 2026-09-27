@@ -86,8 +86,8 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 520 results) and by psycopg,
-SQLAlchemy, Django, asyncpg, node-postgres and JDBC
+servers by `tests/postgres_diff.rs` (about 535 results) and by psycopg,
+SQLAlchemy, Django, asyncpg, node-postgres, Knex, TypeORM and JDBC
 (`tests/clients/postgres/run.sh`).
 Django's own management commands (`migrate`, including the built-in
 `auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a schema

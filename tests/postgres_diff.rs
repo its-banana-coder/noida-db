@@ -425,6 +425,17 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT a.id, b.id, x FROM lt a, lt b, unnest(ARRAY[a.id, b.id]) x WHERE a.id < b.id ORDER BY 1, 2, 3",
         "SELECT unnest(ARRAY[1,2], ARRAY['a','b']), unnest(ARRAY[9], ARRAY['z','w'])",
     ],
+    // A scalar function in FROM returns one row (TypeORM, and other ORMs,
+    // probe the connection with SELECT * FROM current_schema()/version()).
+    &[
+        "SELECT * FROM current_schema()",
+        "SELECT * FROM current_database()",
+        "SELECT * FROM pg_typeof(1)",
+        "SELECT * FROM nosuchfunc()",
+        "CREATE TABLE fr (id int)",
+        "INSERT INTO fr VALUES (1), (2)",
+        "SELECT id, s FROM fr, current_schema() s ORDER BY id",
+    ],
 ];
 
 fn main_test_body() {}

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the committed Postgres client apps (psycopg, SQLAlchemy, Django,
-# asyncpg, node-postgres, JDBC) against a server.
+# asyncpg, node-postgres, Knex, TypeORM, JDBC) against a server.
 #
 #   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
@@ -78,19 +78,29 @@ else
   echo "-- psycopg SKIPPED (not installed)"
 fi
 
-# --- Node: node-postgres ---------------------------------------------------
+# --- Node: node-postgres, Knex and TypeORM ---------------------------------
 if command -v node >/dev/null && command -v npm >/dev/null; then
   if [ ! -d "$cache/node_modules/pg" ]; then
-    echo "== installing node-postgres"
-    (cd "$cache" && npm install --silent --no-package-lock pg >/dev/null 2>&1)
+    echo "== installing node-postgres, Knex and TypeORM"
+    (cd "$cache" && npm install --silent --no-package-lock pg knex typeorm reflect-metadata >/dev/null 2>&1)
   fi
   if [ -d "$cache/node_modules/pg" ]; then
     run_client "node-postgres" env NODE_PATH="$cache/node_modules" node "$here/node/pg_test.js"
   else
     echo "-- node-postgres SKIPPED (npm install failed)"
   fi
+  if [ -d "$cache/node_modules/knex" ]; then
+    run_client "knex" env NODE_PATH="$cache/node_modules" node "$here/node/knex_test.js"
+  else
+    echo "-- knex SKIPPED (npm install failed)"
+  fi
+  if [ -d "$cache/node_modules/typeorm" ]; then
+    run_client "typeorm" env NODE_PATH="$cache/node_modules" node "$here/node/typeorm_test.js"
+  else
+    echo "-- typeorm SKIPPED (npm install failed)"
+  fi
 else
-  echo "-- node-postgres SKIPPED (no node)"
+  echo "-- node-postgres, knex, typeorm SKIPPED (no node)"
 fi
 
 # --- Java: the PostgreSQL JDBC driver --------------------------------------
