@@ -1,6 +1,7 @@
 // pgx (the low-level Go Postgres driver) against noida-db: batched inserts,
-// array/jsonb scan, transactions and rollback, and COPY FROM (reported as a
-// documented gap, not a failure, when it errors).
+// array/jsonb scan, transactions and rollback, and COPY FROM (pgx's fast
+// path uses the binary COPY format, a documented gap, reported as such
+// rather than a failure, when it errors).
 //
 // Run with PGPORT pointing at noida-db (or a real Postgres, which must pass
 // just the same).
@@ -86,7 +87,7 @@ func main() {
 		checks++
 		check(conn.QueryRow(ctx, "SELECT count(*) FROM t").Scan(&n) == nil && n == 4, "copy from result")
 	} else {
-		fmt.Println("-- COPY FROM not supported (documented limitation):", err)
+		fmt.Println("-- COPY FROM (binary format, a documented limitation):", err)
 	}
 
 	_, err = conn.Exec(ctx, `DROP TABLE t`)
