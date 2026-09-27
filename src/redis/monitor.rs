@@ -1,5 +1,6 @@
 //! MONITOR: stream every command other clients run, as Redis 7.2 does
-//! (`replicationFeedMonitors`).
+//! (ported from `replicationFeedMonitors` in src/replication.c and `call` in
+//! src/server.c, BSD-3-Clause, see THIRD_PARTY.md).
 //!
 //! A command is shown after it ran, with the database it left the client in,
 //! except EVAL/EVALSHA/FCALL (and their `_RO` forms), which are shown first so

@@ -14,6 +14,7 @@ mod engine;
 mod geo;
 mod glob;
 mod hashes;
+mod hll;
 mod keys;
 mod lists;
 pub mod longdouble;

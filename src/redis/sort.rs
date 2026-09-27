@@ -1,4 +1,5 @@
-//! SORT and SORT_RO, ported from Redis's sort.c.
+//! SORT and SORT_RO, ported from Redis 7.2's src/sort.c (BSD-3-Clause, see
+//! THIRD_PARTY.md).
 //!
 //! Elements come from a list, set or sorted set; they are ordered as numbers
 //! (or bytes with ALPHA), optionally by the value of another key (`BY`),

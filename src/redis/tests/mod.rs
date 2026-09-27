@@ -7,6 +7,7 @@ mod connection;
 mod devtools;
 mod geo;
 mod hashes;
+mod hll;
 mod introspection;
 mod lists;
 mod monitor;

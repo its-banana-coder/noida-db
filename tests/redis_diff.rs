@@ -2350,6 +2350,38 @@ fn replies_match_real_redis() {
             }
         }
     }
+    // HyperLogLog: generated scripts (too many elements to list by hand),
+    // compared reply for reply, including the raw bytes of the stored string.
+    // They run here, in sequence with the rest, because the parallel tests
+    // FLUSHALL the shared CI server.
+    let mut generated = 0;
+    for (name, cmds) in hll_scripts() {
+        if name.starts_with("@7.0 ") && version < (7, 0) {
+            continue;
+        }
+        for c in [&mut real, &mut ours] {
+            c.run("FLUSHALL");
+        }
+        for cmd in cmds {
+            let refs: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+            let (want, got) = (real.cmd(&refs), ours.cmd(&refs));
+            generated += 1;
+            if want != got {
+                let shown: Vec<String> = cmd
+                    .iter()
+                    .take(3)
+                    .map(|a| format!("{:.40}", String::from_utf8_lossy(a)))
+                    .collect();
+                failures.push(format!(
+                    "[{name}] {}\n    redis: {:.300}\n    noida: {:.300}",
+                    shown.join(" "),
+                    format!("{want:?}"),
+                    format!("{got:?}")
+                ));
+            }
+        }
+    }
+    eprintln!("hyperloglog: {generated} generated commands compared");
     eprintln!(
         "reference Redis {}.{}: ran {ran} scripts ({lines_compared} replies compared), \
          skipped {skipped} scripts and {lines_skipped} lines needing a newer version",
@@ -2500,4 +2532,114 @@ fn monitor_lines_match_real_redis() {
     eprintln!("compared {} monitor lines", want.len());
     assert!(want.len() >= 8, "the reference showed too few lines: {want:?}");
     assert_eq!(got, want);
+}
+
+/// PFADD/PFCOUNT/PFMERGE scenarios: (name, commands).
+fn hll_scripts() -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
+    fn c(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.to_vec()).collect()
+    }
+    fn add(key: &str, from: usize, to: usize) -> Vec<Vec<u8>> {
+        let mut v = vec![b"PFADD".to_vec(), key.as_bytes().to_vec()];
+        v.extend((from..=to).map(|i| i.to_string().into_bytes()));
+        v
+    }
+    let mut out: Vec<(String, Vec<Vec<Vec<u8>>>)> = Vec::new();
+
+    // Sizes across the sparse and dense encodings.
+    for n in [1usize, 7, 10, 100, 500, 1000, 2000, 3000, 5000, 20000] {
+        out.push((
+            format!("{n} elements"),
+            vec![
+                add("hll", 1, n),
+                c(&[b"PFCOUNT", b"hll"]),
+                c(&[b"GET", b"hll"]),
+                c(&[b"STRLEN", b"hll"]),
+                c(&[b"PFADD", b"hll", b"1", b"2", b"3"]),
+                c(&[b"PFCOUNT", b"hll"]),
+                c(&[b"GET", b"hll"]),
+            ],
+        ));
+    }
+
+    // One at a time: exercises splitting and merging sparse runs.
+    let mut singles: Vec<Vec<Vec<u8>>> = (1..=400).map(|i| add("hll", i, i)).collect();
+    singles.push(c(&[b"PFCOUNT", b"hll"]));
+    singles.push(c(&[b"GET", b"hll"]));
+    out.push(("one at a time".into(), singles));
+
+    // Merging, with sparse and dense sources.
+    out.push((
+        "merge".into(),
+        vec![
+            add("a", 1, 300),
+            add("b", 200, 600),
+            add("big", 1, 2000),
+            c(&[b"PFMERGE", b"d", b"a", b"b"]),
+            c(&[b"GET", b"d"]),
+            c(&[b"PFCOUNT", b"d"]),
+            c(&[b"PFCOUNT", b"a", b"b"]),
+            c(&[b"PFCOUNT", b"a", b"b", b"big"]),
+            c(&[b"PFCOUNT", b"a", b"nokey"]),
+            c(&[b"PFMERGE", b"d2", b"a", b"big"]),
+            c(&[b"STRLEN", b"d2"]),
+            c(&[b"PFCOUNT", b"d2"]),
+            c(&[b"GET", b"d2"]),
+            c(&[b"PFMERGE", b"d3", b"nokey", b"a"]),
+            c(&[b"GET", b"d3"]),
+            c(&[b"PFMERGE", b"a", b"b"]),
+            c(&[b"PFCOUNT", b"a"]),
+        ],
+    ));
+
+    // Empty HLLs and TTLs.
+    out.push((
+        "empty and ttl".into(),
+        vec![
+            c(&[b"PFADD", b"e"]),
+            c(&[b"GET", b"e"]),
+            c(&[b"PFCOUNT", b"e"]),
+            c(&[b"PFADD", b"e"]),
+            c(&[b"PFMERGE", b"e2"]),
+            c(&[b"GET", b"e2"]),
+            c(&[b"PFCOUNT", b"e2"]),
+            c(&[b"PFCOUNT", b"nokey"]),
+            c(&[b"PFADD", b"t", b"a"]),
+            c(&[b"EXPIRE", b"t", b"100"]),
+            c(&[b"PFADD", b"t", b"b"]),
+            c(&[b"TTL", b"t"]),
+        ],
+    ));
+
+    // Things that are not HLLs.
+    out.push((
+        "errors".into(),
+        vec![
+            c(&[b"SET", b"s", b"hello"]),
+            c(&[b"PFADD", b"s", b"x"]),
+            c(&[b"PFCOUNT", b"s"]),
+            c(&[b"PFMERGE", b"d", b"s"]),
+            c(&[b"PFMERGE", b"s", b"d"]),
+            c(&[b"SET", b"short", b"abc"]),
+            c(&[b"PFCOUNT", b"short"]),
+            c(&[b"LPUSH", b"l", b"a"]),
+            c(&[b"PFADD", b"l", b"x"]),
+            c(&[b"PFCOUNT", b"l"]),
+        ],
+    ));
+
+    // Redis 7.0 made PFCOUNT and PFMERGE detect a corrupt sparse body; older
+    // versions overrun their register array instead.
+    out.push((
+        "@7.0 corrupt body".into(),
+        vec![
+            c(&[b"PFADD", b"c", b"a", b"b", b"c"]),
+            c(&[b"SETRANGE", b"c", b"16", b"\x7f\xff"]),
+            c(&[b"PFCOUNT", b"c"]),
+            c(&[b"PFADD", b"c", b"z"]),
+            c(&[b"PFCOUNT", b"c", b"c"]),
+            c(&[b"PFMERGE", b"d", b"c"]),
+        ],
+    ));
+    out
 }

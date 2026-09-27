@@ -1,0 +1,105 @@
+# Redis in noida
+
+A Redis-compatible server on port **6379** (RESP2 and RESP3), targeting
+**Redis 7.2**. Real clients (redis-rs today; see "Not tested yet") work
+unchanged.
+
+```
+noida start --only redis            # just Redis
+noida start --redis-port 6380       # another port
+```
+
+Status (from `cargo test --test redis_coverage -- --nocapture`): of Redis
+7.2's 242 commands, **217 are implemented**, **22 are out of scope by design**
+and **3 are not built yet**. Subcommands are counted separately below.
+
+## What works
+
+| Area | Notes |
+|---|---|
+| Strings | all, including `LCS`, `GETEX`, `SETRANGE`, `INCRBYFLOAT` (exact x87 `long double` output on x86-64) |
+| Keys | `EXPIRE` family with `NX/XX/GT/LT`, `SCAN`, `KEYS`, `RENAME`, `COPY`, `MOVE`, `SWAPDB`, `OBJECT`, `TYPE`, 16 databases |
+| Hashes, lists, sets, sorted sets | all commands, with Redis's small-collection encodings and ordering |
+| Blocking commands | `BLPOP` family, `BLMOVE`, `BLMPOP`, `BZPOP*`; blocked clients are served first-in-first-out |
+| Streams | `XADD`, `XRANGE`, `XREAD`, consumer groups (`XGROUP`, `XREADGROUP`, `XACK`, `XCLAIM`, `XAUTOCLAIM`, `XPENDING`), `XINFO` |
+| Geo, bitmaps | all, including `BITFIELD` and `GEOSEARCH` |
+| HyperLogLog | `PFADD`, `PFCOUNT`, `PFMERGE`, byte-identical to Redis (sparse and dense encodings) |
+| Sorting | `SORT`, `SORT_RO` with `BY`, `GET`, `LIMIT`, `STORE`, `ALPHA` |
+| Pub/sub | channels, patterns, sharded channels, RESP3 push messages |
+| Transactions | `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` |
+| Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`), with Redis's error positions |
+| Connection | `HELLO` (RESP3), `CLIENT` (id, name, info, list, kill, pause, reply, no-evict...), `RESET`, `AUTH` |
+| Debugging | `MONITOR` (a live stream of every command), `COMMAND` (info, docs, getkeys, list), `INFO`, `CONFIG GET/SET` |
+| Tool probes | `SLOWLOG`, `LATENCY`, `MEMORY`, `MODULE LIST`, read-only `ACL`. These return empty or estimated data (noida does no performance analysis) |
+
+## Not implemented
+
+### By design (out of scope)
+
+noida is a local development tool. These commands answer as *unknown command*.
+
+| Commands | Why |
+|---|---|
+| `DUMP` `RESTORE` `RESTORE-ASKING` `MIGRATE` | RDB payloads and key migration are production tooling |
+| `PSYNC` `SYNC` `REPLCONF` `REPLICAOF` `SLAVEOF` `ROLE` `WAIT` `WAITAOF` `FAILOVER` | replication |
+| `SENTINEL` | sentinel |
+| `CLUSTER` `ASKING` `READONLY` `READWRITE` | clustering |
+| `DEBUG` `SHUTDOWN` `PFDEBUG` `PFSELFTEST` | server internals |
+| `ACL SETUSER` `DELUSER` `DRYRUN` (and `LOAD`, `SAVE`) | user management: there is one user, `default` |
+| `MODULE LOAD` `LOADEX` `UNLOAD` | plugins |
+| `SCRIPT DEBUG` | the Lua debugger |
+
+### Not built yet
+
+| What | Note |
+|---|---|
+| `FUNCTION` (all subcommands), `FCALL`, `FCALL_RO` | Redis Functions. `EVAL`/`EVALSHA` work |
+| `CLIENT TRACKING` `CACHING` `GETREDIR` `TRACKINGINFO` | client-side caching |
+| Keyspace notifications | `notify-keyspace-events` can be set, but no `__keyspace@*__` / `__keyevent@*__` messages are published, so listening for expired-key events sees nothing |
+| Persistence | all data lives in memory and is gone when noida stops. `SAVE`, `BGSAVE`, `BGREWRITEAOF` succeed but write nothing; `--data-dir` is unused by Redis |
+| `maxmemory` and eviction | the setting is stored, not enforced: no eviction policies, no OOM error |
+| Passwords | `requirepass` is stored, not enforced; `AUTH default <anything>` succeeds |
+| Lua libraries `cmsgpack`, `struct`, `bit` | `cjson` and the `redis` table are available |
+
+### Differences
+
+- `SLOWLOG` and `LATENCY` are always empty; `MEMORY USAGE`/`STATS` are
+  estimates; `INFO` counters that only matter for performance analysis are 0.
+- `INCRBYFLOAT`/`HINCRBYFLOAT` reproduce x86-64 `long double` output. Redis on
+  ARM prints the last digits differently.
+- Reply order of unordered collections (`KEYS`, `SMEMBERS` on big sets) can
+  differ; the real order is an implementation detail.
+- `PFCOUNT` on a hand-corrupted HyperLogLog follows 7.2 (it reports the
+  corruption); Redis 6.x overran its register array.
+
+### Not tested yet
+
+Only the `redis-rs` client is exercised against noida. Jedis, Lettuce, redis-py,
+ioredis, Spring Data Redis, Redisson and script-heavy libraries (BullMQ,
+Sidekiq, Celery) are not, so client-specific gaps may exist.
+
+## How it is verified
+
+Every command family has three layers of tests, and the first two run against
+the real thing:
+
+1. **Engine tests** (`src/redis/tests/`): expected replies and error texts are
+   Redis 7.2's, byte for byte.
+2. **Comparison tests** (`tests/redis_diff.rs`): the same commands run against
+   a real Redis and against noida, and the replies must be identical. CI runs
+   them against Redis 7.2; locally against any `redis-server` on your PATH,
+   skipping lines that need a newer version. Examples: HyperLogLog is compared
+   on 511 commands including the raw stored bytes; `MONITOR` output is
+   compared line by line.
+3. **Real-client tests** (`tests/redis_client.rs`): the `redis` crate over TCP,
+   RESP2 and RESP3.
+
+`tests/redis_coverage.rs` fails if the implemented count ever drops, and
+lists out-of-scope commands explicitly.
+
+## Where the code comes from
+
+Behaviour, error texts and algorithms are ported from Redis 7.2's source
+(BSD-3-Clause); see `THIRD_PARTY.md`. `meta.rs` (command metadata for
+`COMMAND INFO/DOCS`) is generated from Redis's own `commands.def` by
+`scripts/gen-redis-commands.py`.
