@@ -15,8 +15,8 @@ but not identical to the real server.
 |---|---|---|
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
+| Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
 | MySQL | early scaffolding, not merged | no |
-| Kafka | early scaffolding, not merged | no |
 | Memcached, MongoDB, RabbitMQ, Elasticsearch, ClickHouse | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
@@ -153,11 +153,19 @@ nothing here tracks); GIN/GiST indexes, `ts_headline`, and
   scans all of `pg_index` sees fewer rows than on a real server; one that
   names a user table works the same).
 
-## MySQL and Kafka
+## Kafka
 
-Early scaffolding only: the real `mysql` CLI cannot run queries, and standard
-Kafka clients cannot produce or list topics yet. Do not point applications at
-them. The specs in `docs/specs/` describe the target.
+Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported: topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`), and transactions (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`).
+
+**By design**
+- Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
+
+**Not yet**
+- Disk segment persistence (records live in-memory).
+
+## MySQL
+
+Early scaffolding only: the real `mysql` CLI cannot run queries yet.
 
 ## Numbers we do not claim yet
 
