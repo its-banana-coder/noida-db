@@ -8,8 +8,8 @@ use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
 use super::{
-    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, sets, streams,
-    strings, zsets,
+    admin, bitops, config, connection, devtools, geo, hashes, hll, keys, lists, monitor, multi,
+    pubsub, scripting, sets, sort, streams, strings, zsets,
 };
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
@@ -177,6 +177,10 @@ pub struct Client {
     pub last_cmd: Option<String>,
     pub no_evict: bool,
     pub no_touch: bool,
+    /// In MONITOR mode.
+    pub monitor: bool,
+    /// Passed the `requirepass` check (true from the start when none is set).
+    pub authenticated: bool,
     pub reply_off: bool,
     reply_skip: bool,
     pub reply_skip_next: bool,
@@ -219,6 +223,8 @@ pub struct Engine {
     pub started: u64,
     /// Unix seconds of the last SAVE/BGSAVE (LASTSAVE).
     pub last_save: u64,
+    /// The Lua script cache (EVAL, SCRIPT LOAD).
+    pub scripts: super::scripting::Scripts,
     /// Per database: clients blocked on each key, in the order they blocked.
     pub waiting: Vec<HashMap<Vec<u8>, VecDeque<u64>>>,
     /// Replies for clients that were unblocked by other clients' commands.
@@ -227,6 +233,10 @@ pub struct Engine {
     pub(crate) watchers: HashMap<(usize, Vec<u8>), Vec<u64>>,
     pub(crate) pubsub: super::pubsub::PubSub,
     pub(crate) config: super::config::Config,
+    /// Clients in MONITOR mode.
+    pub(crate) monitors: Vec<u64>,
+    /// Depth of script-issued calls (monitors show those as `lua`).
+    pub(crate) lua_calls: u32,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -257,11 +267,16 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
     connection::COMMANDS
         .iter()
         .chain(admin::COMMANDS)
+        .chain(devtools::COMMANDS)
+        .chain(monitor::COMMANDS)
+        .chain(sort::COMMANDS)
+        .chain(hll::COMMANDS)
         .chain(keys::COMMANDS)
         .chain(strings::COMMANDS)
         .chain(hashes::COMMANDS)
         .chain(lists::COMMANDS)
         .chain(sets::COMMANDS)
+        .chain(scripting::COMMANDS)
         .chain(zsets::COMMANDS)
         .chain(multi::COMMANDS)
         .chain(pubsub::COMMANDS)
@@ -433,11 +448,14 @@ impl Engine {
             pause: None,
             started: now,
             last_save: now / 1000,
+            scripts: Default::default(),
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
             watchers: HashMap::new(),
             pubsub: Default::default(),
             config: Default::default(),
+            monitors: Vec::new(),
+            lua_calls: 0,
             next_client_id: 1,
             clock,
             rng: now | 1,
@@ -456,6 +474,7 @@ impl Engine {
     }
 
     pub fn connect(&mut self, conn: ClientConn) -> Session {
+        let open = self.requirepass().is_empty();
         let id = self.next_client_id;
         self.next_client_id += 1;
         let now = self.now();
@@ -474,6 +493,8 @@ impl Engine {
                 last_cmd: None,
                 no_evict: false,
                 no_touch: false,
+                monitor: false,
+                authenticated: open,
                 reply_off: false,
                 reply_skip: false,
                 reply_skip_next: false,
@@ -489,6 +510,16 @@ impl Engine {
         Session { id, resp: 2, closing: false, blocked: false }
     }
 
+    /// The default user's password (`requirepass`); empty means none.
+    pub(crate) fn requirepass(&self) -> String {
+        self.config.get("requirepass").unwrap_or_default()
+    }
+
+    /// `authRequired`: a password is set and this client hasn't given it.
+    fn auth_required(&self, id: u64) -> bool {
+        self.clients.get(&id).is_some_and(|c| !c.authenticated) && !self.requirepass().is_empty()
+    }
+
     pub fn disconnect(&mut self, session: &Session) {
         self.remove_client(session.id);
     }
@@ -498,6 +529,7 @@ impl Engine {
         self.unblock(id);
         self.unwatch_all(id);
         self.unsubscribe_everything(id);
+        self.monitors.retain(|m| *m != id);
         self.replies.remove(&id);
         self.clients.remove(&id)
     }
@@ -535,6 +567,14 @@ impl Engine {
             Err(e) if in_multi => return self.multi_reject(session.id, &name, e),
             Err(e) => return e,
         };
+        // Commands flagged no_auth (AUTH, HELLO, QUIT, RESET) work before
+        // authenticating; everything else is refused. Unknown commands and bad
+        // arity were already reported above, as in Redis.
+        let no_auth = command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("no_auth"));
+        if !no_auth && self.auth_required(session.id) {
+            let e = Value::err("NOAUTH Authentication required.");
+            return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
+        }
         let now = self.now();
         let client = self.clients.get_mut(&session.id).unwrap();
         client.last_interaction = now;
@@ -578,6 +618,15 @@ impl Engine {
         let now = self.now();
         let db = self.clients.get(&session.id).map_or(0, |c| c.db);
         let before = self.watch_snapshot(args, db);
+        // A command retried after being unblocked is not shown a second time.
+        let feed = if reprocess_deadline.is_none() && !self.monitors.is_empty() {
+            super::monitor::feed_mode(args)
+        } else {
+            super::monitor::Feed::Never
+        };
+        if feed == super::monitor::Feed::Before {
+            self.feed_monitors(session.id, args);
+        }
         let mut ctx = Ctx {
             engine: self,
             session,
@@ -590,7 +639,11 @@ impl Engine {
         let reply = match handler(&mut ctx, args) {
             Ok(v) | Err(v) => v,
         };
-        if let Some(req) = ctx.block.take() {
+        let block = ctx.block.take();
+        if feed == super::monitor::Feed::After {
+            self.feed_monitors(session.id, args);
+        }
+        if let Some(req) = block {
             self.block_client(session, req, args);
             return Value::NoReply;
         }

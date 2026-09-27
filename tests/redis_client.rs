@@ -451,3 +451,33 @@ fn stream_consumer_groups_through_a_real_client() -> RedisResult<()> {
     assert_eq!(names, ["worker-1", "worker-2", "worker-3"]);
     Ok(())
 }
+
+#[test]
+fn a_password_protects_the_server() {
+    use noida::redis::resp::Value;
+    let addr = noida::redis::server::spawn_with("127.0.0.1:0", Some("secret")).unwrap();
+
+    // A client that doesn't authenticate is refused.
+    let mut raw = common::RawClient::connect(addr);
+    assert_eq!(raw.run("PING"), Value::err("NOAUTH Authentication required."));
+    assert_eq!(
+        raw.run("AUTH wrong"),
+        Value::err("WRONGPASS invalid username-password pair or user is disabled.")
+    );
+    assert_eq!(raw.run("AUTH secret"), Value::ok());
+    assert_eq!(raw.run("PING"), Value::Simple("PONG".into()));
+
+    // redis-rs authenticates from the URL, on RESP2 and RESP3.
+    for url in
+        [format!("redis://:secret@{addr}/"), format!("redis://:secret@{addr}/?protocol=resp3")]
+    {
+        let mut con =
+            redis::Client::open(url).unwrap().get_connection().expect("password accepted");
+        let _: () = con.set("k", "v").unwrap();
+        let v: String = con.get("k").unwrap();
+        assert_eq!(v, "v");
+    }
+    // A wrong password fails when connecting.
+    let bad = redis::Client::open(format!("redis://:nope@{addr}/")).unwrap();
+    assert!(bad.get_connection().is_err());
+}

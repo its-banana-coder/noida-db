@@ -134,6 +134,9 @@ copying source.
   --all-features -- -D warnings`, `cargo test`, `cargo build
   --no-default-features`, `scripts/check-size.sh`.
 - Add your feature to `default` in Cargo.toml once P0 works.
+- Keep `docs/LIMITATIONS.md` accurate: every PR updates its service's section
+  with what does not work, what is not built yet, and where it differs from the
+  real server.
 - Open a PR to `main` when a milestone is green in CI. The PR description
   reports: what works, how many results were compared against the real
   server (locally and in CI), binary size and idle RAM impact, known gaps.

@@ -2033,6 +2033,175 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "=3 XREADGROUP GROUP g carol BLOCK 10 STREAMS s >",
         ],
     ),
+    // Lua scripting. Scripts have no spaces (the harness splits on them);
+    // `\t` and `\n` stand in where Lua needs a separator.
+    (
+        (6, 0),
+        &[
+            "EVAL return(1) 0",
+            "EVAL return{1,2,{3,'x'}} 0",
+            "EVAL return{1,2,'three',nil,5} 0",
+            "EVAL return(3.9) 0",
+            "EVAL return(-3.9) 0",
+            "EVAL return(true) 0",
+            "EVAL return(false) 0",
+            "EVAL return(nil) 0",
+            "EVAL return{ok='fine'} 0",
+            "EVAL return{err='MyError'} 0",
+            "EVAL return{KEYS[1],ARGV[1]} 1 a b",
+            "EVAL return(#KEYS) 2 a b",
+            "EVAL return(#ARGV) 0 x y z",
+            "EVAL return(redis.call('set',KEYS[1],ARGV[1])) 1 k v",
+            "EVAL return(redis.call('get',KEYS[1])) 1 k",
+            "EVAL return(redis.call('get','nokey')) 0",
+            "EVAL return(redis.call('incrby',KEYS[1],ARGV[1])) 1 n 5",
+            "EVAL return(redis.pcall('incr','k')) 0",
+            "EVAL return(redis.error_reply('WRONGTYPE\\32bad')) 0",
+            "EVAL return(redis.status_reply('FINE')) 0",
+            "EVAL return(redis.sha1hex('')) 0",
+            "EVAL return(cjson.encode({1,2,3})) 0",
+            "EVAL return(cjson.decode('[1,2,3]')[2]) 0",
+            "EVAL return(cjson.encode({a=1})) 0",
+            "EVAL return(1) x",
+            "EVAL return(1) -1",
+            "EVAL return(1) 5 a",
+            "EVAL return(1)",
+            "SCRIPT LOAD return(1)",
+            "EVALSHA 930269f31393d0be681588b6ab08dccee7d6bb67 0",
+            "SCRIPT EXISTS 930269f31393d0be681588b6ab08dccee7d6bb67 ffffffffffffffffffffffffffffffffffffffff",
+            "EVALSHA ffffffffffffffffffffffffffffffffffffffff 0",
+            "SCRIPT FLUSH",
+            "SCRIPT EXISTS 930269f31393d0be681588b6ab08dccee7d6bb67",
+        ],
+    ),
+    // Error texts changed in 7.0: they now carry the script and line.
+    (
+        (7, 0),
+        &[
+            "SET k v",
+            "EVAL return(redis.call('incr','k')) 0",
+            "EVAL local\ta=1\nlocal\tx=redis.call('incr','k')\nreturn\tx 0",
+            "EVAL return(redis.pcall('nosuchcmd')) 0",
+            "EVAL return(redis.pcall()) 0",
+            "EVAL return(redis.error_reply('bad')) 0",
+            "EVAL return(redis.call('nosuchcmd')) 0",
+            "EVAL return(nosuchglobal) 0",
+            "EVAL return(error('boom')) 0",
+        ],
+    ),
+    // Dev-tool probes: the logs are empty on a fresh server.
+    (
+        (6, 0),
+        &[
+            // A real server logs any command over 10ms, so a busy machine can
+            // leave entries behind; turn the log off to keep this deterministic.
+            "CONFIG SET slowlog-log-slower-than -1",
+            "SLOWLOG RESET",
+            "SLOWLOG LEN",
+            "SLOWLOG GET",
+            "SLOWLOG GET 5",
+            "LATENCY LATEST",
+            "LATENCY HISTORY x",
+            "LATENCY GRAPH x",
+            "LATENCY RESET",
+            "@7.0 LATENCY DOCTOR",
+            "MODULE LIST",
+            "MEMORY USAGE nokey",
+            "MEMORY PURGE",
+            "MEMORY DOCTOR",
+        ],
+    ),
+    (
+        (7, 0),
+        &[
+            "SLOWLOG GET -2",
+            "SLOWLOG GET x",
+            "MEMORY USAGE nokey SAMPLES -1",
+            "MEMORY USAGE nokey FOO 1",
+            "ACL WHOAMI",
+            "ACL USERS",
+            "ACL LIST",
+            "ACL GETUSER default",
+            "ACL GETUSER nobody",
+            "ACL CAT",
+            "~ACL CAT string",
+            "ACL CAT nosuch",
+            "ACL GENPASS 0",
+            "ACL GENPASS x",
+        ],
+    ),
+    // SORT: options, patterns, nosort, STORE, and the set-in-script rule.
+    (
+        (6, 0),
+        &[
+            "RPUSH l 3 1 2",
+            "SORT l",
+            "SORT l DESC",
+            "SORT l LIMIT 1 1",
+            "SORT l BY nosort",
+            "SORT l BY nosort DESC",
+            "SORT l BY nosort LIMIT 1 1",
+            "RPUSH s b a c B",
+            "SORT s ALPHA",
+            "SORT s ALPHA DESC",
+            "SORT s",
+            "RPUSH ids 1 2 3",
+            "MSET w_1 3 w_2 1 w_3 2 o_1 one o_2 two o_3 three",
+            "SORT ids BY w_*",
+            "SORT ids BY w_* DESC",
+            "SORT ids BY w_* GET o_*",
+            "SORT ids BY w_* GET # GET o_*",
+            "SORT ids BY w_* GET x_*",
+            "SORT ids GET fixed",
+            "SORT ids BY w_* STORE out",
+            "LRANGE out 0 -1",
+            "SORT ids BY w_* GET o_* GET x_* STORE out2",
+            "LRANGE out2 0 -1",
+            "SORT nokey",
+            "SORT nokey STORE out",
+            "EXISTS out",
+            "HSET u_1 rank 30 name ann",
+            "HSET u_2 rank 10 name bob",
+            "HSET u_3 rank 20 name cy",
+            "SORT ids BY u_*->rank",
+            "SORT ids BY u_*->rank GET u_*->name",
+            "ZADD z 1 a 2 b 3 c",
+            "SORT z BY nosort",
+            "SORT z BY nosort DESC LIMIT 0 2",
+            "SORT z ALPHA",
+            "SADD st 10 9 100",
+            "SORT st",
+            "SORT st ALPHA",
+            "SORT st BY nosort",
+            "SORT st BY nosort STORE out3",
+            "LRANGE out3 0 -1",
+            "EVAL return(redis.call('sort','st','by','nosort')) 0",
+            "RPUSH n 1 2 3 4 5",
+            "SORT n LIMIT 10 2",
+            "SORT n LIMIT -1 2",
+            "SORT n LIMIT 3 100",
+            "SORT n LIMIT 1 0",
+            "SORT n DESC LIMIT 0 2",
+            "SORT n LIMIT 1",
+            "SORT n FOO",
+            "SORT n BY",
+            "SORT n LIMIT a 1",
+            "RPUSH t 1 1.0 01",
+            "SORT t",
+            "RPUSH m 10 1e2 inf -inf 0x10",
+            "SORT m",
+            "RPUSH bad 1 5x",
+            "SORT bad",
+            "SET str v",
+            "SORT str",
+            "SORT ids DESC STORE ids",
+            "LRANGE ids 0 -1",
+        ],
+    ),
+    (
+        (7, 0),
+        &["SORT_RO l", "SORT_RO l DESC ALPHA LIMIT 0 1", "SORT_RO l STORE out", "SORT_RO nokey"],
+    ),
 ];
 
 fn parse_version(v: &str) -> (u32, u32) {
@@ -2184,6 +2353,38 @@ fn replies_match_real_redis() {
             }
         }
     }
+    // HyperLogLog: generated scripts (too many elements to list by hand),
+    // compared reply for reply, including the raw bytes of the stored string.
+    // They run here, in sequence with the rest, because the parallel tests
+    // FLUSHALL the shared CI server.
+    let mut generated = 0;
+    for (name, cmds) in hll_scripts() {
+        if name.starts_with("@7.0 ") && version < (7, 0) {
+            continue;
+        }
+        for c in [&mut real, &mut ours] {
+            c.run("FLUSHALL");
+        }
+        for cmd in cmds {
+            let refs: Vec<&[u8]> = cmd.iter().map(Vec::as_slice).collect();
+            let (want, got) = (real.cmd(&refs), ours.cmd(&refs));
+            generated += 1;
+            if want != got {
+                let shown: Vec<String> = cmd
+                    .iter()
+                    .take(3)
+                    .map(|a| format!("{:.40}", String::from_utf8_lossy(a)))
+                    .collect();
+                failures.push(format!(
+                    "[{name}] {}\n    redis: {:.300}\n    noida: {:.300}",
+                    shown.join(" "),
+                    format!("{want:?}"),
+                    format!("{got:?}")
+                ));
+            }
+        }
+    }
+    eprintln!("hyperloglog: {generated} generated commands compared");
     eprintln!(
         "reference Redis {}.{}: ran {ran} scripts ({lines_compared} replies compared), \
          skipped {skipped} scripts and {lines_skipped} lines needing a newer version",
@@ -2266,4 +2467,182 @@ fn drop_subcommands(v: Value) -> Value {
         }
         other => other,
     }
+}
+
+/// MONITOR streams every command other clients run. Timestamps and client
+/// addresses differ by nature, so lines are compared without them. Every
+/// command this test sends carries a `mon:` marker and only lines with that
+/// marker are kept: CI shares one Redis (in a container, so client addresses
+/// are NAT'd) between the tests in this file, and other tests' traffic is
+/// also in the stream.
+///
+/// EXEC and SELECT are left out: Redis 7 shows them after they ran and older
+/// versions before, so their order is version-specific (unit-tested from the
+/// 7.2 source instead).
+#[test]
+fn monitor_lines_match_real_redis() {
+    let Some(reference) = reference() else {
+        eprintln!("SKIPPED: no reference Redis (set NOIDA_REDIS_REF or install redis-server)");
+        return;
+    };
+    let ours_addr = common::start_noida_redis();
+    let mut real_mon = RawClient::connect(reference.addr);
+    let mut ours_mon = RawClient::connect(ours_addr);
+    for m in [&mut real_mon, &mut ours_mon] {
+        m.set_timeout(1500);
+        assert_eq!(m.run("MONITOR"), Value::ok());
+    }
+    let mut real = RawClient::connect(reference.addr);
+    let mut ours = RawClient::connect(ours_addr);
+
+    let echo_arg: &[u8] = b"mon:a\"b\\c\n\t\x07\x08\0\xc3\xa9";
+    let commands: Vec<Vec<&[u8]>> = vec![
+        vec![b"SET", b"mon:k", b"v"],
+        vec![b"GET", b"mon:k"],
+        vec![b"INCR", b"mon:n"],
+        vec![b"LPUSH", b"mon:l", b"a", b"b"],
+        vec![b"HSET", b"mon:h", b"f", b"v"],
+        vec![b"ECHO", echo_arg],
+        vec![b"CONFIG", b"GET", b"maxmemory"],
+        vec![b"EVAL", b"return(redis.call('set','mon:k','v'))", b"0"],
+        vec![b"NOSUCHCMD", b"mon:x"],
+        vec![b"PING", b"mon:ping"],
+    ];
+    for c in &commands {
+        real.cmd(c);
+        ours.cmd(c);
+    }
+
+    // "<ts> [<db> <addr>] args" -> "[<db>] args" ("[lua] args" for scripts).
+    let collect = |m: &mut RawClient| -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(v) = m.try_read() {
+            let Value::Simple(line) = v else { continue };
+            let Some((_, rest)) = line.split_once(' ') else { continue };
+            let Some((origin, args)) = rest.split_once("] ") else { continue };
+            if !args.contains("mon:") {
+                continue;
+            }
+            let origin = origin.trim_start_matches('[');
+            let shown =
+                if origin.ends_with(" lua") { "lua" } else { origin.split(' ').next().unwrap() };
+            out.push(format!("[{shown}] {args}"));
+        }
+        out
+    };
+    let want = collect(&mut real_mon);
+    let got = collect(&mut ours_mon);
+    eprintln!("compared {} monitor lines", want.len());
+    assert!(want.len() >= 8, "the reference showed too few lines: {want:?}");
+    assert_eq!(got, want);
+}
+
+/// PFADD/PFCOUNT/PFMERGE scenarios: (name, commands).
+fn hll_scripts() -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
+    fn c(parts: &[&[u8]]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.to_vec()).collect()
+    }
+    fn add(key: &str, from: usize, to: usize) -> Vec<Vec<u8>> {
+        let mut v = vec![b"PFADD".to_vec(), key.as_bytes().to_vec()];
+        v.extend((from..=to).map(|i| i.to_string().into_bytes()));
+        v
+    }
+    let mut out: Vec<(String, Vec<Vec<Vec<u8>>>)> = Vec::new();
+
+    // Sizes across the sparse and dense encodings.
+    for n in [1usize, 7, 10, 100, 500, 1000, 2000, 3000, 5000, 20000] {
+        out.push((
+            format!("{n} elements"),
+            vec![
+                add("hll", 1, n),
+                c(&[b"PFCOUNT", b"hll"]),
+                c(&[b"GET", b"hll"]),
+                c(&[b"STRLEN", b"hll"]),
+                c(&[b"PFADD", b"hll", b"1", b"2", b"3"]),
+                c(&[b"PFCOUNT", b"hll"]),
+                c(&[b"GET", b"hll"]),
+            ],
+        ));
+    }
+
+    // One at a time: exercises splitting and merging sparse runs.
+    let mut singles: Vec<Vec<Vec<u8>>> = (1..=400).map(|i| add("hll", i, i)).collect();
+    singles.push(c(&[b"PFCOUNT", b"hll"]));
+    singles.push(c(&[b"GET", b"hll"]));
+    out.push(("one at a time".into(), singles));
+
+    // Merging, with sparse and dense sources.
+    out.push((
+        "merge".into(),
+        vec![
+            add("a", 1, 300),
+            add("b", 200, 600),
+            add("big", 1, 2000),
+            c(&[b"PFMERGE", b"d", b"a", b"b"]),
+            c(&[b"GET", b"d"]),
+            c(&[b"PFCOUNT", b"d"]),
+            c(&[b"PFCOUNT", b"a", b"b"]),
+            c(&[b"PFCOUNT", b"a", b"b", b"big"]),
+            c(&[b"PFCOUNT", b"a", b"nokey"]),
+            c(&[b"PFMERGE", b"d2", b"a", b"big"]),
+            c(&[b"STRLEN", b"d2"]),
+            c(&[b"PFCOUNT", b"d2"]),
+            c(&[b"GET", b"d2"]),
+            c(&[b"PFMERGE", b"d3", b"nokey", b"a"]),
+            c(&[b"GET", b"d3"]),
+            c(&[b"PFMERGE", b"a", b"b"]),
+            c(&[b"PFCOUNT", b"a"]),
+        ],
+    ));
+
+    // Empty HLLs and TTLs.
+    out.push((
+        "empty and ttl".into(),
+        vec![
+            c(&[b"PFADD", b"e"]),
+            c(&[b"GET", b"e"]),
+            c(&[b"PFCOUNT", b"e"]),
+            c(&[b"PFADD", b"e"]),
+            c(&[b"PFMERGE", b"e2"]),
+            c(&[b"GET", b"e2"]),
+            c(&[b"PFCOUNT", b"e2"]),
+            c(&[b"PFCOUNT", b"nokey"]),
+            c(&[b"PFADD", b"t", b"a"]),
+            c(&[b"EXPIRE", b"t", b"100"]),
+            c(&[b"PFADD", b"t", b"b"]),
+            c(&[b"TTL", b"t"]),
+        ],
+    ));
+
+    // Things that are not HLLs.
+    out.push((
+        "errors".into(),
+        vec![
+            c(&[b"SET", b"s", b"hello"]),
+            c(&[b"PFADD", b"s", b"x"]),
+            c(&[b"PFCOUNT", b"s"]),
+            c(&[b"PFMERGE", b"d", b"s"]),
+            c(&[b"PFMERGE", b"s", b"d"]),
+            c(&[b"SET", b"short", b"abc"]),
+            c(&[b"PFCOUNT", b"short"]),
+            c(&[b"LPUSH", b"l", b"a"]),
+            c(&[b"PFADD", b"l", b"x"]),
+            c(&[b"PFCOUNT", b"l"]),
+        ],
+    ));
+
+    // Redis 7.0 made PFCOUNT and PFMERGE detect a corrupt sparse body; older
+    // versions overrun their register array instead.
+    out.push((
+        "@7.0 corrupt body".into(),
+        vec![
+            c(&[b"PFADD", b"c", b"a", b"b", b"c"]),
+            c(&[b"SETRANGE", b"c", b"16", b"\x7f\xff"]),
+            c(&[b"PFCOUNT", b"c"]),
+            c(&[b"PFADD", b"c", b"z"]),
+            c(&[b"PFCOUNT", b"c", b"c"]),
+            c(&[b"PFMERGE", b"d", b"c"]),
+        ],
+    ));
+    out
 }

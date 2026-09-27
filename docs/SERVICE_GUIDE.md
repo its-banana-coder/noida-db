@@ -67,3 +67,9 @@ Search GitHub and crates.io for an existing implementation first. Use a crate,
 or port the reference implementation to Rust (citing it in the module doc and
 in `THIRD_PARTY.md`), and only write from scratch when nothing suitable exists.
 Check the licence first. See "Reuse before you build" in `docs/specs/README.md`.
+
+## Say what doesn't work
+
+Update your service's section in `docs/LIMITATIONS.md` in every PR: what is
+not built yet, what is out of scope, and where behaviour knowingly differs
+from the real server. Users trust the tool more when its gaps are written down.

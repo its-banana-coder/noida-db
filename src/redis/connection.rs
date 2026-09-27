@@ -70,19 +70,26 @@ fn quit(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 
 const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
 
-/// noida has one user, "default", with no password (Redis's out-of-the-box
-/// setup), so any password works for it.
-fn authenticate(user: &[u8], _password: &[u8]) -> Result<(), Value> {
-    if user == b"default" { Ok(()) } else { Err(Value::err(WRONGPASS)) }
+/// There is one user, `default`. Without `requirepass` it has no password
+/// (Redis's out-of-the-box setup) and any password works; with it, the
+/// password must match. A success authenticates the connection.
+fn authenticate(ctx: &mut Ctx, user: &[u8], password: &[u8]) -> Result<(), Value> {
+    let required = ctx.engine.requirepass();
+    if user != b"default" || (!required.is_empty() && password != required.as_bytes()) {
+        return Err(Value::err(WRONGPASS));
+    }
+    ctx.client().authenticated = true;
+    Ok(())
 }
 
-fn auth(_: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+fn auth(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     match a.len() {
-        2 => Err(Value::err(
+        2 if ctx.engine.requirepass().is_empty() => Err(Value::err(
             "ERR AUTH <password> called without any password configured for the default user. \
              Are you sure your configuration is correct?",
         )),
-        3 => authenticate(&a[1], &a[2]).map(|_| Value::ok()),
+        2 => authenticate(ctx, b"default", &a[1]).map(|_| Value::ok()),
+        3 => authenticate(ctx, &a[1], &a[2]).map(|_| Value::ok()),
         _ => Err(syntax()),
     }
 }
@@ -136,7 +143,14 @@ fn hello(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         j += 1;
     }
     if let Some((user, pass)) = credentials {
-        authenticate(user, pass)?;
+        authenticate(ctx, user, pass)?;
+    }
+    if !ctx.client().authenticated {
+        return Err(Value::err(
+            "NOAUTH HELLO must be called with the client already authenticated, otherwise the \
+             HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and \
+             select the RESP protocol version at the same time",
+        ));
     }
     let id = ctx.session.id as i64;
     let client = ctx.client();
@@ -163,7 +177,9 @@ fn reset(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
     let id = ctx.session.id;
     ctx.engine.unwatch_all(id);
     ctx.engine.unsubscribe_everything(id);
+    let open = ctx.engine.requirepass().is_empty();
     let c = ctx.client();
+    c.authenticated = open;
     c.multi = None;
     c.multi_error = false;
     c.dirty_cas = false;
@@ -246,6 +262,9 @@ fn client_id(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 /// performance analysis.
 fn info_line(c: &Client, now: u64) -> String {
     let mut flags = String::new();
+    if c.monitor {
+        flags.push('O');
+    }
     if c.subs.active() {
         flags.push('P');
     }

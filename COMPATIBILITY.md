@@ -1,5 +1,8 @@
 # Compatibility & footprint targets
 
+What does *not* work is listed in [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+The footprint figures below are targets; only the binary size is measured today.
+
 ## The promise
 
 An app that uses these systems in the usual way can point at noida on a
@@ -27,9 +30,10 @@ Redis ~10MB. Docker Desktop's VM comes on top of that.
 How we stay inside the targets:
 - **Data lives on disk.** Only a bounded cache is held in RAM. Kafka logs are
   read straight from files.
-- **Redis data is in memory, as it is in real Redis.** It counts toward
-  `--max-memory`, and when the cap is hit noida follows Redis's `maxmemory`
-  rules (eviction policies, then the OOM error).
+- **Redis data is in memory, as it is in real Redis.** *Planned:* it counts
+  toward `--max-memory`, and when the cap is hit noida follows Redis's
+  `maxmemory` rules (eviction policies, then the OOM error). Not built yet:
+  today nothing is enforced and nothing is persisted.
 - **A thread per connection,** with small stacks. Only the stack memory a
   connection actually touches counts, so an idle one costs KBs, not MBs.
 - **Services start lazily.** A service that no one has connected to allocates
@@ -69,7 +73,7 @@ Every service is its own module:
   commands `DUMP` `RESTORE` `RESTORE-ASKING` `MIGRATE` `PSYNC` `SYNC`
   `REPLCONF` `REPLICAOF` `SLAVEOF` `ROLE` `WAIT` `WAITAOF` `FAILOVER`
   `SENTINEL` `CLUSTER` `ASKING` `READONLY` `READWRITE` `DEBUG` `SHUTDOWN`
-  `PFDEBUG` `PFSELFTEST` `LOLWUT`; they answer as unknown commands.
+  `PFDEBUG` `PFSELFTEST`; they answer as unknown commands.
 
 ### Postgres (port 5432)
 - **In scope:**

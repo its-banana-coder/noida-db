@@ -34,6 +34,21 @@ impl RawClient {
         self.writer.write_all(bytes).unwrap();
     }
 
+    /// Makes reads give up after `ms` instead of blocking forever.
+    pub fn set_timeout(&self, ms: u64) {
+        self.writer.set_read_timeout(Some(std::time::Duration::from_millis(ms))).unwrap();
+    }
+
+    /// Like `read`, but `None` on timeout, error or a closed connection.
+    pub fn try_read(&mut self) -> Option<Value> {
+        resp::read_value(&mut self.reader).ok().flatten()
+    }
+
+    /// The local port of this connection (how MONITOR names a client).
+    pub fn local_port(&self) -> u16 {
+        self.writer.local_addr().unwrap().port()
+    }
+
     pub fn read(&mut self) -> Option<Value> {
         resp::read_value(&mut self.reader).expect("read reply")
     }

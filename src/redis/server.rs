@@ -25,9 +25,34 @@ struct Shared {
 
 /// Binds `addr` and serves Redis on background threads.
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
+    let password = std::env::var("NOIDA_REDIS_PASSWORD").ok().filter(|p| !p.is_empty());
+    spawn_with(addr, password.as_deref())
+}
+
+/// Like `spawn`, with `requirepass` set: new connections must AUTH first.
+/// (`noida-db start` passes `NOIDA_REDIS_PASSWORD` through `spawn`.)
+pub fn spawn_with(addr: &str, password: Option<&str>) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    let engine = Arc::new(Shared { engine: Mutex::new(Engine::new()), replies: Condvar::new() });
+    let mut engine = Engine::new();
+    if let Some(password) = password {
+        // Set it the way CONFIG SET would, from a throwaway connection.
+        let conn = ClientConn {
+            addr: "127.0.0.1:0".into(),
+            laddr: local.to_string(),
+            fd: -1,
+            kill: None,
+            push: None,
+        };
+        let mut session = engine.connect(conn);
+        let args: Vec<Vec<u8>> = ["CONFIG", "SET", "requirepass", password]
+            .iter()
+            .map(|a| a.as_bytes().to_vec())
+            .collect();
+        engine.execute(&mut session, &args);
+        engine.disconnect(&session);
+    }
+    let engine = Arc::new(Shared { engine: Mutex::new(engine), replies: Condvar::new() });
 
     let sweeper = Arc::clone(&engine);
     thread::Builder::new().name("redis-expire".into()).stack_size(STACK_SIZE).spawn(move || {
