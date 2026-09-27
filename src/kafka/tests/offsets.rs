@@ -5,10 +5,12 @@ use kafka_protocol::messages::offset_commit_request::{
 use kafka_protocol::messages::offset_delete_request::{
     OffsetDeleteRequest, OffsetDeleteRequestPartition, OffsetDeleteRequestTopic,
 };
-use kafka_protocol::messages::offset_fetch_request::{OffsetFetchRequest, OffsetFetchRequestTopic};
+use kafka_protocol::messages::offset_fetch_request::{
+    OffsetFetchRequest, OffsetFetchRequestGroup, OffsetFetchRequestTopic, OffsetFetchRequestTopics,
+};
 use kafka_protocol::messages::sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment};
 use kafka_protocol::messages::{GroupId, TopicName};
-use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::protocol::{Encodable, StrBytes};
 
 use super::T;
 
@@ -160,4 +162,49 @@ fn test_offset_delete() {
     del_unknown.group_id = GroupId(StrBytes::from_static_str("nonexistent-group"));
     let del_unknown_resp = t.engine.handle_offset_delete(&del_unknown, 0);
     assert_eq!(del_unknown_resp.error_code, 69);
+}
+
+#[test]
+fn test_offset_fetch_v8() {
+    let t = T::new();
+
+    // Commit offset 100 for v8-grp
+    let mut commit_req = OffsetCommitRequest::default();
+    commit_req.group_id = GroupId(StrBytes::from_static_str("v8-grp"));
+    let mut topic_req = OffsetCommitRequestTopic::default();
+    topic_req.name = TopicName::from(StrBytes::from_static_str("v8-topic"));
+    let mut part_req = OffsetCommitRequestPartition::default();
+    part_req.partition_index = 0;
+    part_req.committed_offset = 100;
+    topic_req.partitions.push(part_req);
+    commit_req.topics.push(topic_req);
+    let commit_resp = t.engine.handle_offset_commit(&commit_req, 8);
+    assert_eq!(commit_resp.topics[0].partitions[0].error_code, 0);
+
+    // Fetch offset using v8 format (groups array)
+    let mut fetch_req = OffsetFetchRequest::default();
+    let mut group_req = OffsetFetchRequestGroup::default();
+    group_req.group_id = GroupId(StrBytes::from_static_str("v8-grp"));
+    let mut topic_req = OffsetFetchRequestTopics::default();
+    topic_req.name = TopicName::from(StrBytes::from_static_str("v8-topic"));
+    topic_req.partition_indexes.push(0);
+    topic_req.partition_indexes.push(1);
+    group_req.topics = Some(vec![topic_req]);
+    fetch_req.groups.push(group_req);
+
+    let fetch_resp = t.engine.handle_offset_fetch(&fetch_req, 8);
+    assert_eq!(fetch_resp.groups.len(), 1);
+    assert_eq!(fetch_resp.groups[0].group_id.as_str(), "v8-grp");
+    assert_eq!(fetch_resp.groups[0].topics.len(), 1);
+    let parts = &fetch_resp.groups[0].topics[0].partitions;
+    assert_eq!(parts[0].partition_index, 0);
+    assert_eq!(parts[0].committed_offset, 100);
+    assert_eq!(parts[0].error_code, 0);
+    assert_eq!(parts[1].partition_index, 1);
+    assert_eq!(parts[1].committed_offset, -1);
+    assert_eq!(parts[1].error_code, 0);
+
+    // Verify OffsetFetchResponse v8 encodes without error
+    let mut buf = bytes::BytesMut::new();
+    fetch_resp.encode(&mut buf, 8).expect("v8 response encoding");
 }

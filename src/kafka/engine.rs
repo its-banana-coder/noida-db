@@ -16,7 +16,7 @@ use kafka_protocol::messages::{
     ApiKey, ApiVersionsResponse, CreateTopicsRequest, CreateTopicsResponse, FetchRequest,
     FetchResponse, InitProducerIdRequest, InitProducerIdResponse, ListOffsetsRequest,
     ListOffsetsResponse, MetadataRequest, MetadataResponse, ProduceRequest, ProduceResponse,
-    ProducerId,
+    ProducerId, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
 use std::collections::{HashMap, HashSet};
@@ -653,12 +653,13 @@ impl EngineState {
         version: i16,
     ) -> kafka_protocol::messages::FindCoordinatorResponse {
         let mut res = kafka_protocol::messages::FindCoordinatorResponse::default();
-        res.node_id = kafka_protocol::messages::BrokerId(self.broker_id);
-        res.host = StrBytes::from_string(self.host.clone());
-        res.port = self.port;
-        res.error_code = 0;
 
-        if version >= 4 {
+        if version <= 3 {
+            res.node_id = kafka_protocol::messages::BrokerId(self.broker_id);
+            res.host = StrBytes::from_string(self.host.clone());
+            res.port = self.port;
+            res.error_code = 0;
+        } else {
             let keys = if !req.coordinator_keys.is_empty() {
                 req.coordinator_keys.clone()
             } else {
@@ -699,8 +700,8 @@ impl EngineState {
         }
 
         // KIP-394: dynamic member join with empty member_id returns MEMBER_ID_REQUIRED (79)
-        // for API version >= 4 (or modern clients).
-        if req.member_id.is_empty() {
+        // for API version >= 4. For v0-v3, coordinator assigns member_id in the first JoinGroup.
+        if version >= 4 && req.member_id.is_empty() {
             let assigned_id =
                 format!("noida-client-{}-{}", self.next_member_counter, uuid_simple());
             self.next_member_counter += 1;
@@ -713,8 +714,18 @@ impl EngineState {
             return res;
         }
 
-        let m_id = req.member_id.as_str().to_string();
-        let is_known = group.members.contains_key(&m_id) || group.pending_member_ids.remove(&m_id);
+        let m_id = if req.member_id.is_empty() {
+            let assigned_id =
+                format!("noida-client-{}-{}", self.next_member_counter, uuid_simple());
+            self.next_member_counter += 1;
+            assigned_id
+        } else {
+            req.member_id.as_str().to_string()
+        };
+
+        let is_known = req.member_id.is_empty()
+            || group.members.contains_key(&m_id)
+            || group.pending_member_ids.remove(&m_id);
 
         if !is_known {
             res.error_code = 25; // UNKNOWN_MEMBER_ID
@@ -1041,41 +1052,125 @@ impl EngineState {
     pub fn handle_offset_fetch(
         &self,
         req: &kafka_protocol::messages::OffsetFetchRequest,
-        _version: i16,
+        version: i16,
     ) -> kafka_protocol::messages::OffsetFetchResponse {
         use kafka_protocol::messages::offset_fetch_response::{
-            OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+            OffsetFetchResponseGroup, OffsetFetchResponsePartition, OffsetFetchResponsePartitions,
+            OffsetFetchResponseTopic, OffsetFetchResponseTopics,
         };
         let mut res = kafka_protocol::messages::OffsetFetchResponse::default();
-        let group_id = req.group_id.as_str().to_string();
 
-        if let Some(topics) = &req.topics {
-            for topic in topics {
-                let mut topic_res = OffsetFetchResponseTopic::default();
-                topic_res.name = topic.name.clone();
-                let topic_name = topic.name.as_str().to_string();
+        if version >= 8 && (!req.groups.is_empty() || req.group_id.is_empty()) {
+            for group_req in &req.groups {
+                let group_id = group_req.group_id.as_str().to_string();
+                let mut group_res = OffsetFetchResponseGroup::default();
+                group_res.group_id = group_req.group_id.clone();
+                group_res.error_code = 0;
 
-                for &partition_index in &topic.partition_indexes {
-                    let mut part_res = OffsetFetchResponsePartition::default();
-                    part_res.partition_index = partition_index;
+                if let Some(topics) = &group_req.topics {
+                    for topic_req in topics {
+                        let mut topic_res = OffsetFetchResponseTopics::default();
+                        topic_res.name = topic_req.name.clone();
+                        let topic_name = topic_req.name.as_str().to_string();
 
-                    if let Some(&offset) = self.committed_offsets.get(&(
-                        group_id.clone(),
-                        topic_name.clone(),
-                        partition_index,
-                    )) {
-                        part_res.committed_offset = offset;
-                        part_res.error_code = 0;
-                    } else {
-                        // Offset uncommitted: offset -1 with error 0
-                        part_res.committed_offset = -1;
-                        part_res.error_code = 0;
+                        for &partition_index in &topic_req.partition_indexes {
+                            let mut part_res = OffsetFetchResponsePartitions::default();
+                            part_res.partition_index = partition_index;
+
+                            if let Some(&offset) = self.committed_offsets.get(&(
+                                group_id.clone(),
+                                topic_name.clone(),
+                                partition_index,
+                            )) {
+                                part_res.committed_offset = offset;
+                                part_res.error_code = 0;
+                            } else {
+                                part_res.committed_offset = -1;
+                                part_res.error_code = 0;
+                            }
+
+                            topic_res.partitions.push(part_res);
+                        }
+
+                        group_res.topics.push(topic_res);
                     }
-
-                    topic_res.partitions.push(part_res);
+                } else {
+                    let mut topics_map: std::collections::BTreeMap<String, Vec<(i32, i64)>> =
+                        std::collections::BTreeMap::new();
+                    for ((g, t, p), &off) in &self.committed_offsets {
+                        if g == &group_id {
+                            topics_map.entry(t.clone()).or_default().push((*p, off));
+                        }
+                    }
+                    for (t_name, mut parts) in topics_map {
+                        parts.sort_by_key(|(p, _)| *p);
+                        let mut topic_res = OffsetFetchResponseTopics::default();
+                        topic_res.name = TopicName::from(StrBytes::from_string(t_name));
+                        for (partition_index, offset) in parts {
+                            let mut part_res = OffsetFetchResponsePartitions::default();
+                            part_res.partition_index = partition_index;
+                            part_res.committed_offset = offset;
+                            part_res.error_code = 0;
+                            topic_res.partitions.push(part_res);
+                        }
+                        group_res.topics.push(topic_res);
+                    }
                 }
 
-                res.topics.push(topic_res);
+                res.groups.push(group_res);
+            }
+        } else {
+            let group_id = req.group_id.as_str().to_string();
+
+            if let Some(topics) = &req.topics {
+                for topic in topics {
+                    let mut topic_res = OffsetFetchResponseTopic::default();
+                    topic_res.name = topic.name.clone();
+                    let topic_name = topic.name.as_str().to_string();
+
+                    for &partition_index in &topic.partition_indexes {
+                        let mut part_res = OffsetFetchResponsePartition::default();
+                        part_res.partition_index = partition_index;
+
+                        if let Some(&offset) = self.committed_offsets.get(&(
+                            group_id.clone(),
+                            topic_name.clone(),
+                            partition_index,
+                        )) {
+                            part_res.committed_offset = offset;
+                            part_res.error_code = 0;
+                        } else {
+                            // Offset uncommitted: offset -1 with error 0
+                            part_res.committed_offset = -1;
+                            part_res.error_code = 0;
+                        }
+
+                        topic_res.partitions.push(part_res);
+                    }
+
+                    res.topics.push(topic_res);
+                }
+            } else {
+                let mut topics_map: std::collections::BTreeMap<String, Vec<(i32, i64)>> =
+                    std::collections::BTreeMap::new();
+                for ((g, t, p), &off) in &self.committed_offsets {
+                    if g == &group_id {
+                        topics_map.entry(t.clone()).or_default().push((*p, off));
+                    }
+                }
+                for (t_name, mut parts) in topics_map {
+                    parts.sort_by_key(|(p, _)| *p);
+                    let mut topic_res = OffsetFetchResponseTopic::default();
+                    topic_res.name = TopicName::from(StrBytes::from_string(t_name));
+                    for (partition_index, offset) in parts {
+                        let mut part_res = OffsetFetchResponsePartition::default();
+                        part_res.partition_index = partition_index;
+                        part_res.committed_offset = offset;
+                        part_res.error_code = 0;
+                        topic_res.partitions.push(part_res);
+                    }
+                    res.topics.push(topic_res);
+                }
             }
         }
 
