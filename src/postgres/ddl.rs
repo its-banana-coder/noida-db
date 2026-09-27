@@ -700,19 +700,22 @@ impl Ddl<'_, '_> {
         };
         let t = self.ctx.db.table_mut(oid).unwrap();
         t.indexes.push(index);
-        // A unique index behaves like a unique constraint.
-        if ci.unique && cols.iter().all(|c| c.is_some()) {
-            let rows = self.ctx.db.table(oid).unwrap().rows.clone();
-            let keys: Vec<usize> = cols.iter().map(|c| c.unwrap()).collect();
-            let t = self.ctx.db.table(oid).unwrap();
-            for (i, r) in rows.iter().enumerate() {
-                if let Some(_dup) = check_unique_violation(t, &keys, r, Some(i), false) {
-                    let names: Vec<String> =
-                        keys.iter().map(|&k| t.columns[k].name.clone()).collect();
-                    let idxname = t.indexes.last().unwrap().name.clone();
+        // Existing rows must already satisfy a unique index.
+        if ci.unique {
+            let t = self.ctx.db.table(oid).unwrap().clone();
+            let idx = t.indexes.last().unwrap().clone();
+            for (i, r) in t.rows.iter().enumerate() {
+                if super::dml::unique_index_conflict(self.ctx, &t, &idx, r, Some(i))?.is_some() {
+                    let names: Vec<String> = idx
+                        .cols
+                        .iter()
+                        .map(|c| {
+                            c.map_or_else(|| idx.exprs[0].clone(), |k| t.columns[k].name.clone())
+                        })
+                        .collect();
                     return Err(PgError::new(
                         code::UNIQUE_VIOLATION,
-                        format!("could not create unique index \"{idxname}\""),
+                        format!("could not create unique index \"{}\"", idx.name),
                     )
                     .detail(format!("Key ({}) is duplicated.", names.join(", "))));
                 }

@@ -9,23 +9,21 @@ pub mod auth;
 pub mod binder;
 pub mod casts;
 pub mod catalog;
-pub mod datetime;
 pub mod ddl;
 pub mod dml;
 pub mod engine;
 pub mod error;
 pub mod exec;
 pub mod funcs;
-pub mod json;
 pub mod keywords;
-pub mod numeric;
 pub mod pgcatalog;
 pub mod plan;
 pub mod server;
 pub mod session;
 pub mod sigs;
 pub mod types;
-pub mod tz;
+
+pub use crate::sql::{datetime, json, numeric, tz};
 
 use std::io;
 use std::net::SocketAddr;

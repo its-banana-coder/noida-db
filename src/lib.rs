@@ -10,6 +10,9 @@ pub mod services;
 #[cfg(feature = "redis")]
 pub mod redis;
 
+#[cfg(feature = "sql")]
+pub mod sql;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 

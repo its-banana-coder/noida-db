@@ -338,6 +338,30 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
             .column(&c.name));
         }
     }
+    for idx in t.indexes.iter().filter(|i| i.unique) {
+        if t.constraints.iter().any(|c| c.index_oid == Some(idx.oid)) {
+            continue;
+        }
+        if let Some(key) = unique_index_conflict(ctx, &t, idx, row, skip)? {
+            let names: Vec<String> = idx
+                .cols
+                .iter()
+                .map(|c| c.map_or_else(|| idx.exprs[0].clone(), |i| t.columns[i].name.clone()))
+                .collect();
+            let vals: Vec<String> = key
+                .iter()
+                .zip(&idx.cols)
+                .map(|(v, c)| value_text(ctx, v, c.map_or(Type::TEXT, |i| t.columns[i].ty)))
+                .collect();
+            return Err(PgError::new(
+                code::UNIQUE_VIOLATION,
+                format!("duplicate key value violates unique constraint \"{}\"", idx.name),
+            )
+            .detail(format!("Key ({})=({}) already exists.", names.join(", "), vals.join(", ")))
+            .table(&schema, &t.name)
+            .constraint(&idx.name));
+        }
+    }
     for cons in &t.constraints {
         match &cons.kind {
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
@@ -424,6 +448,60 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
         }
     }
     Ok(())
+}
+
+/// The key `idx` stores for `row`: `None` when a partial index excludes it.
+fn index_key(
+    ctx: &mut Ctx,
+    t: &Table,
+    idx: &super::catalog::Index,
+    row: &Row,
+) -> PgResult<Option<Vec<Value>>> {
+    if let Some(pred) = &idx.predicate {
+        let e = bind_check(ctx, t, pred)?;
+        if !matches!(exec::eval(&e, row, ctx)?, Value::Bool(true)) {
+            return Ok(None);
+        }
+    }
+    let mut exprs = idx.exprs.iter();
+    let mut key = vec![];
+    for c in &idx.cols {
+        match c {
+            Some(i) => key.push(row[*i].clone()),
+            None => {
+                let sql = exprs.next().expect("expression index key");
+                let e = bind_check(ctx, t, sql)?;
+                key.push(exec::eval(&e, row, ctx)?);
+            }
+        }
+    }
+    Ok(Some(key))
+}
+
+/// The row of `t` (other than `skip`) that `row` collides with in the unique
+/// index `idx`.
+pub fn unique_index_conflict(
+    ctx: &mut Ctx,
+    t: &Table,
+    idx: &super::catalog::Index,
+    row: &Row,
+    skip: Option<usize>,
+) -> PgResult<Option<Vec<Value>>> {
+    let Some(key) = index_key(ctx, t, idx, row)? else { return Ok(None) };
+    if !idx.nulls_not_distinct && key.iter().any(|v| v.is_null()) {
+        return Ok(None);
+    }
+    for (i, other) in t.rows.iter().enumerate() {
+        if Some(i) == skip {
+            continue;
+        }
+        if let Some(k) = index_key(ctx, t, idx, other)?
+            && k.iter().zip(&key).all(|(a, b)| types::values_equal(a, b))
+        {
+            return Ok(Some(key));
+        }
+    }
+    Ok(None)
 }
 
 fn bind_check(ctx: &mut Ctx, t: &Table, sql: &str) -> PgResult<Expr> {

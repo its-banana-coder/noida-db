@@ -346,8 +346,7 @@ impl PosixTz {
             return (self.std_off, false, self.std_name.clone());
         };
         let year =
-            crate::postgres::datetime::civil_from_days((t + self.std_off as i64).div_euclid(86400))
-                .0;
+            crate::sql::datetime::civil_from_days((t + self.std_off as i64).div_euclid(86400)).0;
         // DST starts at local standard time t1, ends at local DST time t2.
         let start = rule_day(*r1, year) * 86400 + *t1 as i64 - self.std_off as i64;
         let end = rule_day(*r2, year) * 86400 + *t2 as i64 - *dst_off as i64;
@@ -362,7 +361,7 @@ impl PosixTz {
 
 /// Unix day of a rule's date in `year`.
 fn rule_day(r: Rule, year: i64) -> i64 {
-    use crate::postgres::datetime::{days_from_civil, is_leap};
+    use crate::sql::datetime::{days_from_civil, is_leap};
     match r {
         Rule::J(n) => {
             let mut d = n as i64 - 1;
@@ -487,18 +486,18 @@ mod tests {
     fn posix_rules() {
         let tz = PosixTz::parse("EST5EDT,M3.2.0,M11.1.0").unwrap();
         // 2030-07-01 12:00 UTC is in DST.
-        let t = crate::postgres::datetime::days_from_civil(2030, 7, 1) * 86400 + 43200;
+        let t = crate::sql::datetime::days_from_civil(2030, 7, 1) * 86400 + 43200;
         assert_eq!(tz.at_utc(t).0, -4 * 3600);
-        let t = crate::postgres::datetime::days_from_civil(2030, 1, 1) * 86400;
+        let t = crate::sql::datetime::days_from_civil(2030, 1, 1) * 86400;
         assert_eq!(tz.at_utc(t).0, -5 * 3600);
     }
 
     #[test]
     fn system_zone_if_present() {
         if let Some(z) = lookup("America/New_York") {
-            let t = crate::postgres::datetime::days_from_civil(2020, 6, 1) * 86400;
+            let t = crate::sql::datetime::days_from_civil(2020, 6, 1) * 86400;
             assert_eq!(z.offset_at_utc(t), -4 * 3600);
-            let t = crate::postgres::datetime::days_from_civil(2020, 1, 1) * 86400;
+            let t = crate::sql::datetime::days_from_civil(2020, 1, 1) * 86400;
             assert_eq!(z.offset_at_utc(t), -5 * 3600);
         }
     }

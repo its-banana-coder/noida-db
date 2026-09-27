@@ -13,7 +13,9 @@ license = "MIT"
 [features]
 default = ["redis", "postgres"]
 redis = []
-postgres = ["dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
+# Shared SQL engine pieces; enabled by every SQL service.
+sql = []
+postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = []
 memcached = []
 
