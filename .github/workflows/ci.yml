@@ -47,6 +47,7 @@ jobs:
       - run: cargo test --test redis_diff -- --nocapture
       - run: cargo test --features postgres --test postgres_diff -- --nocapture
       - run: cargo test --features elasticsearch --test elasticsearch_diff -- --nocapture
+      - run: tests/clients/elasticsearch/run.sh
       # Real drivers and ORMs: psycopg, SQLAlchemy, node-postgres, JDBC.
       - run: tests/clients/postgres/run.sh
       # Modularity: the binary must build with any service set, even none.
