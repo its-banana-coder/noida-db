@@ -15,8 +15,13 @@ but not identical to the real server.
 |---|---|---|
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
+<<<<<<< HEAD
 | Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
 | MySQL | early scaffolding, not merged | no |
+=======
+| MySQL | early scaffolding, not merged | no |
+| Kafka | early scaffolding, not merged | no |
+>>>>>>> origin/main
 | Memcached, MongoDB, RabbitMQ, Elasticsearch, ClickHouse | specs only (`docs/specs/`) | no |
 
 ## By design, for every service

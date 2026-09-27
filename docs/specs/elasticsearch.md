@@ -11,6 +11,46 @@
   `ES_JAVA_OPTS=-Xms512m -Xmx512m`. Env var:
   `NOIDA_ELASTICSEARCH_REF=http://host:port`.
 
+## Roadmap (checked 2026-09-27)
+
+Current state, read from the code: `src/elasticsearch/engine.rs` (~560
+lines) has index CRUD, document CRUD (`_doc`/`_create`/`_source`), `_bulk`,
+and dynamic mapping — a real start on milestone 1. `_search` is not wired
+into `dispatch()` at all yet, so nothing past "index and fetch a document by
+id" works. There are **zero tests** (`grep -c '#\[test\]'` is 0 across all
+three files), and the module's ~700 lines are still uncommitted on disk.
+This is the opposite problem from Kafka: instead of tests trailing features,
+here there's no test harness at all yet to trail. Fix that before writing
+more of the engine, not after:
+
+1. **Commit a checkpoint now.** Uncommitted work of this size is one bad
+   `git checkout` away from being lost. It doesn't need to be finished —
+   `wip(elasticsearch): index and document CRUD, bulk, dynamic mapping` is a
+   fine commit message for a feature branch. Then keep committing in small
+   slices from here.
+2. **Before adding `_search`, set up the three-layer test structure this
+   project uses everywhere else** (see the Redis module for the pattern):
+   - `src/elasticsearch/tests/`: engine-level tests against `Engine::dispatch`
+     directly, no HTTP, checking exact JSON shapes and status codes against
+     what §2/§3 specify (the error JSON shape in §2 especially — get that
+     byte-for-byte right early, since every error path depends on it).
+   - `tests/elasticsearch_diff.rs`: wire up `NOIDA_ELASTICSEARCH_REF` now,
+     even with nothing to compare yet beyond `GET /` and index CRUD — CI
+     already runs the ES 8.15.3 service, so this starts paying off on the
+     first PR.
+   - Back-fill tests for the CRUD/bulk/mapping code that already exists
+     before extending it further.
+3. Then continue in spec order (§8's milestones are still the right shape):
+   finish milestone 1 (the Python/Node clients' `info()`/index/get, with a
+   test asserting it), then `_search` with `match_all`/`term`/`bool`/`range`
+   and BM25 scoring (§3's "Relevance" section — the Lucene norm-encoding
+   detail there is easy to get subtly wrong, so a differential test against
+   real ES's `_score` is what catches it, not eyeballing the formula).
+4. Wire the `elasticsearch` feature into CI (`.github/workflows/ci.yml`
+   needs the ES service and a test step, matching how Redis and Postgres are
+   wired) once milestone 1 has tests behind it — don't wait for the whole
+   spec to be done to get a CI signal.
+
 ## 1. Purpose
 
 Apps using the official clients (Java API client, elasticsearch-py,

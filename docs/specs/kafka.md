@@ -8,6 +8,60 @@
   `apache/kafka:3.8.0` as a single-node KRaft broker. Env var:
   `NOIDA_KAFKA_REF=host:port`.
 
+## Roadmap (checked 2026-09-27)
+
+Where things actually stand, read from the branch itself, not from commit
+messages: `src/kafka/engine.rs` (~1050 lines) already has handlers for
+nearly every P0 key and most of P1 — topics, produce/fetch, consumer groups,
+group admin, configs, and the four transaction APIs. That's real progress.
+But it's outrunning its own tests badly: `tests/kafka_client.rs` has exactly
+**one** test, covering milestone 1–2 only (ApiVersions, CreateTopics,
+Metadata); `tests/kafka_diff.rs` is a stub that does nothing (no local
+broker, no CI run yet). None of §3's P1 work — groups, configs,
+transactions — has a single test proving it does what the spec says. This
+project's rule is tests first; this branch has been writing engine code
+without them, which means nobody, including whoever wrote it, actually
+knows if `handle_join_group` or `handle_add_partitions_to_txn` behave like
+a real broker.
+
+The branch was also 8 commits behind `main` (still on the pre-rename
+`noida` package name, missing every Redis and Postgres commit) and had never
+been run through CI's `-D warnings` clippy pass, which failed on two lints
+in existing code. Do these two first, in order, before writing another
+handler:
+
+1. **`git fetch && git merge origin/main`**, resolve the `Cargo.toml`/
+   `Cargo.lock` conflict by keeping both sides (the `[lib]`/`[[bin]]` split
+   and `sql`/`postgres` features from `main`, `kafka`'s own feature and
+   dependency), then `cargo generate-lockfile`. Confirm with
+   `cargo build --features kafka`, `cargo fmt --check`,
+   `cargo clippy --all-targets --all-features -- -D warnings`, and the
+   existing test.
+2. **Stop adding API keys. Write the tests for what's already there,
+   engine-level first** (`src/kafka/tests/`, following the Redis module's
+   pattern: one file per area, real error codes, no networking). At minimum,
+   one test per handler already in `engine.rs`, covering: correct happy
+   path, the real Kafka error code on each failure branch (see the list in
+   §2), and the group coordinator's state machine transitions (Empty →
+   PreparingRebalance → CompletingRebalance → Stable → Dead) with actual
+   timers, not just the join/sync happy path.
+3. Only then extend `tests/kafka_client.rs` past milestone 2: idempotent
+   producer, a 2-consumer group rebalance (scenario (b) in §5), AdminClient
+   describe/delete. This is what proves the code in `engine.rs` is not just
+   plausible-looking Rust.
+4. Set up `tests/kafka_diff.rs` for real, even without a local broker:
+   build the request/response pairs now (the CI service is already
+   `apache/kafka:3.8.0`; env var `NOIDA_KAFKA_REF` already wired into the
+   spec), so the first CI run on this branch tells you where the engine
+   actually diverges from a real broker. Expect it to find things —
+   that's the point of writing it before more feature work, not after.
+5. Once 1–4 are green in CI, pick up real clients per §5 (Java
+   `kafka-clients` first, since that's this project's primary audience),
+   then continue down the P1/P2 list in §3.
+
+Whoever picks this branch up next: do not add features under time pressure
+just because `engine.rs` compiles. A handler with no test is not done here.
+
 ## 1. Purpose
 
 Producers, consumers, stream processors and admin tools work unchanged

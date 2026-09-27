@@ -87,3 +87,4 @@ required-features = ["kafka"]
 [[test]]
 name = "kafka_diff"
 required-features = ["kafka"]
+
