@@ -337,7 +337,7 @@ fn acl_getuser(_: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let b = Value::bulk;
     let flags = ["on", "nopass", "sanitize-payload"];
     Ok(Value::Map(vec![
-        (b("flags"), Value::Set(flags.iter().map(|f| Value::bulk(f)).collect())),
+        (b("flags"), Value::Set(flags.iter().map(Value::bulk).collect())),
         (b("passwords"), Value::Array(vec![])),
         (b("commands"), b("+@all")),
         (b("keys"), b("~*")),
