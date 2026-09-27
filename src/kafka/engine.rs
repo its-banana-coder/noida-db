@@ -3,6 +3,8 @@
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::create_topics_response::CreatableTopicResult;
 use kafka_protocol::messages::fetch_response::{FetchableTopicResponse, PartitionData};
+use kafka_protocol::messages::find_coordinator_response::Coordinator;
+use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
 use kafka_protocol::messages::list_offsets_response::{
     ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
 };
@@ -17,7 +19,7 @@ use kafka_protocol::messages::{
     ProducerId,
 };
 use kafka_protocol::protocol::StrBytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,7 +29,8 @@ pub struct PartitionState {
     pub leader: i32,
     pub record_batches: Vec<Vec<u8>>,
     pub high_watermark: i64,
-    pub producer_seqs: HashMap<(i64, i16), i32>, // (producer_id, epoch) -> last_sequence
+    // (producer_id, epoch) -> (last_sequence, base_offset)
+    pub producer_seqs: HashMap<(i64, i16), (i32, i64)>,
 }
 
 impl PartitionState {
@@ -45,10 +48,79 @@ impl PartitionState {
 #[derive(Debug, Clone)]
 pub struct TopicState {
     pub name: String,
+    pub is_internal: bool,
     pub partitions: HashMap<i32, PartitionState>,
+    pub configs: HashMap<String, String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupLifecycleState {
+    Empty,
+    PreparingRebalance,
+    CompletingRebalance,
+    Stable,
+    Dead,
+}
+
+impl GroupLifecycleState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Empty => "Empty",
+            Self::PreparingRebalance => "PreparingRebalance",
+            Self::CompletingRebalance => "CompletingRebalance",
+            Self::Stable => "Stable",
+            Self::Dead => "Dead",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupMember {
+    pub member_id: String,
+    pub group_instance_id: Option<String>,
+    pub client_id: String,
+    pub client_host: String,
+    pub session_timeout_ms: i32,
+    pub rebalance_timeout_ms: i32,
+    pub protocol_type: String,
+    pub protocols: Vec<(String, Vec<u8>)>,
+    pub last_heartbeat_ms: i64,
+    pub assignment: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupState {
+    pub group_id: String,
+    pub state: GroupLifecycleState,
+    pub protocol_type: String,
+    pub protocol_name: Option<String>,
+    pub generation_id: i32,
+    pub leader_id: Option<String>,
+    pub members: HashMap<String, GroupMember>,
+    pub pending_member_ids: HashSet<String>,
+    pub awaiting_members: HashMap<String, Vec<(String, Vec<u8>)>>,
+    pub assignments: HashMap<String, Vec<u8>>,
+    pub rebalance_start_ms: i64,
+}
+
+impl GroupState {
+    pub fn new(group_id: String) -> Self {
+        Self {
+            group_id,
+            state: GroupLifecycleState::Empty,
+            protocol_type: String::new(),
+            protocol_name: None,
+            generation_id: 0,
+            leader_id: None,
+            members: HashMap::new(),
+            pending_member_ids: HashSet::new(),
+            awaiting_members: HashMap::new(),
+            assignments: HashMap::new(),
+            rebalance_start_ms: 0,
+        }
+    }
+}
+
 pub struct EngineState {
     pub topics: HashMap<String, TopicState>,
     pub broker_id: i32,
@@ -56,13 +128,32 @@ pub struct EngineState {
     pub port: i32,
     pub cluster_id: String,
     pub next_producer_id: i64,
+    pub next_member_counter: u64,
     // (group_id, topic_name, partition) -> offset
     pub committed_offsets: HashMap<(String, String, i32), i64>,
+    pub groups: HashMap<String, GroupState>,
+    pub broker_configs: HashMap<String, String>,
+    pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl std::fmt::Debug for EngineState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineState")
+            .field("topics", &self.topics)
+            .field("broker_id", &self.broker_id)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("cluster_id", &self.cluster_id)
+            .field("next_producer_id", &self.next_producer_id)
+            .field("committed_offsets", &self.committed_offsets)
+            .field("groups", &self.groups)
+            .finish()
+    }
 }
 
 impl EngineState {
     pub fn new(host: String, port: i32) -> Self {
-        Self {
+        let mut state = Self {
             topics: HashMap::new(),
             broker_id: 1,
             host,
@@ -70,13 +161,49 @@ impl EngineState {
             // Stable base64 UUID style string for cluster id
             cluster_id: "MkU3OEVBNTctOEUyRi00".to_string(),
             next_producer_id: 1000,
+            next_member_counter: 1,
             committed_offsets: HashMap::new(),
+            groups: HashMap::new(),
+            broker_configs: HashMap::new(),
+            clock: None,
+        };
+
+        // Pre-create internal topics as a real KRaft broker does
+        let mut consumer_offsets = TopicState {
+            name: "__consumer_offsets".to_string(),
+            is_internal: true,
+            partitions: HashMap::new(),
+            configs: HashMap::new(),
+        };
+        for p in 0..50 {
+            consumer_offsets.partitions.insert(p, PartitionState::new(p, state.broker_id));
+        }
+        state.topics.insert("__consumer_offsets".to_string(), consumer_offsets);
+
+        let mut txn_state = TopicState {
+            name: "__transaction_state".to_string(),
+            is_internal: true,
+            partitions: HashMap::new(),
+            configs: HashMap::new(),
+        };
+        for p in 0..50 {
+            txn_state.partitions.insert(p, PartitionState::new(p, state.broker_id));
+        }
+        state.topics.insert("__transaction_state".to_string(), txn_state);
+
+        state
+    }
+
+    pub fn now_ms(&self) -> i64 {
+        if let Some(ref clock) = self.clock {
+            clock() as i64
+        } else {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
         }
     }
 
     pub fn handle_api_versions(&self, _version: i16) -> ApiVersionsResponse {
         let mut res = ApiVersionsResponse::default();
-        // Only advertise API keys that noida actually handles
         let supported: &[(ApiKey, i16, i16)] = &[
             (ApiKey::Produce, 0, 9),
             (ApiKey::Fetch, 0, 13),
@@ -145,7 +272,7 @@ impl EngineState {
                 .iter()
                 .filter_map(|t| t.name.as_ref().map(|n| n.as_str().to_string()))
                 .collect(),
-            _ => self.topics.keys().cloned().collect(), // List all topics if empty/none
+            _ => self.topics.keys().cloned().collect(),
         };
 
         for topic_name in topic_names_to_query {
@@ -156,6 +283,7 @@ impl EngineState {
 
             if let Some(state) = self.topics.get(&topic_name) {
                 topic_res.error_code = 0;
+                topic_res.is_internal = state.is_internal;
                 for (p_id, part_state) in &state.partitions {
                     let mut part_res = MetadataResponsePartition::default();
                     part_res.partition_index = *p_id;
@@ -167,8 +295,12 @@ impl EngineState {
                     topic_res.partitions.push(part_res);
                 }
             } else if req.allow_auto_topic_creation {
-                let mut topic_state =
-                    TopicState { name: topic_name.clone(), partitions: HashMap::new() };
+                let mut topic_state = TopicState {
+                    name: topic_name.clone(),
+                    is_internal: false,
+                    partitions: HashMap::new(),
+                    configs: HashMap::new(),
+                };
                 topic_state.partitions.insert(0, PartitionState::new(0, self.broker_id));
 
                 let mut part_res = MetadataResponsePartition::default();
@@ -177,6 +309,7 @@ impl EngineState {
                 part_res.replica_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
                 part_res.isr_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
                 topic_res.partitions.push(part_res);
+                topic_res.is_internal = false;
 
                 self.topics.insert(topic_name, topic_state);
                 topic_res.error_code = 0;
@@ -204,23 +337,32 @@ impl EngineState {
             let topic_name_str = topic.name.as_str();
 
             if topic_name_str.is_empty() {
-                topic_res.error_code = 37; // INVALID_TOPIC_EXCEPTION
+                topic_res.error_code = 17; // INVALID_TOPIC_EXCEPTION
+            } else if topic.num_partitions <= 0 {
+                topic_res.error_code = 37; // INVALID_PARTITIONS
             } else if topic.replication_factor > 1 {
                 topic_res.error_code = 38; // INVALID_REPLICATION_FACTOR
             } else if self.topics.contains_key(topic_name_str) {
                 topic_res.error_code = 36; // TOPIC_ALREADY_EXISTS
             } else {
-                let num_partitions =
-                    if topic.num_partitions > 0 { topic.num_partitions } else { 1 };
-                let mut topic_state =
-                    TopicState { name: topic_name_str.to_string(), partitions: HashMap::new() };
-                for p in 0..num_partitions {
-                    topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
-                }
-                self.topics.insert(topic_name_str.to_string(), topic_state);
                 topic_res.error_code = 0;
-                topic_res.num_partitions = num_partitions;
-                topic_res.replication_factor = 1;
+                if !req.validate_only {
+                    let mut topic_state = TopicState {
+                        name: topic_name_str.to_string(),
+                        is_internal: false,
+                        partitions: HashMap::new(),
+                        configs: HashMap::new(),
+                    };
+                    for p in 0..topic.num_partitions {
+                        topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
+                    }
+                    for conf in &topic.configs {
+                        if let Some(val) = &conf.value {
+                            topic_state.configs.insert(conf.name.to_string(), val.to_string());
+                        }
+                    }
+                    self.topics.insert(topic_name_str.to_string(), topic_state);
+                }
             }
 
             res.topics.push(topic_res);
@@ -270,10 +412,9 @@ impl EngineState {
                 let current_count = topic_state.partitions.len() as i32;
                 let new_count = topic_partition_data.count;
 
-                if new_count < current_count {
+                if new_count <= current_count {
+                    // Partitions can only be increased
                     topic_res.error_code = 37; // INVALID_PARTITIONS
-                } else if new_count == current_count {
-                    topic_res.error_code = 0;
                 } else {
                     for p in current_count..new_count {
                         topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
@@ -307,8 +448,7 @@ impl EngineState {
 
     pub fn handle_produce(&mut self, req: &ProduceRequest, _version: i16) -> ProduceResponse {
         let mut res = ProduceResponse::default();
-        let now =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let now = self.now_ms();
 
         for topic in &req.topic_data {
             let mut topic_res = TopicProduceResponse::default();
@@ -322,6 +462,70 @@ impl EngineState {
                 if let Some(topic_state) = self.topics.get_mut(topic_name) {
                     if let Some(part_state) = topic_state.partitions.get_mut(&partition.index) {
                         if let Some(records) = &partition.records {
+                            // Check if this is a Kafka record batch v2
+                            let is_batch_v2 = records.len() >= 61 && records[16] == 2;
+                            if is_batch_v2 {
+                                let producer_id =
+                                    i64::from_be_bytes(records[43..51].try_into().unwrap());
+                                let producer_epoch =
+                                    i16::from_be_bytes(records[51..53].try_into().unwrap());
+                                let base_sequence =
+                                    i32::from_be_bytes(records[53..57].try_into().unwrap());
+                                let last_offset_delta =
+                                    i32::from_be_bytes(records[23..27].try_into().unwrap());
+
+                                if producer_id >= 0 {
+                                    if let Some(&(last_seq, prev_base_offset)) =
+                                        part_state.producer_seqs.get(&(producer_id, producer_epoch))
+                                    {
+                                        if base_sequence <= last_seq {
+                                            // Duplicate batch acknowledged without re-append
+                                            part_res.error_code = 0;
+                                            part_res.base_offset = prev_base_offset;
+                                            part_res.log_append_time_ms = now;
+                                            topic_res.partition_responses.push(part_res);
+                                            continue;
+                                        } else if base_sequence > last_seq + 1 {
+                                            // Gap in sequence numbers
+                                            part_res.error_code = 45; // OUT_OF_ORDER_SEQUENCE_NUMBER
+                                            topic_res.partition_responses.push(part_res);
+                                            continue;
+                                        }
+                                    } else if base_sequence != 0 {
+                                        // First sequence must be 0
+                                        part_res.error_code = 45; // OUT_OF_ORDER_SEQUENCE_NUMBER
+                                        topic_res.partition_responses.push(part_res);
+                                        continue;
+                                    }
+
+                                    let base_offset = part_state.high_watermark;
+                                    let mut batch_bytes = records.to_vec();
+                                    if batch_bytes.len() >= 8 {
+                                        batch_bytes[0..8]
+                                            .copy_from_slice(&base_offset.to_be_bytes());
+                                    }
+                                    part_state.record_batches.push(batch_bytes);
+                                    let last_seq = base_sequence + last_offset_delta;
+                                    part_state.producer_seqs.insert(
+                                        (producer_id, producer_epoch),
+                                        (last_seq, base_offset),
+                                    );
+                                    let delta = if last_offset_delta >= 0 {
+                                        last_offset_delta as i64 + 1
+                                    } else {
+                                        1
+                                    };
+                                    part_state.high_watermark += delta;
+
+                                    part_res.error_code = 0;
+                                    part_res.base_offset = base_offset;
+                                    part_res.log_append_time_ms = now;
+                                    topic_res.partition_responses.push(part_res);
+                                    continue;
+                                }
+                            }
+
+                            // Non-idempotent or raw payload
                             let base_offset = part_state.high_watermark;
                             part_state.record_batches.push(records.to_vec());
                             part_state.high_watermark += 1;
@@ -418,7 +622,7 @@ impl EngineState {
                             // Earliest
                             part_res.offset = 0;
                         } else {
-                            // Latest (-1) / Max timestamp (-3) / default
+                            // Latest (-1) or timestamp
                             part_res.offset = part_state.high_watermark;
                         }
                     } else {
@@ -439,79 +643,337 @@ impl EngineState {
 
     pub fn handle_find_coordinator(
         &self,
-        _req: &kafka_protocol::messages::FindCoordinatorRequest,
-        _version: i16,
+        req: &kafka_protocol::messages::FindCoordinatorRequest,
+        version: i16,
     ) -> kafka_protocol::messages::FindCoordinatorResponse {
         let mut res = kafka_protocol::messages::FindCoordinatorResponse::default();
         res.node_id = kafka_protocol::messages::BrokerId(self.broker_id);
         res.host = StrBytes::from_string(self.host.clone());
         res.port = self.port;
         res.error_code = 0;
+
+        if version >= 4 {
+            let keys = if !req.coordinator_keys.is_empty() {
+                req.coordinator_keys.clone()
+            } else {
+                vec![req.key.clone()]
+            };
+
+            for k in keys {
+                let mut coord = Coordinator::default();
+                coord.key = k;
+                coord.node_id = kafka_protocol::messages::BrokerId(self.broker_id);
+                coord.host = StrBytes::from_string(self.host.clone());
+                coord.port = self.port;
+                coord.error_code = 0;
+                res.coordinators.push(coord);
+            }
+        }
+
         res
     }
 
     pub fn handle_join_group(
-        &self,
+        &mut self,
         req: &kafka_protocol::messages::JoinGroupRequest,
-        _version: i16,
+        version: i16,
     ) -> kafka_protocol::messages::JoinGroupResponse {
-        use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
         let mut res = kafka_protocol::messages::JoinGroupResponse::default();
+        let group_id = req.group_id.as_str().to_string();
 
-        let member_id = if req.member_id.is_empty() {
-            format!("noida-client-{}", uuid_simple())
-        } else {
-            req.member_id.as_str().to_string()
+        let now = self.now_ms();
+        let group = self
+            .groups
+            .entry(group_id.clone())
+            .or_insert_with(|| GroupState::new(group_id.clone()));
+
+        if group.state == GroupLifecycleState::Dead {
+            res.error_code = 25; // UNKNOWN_MEMBER_ID
+            return res;
+        }
+
+        // KIP-394: dynamic member join with empty member_id returns MEMBER_ID_REQUIRED (79)
+        // for API version >= 4 (or modern clients).
+        if req.member_id.is_empty() {
+            let assigned_id =
+                format!("noida-client-{}-{}", self.next_member_counter, uuid_simple());
+            self.next_member_counter += 1;
+            group.pending_member_ids.insert(assigned_id.clone());
+
+            res.error_code = 79; // MEMBER_ID_REQUIRED
+            res.generation_id = -1;
+            res.member_id = StrBytes::from_string(assigned_id);
+            res.leader = StrBytes::from_static_str("");
+            return res;
+        }
+
+        let m_id = req.member_id.as_str().to_string();
+        let is_known = group.members.contains_key(&m_id) || group.pending_member_ids.remove(&m_id);
+
+        if !is_known {
+            res.error_code = 25; // UNKNOWN_MEMBER_ID
+            return res;
+        }
+
+        let req_proto_type = req.protocol_type.as_str().to_string();
+        if !group.protocol_type.is_empty() && group.protocol_type != req_proto_type {
+            res.error_code = 23; // INCONSISTENT_GROUP_PROTOCOL
+            return res;
+        }
+        if group.protocol_type.is_empty() {
+            group.protocol_type = req_proto_type.clone();
+        }
+
+        let protocols_vec: Vec<(String, Vec<u8>)> = req
+            .protocols
+            .iter()
+            .map(|p| (p.name.as_str().to_string(), p.metadata.to_vec()))
+            .collect();
+
+        let member = GroupMember {
+            member_id: m_id.clone(),
+            group_instance_id: req.group_instance_id.as_ref().map(|s| s.as_str().to_string()),
+            client_id: "test-client".to_string(),
+            client_host: "127.0.0.1".to_string(),
+            session_timeout_ms: req.session_timeout_ms,
+            rebalance_timeout_ms: req.rebalance_timeout_ms,
+            protocol_type: req_proto_type,
+            protocols: protocols_vec.clone(),
+            last_heartbeat_ms: now,
+            assignment: Vec::new(),
         };
 
-        res.error_code = 0;
-        res.generation_id = 1;
-        res.protocol_name = req.protocols.first().map(|p| p.name.clone());
-        res.leader = StrBytes::from_string(member_id.clone());
-        res.member_id = StrBytes::from_string(member_id.clone());
+        group.members.insert(m_id.clone(), member);
+        group.awaiting_members.insert(m_id.clone(), protocols_vec);
 
-        let mut member = JoinGroupResponseMember::default();
-        member.member_id = StrBytes::from_string(member_id);
-        if let Some(first_protocol) = req.protocols.first() {
-            member.metadata = first_protocol.metadata.clone();
+        // State transition: trigger rebalance if Empty or Stable
+        if group.state == GroupLifecycleState::Empty || group.state == GroupLifecycleState::Stable {
+            group.state = GroupLifecycleState::PreparingRebalance;
+            group.generation_id += 1;
+            group.rebalance_start_ms = now;
+            group.assignments.clear();
         }
-        res.members.push(member);
 
+        if group.leader_id.is_none()
+            || !group.members.contains_key(group.leader_id.as_ref().unwrap())
+        {
+            group.leader_id = Some(m_id.clone());
+        }
+
+        // Complete rebalance when all known members have joined
+        if group.awaiting_members.len() >= group.members.len() {
+            group.state = GroupLifecycleState::CompletingRebalance;
+
+            // Protocol selection: pick first protocol of leader that all members support
+            if let Some(leader_id) = &group.leader_id
+                && let Some(leader_protos) = group.awaiting_members.get(leader_id)
+            {
+                for (proto_name, _) in leader_protos {
+                    let supported_by_all = group
+                        .awaiting_members
+                        .values()
+                        .all(|protos| protos.iter().any(|(p, _)| p == proto_name));
+                    if supported_by_all {
+                        group.protocol_name = Some(proto_name.clone());
+                        break;
+                    }
+                }
+            }
+            if group.protocol_name.is_none() {
+                group.protocol_name = req.protocols.first().map(|p| p.name.as_str().to_string());
+            }
+        }
+
+        res.error_code = 0;
+        res.generation_id = group.generation_id;
+        res.protocol_name = group.protocol_name.as_ref().map(|s| StrBytes::from_string(s.clone()));
+        res.leader = StrBytes::from_string(group.leader_id.clone().unwrap_or_default());
+        res.member_id = StrBytes::from_string(m_id.clone());
+
+        // Leader gets the full list of members and their protocol metadata; followers get empty
+        if Some(&m_id) == group.leader_id.as_ref() {
+            for (member_id_str, protos) in &group.awaiting_members {
+                let mut member_res = JoinGroupResponseMember::default();
+                member_res.member_id = StrBytes::from_string(member_id_str.clone());
+                let meta = protos
+                    .iter()
+                    .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
+                    .map(|(_, m)| bytes::Bytes::copy_from_slice(m))
+                    .unwrap_or_default();
+                member_res.metadata = meta;
+                res.members.push(member_res);
+            }
+        }
+
+        let _ = version;
         res
     }
 
     pub fn handle_sync_group(
-        &self,
+        &mut self,
         req: &kafka_protocol::messages::SyncGroupRequest,
         _version: i16,
     ) -> kafka_protocol::messages::SyncGroupResponse {
         let mut res = kafka_protocol::messages::SyncGroupResponse::default();
-        res.error_code = 0;
+        let group_id = req.group_id.as_str().to_string();
+        let m_id = req.member_id.as_str().to_string();
 
-        if let Some(assignment) = req.assignments.first() {
-            res.assignment = assignment.assignment.clone();
+        let group = match self.groups.get_mut(&group_id) {
+            Some(g) if g.state != GroupLifecycleState::Dead => g,
+            _ => {
+                res.error_code = 25; // UNKNOWN_MEMBER_ID
+                return res;
+            }
+        };
+
+        if !group.members.contains_key(&m_id) {
+            res.error_code = 25; // UNKNOWN_MEMBER_ID
+            return res;
         }
 
+        if req.generation_id != group.generation_id {
+            res.error_code = 22; // ILLEGAL_GENERATION
+            return res;
+        }
+
+        if group.state == GroupLifecycleState::PreparingRebalance {
+            res.error_code = 27; // REBALANCE_IN_PROGRESS
+            return res;
+        }
+
+        // If leader sends assignments, store them and transition to Stable
+        if !req.assignments.is_empty() {
+            for assignment in &req.assignments {
+                group.assignments.insert(
+                    assignment.member_id.as_str().to_string(),
+                    assignment.assignment.to_vec(),
+                );
+            }
+            group.state = GroupLifecycleState::Stable;
+            group.awaiting_members.clear();
+        }
+
+        if let Some(assignment) = group.assignments.get(&m_id) {
+            res.assignment = bytes::Bytes::copy_from_slice(assignment);
+        } else if let Some(m) = group.members.get(&m_id)
+            && !m.assignment.is_empty()
+        {
+            res.assignment = bytes::Bytes::copy_from_slice(&m.assignment);
+        }
+
+        res.error_code = 0;
         res
     }
 
     pub fn handle_heartbeat(
-        &self,
-        _req: &kafka_protocol::messages::HeartbeatRequest,
+        &mut self,
+        req: &kafka_protocol::messages::HeartbeatRequest,
         _version: i16,
     ) -> kafka_protocol::messages::HeartbeatResponse {
         let mut res = kafka_protocol::messages::HeartbeatResponse::default();
+        let group_id = req.group_id.as_str().to_string();
+        let m_id = req.member_id.as_str().to_string();
+
+        let now = self.now_ms();
+        let group = match self.groups.get_mut(&group_id) {
+            Some(g) if g.state != GroupLifecycleState::Dead => g,
+            _ => {
+                res.error_code = 25; // UNKNOWN_MEMBER_ID
+                return res;
+            }
+        };
+
+        if !group.members.contains_key(&m_id) {
+            res.error_code = 25; // UNKNOWN_MEMBER_ID
+            return res;
+        }
+
+        if req.generation_id != group.generation_id {
+            res.error_code = 22; // ILLEGAL_GENERATION
+            return res;
+        }
+
+        if group.state == GroupLifecycleState::PreparingRebalance {
+            res.error_code = 27; // REBALANCE_IN_PROGRESS
+            return res;
+        }
+
+        // Check session timeout
+        let member = group.members.get_mut(&m_id).unwrap();
+        if now - member.last_heartbeat_ms > member.session_timeout_ms as i64 {
+            group.members.remove(&m_id);
+            if group.members.is_empty() {
+                group.state = GroupLifecycleState::Empty;
+            } else {
+                group.state = GroupLifecycleState::PreparingRebalance;
+                group.generation_id += 1;
+            }
+            res.error_code = 25; // UNKNOWN_MEMBER_ID
+            return res;
+        }
+
+        member.last_heartbeat_ms = now;
         res.error_code = 0;
         res
     }
 
     pub fn handle_leave_group(
-        &self,
-        _req: &kafka_protocol::messages::LeaveGroupRequest,
-        _version: i16,
+        &mut self,
+        req: &kafka_protocol::messages::LeaveGroupRequest,
+        version: i16,
     ) -> kafka_protocol::messages::LeaveGroupResponse {
+        use kafka_protocol::messages::leave_group_response::MemberResponse;
         let mut res = kafka_protocol::messages::LeaveGroupResponse::default();
-        res.error_code = 0;
+        let group_id = req.group_id.as_str().to_string();
+
+        let group = match self.groups.get_mut(&group_id) {
+            Some(g) if g.state != GroupLifecycleState::Dead => g,
+            _ => {
+                res.error_code = 25; // UNKNOWN_MEMBER_ID
+                return res;
+            }
+        };
+
+        let members_to_leave: Vec<String> = if version >= 3 && !req.members.is_empty() {
+            req.members.iter().map(|m| m.member_id.as_str().to_string()).collect()
+        } else {
+            vec![req.member_id.as_str().to_string()]
+        };
+
+        for m_id in members_to_leave {
+            if group.members.remove(&m_id).is_some() {
+                group.assignments.remove(&m_id);
+                group.awaiting_members.remove(&m_id);
+
+                if version >= 3 {
+                    let mut m_resp = MemberResponse::default();
+                    m_resp.member_id = StrBytes::from_string(m_id.clone());
+                    m_resp.error_code = 0;
+                    res.members.push(m_resp);
+                }
+            } else {
+                if version >= 3 {
+                    let mut m_resp = MemberResponse::default();
+                    m_resp.member_id = StrBytes::from_string(m_id.clone());
+                    m_resp.error_code = 25; // UNKNOWN_MEMBER_ID
+                    res.members.push(m_resp);
+                }
+                res.error_code = 25;
+            }
+        }
+
+        if group.members.is_empty() {
+            group.state = GroupLifecycleState::Empty;
+            group.leader_id = None;
+        } else {
+            // Elect new leader if needed and trigger rebalance
+            if group.leader_id.as_ref().is_none_or(|l| !group.members.contains_key(l)) {
+                group.leader_id = group.members.keys().next().cloned();
+            }
+            group.state = GroupLifecycleState::PreparingRebalance;
+            group.generation_id += 1;
+        }
+
         res
     }
 
@@ -526,6 +988,22 @@ impl EngineState {
         let mut res = kafka_protocol::messages::OffsetCommitResponse::default();
         let group_id = req.group_id.as_str().to_string();
 
+        let mut err = 0;
+        if req.generation_id_or_member_epoch >= 0 {
+            if let Some(group) = self.groups.get(&group_id) {
+                let m_id = req.member_id.as_str().to_string();
+                if !group.members.contains_key(&m_id) {
+                    err = 25; // UNKNOWN_MEMBER_ID
+                } else if req.generation_id_or_member_epoch != group.generation_id {
+                    err = 22; // ILLEGAL_GENERATION
+                } else if group.state == GroupLifecycleState::PreparingRebalance {
+                    err = 27; // REBALANCE_IN_PROGRESS
+                }
+            } else {
+                err = 25; // UNKNOWN_MEMBER_ID
+            }
+        }
+
         for topic in &req.topics {
             let mut topic_res = OffsetCommitResponseTopic::default();
             topic_res.name = topic.name.clone();
@@ -535,12 +1013,16 @@ impl EngineState {
                 let mut part_res = OffsetCommitResponsePartition::default();
                 part_res.partition_index = part.partition_index;
 
-                self.committed_offsets.insert(
-                    (group_id.clone(), topic_name.clone(), part.partition_index),
-                    part.committed_offset,
-                );
+                if err == 0 {
+                    self.committed_offsets.insert(
+                        (group_id.clone(), topic_name.clone(), part.partition_index),
+                        part.committed_offset,
+                    );
+                    part_res.error_code = 0;
+                } else {
+                    part_res.error_code = err;
+                }
 
-                part_res.error_code = 0;
                 topic_res.partitions.push(part_res);
             }
 
@@ -579,6 +1061,7 @@ impl EngineState {
                         part_res.committed_offset = offset;
                         part_res.error_code = 0;
                     } else {
+                        // Offset uncommitted: offset -1 with error 0
                         part_res.committed_offset = -1;
                         part_res.error_code = 0;
                     }
@@ -598,17 +1081,46 @@ impl EngineState {
         req: &kafka_protocol::messages::DescribeGroupsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::DescribeGroupsResponse {
-        use kafka_protocol::messages::describe_groups_response::DescribedGroup;
+        use kafka_protocol::messages::describe_groups_response::{
+            DescribedGroup, DescribedGroupMember,
+        };
         let mut res = kafka_protocol::messages::DescribeGroupsResponse::default();
 
         for group_id in &req.groups {
-            let mut group = DescribedGroup::default();
-            group.group_id = group_id.clone();
-            group.group_state = StrBytes::from_string("Stable".to_string());
-            group.protocol_type = StrBytes::from_string("consumer".to_string());
-            group.protocol_data = StrBytes::from_string("range".to_string());
-            group.error_code = 0;
-            res.groups.push(group);
+            let gid_str = group_id.as_str();
+            let mut desc = DescribedGroup::default();
+            desc.group_id = group_id.clone();
+
+            if let Some(group) = self.groups.get(gid_str) {
+                desc.error_code = 0;
+                desc.group_state = StrBytes::from_string(group.state.as_str().to_string());
+                desc.protocol_type = StrBytes::from_string(group.protocol_type.clone());
+                desc.protocol_data =
+                    StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+
+                for (m_id, m) in &group.members {
+                    let mut dm = DescribedGroupMember::default();
+                    dm.member_id = StrBytes::from_string(m_id.clone());
+                    dm.client_id = StrBytes::from_string(m.client_id.clone());
+                    dm.client_host = StrBytes::from_string(m.client_host.clone());
+
+                    if let Some(proto_name) = &group.protocol_name
+                        && let Some((_, meta)) = m.protocols.iter().find(|(p, _)| p == proto_name)
+                    {
+                        dm.member_metadata = bytes::Bytes::copy_from_slice(meta);
+                    }
+                    if let Some(assignment) = group.assignments.get(m_id) {
+                        dm.member_assignment = bytes::Bytes::copy_from_slice(assignment);
+                    }
+
+                    desc.members.push(dm);
+                }
+            } else {
+                desc.error_code = 0;
+                desc.group_state = StrBytes::from_static_str("Dead");
+            }
+
+            res.groups.push(desc);
         }
 
         res
@@ -621,20 +1133,18 @@ impl EngineState {
     ) -> kafka_protocol::messages::ListGroupsResponse {
         use kafka_protocol::messages::list_groups_response::ListedGroup;
         let mut res = kafka_protocol::messages::ListGroupsResponse::default();
-
-        let mut groups_set = std::collections::HashSet::new();
-        for (g, _, _) in self.committed_offsets.keys() {
-            groups_set.insert(g.clone());
-        }
-
-        for g in groups_set {
-            let mut group = ListedGroup::default();
-            group.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string(g));
-            group.protocol_type = StrBytes::from_string("consumer".to_string());
-            res.groups.push(group);
-        }
-
         res.error_code = 0;
+
+        for (gid, group) in &self.groups {
+            if group.state != GroupLifecycleState::Dead {
+                let mut lg = ListedGroup::default();
+                lg.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string(gid.clone()));
+                lg.protocol_type = StrBytes::from_string(group.protocol_type.clone());
+                lg.group_state = StrBytes::from_string(group.state.as_str().to_string());
+                res.groups.push(lg);
+            }
+        }
+
         res
     }
 
@@ -651,8 +1161,20 @@ impl EngineState {
             let mut result = DeletableGroupResult::default();
             result.group_id = group_id.clone();
 
-            self.committed_offsets.retain(|(g, _, _), _| g != &gid_str);
-            result.error_code = 0;
+            if let Some(group) = self.groups.get_mut(&gid_str) {
+                if group.state != GroupLifecycleState::Empty
+                    && group.state != GroupLifecycleState::Dead
+                {
+                    result.error_code = 68; // NON_EMPTY_GROUP
+                } else {
+                    group.state = GroupLifecycleState::Dead;
+                    self.committed_offsets.retain(|(g, _, _), _| g != &gid_str);
+                    result.error_code = 0;
+                }
+            } else {
+                result.error_code = 69; // GROUP_ID_NOT_FOUND
+            }
+
             res.results.push(result);
         }
 
@@ -673,30 +1195,52 @@ impl EngineState {
             let mut result = DescribeConfigsResult::default();
             result.resource_type = resource.resource_type;
             result.resource_name = resource.resource_name.clone();
-            result.error_code = 0;
 
-            // Provide common default topic/broker configs
-            let configs: &[(&str, &str)] = match resource.resource_type {
-                2 => &[
-                    // Topic
-                    ("cleanup.policy", "delete"),
-                    ("retention.ms", "604800000"),
-                    ("segment.bytes", "1073741824"),
-                ],
-                _ => &[
-                    // Broker/other
+            if resource.resource_type == 2 {
+                // Topic
+                let topic_name = resource.resource_name.as_str();
+                if let Some(topic_state) = self.topics.get(topic_name) {
+                    result.error_code = 0;
+
+                    let mut configs_map: HashMap<String, String> = [
+                        ("cleanup.policy".to_string(), "delete".to_string()),
+                        ("retention.ms".to_string(), "604800000".to_string()),
+                        ("segment.bytes".to_string(), "1073741824".to_string()),
+                    ]
+                    .into_iter()
+                    .collect();
+
+                    for (k, v) in &topic_state.configs {
+                        configs_map.insert(k.clone(), v.clone());
+                    }
+
+                    for (k, v) in configs_map {
+                        let mut conf = DescribeConfigsResourceResult::default();
+                        conf.name = StrBytes::from_string(k);
+                        conf.value = Some(StrBytes::from_string(v));
+                        conf.read_only = false;
+                        result.configs.push(conf);
+                    }
+                } else {
+                    result.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                }
+            } else {
+                // Broker / cluster
+                result.error_code = 0;
+                let configs: &[(&str, &str)] = &[
                     ("auto.create.topics.enable", "true"),
                     ("num.partitions", "1"),
                     ("default.replication.factor", "1"),
-                ],
-            };
+                ];
 
-            for &(k, v) in configs {
-                let mut conf = DescribeConfigsResourceResult::default();
-                conf.name = StrBytes::from_string(k.to_string());
-                conf.value = Some(StrBytes::from_string(v.to_string()));
-                conf.read_only = false;
-                result.configs.push(conf);
+                for &(k, v) in configs {
+                    let mut conf = DescribeConfigsResourceResult::default();
+                    conf.name = StrBytes::from_string(k.to_string());
+                    let val = self.broker_configs.get(k).map(|s| s.as_str()).unwrap_or(v);
+                    conf.value = Some(StrBytes::from_string(val.to_string()));
+                    conf.read_only = false;
+                    result.configs.push(conf);
+                }
             }
 
             res.results.push(result);
@@ -741,12 +1285,12 @@ impl EngineState {
             topic_res.topic = topic.topic.clone();
 
             let topic_name = topic.topic.as_str();
-            for part in &topic.partitions {
+            for partition in &topic.partitions {
                 let mut part_res = EpochEndOffset::default();
-                part_res.partition = part.partition;
+                part_res.partition = partition.partition;
 
-                if let Some(t_state) = self.topics.get(topic_name) {
-                    if let Some(p_state) = t_state.partitions.get(&part.partition) {
+                if let Some(topic_state) = self.topics.get(topic_name) {
+                    if let Some(p_state) = topic_state.partitions.get(&partition.partition) {
                         part_res.error_code = 0;
                         part_res.leader_epoch = 0;
                         part_res.end_offset = p_state.high_watermark;
@@ -849,7 +1393,7 @@ impl EngineState {
     }
 
     pub fn handle_alter_configs(
-        &self,
+        &mut self,
         req: &kafka_protocol::messages::AlterConfigsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::AlterConfigsResponse {
@@ -860,7 +1404,28 @@ impl EngineState {
             let mut resource_res = AlterConfigsResourceResponse::default();
             resource_res.resource_type = resource.resource_type;
             resource_res.resource_name = resource.resource_name.clone();
-            resource_res.error_code = 0;
+
+            if resource.resource_type == 2 {
+                let topic_name = resource.resource_name.as_str();
+                if let Some(topic_state) = self.topics.get_mut(topic_name) {
+                    for entry in &resource.configs {
+                        if let Some(val) = &entry.value {
+                            topic_state.configs.insert(entry.name.to_string(), val.to_string());
+                        }
+                    }
+                    resource_res.error_code = 0;
+                } else {
+                    resource_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                }
+            } else {
+                for entry in &resource.configs {
+                    if let Some(val) = &entry.value {
+                        self.broker_configs.insert(entry.name.to_string(), val.to_string());
+                    }
+                }
+                resource_res.error_code = 0;
+            }
+
             res.responses.push(resource_res);
         }
 
@@ -868,7 +1433,7 @@ impl EngineState {
     }
 
     pub fn handle_incremental_alter_configs(
-        &self,
+        &mut self,
         req: &kafka_protocol::messages::IncrementalAlterConfigsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::IncrementalAlterConfigsResponse {
@@ -879,7 +1444,38 @@ impl EngineState {
             let mut resource_res = AlterConfigsResourceResponse::default();
             resource_res.resource_type = resource.resource_type;
             resource_res.resource_name = resource.resource_name.clone();
-            resource_res.error_code = 0;
+
+            if resource.resource_type == 2 {
+                let topic_name = resource.resource_name.as_str();
+                if let Some(topic_state) = self.topics.get_mut(topic_name) {
+                    for entry in &resource.configs {
+                        if entry.config_operation == 0 {
+                            // SET
+                            if let Some(val) = &entry.value {
+                                topic_state.configs.insert(entry.name.to_string(), val.to_string());
+                            }
+                        } else if entry.config_operation == 1 {
+                            // DELETE
+                            topic_state.configs.remove(entry.name.as_str());
+                        }
+                    }
+                    resource_res.error_code = 0;
+                } else {
+                    resource_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                }
+            } else {
+                for entry in &resource.configs {
+                    if entry.config_operation == 0 {
+                        if let Some(val) = &entry.value {
+                            self.broker_configs.insert(entry.name.to_string(), val.to_string());
+                        }
+                    } else if entry.config_operation == 1 {
+                        self.broker_configs.remove(entry.name.as_str());
+                    }
+                }
+                resource_res.error_code = 0;
+            }
+
             res.responses.push(resource_res);
         }
 
@@ -925,6 +1521,11 @@ impl EngineState {
         let mut res = kafka_protocol::messages::OffsetDeleteResponse::default();
         let group_id = req.group_id.as_str().to_string();
 
+        if !self.groups.contains_key(&group_id) {
+            res.error_code = 69; // GROUP_ID_NOT_FOUND
+            return res;
+        }
+
         for topic in &req.topics {
             let mut topic_res = OffsetDeleteResponseTopic::default();
             topic_res.name = topic.name.clone();
@@ -960,7 +1561,7 @@ impl EngineState {
         for tx_id in &req.transactional_ids {
             let mut tx_state = TransactionState::default();
             tx_state.transactional_id = tx_id.clone();
-            tx_state.transaction_state = StrBytes::from_string("CompleteCommit".to_string());
+            tx_state.transaction_state = StrBytes::from_static_str("CompleteCommit");
             tx_state.error_code = 0;
             res.transaction_states.push(tx_state);
         }
@@ -1016,7 +1617,7 @@ impl EngineState {
         let mut res = kafka_protocol::messages::DescribeLogDirsResponse::default();
 
         let mut log_dir = DescribeLogDirsResult::default();
-        log_dir.log_dir = StrBytes::from_string("/tmp/noida-kafka-logs".to_string());
+        log_dir.log_dir = StrBytes::from_static_str("/tmp/noida-kafka-logs");
         log_dir.error_code = 0;
 
         for (topic_name, topic_state) in &self.topics {
@@ -1047,7 +1648,7 @@ impl EngineState {
     ) -> kafka_protocol::messages::SaslHandshakeResponse {
         let mut res = kafka_protocol::messages::SaslHandshakeResponse::default();
         res.error_code = 0;
-        res.mechanisms.push(StrBytes::from_string("PLAIN".to_string()));
+        res.mechanisms.push(StrBytes::from_static_str("PLAIN"));
         res
     }
 
@@ -1063,18 +1664,29 @@ impl EngineState {
 }
 
 fn uuid_simple() -> u128 {
-    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Engine {
     state: Arc<Mutex<EngineState>>,
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new("127.0.0.1".to_string(), 9092)
+    }
 }
 
 impl Engine {
     pub fn new(host: String, port: i32) -> Self {
         Self { state: Arc::new(Mutex::new(EngineState::new(host, port))) }
+    }
+
+    pub fn with_clock(host: String, port: i32, clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        let mut state = EngineState::new(host, port);
+        state.clock = Some(clock);
+        Self { state: Arc::new(Mutex::new(state)) }
     }
 
     pub fn handle_api_versions(&self, version: i16) -> ApiVersionsResponse {

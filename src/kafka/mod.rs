@@ -4,6 +4,9 @@ pub mod codec;
 pub mod connection;
 pub mod engine;
 
+#[cfg(test)]
+mod tests;
+
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::thread;
