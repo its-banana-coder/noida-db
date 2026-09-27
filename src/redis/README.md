@@ -26,7 +26,7 @@ and **3 are not built yet**. Subcommands are counted separately below.
 | Sorting | `SORT`, `SORT_RO` with `BY`, `GET`, `LIMIT`, `STORE`, `ALPHA` |
 | Pub/sub | channels, patterns, sharded channels, RESP3 push messages |
 | Transactions | `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` |
-| Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`), with Redis's error positions |
+| Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`, `cmsgpack`), with Redis's error positions |
 | Connection | `HELLO` (RESP3), `CLIENT` (id, name, info, list, kill, pause, reply, no-evict...), `RESET`, `AUTH`. `requirepass` is enforced (`CONFIG SET requirepass x`, or `NOIDA_REDIS_PASSWORD` at startup); there is one user, `default` |
 | Debugging | `MONITOR` (a live stream of every command), `COMMAND` (info, docs, getkeys, list), `INFO`, `CONFIG GET/SET` |
 | Tool probes | `SLOWLOG`, `LATENCY`, `MEMORY`, `MODULE LIST`, read-only `ACL`. These return empty or estimated data (noida-db does no performance analysis) |
@@ -57,7 +57,7 @@ noida-db is a local development tool. These commands answer as *unknown command*
 | Keyspace notifications | `notify-keyspace-events` can be set, but no `__keyspace@*__` / `__keyevent@*__` messages are published, so listening for expired-key events sees nothing |
 | Persistence | all data lives in memory and is gone when noida-db stops. `SAVE`, `BGSAVE`, `BGREWRITEAOF` succeed but write nothing; `--data-dir` is unused by Redis |
 | `maxmemory` and eviction | the setting is stored, not enforced: no eviction policies, no OOM error |
-| Lua libraries `cmsgpack`, `struct`, `bit` | `cjson` and the `redis` table are available |
+| Lua libraries `struct`, `bit` | `cjson`, `cmsgpack` and the `redis` table are available |
 
 ### Differences
 
@@ -73,14 +73,16 @@ noida-db is a local development tool. These commands answer as *unknown command*
 ### Client coverage
 
 Tested against noida-db, each over RESP2 and RESP3 (`tests/clients/redis/run.sh`):
-**redis-py** (84 checks) and **ioredis** (56 checks), plus `redis-rs` in
+**redis-py** (84 checks), **ioredis** (56 checks) and **BullMQ** (17 checks: queues,
+workers, retries with backoff, delayed and prioritised jobs, pause; it runs about
+50 Lua scripts), plus `redis-rs` in
 `tests/redis_client.rs`. The checks cover strings, hashes, lists, sets, sorted
 sets, `SCAN`, pipelines, `MULTI`/`WATCH`, Lua scripts, pub/sub, streams and
 consumer groups, HyperLogLog, `SORT`, geo, bitmaps, errors, binary data and
 blocking pops.
 
-Not tried yet: Jedis, Lettuce, Spring Data Redis, Redisson, and script-heavy
-libraries (BullMQ, Sidekiq, Celery), so client-specific gaps may exist there.
+Not tried yet: Jedis, Lettuce, Spring Data Redis, Redisson, Sidekiq, Celery,
+so client-specific gaps may exist there.
 
 ## How it is verified
 

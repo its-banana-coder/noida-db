@@ -88,6 +88,9 @@ pub fn int(n: i64) -> Value {
 pub fn bulk(s: &str) -> Value {
     Value::bulk(s)
 }
+pub fn bulk_bytes(b: &[u8]) -> Value {
+    Value::bulk(b)
+}
 pub fn simple(s: &str) -> Value {
     Value::Simple(s.into())
 }

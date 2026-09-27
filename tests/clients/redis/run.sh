@@ -54,18 +54,24 @@ else
   skip "redis-py" "no python3"
 fi
 
-# ioredis
+# Node clients: ioredis, and BullMQ (the job queue, which is Lua-script heavy)
 if command -v node >/dev/null && command -v npm >/dev/null; then
-  if [ ! -d "$work/node/node_modules/ioredis" ]; then
-    mkdir -p "$work/node" && (cd "$work/node" && npm init -y >/dev/null 2>&1 && npm install --silent ioredis >/dev/null 2>&1)
+  if [ ! -d "$work/node/node_modules/bullmq" ]; then
+    mkdir -p "$work/node" && (cd "$work/node" && npm init -y >/dev/null 2>&1 && npm install --silent ioredis bullmq >/dev/null 2>&1)
   fi
   if [ -d "$work/node/node_modules/ioredis" ]; then
     run "ioredis" env NODE_PATH="$PWD/$work/node/node_modules" node "$here/ioredis_test.js"
   else
     skip "ioredis" "could not install"
   fi
+  if [ -d "$work/node/node_modules/bullmq" ]; then
+    run "bullmq" env NODE_PATH="$PWD/$work/node/node_modules" node "$here/bullmq_test.js"
+  else
+    skip "bullmq" "could not install"
+  fi
 else
   skip "ioredis" "no node"
+  skip "bullmq" "no node"
 fi
 
 echo

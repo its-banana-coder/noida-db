@@ -198,3 +198,91 @@ fn an_undefined_global_reports_the_scripts_own_line() {
     );
     assert!(e.ends_with(", on @user_script:1."), "{e}");
 }
+
+#[test]
+fn cmsgpack_packs_and_unpacks() {
+    let mut t = T::new();
+    assert_eq!(
+        t.run("EVAL \"return cmsgpack.pack(1,-1,200)\" 0"),
+        bulk_bytes(&[0x01, 0xff, 0xcc, 0xc8])
+    );
+    assert_eq!(
+        t.run("EVAL \"return cmsgpack.pack('a',true,nil)\" 0"),
+        bulk_bytes(&[0xa1, b'a', 0xc3, 0xc0])
+    );
+    assert_eq!(t.run("EVAL \"return cmsgpack.pack({1,2})\" 0"), bulk_bytes(&[0x92, 1, 2]));
+    assert_eq!(t.run("EVAL \"return cmsgpack.pack({a=1})\" 0"), bulk_bytes(&[0x81, 0xa1, b'a', 1]));
+    assert_eq!(
+        t.run("EVAL \"return cmsgpack.pack(1.5)\" 0"),
+        bulk_bytes(&[0xca, 0x3f, 0xc0, 0, 0])
+    );
+    assert_eq!(
+        t.run("EVAL \"return {cmsgpack.unpack(cmsgpack.pack(1,'a',{2}))}\" 0"),
+        arr(vec![int(1), bulk("a"), arr(vec![int(2)])])
+    );
+    assert_eq!(
+        t.run("EVAL \"return {cmsgpack.unpack_one(cmsgpack.pack(7,8,9))}\" 0"),
+        arr(vec![int(1), int(7)]),
+        "unpack_one returns the next offset first"
+    );
+    assert_eq!(
+        t.run("EVAL \"return {cmsgpack.unpack_one(cmsgpack.pack(7,8,9), 2)}\" 0"),
+        arr(vec![int(-1), int(9)]),
+        "and -1 once the input is used up"
+    );
+}
+
+#[test]
+fn cmsgpack_reports_bad_input() {
+    let mut t = T::new();
+    let msg = |t: &mut T, code: &str| match t.run(&format!("EVAL \"{code}\" 0")) {
+        Value::Error(e) => e,
+        other => panic!("expected an error, got {other:?}"),
+    };
+    assert!(
+        msg(&mut t, "return cmsgpack.unpack(string.char(145))").contains("Missing bytes in input.")
+    );
+    assert!(
+        msg(&mut t, "return cmsgpack.unpack(string.char(193))")
+            .contains("Bad data format in input.")
+    );
+    assert!(msg(&mut t, "return cmsgpack.pack()").contains("MessagePack pack needs input."));
+}
+
+#[test]
+fn lua_numbers_reach_commands_at_full_precision() {
+    // Millisecond timestamps must not round to Lua's 14 significant digits
+    // (BullMQ's delayed jobs depend on it).
+    let mut t = T::new();
+    t.run("EVAL \"return redis.call('set','k',1790482289286.5)\" 0");
+    assert_eq!(t.run("GET k"), bulk("1790482289286.5"));
+    t.run("EVAL \"return redis.call('set','k',7333814913605631)\" 0");
+    assert_eq!(t.run("GET k"), bulk("7333814913605631"));
+    t.run("EVAL \"return redis.call('set','k',0.1)\" 0");
+    assert_eq!(t.run("GET k"), bulk("0.1"));
+    t.run("EVAL \"return redis.call('set','k',1e19)\" 0");
+    assert_eq!(t.run("GET k"), bulk("1e+19"));
+}
+
+#[test]
+fn a_resp3_client_still_gets_resp2_replies_inside_scripts() {
+    let mut t = T::new();
+    t.run("ZADD z 1 a");
+    let mut c = t.connect();
+    t.run_as(&mut c, "HELLO 3");
+    // The script sees the flat RESP2 shape, as in Redis, unless it asks for RESP3.
+    assert_eq!(
+        t.run_as(&mut c, "EVAL \"return redis.call('zrange','z',0,-1,'withscores')\" 0"),
+        arr(vec![bulk("a"), bulk("1")])
+    );
+    assert_eq!(
+        t.run_as(
+            &mut c,
+            "EVAL \"redis.setresp(3); return #redis.call('zrange','z',0,-1,'withscores')\" 0"
+        ),
+        int(1)
+    );
+    // ... and the client itself is still on RESP3 afterwards.
+    assert!(matches!(t.run_as(&mut c, "ZRANGE z 0 -1 WITHSCORES"), Value::Array(_)));
+    assert_eq!(c.resp, 3);
+}
