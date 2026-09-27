@@ -81,7 +81,7 @@ Every service is its own module:
     declining SSL cleanly.
   - SQL: DDL, DML, joins, subqueries, CTEs, window functions, aggregates,
     transactions, `ON CONFLICT`, `RETURNING`, sequences and identity columns,
-    constraints.
+    constraints, `LISTEN`/`NOTIFY`.
   - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz
     and numeric.
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,

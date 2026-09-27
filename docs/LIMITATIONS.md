@@ -109,7 +109,7 @@ similar were compared by hand against a real server.
 
 **Not yet**
 
-- PL/pgSQL and stored procedures, extensions, `LISTEN`/`NOTIFY`, `COPY`.
+- PL/pgSQL and stored procedures, extensions, `COPY`.
 - Concurrency is one writer at a time.
 
 **Differs**
