@@ -79,6 +79,28 @@ else
   skip "celery" "no python3"
 fi
 
+# Sidekiq (Ruby): gems install into target/, not the system gem home.
+if command -v ruby >/dev/null && command -v gem >/dev/null; then
+  export GEM_HOME="$PWD/$work/gems"
+  export GEM_PATH="$GEM_HOME"
+  export PATH="$GEM_HOME/bin:$PATH"
+  if [ ! -x "$GEM_HOME/bin/sidekiq" ]; then
+    gem install -N sidekiq redis >/dev/null 2>&1
+  fi
+  if [ -x "$GEM_HOME/bin/sidekiq" ]; then
+    (cd "$here" && "$GEM_HOME/bin/sidekiq" -r ./sidekiq_jobs.rb -c 2 -q default \
+       >"$OLDPWD/$work/sidekiq-worker.log" 2>&1 &
+     echo $! >"$OLDPWD/$work/sidekiq-worker.pid")
+    sleep 2
+    run "sidekiq" ruby "$here/sidekiq_test.rb"
+    kill "$(cat "$work/sidekiq-worker.pid")" 2>/dev/null
+  else
+    skip "sidekiq" "could not install"
+  fi
+else
+  skip "sidekiq" "no ruby"
+fi
+
 # Node clients: node-redis (the official client), ioredis, and BullMQ (the
 # job queue, which is Lua-script heavy)
 if command -v node >/dev/null && command -v npm >/dev/null; then
