@@ -127,6 +127,19 @@ Early scaffolding only: the real `mysql` CLI cannot run queries, and standard
 Kafka clients cannot produce or list topics yet. Do not point applications at
 them. The specs in `docs/specs/` describe the target.
 
+## Elasticsearch
+
+Early milestone 1 implementation. The HTTP server returns the required
+`X-Elastic-Product` header and supports index create/get/delete, mapping and
+settings endpoints, basic document get/index/create/update/delete, `_mget`,
+bulk indexing/deletion, aliases, and index templates. Storage is in memory
+and is lost when the process exits. Bulk chunked transfer encoding is accepted.
+
+Search and query APIs, analysis, sorting, aggregations, highlighting, scroll,
+PIT, gzip, full dynamic mapping rules, optimistic concurrency parameters,
+index patterns, and exact Elasticsearch error/response parity are not built
+yet. This is not ready to replace Elasticsearch for application workflows.
+
 ## Numbers we do not claim yet
 
 - The footprint targets in `COMPATIBILITY.md` (idle RAM, binary size, "50x

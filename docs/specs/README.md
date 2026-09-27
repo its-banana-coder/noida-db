@@ -12,7 +12,7 @@ agent (or person) can pick one up without other context.
 | Memcached | [memcached.md](memcached.md) | 11211 | open |
 | MongoDB | [mongodb.md](mongodb.md) | 27017 | open |
 | RabbitMQ | [rabbitmq.md](rabbitmq.md) | 5672, 15672 | open |
-| Elasticsearch | [elasticsearch.md](elasticsearch.md) | 9200 | open |
+| Elasticsearch | [elasticsearch.md](elasticsearch.md) | 9200 | building (`svc/elasticsearch`, milestone 1) |
 | ClickHouse | [clickhouse.md](clickhouse.md) | 8123, 9000 | open |
 
 ## Read first, in this order

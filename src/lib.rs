@@ -21,3 +21,6 @@ pub mod kafka;
 
 #[cfg(feature = "memcached")]
 pub mod memcached;
+
+#[cfg(feature = "elasticsearch")]
+pub mod elasticsearch;
