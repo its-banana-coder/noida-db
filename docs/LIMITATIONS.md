@@ -87,7 +87,8 @@ current count).
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
 servers by `tests/postgres_diff.rs` (about 520 results) and by psycopg,
-SQLAlchemy, Django, node-postgres and JDBC (`tests/clients/postgres/run.sh`).
+SQLAlchemy, Django, asyncpg, node-postgres and JDBC
+(`tests/clients/postgres/run.sh`).
 Django's own management commands (`migrate`, including the built-in
 `auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a schema
 change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M, transactions and
