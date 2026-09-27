@@ -72,16 +72,18 @@ noida-db is a local development tool. These commands answer as *unknown command*
 
 ### Client coverage
 
-Tested against noida-db, each over RESP2 and RESP3 (`tests/clients/redis/run.sh`):
-**redis-py** (84 checks), **ioredis** (56 checks) and **BullMQ** (17 checks: queues,
-workers, retries with backoff, delayed and prioritised jobs, pause; it runs about
-50 Lua scripts), plus `redis-rs` in
-`tests/redis_client.rs`. The checks cover strings, hashes, lists, sets, sorted
-sets, `SCAN`, pipelines, `MULTI`/`WATCH`, Lua scripts, pub/sub, streams and
-consumer groups, HyperLogLog, `SORT`, geo, bitmaps, errors, binary data and
-blocking pops.
+Tested against noida-db, each over RESP2 and RESP3 (`tests/clients/redis/run.sh`,
+one command, installs its own dependencies under `target/`): **redis-py** (84
+checks), **node-redis** (34 checks), **ioredis** (56 checks), **go-redis** (84
+checks), **Jedis** (40 checks) and **Lettuce** (28 checks) for the general
+command surface; **BullMQ** (17 checks), **RQ** (14 checks) and **Celery** (5
+checks) for job queues built on Lua scripts, sorted sets and streams; plus
+`redis-rs` in `tests/redis_client.rs`. Together the checks cover strings,
+hashes, lists, sets, sorted sets, `SCAN`, pipelines, `MULTI`/`WATCH`, Lua
+scripts, pub/sub, streams and consumer groups, HyperLogLog, `SORT`, geo,
+bitmaps, errors, binary data and blocking pops.
 
-Not tried yet: Jedis, Lettuce, Spring Data Redis, Redisson, Sidekiq, Celery,
+Not tried yet: Spring Data Redis, Redisson, Sidekiq (no Ruby toolchain here),
 so client-specific gaps may exist there.
 
 ## How it is verified
