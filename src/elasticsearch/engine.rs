@@ -232,10 +232,8 @@ impl Engine {
                 .map(|d| (200, d.source.clone()))
                 .unwrap_or_else(|| missing_doc(index, id));
         }
-        if id.is_empty() {
-            if method != "POST" {
-                return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
-            }
+        if id.is_empty() && method != "POST" {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
         let id = if id.is_empty() { auto_id() } else { id.to_string() };
         match method {
@@ -345,17 +343,24 @@ impl Engine {
             let id =
                 opts.get("_id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(auto_id);
             if action == "delete" {
-                let (status, res) =
+                let (status, mut res) =
                     self.document_api("DELETE", ix, &id, "_doc", &HashMap::new(), b"");
                 errors |= status >= 300;
-                items.push(json!({action:res}));
+                res["status"] = json!(status);
+                let mut item = Map::new();
+                item.insert(action.to_string(), res);
+                items.push(Value::Object(item));
             } else {
                 let data = lines.next().unwrap_or("").as_bytes();
                 let verb = if action == "create" { "POST" } else { "PUT" };
                 let kind = if action == "create" { "_create" } else { "_doc" };
-                let (status, res) = self.document_api(verb, ix, &id, kind, &HashMap::new(), data);
+                let (status, mut res) =
+                    self.document_api(verb, ix, &id, kind, &HashMap::new(), data);
                 errors |= status >= 300;
-                items.push(json!({action:res}));
+                res["status"] = json!(status);
+                let mut item = Map::new();
+                item.insert(action.to_string(), res);
+                items.push(Value::Object(item));
             }
         }
         (200, json!({"took":0,"errors":errors,"items":items}))
@@ -507,7 +512,11 @@ fn query_params(q: &str) -> HashMap<String, String> {
 fn merge(a: &mut Value, b: Value) {
     if let (Some(x), Some(y)) = (a.as_object_mut(), b.as_object()) {
         for (k, v) in y {
-            x.insert(k.clone(), v.clone());
+            if let Some(existing) = x.get_mut(k) {
+                merge(existing, v.clone());
+            } else {
+                x.insert(k.clone(), v.clone());
+            }
         }
     } else {
         *a = b;

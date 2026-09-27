@@ -103,9 +103,7 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         w.write_all(&bytes)?;
         w.flush()?;
         if connection_close
-            || headers
-                .get("connection")
-                .is_some_and(|v| v.eq_ignore_ascii_case("keep-alive") == false)
+            || headers.get("connection").is_some_and(|v| !v.eq_ignore_ascii_case("keep-alive"))
         {
             break;
         }
