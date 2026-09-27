@@ -4,6 +4,7 @@ mod admin;
 mod bitops;
 mod blocking;
 mod cjson;
+mod cmsgpack;
 mod command_meta;
 mod config;
 mod config_table;
