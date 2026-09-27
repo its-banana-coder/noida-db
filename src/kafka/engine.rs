@@ -91,6 +91,12 @@ impl EngineState {
             (ApiKey::Heartbeat, 0, 4),
             (ApiKey::LeaveGroup, 0, 5),
             (ApiKey::SyncGroup, 0, 5),
+            (ApiKey::DescribeGroups, 0, 5),
+            (ApiKey::ListGroups, 0, 4),
+            (ApiKey::DeleteGroups, 0, 2),
+            (ApiKey::DescribeConfigs, 0, 4),
+            (ApiKey::DescribeCluster, 0, 0),
+            (ApiKey::OffsetForLeaderEpoch, 0, 4),
             (ApiKey::ApiVersions, 0, 3),
             (ApiKey::CreateTopics, 0, 7),
             (ApiKey::DeleteTopics, 0, 6),
@@ -575,6 +581,177 @@ impl EngineState {
 
         res
     }
+
+    pub fn handle_describe_groups(
+        &self,
+        req: &kafka_protocol::messages::DescribeGroupsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DescribeGroupsResponse {
+        use kafka_protocol::messages::describe_groups_response::DescribedGroup;
+        let mut res = kafka_protocol::messages::DescribeGroupsResponse::default();
+
+        for group_id in &req.groups {
+            let mut group = DescribedGroup::default();
+            group.group_id = group_id.clone();
+            group.group_state = StrBytes::from_string("Stable".to_string());
+            group.protocol_type = StrBytes::from_string("consumer".to_string());
+            group.protocol_data = StrBytes::from_string("range".to_string());
+            group.error_code = 0;
+            res.groups.push(group);
+        }
+
+        res
+    }
+
+    pub fn handle_list_groups(
+        &self,
+        _req: &kafka_protocol::messages::ListGroupsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::ListGroupsResponse {
+        use kafka_protocol::messages::list_groups_response::ListedGroup;
+        let mut res = kafka_protocol::messages::ListGroupsResponse::default();
+
+        let mut groups_set = std::collections::HashSet::new();
+        for (g, _, _) in self.committed_offsets.keys() {
+            groups_set.insert(g.clone());
+        }
+
+        for g in groups_set {
+            let mut group = ListedGroup::default();
+            group.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string(g));
+            group.protocol_type = StrBytes::from_string("consumer".to_string());
+            res.groups.push(group);
+        }
+
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_delete_groups(
+        &mut self,
+        req: &kafka_protocol::messages::DeleteGroupsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DeleteGroupsResponse {
+        use kafka_protocol::messages::delete_groups_response::DeletableGroupResult;
+        let mut res = kafka_protocol::messages::DeleteGroupsResponse::default();
+
+        for group_id in &req.groups_names {
+            let gid_str = group_id.as_str().to_string();
+            let mut result = DeletableGroupResult::default();
+            result.group_id = group_id.clone();
+
+            self.committed_offsets.retain(|(g, _, _), _| g != &gid_str);
+            result.error_code = 0;
+            res.results.push(result);
+        }
+
+        res
+    }
+
+    pub fn handle_describe_configs(
+        &self,
+        req: &kafka_protocol::messages::DescribeConfigsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DescribeConfigsResponse {
+        use kafka_protocol::messages::describe_configs_response::{
+            DescribeConfigsResourceResult, DescribeConfigsResult,
+        };
+        let mut res = kafka_protocol::messages::DescribeConfigsResponse::default();
+
+        for resource in &req.resources {
+            let mut result = DescribeConfigsResult::default();
+            result.resource_type = resource.resource_type;
+            result.resource_name = resource.resource_name.clone();
+            result.error_code = 0;
+
+            // Provide common default topic/broker configs
+            let configs: &[(&str, &str)] = match resource.resource_type {
+                2 => &[ // Topic
+                    ("cleanup.policy", "delete"),
+                    ("retention.ms", "604800000"),
+                    ("segment.bytes", "1073741824"),
+                ],
+                _ => &[ // Broker/other
+                    ("auto.create.topics.enable", "true"),
+                    ("num.partitions", "1"),
+                    ("default.replication.factor", "1"),
+                ],
+            };
+
+            for &(k, v) in configs {
+                let mut conf = DescribeConfigsResourceResult::default();
+                conf.name = StrBytes::from_string(k.to_string());
+                conf.value = Some(StrBytes::from_string(v.to_string()));
+                conf.read_only = false;
+                result.configs.push(conf);
+            }
+
+            res.results.push(result);
+        }
+
+        res
+    }
+
+    pub fn handle_describe_cluster(
+        &self,
+        _req: &kafka_protocol::messages::DescribeClusterRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DescribeClusterResponse {
+        use kafka_protocol::messages::describe_cluster_response::DescribeClusterBroker;
+        let mut res = kafka_protocol::messages::DescribeClusterResponse::default();
+
+        res.cluster_id = StrBytes::from_string(self.cluster_id.clone());
+        res.controller_id = kafka_protocol::messages::BrokerId(self.broker_id);
+
+        let mut broker = DescribeClusterBroker::default();
+        broker.broker_id = kafka_protocol::messages::BrokerId(self.broker_id);
+        broker.host = StrBytes::from_string(self.host.clone());
+        broker.port = self.port;
+        res.brokers.push(broker);
+
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_offset_for_leader_epoch(
+        &self,
+        req: &kafka_protocol::messages::OffsetForLeaderEpochRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::OffsetForLeaderEpochResponse {
+        use kafka_protocol::messages::offset_for_leader_epoch_response::{
+            EpochEndOffset, OffsetForLeaderTopicResult,
+        };
+        let mut res = kafka_protocol::messages::OffsetForLeaderEpochResponse::default();
+
+        for topic in &req.topics {
+            let mut topic_res = OffsetForLeaderTopicResult::default();
+            topic_res.topic = topic.topic.clone();
+
+            let topic_name = topic.topic.as_str();
+            for part in &topic.partitions {
+                let mut part_res = EpochEndOffset::default();
+                part_res.partition = part.partition;
+
+                if let Some(t_state) = self.topics.get(topic_name) {
+                    if let Some(p_state) = t_state.partitions.get(&part.partition) {
+                        part_res.error_code = 0;
+                        part_res.leader_epoch = 0;
+                        part_res.end_offset = p_state.high_watermark;
+                    } else {
+                        part_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                    }
+                } else {
+                    part_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                }
+
+                topic_res.partitions.push(part_res);
+            }
+
+            res.topics.push(topic_res);
+        }
+
+        res
+    }
 }
 
 fn uuid_simple() -> u128 {
@@ -702,5 +879,53 @@ impl Engine {
         version: i16,
     ) -> kafka_protocol::messages::OffsetFetchResponse {
         self.state.lock().unwrap().handle_offset_fetch(req, version)
+    }
+
+    pub fn handle_describe_groups(
+        &self,
+        req: &kafka_protocol::messages::DescribeGroupsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DescribeGroupsResponse {
+        self.state.lock().unwrap().handle_describe_groups(req, version)
+    }
+
+    pub fn handle_list_groups(
+        &self,
+        req: &kafka_protocol::messages::ListGroupsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::ListGroupsResponse {
+        self.state.lock().unwrap().handle_list_groups(req, version)
+    }
+
+    pub fn handle_delete_groups(
+        &self,
+        req: &kafka_protocol::messages::DeleteGroupsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DeleteGroupsResponse {
+        self.state.lock().unwrap().handle_delete_groups(req, version)
+    }
+
+    pub fn handle_describe_configs(
+        &self,
+        req: &kafka_protocol::messages::DescribeConfigsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DescribeConfigsResponse {
+        self.state.lock().unwrap().handle_describe_configs(req, version)
+    }
+
+    pub fn handle_describe_cluster(
+        &self,
+        req: &kafka_protocol::messages::DescribeClusterRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DescribeClusterResponse {
+        self.state.lock().unwrap().handle_describe_cluster(req, version)
+    }
+
+    pub fn handle_offset_for_leader_epoch(
+        &self,
+        req: &kafka_protocol::messages::OffsetForLeaderEpochRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::OffsetForLeaderEpochResponse {
+        self.state.lock().unwrap().handle_offset_for_leader_epoch(req, version)
     }
 }

@@ -265,4 +265,55 @@ fn test_kafka_milestone_1_and_2() {
         &fetch_off_req,
     );
     assert_eq!(fetch_off_resp.topics[0].partitions[0].committed_offset, 42);
+
+    // 14. ListGroups & DescribeGroups
+    let list_groups_req = kafka_protocol::messages::ListGroupsRequest::default();
+    let list_groups_resp: kafka_protocol::messages::ListGroupsResponse = send_request(
+        &mut stream,
+        ApiKey::ListGroups,
+        2,
+        15,
+        Some("test-client"),
+        &list_groups_req,
+    );
+    assert_eq!(list_groups_resp.error_code, 0);
+
+    let mut desc_groups_req = kafka_protocol::messages::DescribeGroupsRequest::default();
+    desc_groups_req.groups.push(kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string())));
+    let desc_groups_resp: kafka_protocol::messages::DescribeGroupsResponse = send_request(
+        &mut stream,
+        ApiKey::DescribeGroups,
+        3,
+        16,
+        Some("test-client"),
+        &desc_groups_req,
+    );
+    assert_eq!(desc_groups_resp.groups[0].error_code, 0);
+
+    // 15. DescribeConfigs & DescribeCluster
+    let mut desc_cfg_req = kafka_protocol::messages::DescribeConfigsRequest::default();
+    let mut cfg_res = kafka_protocol::messages::describe_configs_request::DescribeConfigsResource::default();
+    cfg_res.resource_type = 2; // Topic
+    cfg_res.resource_name = StrBytes::from_string("milestone2-topic".to_string());
+    desc_cfg_req.resources.push(cfg_res);
+    let desc_cfg_resp: kafka_protocol::messages::DescribeConfigsResponse = send_request(
+        &mut stream,
+        ApiKey::DescribeConfigs,
+        2,
+        17,
+        Some("test-client"),
+        &desc_cfg_req,
+    );
+    assert_eq!(desc_cfg_resp.results[0].error_code, 0);
+
+    let desc_cluster_req = kafka_protocol::messages::DescribeClusterRequest::default();
+    let desc_cluster_resp: kafka_protocol::messages::DescribeClusterResponse = send_request(
+        &mut stream,
+        ApiKey::DescribeCluster,
+        0,
+        18,
+        Some("test-client"),
+        &desc_cluster_req,
+    );
+    assert_eq!(desc_cluster_resp.error_code, 0);
 }

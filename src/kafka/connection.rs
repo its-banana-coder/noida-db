@@ -264,6 +264,84 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     header.request_api_version,
                 )
             }
+            ApiKey::DescribeGroups => {
+                let req = match kafka_protocol::messages::DescribeGroupsRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_describe_groups(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::ListGroups => {
+                let req = match kafka_protocol::messages::ListGroupsRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_list_groups(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DeleteGroups => {
+                let req = match kafka_protocol::messages::DeleteGroupsRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_delete_groups(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DescribeConfigs => {
+                let req = match kafka_protocol::messages::DescribeConfigsRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_describe_configs(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DescribeCluster => {
+                let req = match kafka_protocol::messages::DescribeClusterRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_describe_cluster(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::OffsetForLeaderEpoch => {
+                let req = match kafka_protocol::messages::OffsetForLeaderEpochRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_offset_for_leader_epoch(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
             _ => break,
         };
 
