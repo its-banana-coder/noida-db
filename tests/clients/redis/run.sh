@@ -106,20 +106,26 @@ else
   skip "bullmq" "no node"
 fi
 
-# Java clients: Jedis and Lettuce (Gradle, self-fetched wrapper; nothing
-# global, cache under target/)
+# Java clients: Jedis, Lettuce, Spring Data Redis and Redisson (Gradle,
+# self-fetched wrapper; nothing global, cache under target/)
 if command -v java >/dev/null; then
   export GRADLE_USER_HOME="$PWD/$work/gradle-home"
   if (cd "$here/java" && ./gradlew --console=plain -q compileJava >/dev/null 2>&1); then
     run "jedis" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=JedisTest"
     run "lettuce" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=LettuceTest"
+    run "spring-data-redis" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=SpringDataRedisTest"
+    run "redisson" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=RedissonTest"
   else
     skip "jedis" "could not build"
     skip "lettuce" "could not build"
+    skip "spring-data-redis" "could not build"
+    skip "redisson" "could not build"
   fi
 else
   skip "jedis" "no java"
   skip "lettuce" "no java"
+  skip "spring-data-redis" "no java"
+  skip "redisson" "no java"
 fi
 
 # go-redis (speaks RESP3 by default)
