@@ -2435,9 +2435,11 @@ fn drop_subcommands(v: Value) -> Value {
 }
 
 /// MONITOR streams every command other clients run. Timestamps and client
-/// addresses differ by nature, so lines are compared without them. Only this
-/// test's own client (and the script commands that carry its `mon:` keys) are
-/// kept, because CI shares one Redis between the tests in this file.
+/// addresses differ by nature, so lines are compared without them. Every
+/// command this test sends carries a `mon:` marker and only lines with that
+/// marker are kept: CI shares one Redis (in a container, so client addresses
+/// are NAT'd) between the tests in this file, and other tests' traffic is
+/// also in the stream.
 ///
 /// EXEC and SELECT are left out: Redis 7 shows them after they ran and older
 /// versions before, so their order is version-specific (unit-tested from the
@@ -2452,14 +2454,13 @@ fn monitor_lines_match_real_redis() {
     let mut real_mon = RawClient::connect(reference.addr);
     let mut ours_mon = RawClient::connect(ours_addr);
     for m in [&mut real_mon, &mut ours_mon] {
-        m.set_timeout(800);
+        m.set_timeout(1500);
         assert_eq!(m.run("MONITOR"), Value::ok());
     }
     let mut real = RawClient::connect(reference.addr);
     let mut ours = RawClient::connect(ours_addr);
-    let real_port = format!("127.0.0.1:{}", real.local_port());
 
-    let echo_arg: &[u8] = b"a\"b\\c\n\t\x07\x08\0\xc3\xa9";
+    let echo_arg: &[u8] = b"mon:a\"b\\c\n\t\x07\x08\0\xc3\xa9";
     let commands: Vec<Vec<&[u8]>> = vec![
         vec![b"SET", b"mon:k", b"v"],
         vec![b"GET", b"mon:k"],
@@ -2469,48 +2470,33 @@ fn monitor_lines_match_real_redis() {
         vec![b"ECHO", echo_arg],
         vec![b"CONFIG", b"GET", b"maxmemory"],
         vec![b"EVAL", b"return(redis.call('set','mon:k','v'))", b"0"],
-        vec![b"NOSUCHCMD", b"x"],
-        vec![b"PING"],
+        vec![b"NOSUCHCMD", b"mon:x"],
+        vec![b"PING", b"mon:ping"],
     ];
     for c in &commands {
         real.cmd(c);
         ours.cmd(c);
     }
 
-    // "<ts> [<db> <addr>] args" -> "[<db>] args"; script lines have no addr.
-    let normalize = |v: Value| -> Option<String> {
-        let Value::Simple(line) = v else { panic!("monitor lines are simple strings: {v:?}") };
-        let (_, rest) = line.split_once(' ').expect("timestamp then a space");
-        let (origin, args) = rest.split_once("] ")?;
-        let origin = origin.trim_start_matches('[');
-        let mine = origin.ends_with(&real_port);
-        let lua = origin.ends_with(" lua") && args.contains("mon:");
-        if !(mine || lua) && !origin.contains("127.0.0.1:") {
-            return None;
-        }
-        let db = origin.split(' ').next().unwrap();
-        let shown = if origin.ends_with(" lua") { "lua".to_string() } else { db.to_string() };
-        Some(format!("[{shown}] {args}"))
-    };
-    let collect = |m: &mut RawClient, keep_ours: bool| -> Vec<String> {
+    // "<ts> [<db> <addr>] args" -> "[<db>] args" ("[lua] args" for scripts).
+    let collect = |m: &mut RawClient| -> Vec<String> {
         let mut out = Vec::new();
         while let Some(v) = m.try_read() {
-            let Value::Simple(line) = &v else { continue };
-            if keep_ours {
-                // noida only sees this test's clients, so keep everything.
-                let (_, rest) = line.split_once(' ').unwrap();
-                let (origin, args) = rest.split_once("] ").unwrap();
-                let db = origin.trim_start_matches('[').split(' ').next().unwrap();
-                let shown = if origin.ends_with(" lua") { "lua" } else { db };
-                out.push(format!("[{shown}] {args}"));
-            } else if let Some(n) = normalize(v) {
-                out.push(n);
+            let Value::Simple(line) = v else { continue };
+            let Some((_, rest)) = line.split_once(' ') else { continue };
+            let Some((origin, args)) = rest.split_once("] ") else { continue };
+            if !args.contains("mon:") {
+                continue;
             }
+            let origin = origin.trim_start_matches('[');
+            let shown =
+                if origin.ends_with(" lua") { "lua" } else { origin.split(' ').next().unwrap() };
+            out.push(format!("[{shown}] {args}"));
         }
         out
     };
-    let want = collect(&mut real_mon, false);
-    let got = collect(&mut ours_mon, true);
+    let want = collect(&mut real_mon);
+    let got = collect(&mut ours_mon);
     eprintln!("compared {} monitor lines", want.len());
     assert!(want.len() >= 8, "the reference showed too few lines: {want:?}");
     assert_eq!(got, want);
