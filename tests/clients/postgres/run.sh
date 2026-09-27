@@ -27,7 +27,7 @@ if [ -z "${PGPORT:-}" ]; then
   cargo build --quiet --features postgres --bin noida-db || exit 1
   PGPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
   "$root/target/debug/noida-db" start --only postgres --postgres-port "$PGPORT" \
-    --data-dir "$cache/noida-data" >"$cache/noida.log" 2>&1 &
+    --data-dir "$cache/noida-db-data" >"$cache/noida-db.log" 2>&1 &
   started_noida=$!
   for _ in $(seq 1 50); do
     (echo > "/dev/tcp/127.0.0.1/$PGPORT") 2>/dev/null && break

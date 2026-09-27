@@ -1,4 +1,4 @@
-// The PostgreSQL JDBC driver against noida: prepared statements, batches,
+// The PostgreSQL JDBC driver against noida-db: prepared statements, batches,
 // transactions, and the DatabaseMetaData calls Hibernate and Flyway make.
 
 import java.math.BigDecimal;

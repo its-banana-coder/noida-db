@@ -14,7 +14,7 @@ but not identical to the real server.
 | Service | State | Usable with real clients? |
 |---|---|---|
 | Redis | most commands done (see below) | yes |
-| Postgres | in progress | partly (see `COMPATIBILITY.md`) |
+| Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | MySQL | early scaffolding, not merged | no |
 | Kafka | early scaffolding, not merged | no |
 | Memcached, MongoDB, RabbitMQ, Elasticsearch, ClickHouse | specs only (`docs/specs/`) | no |
@@ -85,11 +85,32 @@ current count).
 
 ## Postgres
 
-Work in progress; the authoritative list is the Postgres section of
-`COMPATIBILITY.md` plus the notes in the Postgres pull requests. Known
-directions not covered yet: `PL/pgSQL` and stored procedures, extensions,
-logical replication, `LISTEN`/`NOTIFY`, `COPY`, full window-function coverage.
-Concurrency is one writer at a time.
+Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
+servers by `tests/postgres_diff.rs` (about 455 results) and by psycopg,
+SQLAlchemy, node-postgres and JDBC (`tests/clients/postgres/run.sh`). The
+introspection queries Django, Prisma and Hibernate send are in the diff tests.
+
+**By design**
+
+- Replication of any kind. A connection with the `replication` startup
+  parameter is treated as an ordinary one, so `pg_basebackup` and
+  `pg_recvlogical` do not work.
+- Roles and privileges are not enforced: `GRANT`, `REVOKE` and
+  `CREATE/ALTER ROLE` are accepted so migrations run. There is one login.
+- `EXPLAIN ANALYZE`, statistics views and tuning: `EXPLAIN` returns a minimal
+  plan; `VACUUM` and `ANALYZE` are accepted and do nothing.
+
+**Not yet**
+
+- PL/pgSQL and stored procedures, extensions, `LISTEN`/`NOTIFY`, `COPY`.
+- Concurrency is one writer at a time.
+
+**Differs**
+
+- Enum values order and compare by label text, not declaration order (`<`,
+  `ORDER BY`, `min`/`max`).
+- `pg_attribute` has no system columns (`ctid`, `xmin`, ...).
+- `server_version` reports 16.4.
 
 ## MySQL and Kafka
 

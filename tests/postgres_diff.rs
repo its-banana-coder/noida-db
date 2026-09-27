@@ -415,7 +415,7 @@ fn reference() -> Option<Ref> {
             .into_iter()
             .map(Path::new)
             .find(|p| p.join("initdb").exists())?;
-    let dir = std::env::temp_dir().join(format!("noida-pgref-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("noida-db-pgref-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let data = dir.join("data");
     std::fs::create_dir_all(&data).ok()?;
