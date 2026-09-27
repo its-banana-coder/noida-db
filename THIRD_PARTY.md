@@ -1,6 +1,6 @@
 # Third-party code
 
-noida is MIT licensed. This file lists code that was ported or copied from
+noida-db is MIT licensed. This file lists code that was ported or copied from
 other projects, with its licence. Crates pulled in through `Cargo.toml` carry
 their own licences (`cargo tree` lists them) and are not repeated here.
 

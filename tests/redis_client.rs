@@ -1,4 +1,4 @@
-//! A real Redis client library (redis-rs) against noida over TCP.
+//! A real Redis client library (redis-rs) against noida-db over TCP.
 
 mod common;
 

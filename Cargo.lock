@@ -613,7 +613,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "noida"
+name = "noida-db"
 version = "0.1.0"
 dependencies = [
  "bytes",

@@ -5,13 +5,13 @@ The footprint figures below are targets; only the binary size is measured today.
 
 ## The promise
 
-An app that uses these systems in the usual way can point at noida on a
+An app that uses these systems in the usual way can point at noida-db on a
 laptop and work without code changes, using the common drivers, ORMs,
 migration tools and CLIs.
 
 "100% compatible" means **100% of the compatibility test suite passes**. The
 suite is a set of real-client scenarios, each run against both the real server
-and noida, with the results compared. Anything outside the suite returns the
+and noida-db, with the results compared. Anything outside the suite returns the
 real system's own "not supported" error, never a silently wrong result.
 
 ## Footprint targets
@@ -31,7 +31,7 @@ How we stay inside the targets:
 - **Data lives on disk.** Only a bounded cache is held in RAM. Kafka logs are
   read straight from files.
 - **Redis data is in memory, as it is in real Redis.** *Planned:* it counts
-  toward `--max-memory`, and when the cap is hit noida follows Redis's
+  toward `--max-memory`, and when the cap is hit noida-db follows Redis's
   `maxmemory` rules (eviction policies, then the OOM error). Not built yet:
   today nothing is enforced and nothing is persisted.
 - **A thread per connection,** with small stacks. Only the stack memory a
@@ -45,7 +45,7 @@ Every service is its own module:
 - **Build time:** each service is a Cargo feature (`redis`, `postgres`, ...),
   all on by default. `cargo build --no-default-features --features redis,postgres`
   leaves the other services out of the binary entirely.
-- **Run time:** `noida start --only redis,postgres` starts only those. A
+- **Run time:** `noida-db start --only redis,postgres` starts only those. A
   service that is off opens no port and allocates no memory.
 
 ## Rules for every system
@@ -55,9 +55,9 @@ Every service is its own module:
   replication, clustering, sharding, sentinel/HA/failover, backup/restore/
   migration (DUMP/RESTORE/MIGRATE, snapshots), or multi-user security
   management. See "Scope filter" in `docs/specs/README.md`.
-- **No performance analysis.** noida never implements EXPLAIN ANALYZE,
+- **No performance analysis.** noida-db never implements EXPLAIN ANALYZE,
   SLOWLOG, LATENCY, profilers or query statistics. Where clients or tools may
-  send these, noida accepts them and returns an empty or minimal reply so
+  send these, noida-db accepts them and returns an empty or minimal reply so
   nothing breaks.
 - **Not in scope:** clustering, replication, sharding, sentinel, high
   availability, failover, backup/restore/migration, performance tuning,
@@ -151,7 +151,7 @@ Every service is its own module:
   - CRUD, the query and update operators, indexes (unique, TTL), the
     aggregation pipeline, change streams, transactions and GridFS.
   - The official drivers, Spring Data MongoDB and Mongoose working.
-- **Out of scope:** sharding, replica sets (noida replies as a single-node
+- **Out of scope:** sharding, replica sets (noida-db replies as a single-node
   replica set so transactions and change streams work), `$where` and
   server-side JavaScript.
 

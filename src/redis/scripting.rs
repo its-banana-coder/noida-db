@@ -1,7 +1,7 @@
 //! Lua scripting: EVAL, EVALSHA, their read-only variants and SCRIPT,
 //! ported from Redis's eval.c and script_lua.c.
 //!
-//! Redis embeds Lua 5.1, so noida embeds the same interpreter (mlua with a
+//! Redis embeds Lua 5.1, so noida-db embeds the same interpreter (mlua with a
 //! vendored Lua 5.1). Each script runs in a fresh interpreter with Redis's
 //! sandbox: no globals may be created or read unless they exist, `redis.*`
 //! runs commands through the engine, and the Lua/RESP conversions and error
@@ -103,7 +103,7 @@ setmetatable(_G, {
 })
 "#;
 
-/// Scripts noida has seen, by SHA-1 digest (Redis's script cache).
+/// Scripts noida-db has seen, by SHA-1 digest (Redis's script cache).
 #[derive(Default)]
 pub struct Scripts {
     pub cache: std::collections::HashMap<String, Vec<u8>>,
@@ -189,7 +189,7 @@ fn script_flush(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     Ok(Value::ok())
 }
 
-/// No script ever runs long enough to be killed: noida runs them to
+/// No script ever runs long enough to be killed: noida-db runs them to
 /// completion while holding the engine lock.
 fn script_kill(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
     Err(Value::err("NOTBUSY No scripts in execution right now."))
@@ -379,7 +379,7 @@ fn build_env(
             Ok(sha1::hex(&bytes))
         })?,
     )?;
-    // noida keeps no log file; the levels exist so scripts can call it.
+    // noida-db keeps no log file; the levels exist so scripts can call it.
     redis.raw_set("log", lua.create_function(|_, _: Variadic<Lv>| Ok(()))?)?;
     for (name, level) in
         [("LOG_DEBUG", 0), ("LOG_VERBOSE", 1), ("LOG_NOTICE", 2), ("LOG_WARNING", 3)]

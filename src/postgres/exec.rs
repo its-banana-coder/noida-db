@@ -493,7 +493,7 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
     let text = |v: &Value| v.as_str().unwrap_or("").to_string();
     Ok(match name {
         "version" => Value::text(format!(
-            "PostgreSQL {} on x86_64-pc-linux-gnu, compiled by noida, 64-bit",
+            "PostgreSQL {} on x86_64-pc-linux-gnu, compiled by noida-db, 64-bit",
             super::session::SERVER_VERSION
         )),
         "current_database" => Value::text(ctx.rt.database.clone()),

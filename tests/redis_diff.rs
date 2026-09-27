@@ -1,4 +1,4 @@
-//! Differential tests: every script runs against real Redis and noida, and
+//! Differential tests: every script runs against real Redis and noida-db, and
 //! every reply must be identical.
 //!
 //! The reference server is `NOIDA_REDIS_REF=host:port` if set (CI points this
@@ -2349,7 +2349,7 @@ fn replies_match_real_redis() {
             }
             lines_compared += 1;
             if want != got {
-                failures.push(format!("{line}\n    redis: {want:?}\n    noida: {got:?}"));
+                failures.push(format!("{line}\n    redis: {want:?}\n    noida-db: {got:?}"));
             }
         }
     }
@@ -2376,7 +2376,7 @@ fn replies_match_real_redis() {
                     .map(|a| format!("{:.40}", String::from_utf8_lossy(a)))
                     .collect();
                 failures.push(format!(
-                    "[{name}] {}\n    redis: {:.300}\n    noida: {:.300}",
+                    "[{name}] {}\n    redis: {:.300}\n    noida-db: {:.300}",
                     shown.join(" "),
                     format!("{want:?}"),
                     format!("{got:?}")
@@ -2398,7 +2398,7 @@ fn replies_match_real_redis() {
     );
 }
 
-/// COMMAND INFO and COMMAND DOCS for every command and subcommand noida
+/// COMMAND INFO and COMMAND DOCS for every command and subcommand noida-db
 /// implements must match real Redis exactly. This checks the generated
 /// command table and the code that formats it.
 #[test]
@@ -2438,7 +2438,7 @@ fn command_introspection_matches_real_redis() {
             };
             compared += 1;
             if want != got {
-                failures.push(format!("{line}\n    redis: {want:?}\n    noida: {got:?}"));
+                failures.push(format!("{line}\n    redis: {want:?}\n    noida-db: {got:?}"));
             }
         }
     }

@@ -2,7 +2,7 @@
 //!
 //! The parameter table (src/redis/config_table.rs) is generated from
 //! Redis 7.2's own table, so every name, alias, default, range and enum is
-//! Redis's. Values are remembered and reported back; the ones noida acts
+//! Redis's. Values are remembered and reported back; the ones noida-db acts
 //! on are read from here by the rest of the server.
 
 use std::collections::HashMap;
@@ -79,7 +79,7 @@ impl Config {
 }
 
 impl Engine {
-    /// A parameter's value as a number, for the places noida honours it.
+    /// A parameter's value as a number, for the places noida-db honours it.
     pub fn config_num(&self, name: &str) -> i64 {
         self.config.get(name).and_then(|v| v.parse().ok()).unwrap_or(0)
     }
@@ -338,13 +338,13 @@ fn config_set(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn config_resetstat(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
-    // The INFO counters noida reports are constants, so there is nothing
+    // The INFO counters noida-db reports are constants, so there is nothing
     // to clear.
     Ok(Value::ok())
 }
 
 fn config_rewrite(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
-    // noida is always started without a configuration file.
+    // noida-db is always started without a configuration file.
     Err(Value::err("ERR The server is running without a config file"))
 }
 

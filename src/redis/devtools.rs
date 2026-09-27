@@ -1,7 +1,7 @@
 //! Commands developer GUIs and CLIs probe on connect: SLOWLOG, LATENCY,
 //! MEMORY, MODULE LIST and the read-only parts of ACL (Redis 7.2 shapes).
 //!
-//! noida does no performance analysis, so the slow log and latency history
+//! noida-db does no performance analysis, so the slow log and latency history
 //! are always empty and MEMORY figures are estimates. There is one user,
 //! `default`, so ACL only reports it; user management is a production
 //! concern and is left out (see the scope filter in docs/specs/README.md).
@@ -177,7 +177,7 @@ fn memory_help(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 }
 
 fn memory_doctor(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
-    // Under 5MB Redis reports the instance as empty; noida always is.
+    // Under 5MB Redis reports the instance as empty; noida-db always is.
     Ok(txt("Hi Sam, this instance is empty or is using very little memory, my issues detector \
          can't be used in these conditions. Please, leave for your mission on Earth and fill it \
          with some data. The new Sam and I will be back to our programming as soon as I finished \
@@ -189,7 +189,7 @@ fn memory_malloc_stats(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 }
 
 /// A rough size in bytes: enough for tools to rank keys, not an exact
-/// figure (noida's memory layout is not Redis's).
+/// figure (noida-db's memory layout is not Redis's).
 fn estimate(key: &[u8], entry: &Entry) -> i64 {
     let value = match &entry.data {
         Data::Str(s) => s.len() + 16,

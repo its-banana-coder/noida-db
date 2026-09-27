@@ -1,7 +1,7 @@
 //! Streams, ported from Redis's t_stream.c.
 //!
 //! Entries live in an ordered map keyed by (ms, seq). Trimming is always
-//! exact: Redis's `~` only drops whole listpack nodes, which noida doesn't
+//! exact: Redis's `~` only drops whole listpack nodes, which noida-db doesn't
 //! model, so `~` trims like `=`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1332,7 +1332,7 @@ fn xinfo(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     // Fields every XINFO STREAM form starts with.
     let mut out = vec![
         field("length", Value::Integer(s.len() as i64)),
-        // noida has no radix tree; it reports what a small stream looks
+        // noida-db has no radix tree; it reports what a small stream looks
         // like in Redis.
         field("radix-tree-keys", Value::Integer(s.len().min(1) as i64)),
         field("radix-tree-nodes", Value::Integer(s.len().min(1) as i64 + 1)),

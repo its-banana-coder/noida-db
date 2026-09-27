@@ -6,7 +6,7 @@ use super::error::{PgError, PgResult, code};
 use super::types::FmtCtx;
 use super::tz::{self, Zone};
 
-/// The Postgres version noida reports.
+/// The Postgres version noida-db reports.
 pub const SERVER_VERSION: &str = "16.4";
 pub const SERVER_VERSION_NUM: &str = "160004";
 
@@ -136,8 +136,10 @@ impl Default for Settings {
         let values: BTreeMap<String, String> =
             DEFAULTS.iter().map(|(n, v, _)| (n.to_string(), v.to_string())).collect();
         let mut s = Settings { session_defaults: values.clone(), values, zone: Zone::utc() };
-        s.values
-            .insert("server_version_full".into(), format!("PostgreSQL {SERVER_VERSION} (noida)"));
+        s.values.insert(
+            "server_version_full".into(),
+            format!("PostgreSQL {SERVER_VERSION} (noida-db)"),
+        );
         s.session_defaults = s.values.clone();
         s
     }
@@ -299,7 +301,7 @@ impl Settings {
                 if parts.iter().any(|p| matches!(*p, "sql" | "postgres" | "german")) {
                     return Err(PgError::new(
                         code::FEATURE_NOT_SUPPORTED,
-                        "noida only supports DateStyle ISO output",
+                        "noida-db only supports DateStyle ISO output",
                     ));
                 }
                 let order = if parts.iter().any(|p| matches!(*p, "dmy" | "euro" | "european")) {

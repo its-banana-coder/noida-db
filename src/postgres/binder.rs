@@ -4398,7 +4398,7 @@ fn guess_unknown(other: Type, _op: &str) -> Type {
     if other.is_unknown() { Type::NUMERIC } else { other }
 }
 
-/// Operator names noida implements, for `OPERATOR(schema.op)` syntax.
+/// Operator names noida-db implements, for `OPERATOR(schema.op)` syntax.
 fn known_operator(op: &str) -> Option<&'static str> {
     const OPS: &[&str] = &[
         "+", "-", "*", "/", "%", "^", "||", "&", "|", "#", "<<", ">>", "->", "->>", "#>", "#>>",

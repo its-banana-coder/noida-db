@@ -32,7 +32,7 @@ use super::types::{self, Type, Value};
 /// the pages a connection touches cost anything.
 const STACK_SIZE: usize = 16 * 1024 * 1024;
 
-/// How noida asks clients to authenticate, and the password it expects.
+/// How noida-db asks clients to authenticate, and the password it expects.
 #[derive(Clone)]
 pub struct Config {
     pub auth: AuthMethod,

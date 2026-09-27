@@ -1,4 +1,4 @@
-# Building a noida service
+# Building a noida-db service
 
 Every service follows the same shape. Redis (`src/redis/`) is the reference
 implementation; read it before starting.
@@ -28,7 +28,7 @@ implementation; read it before starting.
 
 - `src/<service>/mod.rs` exposes `pub fn spawn(addr: &str) ->
   io::Result<SocketAddr>`: bind, serve on background threads, return the
-  bound address. `src/services.rs` already routes `noida start` to it.
+  bound address. `src/services.rs` already routes `noida-db start` to it.
 - Put the service behind its Cargo feature (already declared in Cargo.toml).
   Add it to `default` once it serves something useful.
 - Keep protocol, engine and server separate so the engine is testable
@@ -43,7 +43,7 @@ Write the tests first, watch them fail, then implement.
 3. **Real-client tests** (`tests/<service>_client.rs`): a real driver crate
    (dev-dependency only) talks to `spawn("127.0.0.1:0")`.
 4. **Differential tests** (`tests/<service>_diff.rs`): run the same script
-   against the real server and noida and require identical results. Use
+   against the real server and noida-db and require identical results. Use
    `NOIDA_<SERVICE>_REF=host:port` if set (CI), else start a local server if
    one is installed, else print `SKIPPED` and pass. See `tests/redis_diff.rs`.
 

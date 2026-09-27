@@ -2,7 +2,7 @@
 # Runs the committed Postgres client apps (psycopg, SQLAlchemy, node-postgres,
 # JDBC) against a server.
 #
-#   tests/clients/postgres/run.sh            # starts noida on a free port
+#   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
 #
 # Dependencies are fetched into target/client-deps on first use. A client
@@ -23,10 +23,10 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGPORT:-}" ]; then
-  echo "== starting noida"
-  cargo build --quiet --features postgres --bin noida || exit 1
+  echo "== starting noida-db"
+  cargo build --quiet --features postgres --bin noida-db || exit 1
   PGPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-  "$root/target/debug/noida" start --only postgres --postgres-port "$PGPORT" \
+  "$root/target/debug/noida-db" start --only postgres --postgres-port "$PGPORT" \
     --data-dir "$cache/noida-data" >"$cache/noida.log" 2>&1 &
   started_noida=$!
   for _ in $(seq 1 50); do

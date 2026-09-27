@@ -1,5 +1,5 @@
 //! Commands developer GUIs and CLIs probe: SLOWLOG, LATENCY, MEMORY,
-//! MODULE LIST and the read-only parts of ACL. noida does no performance
+//! MODULE LIST and the read-only parts of ACL. noida-db does no performance
 //! analysis, so the logs are always empty; the shapes match Redis 7.2.
 
 use super::*;

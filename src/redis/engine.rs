@@ -245,7 +245,7 @@ pub struct Engine {
 pub type Reply = Result<Value, Value>;
 pub type Handler = fn(&mut Ctx, &[Vec<u8>]) -> Reply;
 
-/// A command noida implements. Arity and every other property come from
+/// A command noida-db implements. Arity and every other property come from
 /// Redis's own command table (`command_meta`).
 pub struct Command {
     pub name: &'static str,
@@ -292,12 +292,12 @@ fn find(name: &str) -> Option<&'static Command> {
     INDEX.get_or_init(|| command_table().map(|c| (c.name, c)).collect()).get(name).copied()
 }
 
-/// Names of every top-level command noida implements.
+/// Names of every top-level command noida-db implements.
 pub fn command_names() -> impl Iterator<Item = &'static str> {
     command_table().map(|c| c.name)
 }
 
-/// Whether noida implements a command, by full name ("get",
+/// Whether noida-db implements a command, by full name ("get",
 /// "client|setname").
 pub fn is_implemented(fullname: &str) -> bool {
     match fullname.split_once('|') {

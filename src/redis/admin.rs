@@ -18,7 +18,7 @@ pub static COMMANDS: &[Command] = &[
 ];
 
 // ---- persistence ----
-// noida keeps Redis data in memory only, so saving is instant and writes
+// noida-db keeps Redis data in memory only, so saving is instant and writes
 // nothing; the replies are Redis's.
 
 fn save(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
@@ -63,7 +63,7 @@ static COMMAND: &[Command] = &[
     cmd("list", command_list),
 ];
 
-/// COMMAND reports only what noida implements, so clients never plan
+/// COMMAND reports only what noida-db implements, so clients never plan
 /// around a command that would fail.
 fn implemented() -> impl Iterator<Item = &'static CommandMeta> {
     command_meta::all().iter().filter(|c| is_implemented(c.name))
@@ -267,7 +267,7 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 f("os", format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)),
                 f("arch_bits", (usize::BITS).to_string()),
                 f("monotonic_clock", "POSIX clock_gettime".into()),
-                f("multiplexing_api", "noida".into()),
+                f("multiplexing_api", "noida-db".into()),
                 f("atomicvar_api", "c11-builtin".into()),
                 f("gcc_version", "0.0.0".into()),
                 f("process_id", std::process::id().to_string()),

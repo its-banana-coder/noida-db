@@ -1,6 +1,6 @@
 # What doesn't work
 
-noida is a **local development** tool. This page lists what it does not do,
+noida-db is a **local development** tool. This page lists what it does not do,
 what is not built yet, and where it knowingly differs from the real servers.
 Every service PR must update its section: if you find a gap that isn't here,
 add it.
@@ -31,7 +31,7 @@ answer as *unknown*.
 - Performance analysis and tuning: no `EXPLAIN ANALYZE`, profilers or query
   statistics. Where a developer GUI probes an inspection command, the reply is
   empty or minimal.
-- Real clustering behaviour of any kind. noida is one process on one machine.
+- Real clustering behaviour of any kind. noida-db is one process on one machine.
 
 ## Redis
 
@@ -65,7 +65,7 @@ current count).
   is not enforced.
 - Lua libraries `cmsgpack`, `struct` and `bit`. `cjson` and the `redis` table
   are available.
-- Persistence. All data lives in memory and is gone when noida stops.
+- Persistence. All data lives in memory and is gone when noida-db stops.
   `SAVE`, `BGSAVE` and `BGREWRITEAOF` succeed but write nothing. `--data-dir`
   is not used by Redis yet.
 

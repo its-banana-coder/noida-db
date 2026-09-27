@@ -1,6 +1,6 @@
 # Service specs
 
-Each file here is a self-contained brief for building one noida service. An
+Each file here is a self-contained brief for building one noida-db service. An
 agent (or person) can pick one up without other context.
 
 | Service | Spec | Port(s) | Status |
@@ -49,7 +49,7 @@ agent (or person) can pick one up without other context.
 
 ## Scope filter: local development only
 
-noida is a development tool. Build what a developer on a laptop uses while
+noida-db is a development tool. Build what a developer on a laptop uses while
 building or debugging an app. **Do not implement, not even as stubs or cheap
 error replies**, anything whose purpose is running or operating production:
 
@@ -97,7 +97,7 @@ implementation and use it**:
 The differential tests against the real server are what make porting safe:
 port, then compare.
 
-**Licences matter.** noida is MIT. Port or copy only code under a permissive
+**Licences matter.** noida-db is MIT. Port or copy only code under a permissive
 licence (MIT, Apache-2.0, BSD, ISC, PostgreSQL). Never copy GPL, AGPL, SSPL,
 Elastic-licence or RSAL code. Record every ported source in `THIRD_PARTY.md`
 with its licence, keeping the upstream copyright notice. Verify the licence
@@ -146,10 +146,10 @@ copying source.
 1. All P0 items work and are covered by engine tests, real-client tests and
    differential tests.
 2. The client matrix in the spec passes (each listed driver/ORM runs its
-   scenario against noida), with the test apps committed and runnable from
+   scenario against noida-db), with the test apps committed and runnable from
    one script.
 3. CI compares against the real server image named in the spec and passes.
-4. `noida start` serves the service, `--only <service>` and
+4. `noida-db start` serves the service, `--only <service>` and
    `--<service>-port` work, and the binary stays within budget.
 5. The service's section of `COMPATIBILITY.md` states exactly what is and
    isn't supported.

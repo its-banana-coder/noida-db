@@ -1,4 +1,4 @@
-"""SQLAlchemy (Core, ORM and reflection) on psycopg 3 against noida."""
+"""SQLAlchemy (Core, ORM and reflection) on psycopg 3 against noida-db."""
 
 import os
 import sys

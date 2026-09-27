@@ -1,4 +1,4 @@
-//! noida: one tiny local binary standing in for Postgres, MySQL, Redis,
+//! noida-db: one tiny local binary standing in for Postgres, MySQL, Redis,
 //! Kafka, Elasticsearch, ClickHouse, Memcached, MongoDB and RabbitMQ during
 //! development.
 
@@ -20,7 +20,7 @@ fn main() -> ExitCode {
 
     match command {
         Command::Help => println!("{}", config::USAGE),
-        Command::Version => println!("noida {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => println!("noida-db {}", env!("CARGO_PKG_VERSION")),
         Command::Start(cfg) => {
             if let Err(err) = start(&cfg) {
                 eprintln!("error: {err}");
@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 
 fn start(cfg: &Config) -> std::io::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    println!("noida {} | data dir: {}", env!("CARGO_PKG_VERSION"), cfg.data_dir.display());
+    println!("noida-db {} | data dir: {}", env!("CARGO_PKG_VERSION"), cfg.data_dir.display());
     for svc in &cfg.services {
         let addr = format!("{}:{}", cfg.host, svc.port);
         match noida::services::start(svc.name, &addr) {

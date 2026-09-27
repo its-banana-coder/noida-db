@@ -1,5 +1,5 @@
 //! Differential tests: every script runs against a real Postgres and against
-//! noida, and the results must match — values, column names, column types and
+//! noida-db, and the results must match — values, column names, column types and
 //! SQLSTATE codes.
 //!
 //! The reference server is `NOIDA_POSTGRES_REF=host:port` if set (CI points
@@ -547,7 +547,7 @@ fn differential() {
         println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
         return;
     };
-    let addr = noida::postgres::spawn("127.0.0.1:0").expect("start noida");
+    let addr = noida::postgres::spawn("127.0.0.1:0").expect("start noida-db");
     let noida_url = format!("host=127.0.0.1 port={} user=postgres dbname=postgres", addr.port());
 
     let mut compared = 0usize;
@@ -555,7 +555,7 @@ fn differential() {
     let mut failures = vec![];
     for (i, script) in SCRIPTS.iter().enumerate() {
         // Each script gets a clean schema on both servers.
-        let mut mine = Client::connect(&noida_url, NoTls).expect("connect to noida");
+        let mut mine = Client::connect(&noida_url, NoTls).expect("connect to noida-db");
         reset(&mut reference.client);
         reset(&mut mine);
         for raw in script.iter() {
@@ -568,8 +568,9 @@ fn differential() {
             }
             compared += 1;
             if want != got {
-                failures
-                    .push(format!("script {i}: {sql}\n  postgres: {want:?}\n  noida:    {got:?}"));
+                failures.push(format!(
+                    "script {i}: {sql}\n  postgres: {want:?}\n  noida-db:    {got:?}"
+                ));
                 continue;
             }
             // Result column types must match too.
@@ -578,7 +579,7 @@ fn differential() {
                 compared += 1;
                 if got_types.as_ref() != Some(&want_types) {
                     failures.push(format!(
-                        "script {i} column types: {sql}\n  postgres: {want_types:?}\n  noida:    {got_types:?}"
+                        "script {i} column types: {sql}\n  postgres: {want_types:?}\n  noida-db:    {got_types:?}"
                     ));
                 }
             }

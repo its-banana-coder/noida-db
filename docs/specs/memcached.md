@@ -1,4 +1,4 @@
-# Memcached: noida spec
+# Memcached: noida-db spec
 
 - **Module:** `src/memcached/` (stub exists), Cargo feature `memcached`,
   branch `svc/memcached`
@@ -116,7 +116,7 @@ Commit test apps under `tests/clients/memcached/` with a runner script.
 ## 8. Differential tests
 
 `tests/memcached_diff.rs` sends raw protocol scripts (text, meta and binary
-as byte strings) to real memcached and noida and compares responses byte
+as byte strings) to real memcached and noida-db and compares responses byte
 for byte, ignoring only values that legitimately differ (`version`, `stats`
 numbers, CAS values, which are compared for relative behaviour instead).
 Cover every command above including error and noreply paths. Print the

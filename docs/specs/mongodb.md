@@ -1,4 +1,4 @@
-# MongoDB: noida spec
+# MongoDB: noida-db spec
 
 - **Module:** `src/mongodb/`, Cargo feature `mongodb`, branch `svc/mongodb`
 - **Port:** 27017
@@ -170,7 +170,7 @@ Commit test apps under `tests/clients/mongodb/` with a runner script.
 ## 8. Differential tests
 
 `tests/mongodb_diff.rs` runs command sequences (as BSON documents) against
-real MongoDB and noida and compares replies with normalization only for
+real MongoDB and noida-db and compares replies with normalization only for
 values that legitimately differ (`$clusterTime`, `operationTime`,
 `electionId`, `localTime`, connection ids, ObjectIds generated server-side,
 cursor ids). Cover every P0 command and operator, including error replies.

@@ -1,4 +1,4 @@
-//! Tracks how many of Redis 7.2's 242 commands noida implements.
+//! Tracks how many of Redis 7.2's 242 commands noida-db implements.
 //!
 //! `IMPLEMENTED_FLOOR` is a ratchet: raise it whenever commands land, and the
 //! test fails if coverage ever drops. `all_commands_implemented` is the
@@ -20,7 +20,7 @@ fn commands() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
-/// Commands noida deliberately does not have: production-only operations
+/// Commands noida-db deliberately does not have: production-only operations
 /// (see the scope filter in docs/specs/README.md). They answer as unknown.
 /// The same list, with the reasons, is in docs/LIMITATIONS.md.
 const OUT_OF_SCOPE: &[&str] = &[
@@ -72,7 +72,7 @@ fn coverage_never_drops() {
 
 #[test]
 fn every_implemented_command_is_a_real_redis_command() {
-    // Catches typos in the command table: noida must not invent commands.
+    // Catches typos in the command table: noida-db must not invent commands.
     let real: Vec<_> = commands().into_iter().map(|(n, _)| n).collect();
     let invented: Vec<_> = noida::redis::command_names().filter(|n| !real.contains(n)).collect();
     assert!(invented.is_empty(), "not Redis 7.2 commands: {invented:?}");

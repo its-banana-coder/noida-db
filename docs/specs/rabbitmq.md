@@ -1,4 +1,4 @@
-# RabbitMQ: noida spec
+# RabbitMQ: noida-db spec
 
 - **Module:** `src/rabbitmq/`, Cargo feature `rabbitmq`, branch
   `svc/rabbitmq`
@@ -142,7 +142,7 @@ Commit test apps under `tests/clients/rabbitmq/` with a runner script.
 ## 6. Differential tests
 
 `tests/rabbitmq_diff.rs` runs frame-level scenarios against real RabbitMQ
-and noida and compares decoded methods, properties, bodies and close
+and noida-db and compares decoded methods, properties, bodies and close
 codes/texts, normalizing server-generated names (`amq.gen-*`, consumer
 tags), timestamps and server properties' version details. A second suite
 compares management API JSON for the same state (ignoring stats and node
@@ -154,7 +154,7 @@ compared frames/responses.
 Clustering, federation, shovel, plugins (other than the management API
 subset above), streams protocol (port 5552), MQTT/STOMP/AMQP 1.0, TLS,
 policies and operator policies (P2: accept and store), memory/disk alarms
-(except honouring noida's memory cap), the management web UI.
+(except honouring noida-db's memory cap), the management web UI.
 
 ## 8. Milestones
 

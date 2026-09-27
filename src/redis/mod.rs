@@ -38,5 +38,5 @@ mod zsets;
 
 pub use engine::{ClientConn, Engine, Session, command_names, is_implemented};
 
-/// The Redis version noida reports (HELLO, INFO).
+/// The Redis version noida-db reports (HELLO, INFO).
 pub const REDIS_VERSION: &str = "7.2.5";

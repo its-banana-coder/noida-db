@@ -537,7 +537,7 @@ pub fn list_filter(cmd: &CommandMeta, kind: &str, arg: &[u8]) -> bool {
             ACL_ORDER.contains(&cat.as_str()) && cmd.acl_categories().contains(&cat.as_str())
         }
         "pattern" => glob::matches(arg, cmd.name.as_bytes(), true),
-        // noida loads no modules.
+        // noida-db loads no modules.
         _ => false,
     }
 }

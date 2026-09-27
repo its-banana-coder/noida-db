@@ -1,6 +1,6 @@
-"""psycopg 3 against noida: parameterized CRUD, transactions, types, catalogs.
+"""psycopg 3 against noida-db: parameterized CRUD, transactions, types, catalogs.
 
-Run with PGPORT pointing at noida (or at a real Postgres, which must pass
+Run with PGPORT pointing at noida-db (or at a real Postgres, which must pass
 just the same).
 """
 

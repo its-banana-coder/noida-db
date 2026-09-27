@@ -6,9 +6,9 @@ use std::net::{SocketAddr, TcpStream};
 
 use noida::redis::resp::{self, Value};
 
-/// Starts a fresh noida Redis server on a free port.
+/// Starts a fresh noida-db Redis server on a free port.
 pub fn start_noida_redis() -> SocketAddr {
-    noida::redis::server::spawn("127.0.0.1:0").expect("start noida redis")
+    noida::redis::server::spawn("127.0.0.1:0").expect("start noida-db redis")
 }
 
 /// A minimal raw RESP client, so tests see exact replies.

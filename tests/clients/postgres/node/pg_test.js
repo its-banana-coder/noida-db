@@ -1,4 +1,4 @@
-// node-postgres against noida: parameterized CRUD, types, transactions,
+// node-postgres against noida-db: parameterized CRUD, types, transactions,
 // pooling and catalog introspection.
 'use strict';
 

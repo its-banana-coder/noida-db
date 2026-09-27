@@ -63,7 +63,7 @@ impl Ddl<'_, '_> {
         let parts = name_parts(&ct.name);
         let (schema, name) = self.target(&parts)?;
         if ct.temporary {
-            // Temporary tables live in the session's own schema; noida keeps
+            // Temporary tables live in the session's own schema; noida-db keeps
             // them in the normal one, which is fine for a single connection.
         }
         if self.ctx.db.relation_exists(schema, &name) {

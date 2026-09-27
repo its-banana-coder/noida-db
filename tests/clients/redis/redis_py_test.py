@@ -1,6 +1,6 @@
-"""redis-py against noida: the things applications do, over RESP2 and RESP3.
+"""redis-py against noida-db: the things applications do, over RESP2 and RESP3.
 
-Run through tests/clients/redis/run.sh, which starts noida and sets
+Run through tests/clients/redis/run.sh, which starts noida-db and sets
 NOIDA_REDIS_PORT.
 """
 

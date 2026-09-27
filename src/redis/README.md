@@ -1,11 +1,11 @@
-# Redis in noida
+# Redis in noida-db
 
 A Redis-compatible server on port **6379** (RESP2 and RESP3), targeting
 **Redis 7.2**. Real clients work unchanged (see "Client coverage").
 
 ```
-noida start --only redis            # just Redis
-noida start --redis-port 6380       # another port
+noida-db start --only redis            # just Redis
+noida-db start --redis-port 6380       # another port
 ```
 
 Status (from `cargo test --test redis_coverage -- --nocapture`): of Redis
@@ -29,13 +29,13 @@ and **3 are not built yet**. Subcommands are counted separately below.
 | Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`), with Redis's error positions |
 | Connection | `HELLO` (RESP3), `CLIENT` (id, name, info, list, kill, pause, reply, no-evict...), `RESET`, `AUTH`. `requirepass` is enforced (`CONFIG SET requirepass x`, or `NOIDA_REDIS_PASSWORD` at startup); there is one user, `default` |
 | Debugging | `MONITOR` (a live stream of every command), `COMMAND` (info, docs, getkeys, list), `INFO`, `CONFIG GET/SET` |
-| Tool probes | `SLOWLOG`, `LATENCY`, `MEMORY`, `MODULE LIST`, read-only `ACL`. These return empty or estimated data (noida does no performance analysis) |
+| Tool probes | `SLOWLOG`, `LATENCY`, `MEMORY`, `MODULE LIST`, read-only `ACL`. These return empty or estimated data (noida-db does no performance analysis) |
 
 ## Not implemented
 
 ### By design (out of scope)
 
-noida is a local development tool. These commands answer as *unknown command*.
+noida-db is a local development tool. These commands answer as *unknown command*.
 
 | Commands | Why |
 |---|---|
@@ -55,7 +55,7 @@ noida is a local development tool. These commands answer as *unknown command*.
 | `FUNCTION` (all subcommands), `FCALL`, `FCALL_RO` | Redis Functions. `EVAL`/`EVALSHA` work |
 | `CLIENT TRACKING` `CACHING` `GETREDIR` `TRACKINGINFO` | client-side caching |
 | Keyspace notifications | `notify-keyspace-events` can be set, but no `__keyspace@*__` / `__keyevent@*__` messages are published, so listening for expired-key events sees nothing |
-| Persistence | all data lives in memory and is gone when noida stops. `SAVE`, `BGSAVE`, `BGREWRITEAOF` succeed but write nothing; `--data-dir` is unused by Redis |
+| Persistence | all data lives in memory and is gone when noida-db stops. `SAVE`, `BGSAVE`, `BGREWRITEAOF` succeed but write nothing; `--data-dir` is unused by Redis |
 | `maxmemory` and eviction | the setting is stored, not enforced: no eviction policies, no OOM error |
 | Lua libraries `cmsgpack`, `struct`, `bit` | `cjson` and the `redis` table are available |
 
@@ -90,7 +90,7 @@ the real thing:
 1. **Engine tests** (`src/redis/tests/`): expected replies and error texts are
    Redis 7.2's, byte for byte.
 2. **Comparison tests** (`tests/redis_diff.rs`): the same commands run against
-   a real Redis and against noida, and the replies must be identical. CI runs
+   a real Redis and against noida-db, and the replies must be identical. CI runs
    them against Redis 7.2; locally against any `redis-server` on your PATH,
    skipping lines that need a newer version. Examples: HyperLogLog is compared
    on 511 commands including the raw stored bytes; `MONITOR` output is

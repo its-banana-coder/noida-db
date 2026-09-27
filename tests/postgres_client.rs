@@ -1,4 +1,4 @@
-//! Real-client tests: the `postgres` crate talks to noida over TCP,
+//! Real-client tests: the `postgres` crate talks to noida-db over TCP,
 //! exercising the simple and extended query protocols.
 
 use std::net::SocketAddr;
@@ -7,7 +7,7 @@ use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, SimpleQueryMessage};
 
 fn start() -> SocketAddr {
-    noida::postgres::spawn("127.0.0.1:0").expect("start noida postgres")
+    noida::postgres::spawn("127.0.0.1:0").expect("start noida-db postgres")
 }
 
 fn connect(addr: SocketAddr) -> Client {

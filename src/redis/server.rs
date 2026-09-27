@@ -1,5 +1,5 @@
 //! TCP front end: one thread per connection, one engine behind a mutex.
-//! Simple on purpose; noida is for local development.
+//! Simple on purpose; noida-db is for local development.
 
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};

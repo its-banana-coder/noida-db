@@ -258,7 +258,7 @@ fn client_id(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 }
 
 /// One CLIENT LIST line, field for field as Redis's `catClientInfoString`.
-/// Buffer and memory counters are reported as 0: noida doesn't do
+/// Buffer and memory counters are reported as 0: noida-db doesn't do
 /// performance analysis.
 fn info_line(c: &Client, now: u64) -> String {
     let mut flags = String::new();
