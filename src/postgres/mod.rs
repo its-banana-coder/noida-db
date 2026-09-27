@@ -18,6 +18,7 @@ pub mod funcs;
 pub mod keywords;
 pub mod pgcatalog;
 pub mod plan;
+pub mod seqddl;
 pub mod server;
 pub mod session;
 pub mod sigs;
@@ -35,6 +36,8 @@ use sqlparser::parser::Parser;
 
 /// Parses a SQL string into statements.
 pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
+    let rewritten = seqddl::rewrite(sql)?;
+    let sql = rewritten.as_deref().unwrap_or(sql);
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(syntax_error)
 }
 

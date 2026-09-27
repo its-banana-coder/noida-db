@@ -1356,7 +1356,22 @@ impl<'a> Binder<'a> {
             let cols = pgcatalog::columns(&key);
             return Ok((From::Virtual { name: key, ncols: cols.len() }, cols, name));
         }
-        let oid = self.lookup_table_oid(schema.as_deref(), &name)?;
+        let oid = match self.lookup_table_oid(schema.as_deref(), &name) {
+            Ok(oid) => oid,
+            // A sequence reads as a one-row table of its state.
+            Err(e) => {
+                let Ok(seq) = self.lookup_sequence_oid(schema.as_deref(), &name) else {
+                    return Err(e);
+                };
+                let cols = vec![
+                    OutCol::new("last_value", Type::INT8),
+                    OutCol::new("log_cnt", Type::INT8),
+                    OutCol::new("is_called", Type::BOOL),
+                ];
+                let key = format!("{}{seq}", pgcatalog::SEQUENCE_STATE_PREFIX);
+                return Ok((From::Virtual { name: key, ncols: 3 }, cols, name));
+            }
+        };
         let t = self.db.table(oid).unwrap();
         if t.kind == RelKind::View {
             let sql = t.view_sql.clone().unwrap_or_default();
@@ -1384,6 +1399,23 @@ impl<'a> Binder<'a> {
         }
         let cols = table_out_cols(t);
         Ok((From::Table { oid, ncols: t.columns.len() }, cols, name))
+    }
+
+    /// The oid of the sequence `schema.name` (or found on the search path).
+    pub fn lookup_sequence_oid(&self, schema: Option<&str>, name: &str) -> PgResult<u32> {
+        let full = match schema {
+            Some(s) => format!("{s}.{name}"),
+            None => name.to_string(),
+        };
+        let schemas: Vec<String> = match schema {
+            Some(s) => vec![s.to_string()],
+            None => self.sess.search_path.clone(),
+        };
+        schemas
+            .iter()
+            .filter_map(|s| self.db.schema_by_name(s))
+            .find_map(|sid| self.db.find_sequence(sid, name).map(|q| q.oid))
+            .ok_or_else(|| super::catalog::undefined_table(&full))
     }
 
     pub fn lookup_table_oid(&self, schema: Option<&str>, name: &str) -> PgResult<u32> {
@@ -2363,10 +2395,19 @@ impl<'a> Binder<'a> {
                 }
             }
             "&" | "|" | "#" | "<<" | ">>" => {
+                let width = |t: Type| match t.base {
+                    Base::Int2 => 2,
+                    Base::Int4 => 4,
+                    _ => 8,
+                };
+                let shift = matches!(op, "<<" | ">>");
                 let t = if lt.is_unknown() && rt.is_unknown() {
                     Type::INT4
-                } else if lt.is_integer() {
+                } else if lt.is_integer() && (shift || rt.is_unknown() || !rt.is_integer()) {
                     lt
+                } else if lt.is_integer() && rt.is_integer() {
+                    // int2 & int4 runs as int4 & int4, the wider operand.
+                    if width(rt) > width(lt) { rt } else { lt }
                 } else {
                     rt
                 };
@@ -3354,6 +3395,18 @@ impl<'a> Binder<'a> {
             match &te.e {
                 Expr::Const(Value::Null) => return Ok(Expr::Const(Value::Null)),
                 Expr::Const(Value::Text(s)) => {
+                    if let (Base::Enum(oid), false) = (target.base, target.array)
+                        && let Some(e) = self.db.enums.get(&oid)
+                        && !e.labels.iter().any(|(_, l, _)| l == s)
+                    {
+                        return Err(PgError::new(
+                            code::INVALID_TEXT_REPRESENTATION,
+                            format!(
+                                "invalid input value for enum {}: \"{s}\"",
+                                super::funcs::quote_ident(&e.name)
+                            ),
+                        ));
+                    }
                     let v = types::from_text(s, target, &self.dctx())?;
                     let v = types::apply_typmod(v, target, typmod, ctx == CastCtx::Explicit)?;
                     return Ok(Expr::Const(v));
@@ -3699,7 +3752,7 @@ impl<'a> Binder<'a> {
                 c.identity.map(|(_, seq)| {
                     let name =
                         self.db.sequences.get(&seq).map(|s| s.name.clone()).unwrap_or_default();
-                    format!("nextval('{name}'::regclass)")
+                    format!("nextval('{}'::regclass)", super::funcs::quote_ident(&name))
                 })
             });
             out.push(match src {

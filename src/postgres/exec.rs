@@ -96,6 +96,19 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
                     .unwrap_or_else(|| oid.to_string());
                 return Ok(Value::Text(text));
             }
+            if let (Base::Enum(oid), Value::Text(s)) = (to.base, &v)
+                && !to.array
+                && let Some(e) = ctx.db.enums.get(&oid)
+                && !e.labels.iter().any(|(_, l, _)| l == s)
+            {
+                return Err(PgError::new(
+                    code::INVALID_TEXT_REPRESENTATION,
+                    format!(
+                        "invalid input value for enum {}: \"{s}\"",
+                        funcs::quote_ident(&e.name)
+                    ),
+                ));
+            }
             let (fmt, now, _) = env!(ctx);
             casts::cast(v, *from, *to, *typmod, *explicit, &fmt, now)?
         }
@@ -393,15 +406,21 @@ fn run_subquery(q: &Query, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
 
 /// Names for reg* values, built from the live catalog.
 fn reg_names(ctx: &Ctx) -> types::RegNames {
+    build_reg_names(ctx.db, &ctx.rt.user)
+}
+
+/// Names `reg*` values print as: identifiers quoted the way Postgres does.
+pub fn build_reg_names(db: &DbState, user: &str) -> types::RegNames {
+    let q = super::funcs::quote_ident;
     let mut r = types::RegNames::default();
-    for t in ctx.db.tables.values() {
-        r.class.insert(t.oid, t.name.clone());
+    for t in db.tables.values() {
+        r.class.insert(t.oid, q(&t.name));
         for i in &t.indexes {
-            r.class.insert(i.oid, i.name.clone());
+            r.class.insert(i.oid, q(&i.name));
         }
     }
-    for s in ctx.db.sequences.values() {
-        r.class.insert(s.oid, s.name.clone());
+    for s in db.sequences.values() {
+        r.class.insert(s.oid, q(&s.name));
     }
     for ti in types::TYPES {
         r.types.insert(ti.oid, Type::of(ti.base).display(-1));
@@ -409,16 +428,16 @@ fn reg_names(ctx: &Ctx) -> types::RegNames {
             r.types.insert(ti.array_oid, Type::array_of(ti.base).display(-1));
         }
     }
-    for e in ctx.db.enums.values() {
-        r.types.insert(e.oid, e.name.clone());
+    for e in db.enums.values() {
+        r.types.insert(e.oid, q(&e.name));
     }
     for sig in super::sigs::all_sigs() {
         r.procs.insert(sig.oid, sig.name.to_string());
     }
-    for s in ctx.db.schemas.values() {
+    for s in db.schemas.values() {
         r.namespaces.insert(s.oid, s.name.clone());
     }
-    r.roles.insert(10, ctx.rt.user.clone());
+    r.roles.insert(10, user.to_string());
     r
 }
 
@@ -528,8 +547,19 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             Value::text(v)
         }
         "pg_get_expr" => a[0].clone(),
-        "pg_table_is_visible"
-        | "pg_type_is_visible"
+        "pg_table_is_visible" => {
+            match super::pgcatalog::relation_namespace(ctx.db, a[0].as_int().unwrap_or(0) as u32) {
+                None => Value::Null,
+                Some(ns) => {
+                    let path = ctx.rt.settings.search_path(&ctx.rt.user);
+                    Value::Bool(
+                        ns == super::catalog::PG_CATALOG_NS
+                            || path.iter().any(|s| ctx.db.schema_by_name(s) == Some(ns)),
+                    )
+                }
+            }
+        }
+        "pg_type_is_visible"
         | "pg_function_is_visible"
         | "pg_collation_is_visible"
         | "pg_operator_is_visible"
@@ -561,12 +591,12 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
         "pg_sleep" => {
             let secs = funcs::as_f64(&a[0]).clamp(0.0, 10.0);
             std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-            Value::Null
+            void()
         }
         "pg_advisory_lock"
         | "pg_advisory_xact_lock"
         | "pg_advisory_lock_shared"
-        | "pg_advisory_unlock_all" => Value::Null,
+        | "pg_advisory_unlock_all" => void(),
         "pg_advisory_unlock"
         | "pg_try_advisory_lock"
         | "pg_try_advisory_xact_lock"
@@ -866,6 +896,11 @@ fn first_schema(ctx: &mut Ctx) -> Option<String> {
     ctx.rt.settings.search_path(&user).into_iter().find(|s| ctx.db.schema_by_name(s).is_some())
 }
 
+/// The value of a `void` result: sent as an empty string, never NULL.
+fn void() -> Value {
+    Value::text("")
+}
+
 pub fn nextval(ctx: &mut Ctx, oid: u32) -> PgResult<i64> {
     let seq = ctx
         .db
@@ -888,7 +923,7 @@ pub fn nextval(ctx: &mut Ctx, oid: u32) -> PgResult<i64> {
         let wrapped = if seq.increment > 0 && n > seq.max {
             if !seq.cycle {
                 return Err(PgError::new(
-                    code::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    code::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
                     format!(
                         "nextval: reached maximum value of sequence \"{}\" ({})",
                         seq.name, seq.max
@@ -899,7 +934,7 @@ pub fn nextval(ctx: &mut Ctx, oid: u32) -> PgResult<i64> {
         } else if seq.increment < 0 && n < seq.min {
             if !seq.cycle {
                 return Err(PgError::new(
-                    code::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    code::SEQUENCE_GENERATOR_LIMIT_EXCEEDED,
                     format!(
                         "nextval: reached minimum value of sequence \"{}\" ({})",
                         seq.name, seq.min
@@ -1901,6 +1936,8 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
         states: Vec<AggState>,
         counts: Vec<i64>,
         seen: Vec<Vec<Value>>,
+        /// Inputs of aggregates with ORDER BY: (sort keys, arguments).
+        ordered: Vec<Vec<(Vec<Value>, Vec<Value>)>>,
     }
     let mut groups: Vec<Group> = vec![];
     for r in rows {
@@ -1916,6 +1953,7 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
                     states: aggs.iter().map(new_state).collect(),
                     counts: vec![0; aggs.len()],
                     seen: vec![vec![]; aggs.len()],
+                    ordered: vec![vec![]; aggs.len()],
                 });
                 groups.len() - 1
             }
@@ -1940,8 +1978,47 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
                 }
                 groups[idx].seen[i].push(first);
             }
+            if !agg.order.is_empty() {
+                let mut keys = Vec::with_capacity(agg.order.len());
+                for (e, _, _) in &agg.order {
+                    keys.push(eval(e, r, ctx)?);
+                }
+                groups[idx].ordered[i].push((keys, vals));
+                continue;
+            }
             let g = &mut groups[idx];
             accumulate(&mut g.states[i], agg, &vals, &mut g.counts[i])?;
+        }
+    }
+    // Aggregates with ORDER BY see their inputs in that order.
+    for g in &mut groups {
+        for (i, agg) in aggs.iter().enumerate() {
+            if agg.order.is_empty() {
+                continue;
+            }
+            let mut inputs = std::mem::take(&mut g.ordered[i]);
+            inputs.sort_by(|a, b| {
+                for (k, (_, desc, nulls_first)) in agg.order.iter().enumerate() {
+                    let o = match (a.0[k].is_null(), b.0[k].is_null()) {
+                        (true, true) => Ordering::Equal,
+                        (true, false) if *nulls_first => Ordering::Less,
+                        (true, false) => Ordering::Greater,
+                        (false, true) if *nulls_first => Ordering::Greater,
+                        (false, true) => Ordering::Less,
+                        _ => {
+                            let c = types::cmp_values(&a.0[k], &b.0[k]);
+                            if *desc { c.reverse() } else { c }
+                        }
+                    };
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                Ordering::Equal
+            });
+            for (_, vals) in inputs {
+                accumulate(&mut g.states[i], agg, &vals, &mut g.counts[i])?;
+            }
         }
     }
     // An aggregate with no GROUP BY over no rows still returns one row.
@@ -1951,6 +2028,7 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
             states: aggs.iter().map(new_state).collect(),
             counts: vec![0; aggs.len()],
             seen: vec![],
+            ordered: vec![vec![]; aggs.len()],
         });
     }
     let mut out = vec![];

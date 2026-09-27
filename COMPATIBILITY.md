@@ -84,6 +84,8 @@ Every service is its own module:
     Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
 - **Out of scope (for now):** PL/pgSQL and stored procedures, extensions,
   logical replication. Concurrency is one writer at a time.
+- **Known gap:** enum values order and compare by label text, not by the
+  order they were declared in (`<`, `ORDER BY`, `min`/`max`).
 - **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
   migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
   `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported.

@@ -7,6 +7,7 @@ use super::catalog::*;
 use super::error::{PgError, PgResult, code};
 use super::exec::Ctx;
 use super::plan::Expr;
+use super::seqddl::SeqDdl;
 use super::types::{self, Base, Type, Value};
 
 pub struct Ddl<'a, 'b> {
@@ -114,7 +115,9 @@ impl Ddl<'_, '_> {
                 match &opt.option {
                     a::ColumnOption::NotNull => c.not_null = true,
                     a::ColumnOption::Null => {}
-                    a::ColumnOption::Default(e) => c.default = Some(e.to_string()),
+                    a::ColumnOption::Default(e) => {
+                        c.default = Some(default_sql(self.ctx.db, e, ty))
+                    }
                     a::ColumnOption::PrimaryKey(pk) => {
                         c.not_null = true;
                         let n =
@@ -192,7 +195,8 @@ impl Ddl<'_, '_> {
             let t = self.ctx.db.table_mut(oid).unwrap();
             if serial_cols.contains(&i) {
                 t.columns[i].identity = None;
-                t.columns[i].default = Some(format!("nextval('{seq_name}'::regclass)"));
+                t.columns[i].default =
+                    Some(format!("nextval('{}'::regclass)", super::funcs::quote_ident(&seq_name)));
             } else {
                 t.columns[i].identity = Some((t.columns[i].identity.unwrap().0, seq_oid));
             }
@@ -486,11 +490,11 @@ impl Ddl<'_, '_> {
         Ok(oid)
     }
 
-    pub fn create_sequence(&mut self, cs: &CreateSequenceStmt) -> PgResult<String> {
-        let parts = name_parts(cs.name);
-        let (schema, name) = self.target(&parts)?;
+    /// `CREATE SEQUENCE`.
+    pub fn create_sequence(&mut self, d: &SeqDdl) -> PgResult<String> {
+        let (schema, name) = self.target(&d.name)?;
         if self.ctx.db.relation_exists(schema, &name) {
-            if cs.if_not_exists {
+            if d.if_flag {
                 return Ok("CREATE SEQUENCE".into());
             }
             return Err(PgError::new(
@@ -498,53 +502,112 @@ impl Ddl<'_, '_> {
                 format!("relation \"{name}\" already exists"),
             ));
         }
-        let oid = self.create_sequence_object(schema, &name, Type::INT8, None)?;
-        let seq = self.ctx.db.sequences.get_mut(&oid).unwrap();
-        let mut start: Option<i64> = None;
-        for opt in cs.sequence_options {
-            match opt {
-                a::SequenceOptions::IncrementBy(e, _) => {
-                    seq.increment = literal_int(e)?;
-                    if seq.increment == 0 {
-                        return Err(PgError::new(
-                            code::INVALID_PARAMETER_VALUE,
-                            "INCREMENT must not be zero",
-                        ));
-                    }
-                }
-                a::SequenceOptions::MinValue(v) => match v {
-                    Some(e) => seq.min = literal_int(e)?,
-                    None => seq.min = if seq.increment > 0 { 1 } else { i64::MIN },
-                },
-                a::SequenceOptions::MaxValue(v) => match v {
-                    Some(e) => seq.max = literal_int(e)?,
-                    None => seq.max = if seq.increment > 0 { i64::MAX } else { -1 },
-                },
-                a::SequenceOptions::StartWith(e, _) => start = Some(literal_int(e)?),
-                a::SequenceOptions::Cache(e) => seq.cache = literal_int(e)?,
-                a::SequenceOptions::Cycle(no) => seq.cycle = !*no,
+        let ty = match d.as_type.as_deref() {
+            None | Some("bigint" | "int8") => Type::INT8,
+            Some("integer" | "int" | "int4") => Type::INT4,
+            Some("smallint" | "int2") => Type::INT2,
+            Some(_) => {
+                return Err(PgError::new(
+                    code::INVALID_PARAMETER_VALUE,
+                    "sequence type must be smallint, integer, or bigint",
+                ));
             }
+        };
+        let oid = self.create_sequence_object(schema, &name, ty, None)?;
+        let mut seq = self.ctx.db.sequences.remove(&oid).unwrap();
+        let result = apply_seq_options(&mut seq, d, true);
+        self.ctx.db.sequences.insert(oid, seq);
+        if let Err(e) = result {
+            self.ctx.db.sequences.remove(&oid);
+            return Err(e);
         }
-        if seq.increment < 0 && seq.min == 1 {
-            seq.min = i64::MIN;
-            seq.max = -1;
+        self.set_sequence_owner(oid, d.owned_by.as_ref())?;
+        Ok("CREATE SEQUENCE".into())
+    }
+
+    /// `ALTER SEQUENCE`.
+    pub fn alter_sequence(&mut self, d: &SeqDdl) -> PgResult<String> {
+        let (db, info) = self.binder();
+        let b = Binder::new(&db, &info, &[]);
+        let (qualifier, name) = (
+            (d.name.len() > 1).then(|| d.name[d.name.len() - 2].clone()),
+            d.name.last().cloned().unwrap_or_default(),
+        );
+        let found = match b.lookup_sequence_oid(qualifier.as_deref(), &name) {
+            Ok(oid) => oid,
+            Err(_) if d.if_flag => return Ok("ALTER SEQUENCE".into()),
+            Err(e) => return Err(e),
+        };
+        let mut seq = self.ctx.db.sequences.get(&found).cloned().unwrap();
+        apply_seq_options(&mut seq, d, false)?;
+        if let Some(new_name) = &d.rename_to {
+            if self.ctx.db.relation_exists(seq.schema, new_name) {
+                return Err(PgError::new(
+                    code::DUPLICATE_TABLE,
+                    format!("relation \"{new_name}\" already exists"),
+                ));
+            }
+            seq.name = types::truncate_name(new_name);
         }
-        seq.start = start.unwrap_or(if seq.increment > 0 { seq.min } else { seq.max });
-        if let Some(owned) = cs.owned_by {
-            let parts = name_parts(owned);
-            if parts.len() >= 2 && parts[0] != "none" {
+        if let Some(schema) = &d.set_schema {
+            seq.schema = self.ctx.db.schema_by_name(schema).ok_or_else(|| {
+                PgError::new(
+                    code::INVALID_SCHEMA_NAME,
+                    format!("schema \"{schema}\" does not exist"),
+                )
+            })?;
+        }
+        self.ctx.db.sequences.insert(found, seq);
+        if let Some(restart) = d.restart {
+            let s = &self.ctx.db.sequences[&found];
+            let at = restart.unwrap_or(s.start);
+            if at < s.min || at > s.max {
+                let (word, limit) = if at < s.min { ("less", s.min) } else { ("greater", s.max) };
+                return Err(PgError::new(
+                    code::INVALID_PARAMETER_VALUE,
+                    format!(
+                        "RESTART value ({at}) cannot be {word} than {}VALUE ({limit})",
+                        if at < s.min { "MIN" } else { "MAX" }
+                    ),
+                ));
+            }
+            self.ctx.seqs.insert(found, SeqValue { last: at, is_called: false });
+        }
+        self.set_sequence_owner(found, d.owned_by.as_ref())?;
+        Ok("ALTER SEQUENCE".into())
+    }
+
+    /// Applies `OWNED BY table.column` (`Some(None)` is `OWNED BY NONE`).
+    fn set_sequence_owner(
+        &mut self,
+        oid: u32,
+        owned_by: Option<&Option<Vec<String>>>,
+    ) -> PgResult<()> {
+        let Some(target) = owned_by else { return Ok(()) };
+        let owner = match target {
+            None => None,
+            Some(parts) if parts.len() >= 2 => {
                 let col = parts.last().unwrap().clone();
                 let tname = parts[parts.len() - 2].clone();
+                let qualifier = (parts.len() > 2).then(|| parts[parts.len() - 3].clone());
                 let (db, info) = self.binder();
                 let b = Binder::new(&db, &info, &[]);
-                if let Ok(toid) = b.lookup_table_oid(None, &tname)
-                    && let Some(idx) = db.table(toid).and_then(|t| t.col_index(&col))
-                {
-                    self.ctx.db.sequences.get_mut(&oid).unwrap().owned_by = Some((toid, idx));
-                }
+                let toid = b.lookup_table_oid(qualifier.as_deref(), &tname)?;
+                let idx = db.table(toid).and_then(|t| t.col_index(&col)).ok_or_else(|| {
+                    PgError::new(
+                        code::UNDEFINED_COLUMN,
+                        format!("column \"{col}\" of relation \"{tname}\" does not exist"),
+                    )
+                })?;
+                Some((toid, idx))
             }
-        }
-        Ok("CREATE SEQUENCE".into())
+            Some(_) => {
+                return Err(PgError::new(code::SYNTAX_ERROR, "invalid OWNED BY option")
+                    .hint("Specify OWNED BY table.column or OWNED BY NONE."));
+            }
+        };
+        self.ctx.db.sequences.get_mut(&oid).unwrap().owned_by = owner;
+        Ok(())
     }
 
     pub fn create_schema(&mut self, name: &a::SchemaName, if_not_exists: bool) -> PgResult<String> {
@@ -770,6 +833,10 @@ impl Ddl<'_, '_> {
                             code::UNDEFINED_OBJECT,
                             format!("type \"{n}\" does not exist"),
                         ),
+                        a::ObjectType::Index => PgError::new(
+                            code::UNDEFINED_OBJECT,
+                            format!("index \"{n}\" does not exist"),
+                        ),
                         _ => undefined_table(&n),
                     });
                 }
@@ -840,6 +907,40 @@ impl Ddl<'_, '_> {
                 self.ctx.seqs.remove(&oid);
             }
             a::ObjectType::Type => {
+                let users: Vec<(u32, usize)> = self
+                    .ctx
+                    .db
+                    .tables
+                    .values()
+                    .flat_map(|t| {
+                        t.columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| !c.dropped && c.ty.base == Base::Enum(oid))
+                            .map(move |(i, _)| (t.oid, i))
+                    })
+                    .collect();
+                if !users.is_empty() && !cascade {
+                    let name =
+                        self.ctx.db.enums.get(&oid).map(|e| e.name.clone()).unwrap_or_default();
+                    let (t, i) = users[0];
+                    let tb = self.ctx.db.table(t).unwrap();
+                    return Err(PgError::new(
+                        code::DEPENDENT_OBJECTS_STILL_EXIST,
+                        format!("cannot drop type {name} because other objects depend on it"),
+                    )
+                    .detail(format!(
+                        "column {} of table {} depends on type {name}",
+                        tb.columns[i].name, tb.name
+                    ))
+                    .hint("Use DROP ... CASCADE to drop the dependent objects too."));
+                }
+                for (t, i) in users {
+                    let tm = self.ctx.db.table_mut(t).unwrap();
+                    tm.columns[i].dropped = true;
+                    tm.columns[i].not_null = false;
+                    tm.columns[i].default = None;
+                }
                 self.ctx.db.enums.remove(&oid);
             }
             a::ObjectType::Index => {
@@ -947,7 +1048,9 @@ impl Ddl<'_, '_> {
                 for opt in &column_def.options {
                     match &opt.option {
                         a::ColumnOption::NotNull => c.not_null = true,
-                        a::ColumnOption::Default(e) => c.default = Some(e.to_string()),
+                        a::ColumnOption::Default(e) => {
+                            c.default = Some(default_sql(self.ctx.db, e, ty))
+                        }
                         a::ColumnOption::PrimaryKey(_) => {
                             pending.push(PendingConstraint::PrimaryKey)
                         }
@@ -1340,12 +1443,108 @@ fn index_column_names(cols: &[a::IndexColumn]) -> Vec<String> {
         .collect()
 }
 
-/// The parts of `Statement::CreateSequence` the engine passes along.
-pub struct CreateSequenceStmt<'a> {
-    pub name: &'a a::ObjectName,
-    pub if_not_exists: bool,
-    pub sequence_options: &'a [a::SequenceOptions],
-    pub owned_by: Option<&'a a::ObjectName>,
+/// Fills in a sequence from its options: PostgreSQL's defaults on create,
+/// only the options given on alter. Errors carry Postgres's own wording.
+fn apply_seq_options(seq: &mut Sequence, d: &SeqDdl, create: bool) -> PgResult<()> {
+    let bad = |msg: String| PgError::new(code::INVALID_PARAMETER_VALUE, msg);
+    let (ty_min, ty_max, ty_name) = match seq.ty.base {
+        Base::Int2 => (i16::MIN as i64, i16::MAX as i64, "smallint"),
+        Base::Int4 => (i32::MIN as i64, i32::MAX as i64, "integer"),
+        _ => (i64::MIN, i64::MAX, "bigint"),
+    };
+    if let Some(i) = d.increment {
+        if i == 0 {
+            return Err(bad("INCREMENT must not be zero".into()));
+        }
+        seq.increment = i;
+    }
+    let ascending = seq.increment > 0;
+    match d.min {
+        Some(Some(v)) => seq.min = v,
+        Some(None) => seq.min = if ascending { 1 } else { ty_min },
+        // A changed direction moves a default bound with it.
+        None if create
+            || d.increment.is_some() && seq.min == if ascending { ty_min } else { 1 } =>
+        {
+            seq.min = if ascending { 1 } else { ty_min }
+        }
+        None => {}
+    }
+    match d.max {
+        Some(Some(v)) => seq.max = v,
+        Some(None) => seq.max = if ascending { ty_max } else { -1 },
+        None if create
+            || d.increment.is_some() && seq.max == if ascending { -1 } else { ty_max } =>
+        {
+            seq.max = if ascending { ty_max } else { -1 }
+        }
+        None => {}
+    }
+    if seq.max > ty_max {
+        return Err(bad(format!(
+            "MAXVALUE ({}) is out of range for sequence data type {ty_name}",
+            seq.max
+        )));
+    }
+    if seq.min < ty_min {
+        return Err(bad(format!(
+            "MINVALUE ({}) is out of range for sequence data type {ty_name}",
+            seq.min
+        )));
+    }
+    if seq.min >= seq.max {
+        return Err(bad(format!(
+            "MINVALUE ({}) must be less than MAXVALUE ({})",
+            seq.min, seq.max
+        )));
+    }
+    match d.start {
+        Some(v) => seq.start = v,
+        None if create => seq.start = if ascending { seq.min } else { seq.max },
+        None => {}
+    }
+    if seq.start < seq.min {
+        return Err(bad(format!(
+            "START value ({}) cannot be less than MINVALUE ({})",
+            seq.start, seq.min
+        )));
+    }
+    if seq.start > seq.max {
+        return Err(bad(format!(
+            "START value ({}) cannot be greater than MAXVALUE ({})",
+            seq.start, seq.max
+        )));
+    }
+    if let Some(c) = d.cache {
+        if c < 1 {
+            return Err(bad(format!("CACHE ({c}) must be greater than zero")));
+        }
+        seq.cache = c;
+    }
+    if let Some(c) = d.cycle {
+        seq.cycle = c;
+    }
+    Ok(())
+}
+
+/// A column default as Postgres stores it: a string literal keeps the cast
+/// to the column type (`'x'::character varying`), anything else prints as is.
+fn default_sql(db: &DbState, e: &a::Expr, ty: Type) -> String {
+    let literal = matches!(
+        e,
+        a::Expr::Value(v) if matches!(v.value, a::Value::SingleQuotedString(_))
+    );
+    if !literal || ty.is_unknown() {
+        return e.to_string();
+    }
+    let name = match ty.base {
+        Base::Enum(oid) => {
+            db.enums.get(&oid).map_or_else(String::new, |x| super::funcs::quote_ident(&x.name))
+        }
+        Base::Bpchar => "bpchar".to_string(),
+        _ => ty.display(-1),
+    };
+    format!("{e}::{name}")
 }
 
 /// Renames a bare identifier in stored SQL, leaving strings and quoted
@@ -1401,19 +1600,6 @@ fn fk_action(a: &Option<a::ReferentialAction>) -> FkAction {
         Some(sqlparser::ast::ReferentialAction::SetDefault) => FkAction::SetDefault,
         Some(sqlparser::ast::ReferentialAction::Restrict) => FkAction::Restrict,
         _ => FkAction::NoAction,
-    }
-}
-
-fn literal_int(e: &a::Expr) -> PgResult<i64> {
-    match e {
-        a::Expr::Value(v) => match &v.value {
-            a::Value::Number(n, _) => {
-                n.parse().map_err(|_| PgError::new(code::SYNTAX_ERROR, "invalid integer"))
-            }
-            _ => Err(PgError::new(code::SYNTAX_ERROR, "expected an integer")),
-        },
-        a::Expr::UnaryOp { op: a::UnaryOperator::Minus, expr } => Ok(-literal_int(expr)?),
-        _ => Err(PgError::new(code::SYNTAX_ERROR, "expected an integer")),
     }
 }
 

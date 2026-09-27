@@ -398,7 +398,7 @@ impl Engine {
                 }
                 let value = s.rt.settings.get(&name)?;
                 Ok(StmtResult {
-                    cols: vec![OutCol::new(name.to_lowercase(), Type::TEXT)],
+                    cols: vec![OutCol::new(name.clone(), Type::TEXT)],
                     rows: vec![vec![Value::text(value)]],
                     tag: "SHOW".into(),
                     notices: vec![],
@@ -830,35 +830,7 @@ impl Engine {
         if !cols.iter().any(|c| c.ty.is_reg()) {
             return None;
         }
-        Some(Arc::new(self.with_db(s, |db| {
-            let mut r = RegNames::default();
-            for t in db.tables.values() {
-                r.class.insert(t.oid, t.name.clone());
-                for i in &t.indexes {
-                    r.class.insert(i.oid, i.name.clone());
-                }
-            }
-            for sq in db.sequences.values() {
-                r.class.insert(sq.oid, sq.name.clone());
-            }
-            for ti in types::TYPES {
-                r.types.insert(ti.oid, Type::of(ti.base).display(-1));
-                if ti.array_oid != 0 {
-                    r.types.insert(ti.array_oid, Type::array_of(ti.base).display(-1));
-                }
-            }
-            for e in db.enums.values() {
-                r.types.insert(e.oid, e.name.clone());
-            }
-            for sig in super::sigs::all_sigs() {
-                r.procs.insert(sig.oid, sig.name.to_string());
-            }
-            for sc in db.schemas.values() {
-                r.namespaces.insert(sc.oid, sc.name.clone());
-            }
-            r.roles.insert(10, s.rt.user.clone());
-            r
-        })))
+        Some(Arc::new(self.with_db(s, |db| super::exec::build_reg_names(db, &s.rt.user))))
     }
 }
 
@@ -922,7 +894,7 @@ fn describe_other(
                     OutCol::new("description", Type::TEXT),
                 ]
             } else {
-                vec![OutCol::new(name.to_lowercase(), Type::TEXT)]
+                vec![OutCol::new(name.clone(), Type::TEXT)]
             }
         }
         a::Statement::Explain { .. } => vec![OutCol::new("QUERY PLAN", Type::TEXT)],
@@ -991,15 +963,24 @@ fn run_one(ctx: &mut Ctx, stmt: &a::Statement, info: &SessionInfo) -> PgResult<S
             let tag = d.create_schema(schema_name, *if_not_exists)?;
             Ok(StmtResult::tag(tag))
         }
-        S::CreateSequence { name, if_not_exists, sequence_options, owned_by, .. } => {
-            let cs = super::ddl::CreateSequenceStmt {
-                name,
-                if_not_exists: *if_not_exists,
-                sequence_options,
-                owned_by: owned_by.as_ref(),
-            };
+        // CREATE and ALTER SEQUENCE arrive as a CALL (see seqddl.rs).
+        S::Call(f) if f.name.to_string() == super::seqddl::CALL_NAME => {
+            let text = match &f.args {
+                a::FunctionArguments::List(l) => l.args.iter().find_map(|x| match x {
+                    a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(a::Expr::Value(v))) => {
+                        match &v.value {
+                            a::Value::SingleQuotedString(s) => Some(s.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            }
+            .unwrap_or_default();
+            let sq = super::seqddl::parse(&text)?;
             let mut d = ddl(ctx, info);
-            let tag = d.create_sequence(&cs)?;
+            let tag = if sq.create { d.create_sequence(&sq)? } else { d.alter_sequence(&sq)? };
             Ok(StmtResult::tag(tag))
         }
         S::CreateType { name, representation } => {

@@ -3,7 +3,9 @@
 
 use std::sync::OnceLock;
 
-use super::catalog::{ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, Row};
+use super::catalog::{
+    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, Row, SeqValue,
+};
 use super::error::PgResult;
 use super::exec::Ctx;
 use super::plan::OutCol;
@@ -169,7 +171,7 @@ self_referencing_column_name name, reference_generation varchar, user_defined_ty
 user_defined_type_schema name, user_defined_type_name name, is_insertable_into varchar, is_typed varchar, \
 commit_action varchar
 information_schema.columns/13481/v: table_catalog name, table_schema name, table_name name, column_name name, \
-ordinal_position int4, column_default text, is_nullable varchar, data_type varchar, character_maximum_length int4, \
+ordinal_position int4, column_default varchar, is_nullable varchar, data_type varchar, character_maximum_length int4, \
 character_octet_length int4, numeric_precision int4, numeric_precision_radix int4, numeric_scale int4, \
 datetime_precision int4, interval_type varchar, interval_precision int4, character_set_catalog name, \
 character_set_schema name, character_set_name name, collation_catalog name, collation_schema name, \
@@ -331,6 +333,13 @@ fn system_relations() -> impl Iterator<Item = (&'static str, u32, char, u32)> {
     })
 }
 
+/// The schema oid of the table, view, index, sequence or catalog relation `oid`.
+pub fn relation_namespace(db: &DbState, oid: u32) -> Option<u32> {
+    db.relation_name(oid)
+        .map(|(schema, _)| schema)
+        .or_else(|| system_relations().find(|r| r.1 == oid).map(|r| r.3))
+}
+
 /// Resolves the relation a FROM item refers to, qualified or not.
 pub fn columns(name: &str) -> Vec<OutCol> {
     find(name).map(|r| r.cols.clone()).unwrap_or_default()
@@ -370,7 +379,15 @@ fn arr(items: Vec<Value>) -> Value {
 const NULL: Value = Value::Null;
 
 /// Builds the rows of a catalog relation.
+/// Prefix of the virtual relation that is one sequence's state.
+pub const SEQUENCE_STATE_PREFIX: &str = "noida_sequence:";
+
 pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
+    if let Some(oid) = name.strip_prefix(SEQUENCE_STATE_PREFIX).and_then(|o| o.parse().ok()) {
+        let start = ctx.db.sequences.get(&oid).map_or(1, |s| s.start);
+        let v = ctx.seqs.get(&oid).cloned().unwrap_or(SeqValue { last: start, is_called: false });
+        return Ok(vec![vec![n(v.last), n(0), b(v.is_called)]]);
+    }
     let db: &DbState = ctx.db;
     let user = ctx.rt.user.clone();
     let database = ctx.rt.database.clone();
@@ -417,6 +434,26 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
             for s in db.sequences.values() {
                 out.push(pg_class_row(s.oid, &s.name, s.schema, 'S', 3, 0, false, 1, 0));
+            }
+        }
+        // Only the dependencies clients read: a serial, identity or OWNED BY
+        // sequence depends on its column.
+        "pg_depend" => {
+            for sq in db.sequences.values() {
+                let Some((table, col)) = sq.owned_by else { continue };
+                let identity = db
+                    .table(table)
+                    .and_then(|t| t.columns.get(col))
+                    .is_some_and(|c| c.identity.is_some_and(|(_, seq)| seq == sq.oid));
+                out.push(vec![
+                    n(1259),
+                    n(sq.oid as i64),
+                    n(0),
+                    n(1259),
+                    n(table as i64),
+                    n(col as i64 + 1),
+                    ch(if identity { 'i' } else { 'a' }),
+                ]);
             }
         }
         "pg_attribute" => {
@@ -1046,6 +1083,14 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 for (i, c) in tb.live_columns() {
                     let ty = c.ty;
                     let (prec, radix, scale) = numeric_info(ty, c.typmod);
+                    let udt = match ty.base {
+                        Base::Enum(oid) => {
+                            db.enums.get(&oid).map_or(("public".to_string(), ty.name()), |e| {
+                                (db.schema_name(e.schema).to_string(), e.name.clone())
+                            })
+                        }
+                        _ => ("pg_catalog".to_string(), ty.name()),
+                    };
                     out.push(vec![
                         t(&database),
                         t(db.schema_name(tb.schema)),
@@ -1073,8 +1118,8 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         NULL,
                         NULL,
                         t(&database),
-                        t("pg_catalog"),
-                        t(ty.name()),
+                        t(udt.0),
+                        t(udt.1),
                         NULL,
                         NULL,
                         NULL,
@@ -1264,7 +1309,11 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     t(db.schema_name(s.schema)),
                     t(&s.name),
                     t(data_type_name(s.ty)),
-                    n(64),
+                    n(match s.ty.base {
+                        Base::Int2 => 16,
+                        Base::Int4 => 32,
+                        _ => 64,
+                    }),
                     n(2),
                     n(0),
                     t(s.start.to_string()),

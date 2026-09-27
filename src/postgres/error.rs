@@ -108,6 +108,7 @@ pub mod code {
     pub const FEATURE_NOT_SUPPORTED: &str = "0A000";
     pub const INVALID_PARAMETER_VALUE: &str = "22023";
     pub const STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
+    pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
     pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
