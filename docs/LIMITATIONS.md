@@ -15,13 +15,8 @@ but not identical to the real server.
 |---|---|---|
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
-<<<<<<< HEAD
-| Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
+| Kafka | native binary protocol, topics, consumer groups, configs (see below); transactions are protocol-shaped only, not merged to `main` yet | yes, apart from transactions |
 | MySQL | early scaffolding, not merged | no |
-=======
-| MySQL | early scaffolding, not merged | no |
-| Kafka | early scaffolding, not merged | no |
->>>>>>> origin/main
 | Memcached, MongoDB, RabbitMQ, Elasticsearch, ClickHouse | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
@@ -146,13 +141,16 @@ alternatives.
 
 ## Kafka
 
-Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported: topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`), and transactions (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`).
+Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported and verified against real clients (kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka): topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`, every compression codec), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`, multi-consumer rebalance), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`).
+
+The transaction APIs (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`) are wired on the wire and always answer success, but are **not functionally real yet**: a transactional producer isn't fenced by a newer one using the same `transactional.id`, and a `read_committed` consumer sees aborted records as if they were committed (there's no per-partition staging, last-stable-offset, or control-record filtering). Confirmed against a real transactional Java `kafka-clients` producer and Spring Kafka's `KafkaTemplate`/`TransactionTemplate`. See the Roadmap in `docs/specs/kafka.md` for what real support needs.
 
 **By design**
 - Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
 
 **Not yet**
 - Disk segment persistence (records live in-memory).
+- Real transactional isolation and producer fencing (see above).
 
 ## MySQL
 
