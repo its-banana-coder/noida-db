@@ -93,14 +93,25 @@ current count).
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
 servers by `tests/postgres_diff.rs` (about 535 results) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx,
-GORM and JDBC (`tests/clients/postgres/run.sh`). `COPY` (used by pgx's
-`CopyFrom`) is a documented gap, reported as such rather than a failure.
-Django's own management commands (`migrate`, including the built-in
-`auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a schema
-change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M, transactions and
-savepoints, introspection) pass end to end. The introspection queries Prisma
-and Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
+GORM and JDBC (`tests/clients/postgres/run.sh`). Django's own management
+commands (`migrate`, including the built-in `auth`/`admin`/`sessions`/
+`contenttypes` apps, `makemigrations` for a schema change, `bulk_create`,
+joins, aggregates, `F()`/`Q()`, M2M, transactions and savepoints,
+introspection) pass end to end. The introspection queries Prisma and
+Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
 similar were compared by hand against a real server.
+
+`COPY ... FROM/TO STDIN/STDOUT` (text and CSV) works: `pg_dump`/`psql`
+restoring a real dump (the standard "seed my dev DB from a snapshot"
+workflow), psycopg's and node-postgres's dedicated `copy()`/`copy-from`
+APIs, and the `postgres`/`tokio-postgres` Rust crate's `copy_in`/`copy_out`
+(over the extended query protocol, which is what that crate actually uses)
+all round-trip byte-for-byte against a real server, including nulls,
+arrays, jsonb and embedded newlines/tabs/backslashes — see
+`tests/postgres_diff.rs`'s `copy_matches_real_postgres`. `COPY` to/from a
+server-side file or program, and `FORMAT BINARY` (used by pgx's `CopyFrom`
+fast path), are not implemented; a client always has STDIN/STDOUT
+alternatives.
 
 **By design**
 
@@ -115,7 +126,11 @@ similar were compared by hand against a real server.
 
 **Not yet**
 
-- PL/pgSQL and stored procedures, extensions, `COPY`.
+- PL/pgSQL and stored procedures (so no triggers either), extensions.
+- Full-text search (`tsvector`/`tsquery` have no functions or operators),
+  range types, `CREATE PROCEDURE`/`CALL`.
+- `REFRESH MATERIALIZED VIEW` (a syntax error, not yet parsed).
+- `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
 
 **Differs**

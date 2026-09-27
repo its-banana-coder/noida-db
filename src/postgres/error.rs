@@ -119,6 +119,7 @@ pub mod code {
     pub const ARRAY_SUBSCRIPT_ERROR: &str = "2202E";
     pub const INVALID_TEXT_REPRESENTATION: &str = "22P02";
     pub const INVALID_BINARY_REPRESENTATION: &str = "22P03";
+    pub const BAD_COPY_FILE_FORMAT: &str = "22P04";
     pub const INVALID_REGULAR_EXPRESSION: &str = "2201B";
     pub const INVALID_ROW_COUNT_IN_LIMIT: &str = "2201W";
     pub const INVALID_ROW_COUNT_IN_OFFSET: &str = "2201X";

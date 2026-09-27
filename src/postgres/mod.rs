@@ -9,6 +9,7 @@ pub mod auth;
 pub mod binder;
 pub mod casts;
 pub mod catalog;
+pub mod copy;
 pub mod ddl;
 pub mod dml;
 pub mod engine;

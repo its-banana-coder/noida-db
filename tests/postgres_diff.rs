@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use std::io::{Read, Write};
+use std::sync::Mutex;
+
 use postgres::{Client, NoTls, SimpleQueryMessage};
 
 /// Scripts to compare. `@16` marks a statement that only matches on
@@ -607,8 +610,16 @@ fn describe(client: &mut Client, sql: &str) -> Option<Vec<String>> {
     Some(stmt.columns().iter().map(|c| c.type_().name().to_string()).collect())
 }
 
+/// Both #[test] fns below may talk to the SAME external reference server
+/// (NOIDA_POSTGRES_REF, in CI): cargo runs test functions concurrently by
+/// default, and one test's schema-wide reset would otherwise be able to
+/// drop the table another test is mid-COPY into. This makes the two take
+/// turns.
+static REF_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn differential() {
+    let _guard = REF_LOCK.lock().unwrap();
     main_test_body();
     let Some(mut reference) = reference() else {
         println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
@@ -709,4 +720,73 @@ fn directives(raw: &str) -> (&str, bool, u32) {
         break;
     }
     (sql, compare, min_version)
+}
+
+/// `COPY ... FROM/TO STDIN/STDOUT`, text and CSV: escapes, nulls, arrays,
+/// jsonb, and both directions, byte-for-byte against a real server.
+#[test]
+fn copy_matches_real_postgres() {
+    let _guard = REF_LOCK.lock().unwrap();
+    let Some(mut reference) = reference() else {
+        println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
+        return;
+    };
+    let addr = noida::postgres::spawn("127.0.0.1:0").expect("start noida");
+    let noida_url = format!("host=127.0.0.1 port={} user=postgres dbname=postgres", addr.port());
+    let mut mine = Client::connect(&noida_url, NoTls).expect("connect to noida");
+    for c in [&mut reference.client, &mut mine] {
+        c.simple_query(
+            "DROP TABLE IF EXISTS ct; CREATE TABLE ct (id int PRIMARY KEY, v text, tags text[], meta jsonb, n numeric(8,2))",
+        )
+        .unwrap();
+    }
+
+    let rows: &[&str] = &[
+        "1\tplain\t{a,b}\t{\"k\": 1}\t9.50\n",
+        "2\t\\N\t{}\t{}\t0.00\n",
+        "3\twith\\ttab and \\\\backslash\t{x}\t[1,2]\t-3.25\n",
+        "4\tline1\\nline2\t{}\t{}\t\\N\n",
+    ];
+    for c in [&mut reference.client, &mut mine] {
+        let mut w = c.copy_in("COPY ct (id, v, tags, meta, n) FROM STDIN").unwrap();
+        for r in rows {
+            w.write_all(r.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let want: Vec<Outcome> =
+        vec![run(&mut reference.client, "SELECT id, v, tags, meta, n FROM ct ORDER BY id")];
+    let got: Vec<Outcome> = vec![run(&mut mine, "SELECT id, v, tags, meta, n FROM ct ORDER BY id")];
+    assert_eq!(want, got, "rows loaded by COPY FROM STDIN (text format) differ");
+
+    // COPY TO STDOUT must produce the identical byte stream, in both formats.
+    for (label, sql) in [
+        ("text", "COPY ct TO STDOUT"),
+        (
+            "csv+header",
+            "COPY (SELECT id, v, n FROM ct ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)",
+        ),
+    ] {
+        let mut want_bytes = vec![];
+        reference.client.copy_out(sql).unwrap().read_to_end(&mut want_bytes).unwrap();
+        let mut got_bytes = vec![];
+        mine.copy_out(sql).unwrap().read_to_end(&mut got_bytes).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&want_bytes),
+            String::from_utf8_lossy(&got_bytes),
+            "COPY TO STDOUT ({label}) differs"
+        );
+    }
+
+    // A row that fails a constraint rolls back the whole COPY, not just
+    // that row - and reports it as a real Postgres COPY failure would.
+    for c in [&mut reference.client, &mut mine] {
+        let mut w = c.copy_in("COPY ct (id, v) FROM STDIN").unwrap();
+        w.write_all(b"1\tduplicate\n").unwrap();
+        let err = w.finish().is_err();
+        assert!(err, "a COPY violating a constraint must fail");
+        let n: i64 = c.query_one("SELECT count(*) FROM ct", &[]).unwrap().get(0);
+        assert_eq!(n, 4, "a failed COPY must not partially apply");
+    }
 }

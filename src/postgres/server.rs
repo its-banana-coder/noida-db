@@ -5,6 +5,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
 use bytes::{Buf, BytesMut};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyInResponse, CopyOutResponse};
 use pgwire::messages::data::{DataRow, FieldDescription, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     BindComplete, CloseComplete, ParseComplete, PortalSuspended,
@@ -20,6 +21,7 @@ use pgwire::messages::{
     DecodeContext, PgWireBackendMessage, PgWireFrontendMessage, ProtocolVersion,
     SslNegotiationMetaMessage,
 };
+use sqlparser::ast as a;
 
 use super::auth::{AuthMethod, Scram, ScramError};
 use super::engine::{Engine, Portal, Prepared, Session, StmtResult, TxStatus};
@@ -492,7 +494,12 @@ fn simple_query(
         engine.begin_implicit(session);
     }
     for stmt in &stmts {
-        match engine.execute(session, stmt, &[]) {
+        let outcome = if let a::Statement::Copy { .. } = stmt {
+            handle_copy(conn, engine, session, stmt)?
+        } else {
+            engine.execute(session, stmt, &[])
+        };
+        match outcome {
             Ok(result) => {
                 notices(conn, &result.notices)?;
                 params_changed(conn, &result.params_changed)?;
@@ -532,6 +539,248 @@ fn simple_query(
         error(conn, session, e)?;
     }
     Ok(())
+}
+
+/// `COPY ... FROM/TO STDIN/STDOUT`. `COPY ... FROM/TO` a server-side file or
+/// program is refused: every real client (`\copy`, pg_dump/pg_restore, every
+/// driver) uses STDIN/STDOUT, and this tool has no reason to read or write
+/// files on its own host on a client's behalf.
+///
+/// `FROM STDIN` is turned into batches of `INSERT INTO t VALUES (...)`, run
+/// through the engine exactly like a real `INSERT` (so defaults, generated
+/// columns, sequences and constraints all behave the same); `TO STDOUT` runs
+/// a `SELECT` and formats what comes back. The whole COPY is one
+/// transaction, matching Postgres: an error partway through rolls back
+/// everything read so far.
+fn handle_copy(
+    conn: &mut Conn,
+    engine: &Engine,
+    session: &mut Session,
+    stmt: &a::Statement,
+) -> io::Result<PgResult<StmtResult>> {
+    let a::Statement::Copy { source, to, target, options, legacy_options, .. } = stmt else {
+        unreachable!("caller checked this is a Copy statement")
+    };
+    if !matches!(target, a::CopyTarget::Stdin | a::CopyTarget::Stdout) {
+        return Ok(Err(super::binder::unsupported("COPY to/from a server-side file or program")));
+    }
+    let spec = match super::copy::spec_from_options(options, legacy_options) {
+        Ok(s) => s,
+        Err(e) => return Ok(Err(e)),
+    };
+    if *to {
+        copy_out(conn, engine, session, source, &spec)
+    } else {
+        copy_in(conn, engine, session, source, &spec)
+    }
+}
+
+fn qualify_table(parts: &[String]) -> String {
+    parts.iter().map(|p| super::funcs::quote_ident(p)).collect::<Vec<_>>().join(".")
+}
+
+fn copy_in(
+    conn: &mut Conn,
+    engine: &Engine,
+    session: &mut Session,
+    source: &a::CopySource,
+    spec: &super::copy::CopySpec,
+) -> io::Result<PgResult<StmtResult>> {
+    let a::CopySource::Table { table_name, columns } = source else {
+        return Ok(Err(super::binder::unsupported("COPY FROM a query")));
+    };
+    let table = qualify_table(&super::binder::name_parts(table_name));
+    let col_list = if columns.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> =
+            columns.iter().map(|c| super::funcs::quote_ident(&ident_text(c))).collect();
+        format!(" ({})", names.join(", "))
+    };
+    let ncols = if columns.is_empty() { None } else { Some(columns.len()) };
+
+    conn.send(PgWireBackendMessage::CopyInResponse(CopyInResponse::new(
+        0,
+        ncols.unwrap_or(0) as i16,
+        vec![0; ncols.unwrap_or(0)],
+    )))?;
+    conn.flush()?;
+
+    engine.begin_implicit(session);
+    let mut total = 0i64;
+    let mut batch: Vec<String> = vec![];
+    let mut pending = String::new();
+    let mut header_seen = !spec.header;
+    let mut failed: Option<PgError> = None;
+    const BATCH: usize = 500;
+
+    let mut flush_batch = |batch: &mut Vec<String>, failed: &mut Option<PgError>| {
+        if batch.is_empty() || failed.is_some() {
+            return;
+        }
+        let sql = format!("INSERT INTO {table}{col_list} VALUES {}", batch.join(", "));
+        match engine.parse_sql(&sql).and_then(|stmts| engine.execute(session, &stmts[0], &[])) {
+            Ok(_) => total += batch.len() as i64,
+            Err(e) => *failed = Some(e),
+        }
+        batch.clear();
+    };
+
+    'copy: loop {
+        let Some(msg) = conn.recv()? else { break };
+        match msg {
+            PgWireFrontendMessage::CopyData(d) => {
+                pending.push_str(&String::from_utf8_lossy(&d.data));
+                while let Some(nl) = pending.find('\n') {
+                    let line =
+                        pending[..nl].strip_suffix('\r').unwrap_or(&pending[..nl]).to_string();
+                    pending.drain(..=nl);
+                    if !header_seen {
+                        header_seen = true;
+                        continue;
+                    }
+                    if failed.is_some() {
+                        continue;
+                    }
+                    match super::copy::decode_line(&line, spec) {
+                        Ok(fields) => {
+                            let lits: Vec<String> = fields
+                                .into_iter()
+                                .map(|f| match f {
+                                    None => "NULL".to_string(),
+                                    Some(s) => super::funcs::quote_literal(&s),
+                                })
+                                .collect();
+                            batch.push(format!("({})", lits.join(", ")));
+                            if batch.len() >= BATCH {
+                                flush_batch(&mut batch, &mut failed);
+                            }
+                        }
+                        Err(e) => failed = Some(e),
+                    }
+                }
+            }
+            PgWireFrontendMessage::CopyDone(_) => {
+                if !pending.is_empty() && failed.is_none() && header_seen {
+                    match super::copy::decode_line(&pending, spec) {
+                        Ok(fields) => {
+                            let lits: Vec<String> = fields
+                                .into_iter()
+                                .map(|f| match f {
+                                    None => "NULL".to_string(),
+                                    Some(s) => super::funcs::quote_literal(&s),
+                                })
+                                .collect();
+                            batch.push(format!("({})", lits.join(", ")));
+                        }
+                        Err(e) => failed = Some(e),
+                    }
+                }
+                flush_batch(&mut batch, &mut failed);
+                break 'copy;
+            }
+            PgWireFrontendMessage::CopyFail(f) => {
+                failed = Some(PgError::new(
+                    code::QUERY_CANCELED,
+                    format!("COPY from stdin failed: {}", f.message),
+                ));
+                break 'copy;
+            }
+            // A driver may pipeline Bind/Execute/Sync (or Flush) ahead of
+            // actually writing any CopyData, to get CopyInResponse back
+            // promptly; a real server ignores Flush/Sync during COPY IN
+            // rather than treating them as the end of the pipeline.
+            PgWireFrontendMessage::Flush(_) => conn.flush()?,
+            PgWireFrontendMessage::Sync(_) => {}
+            _ => {
+                failed =
+                    Some(PgError::new(code::PROTOCOL_VIOLATION, "unexpected message during COPY"));
+                break 'copy;
+            }
+        }
+    }
+
+    if let Some(e) = failed {
+        engine.rollback_implicit(session);
+        return Ok(Err(e));
+    }
+    match engine.commit_implicit(session) {
+        Ok(()) => Ok(Ok(StmtResult { tag: format!("COPY {total}"), ..empty_result() })),
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+fn copy_out(
+    conn: &mut Conn,
+    engine: &Engine,
+    session: &mut Session,
+    source: &a::CopySource,
+    spec: &super::copy::CopySpec,
+) -> io::Result<PgResult<StmtResult>> {
+    let sql = match source {
+        a::CopySource::Table { table_name, columns } => {
+            let table = qualify_table(&super::binder::name_parts(table_name));
+            if columns.is_empty() {
+                format!("SELECT * FROM {table}")
+            } else {
+                let names: Vec<String> =
+                    columns.iter().map(|c| super::funcs::quote_ident(&ident_text(c))).collect();
+                format!("SELECT {} FROM {table}", names.join(", "))
+            }
+        }
+        a::CopySource::Query(q) => q.to_string(),
+    };
+    let stmts = match engine.parse_sql(&sql) {
+        Ok(s) => s,
+        Err(e) => return Ok(Err(e)),
+    };
+    let result = match engine.execute(session, &stmts[0], &[]) {
+        Ok(r) => r,
+        Err(e) => return Ok(Err(e)),
+    };
+    let ncols = result.cols.len();
+    conn.send(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
+        0,
+        ncols as i16,
+        vec![0; ncols],
+    )))?;
+    let fmt = session.rt.settings.fmt();
+    let reg = engine.reg_names(session, &result.cols);
+    let fmt = types::FmtCtx { reg_names: reg, ..fmt };
+    let tys: Vec<Type> = result.cols.iter().map(|c| c.ty).collect();
+    if spec.header && spec.format == super::copy::Format::Csv {
+        let names: Vec<String> = result.cols.iter().map(|c| c.name.clone()).collect();
+        conn.send(PgWireBackendMessage::CopyData(CopyData::new(
+            super::copy::header_row(&names, spec).into_bytes().into(),
+        )))?;
+    }
+    for row in &result.rows {
+        let line = super::copy::encode_row(row, &tys, spec, &fmt);
+        conn.send(PgWireBackendMessage::CopyData(CopyData::new(line.into_bytes().into())))?;
+    }
+    conn.send(PgWireBackendMessage::CopyDone(CopyDone::new()))?;
+    let n = result.rows.len();
+    Ok(Ok(StmtResult { tag: format!("COPY {n}"), ..empty_result() }))
+}
+
+fn empty_result() -> StmtResult {
+    StmtResult {
+        cols: vec![],
+        rows: vec![],
+        tag: String::new(),
+        notices: vec![],
+        params_changed: vec![],
+        returns_rows: false,
+    }
+}
+
+/// An identifier's normalized text (lowercased unless it was quoted), for
+/// embedding into synthesized SQL after re-quoting.
+fn ident_text(id: &a::Ident) -> String {
+    match id.quote_style {
+        Some(_) => id.value.clone(),
+        None => id.value.to_lowercase(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -713,7 +962,11 @@ fn do_execute(
             return Ok(());
         };
         engine.begin_implicit(session);
-        let result: StmtResult = engine.execute(session, &stmt, &params)?;
+        let result: StmtResult = if let a::Statement::Copy { .. } = &stmt {
+            handle_copy(conn, engine, session, &stmt).map_err(io_to_pg)??
+        } else {
+            engine.execute(session, &stmt, &params)?
+        };
         notices(conn, &result.notices).map_err(io_to_pg)?;
         params_changed(conn, &result.params_changed).map_err(io_to_pg)?;
         let portal = session.portals.get_mut(name).unwrap();
