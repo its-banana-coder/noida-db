@@ -25,10 +25,7 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
 
         let mut buf = frame;
         // Determine header version dynamically based on request header version
-        let header_version = match peek_header_version(&buf) {
-            Some(v) => v,
-            None => 2, // fallback
-        };
+        let header_version = peek_header_version(&buf).unwrap_or(2); // fallback
 
         let mut buf_decode = buf.clone();
         let header = match RequestHeader::decode(&mut buf_decode, header_version) {
@@ -95,11 +92,11 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::InitProducerId => {
-                let req =
-                    match InitProducerIdRequest::decode(&mut buf, header.request_api_version) {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
+                let req = match InitProducerIdRequest::decode(&mut buf, header.request_api_version)
+                {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
                 let resp = engine.handle_init_producer_id(&req, header.request_api_version);
                 encode_response(
                     &header,
@@ -148,7 +145,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::DeleteTopics => {
-                let req = match kafka_protocol::messages::DeleteTopicsRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::DeleteTopicsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -161,7 +161,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::CreatePartitions => {
-                let req = match kafka_protocol::messages::CreatePartitionsRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::CreatePartitionsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -174,7 +177,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::FindCoordinator => {
-                let req = match kafka_protocol::messages::FindCoordinatorRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::FindCoordinatorRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -187,7 +193,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::JoinGroup => {
-                let req = match kafka_protocol::messages::JoinGroupRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::JoinGroupRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -200,7 +209,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::SyncGroup => {
-                let req = match kafka_protocol::messages::SyncGroupRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::SyncGroupRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -213,7 +225,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::Heartbeat => {
-                let req = match kafka_protocol::messages::HeartbeatRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::HeartbeatRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -226,7 +241,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::LeaveGroup => {
-                let req = match kafka_protocol::messages::LeaveGroupRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::LeaveGroupRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -239,7 +257,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::OffsetCommit => {
-                let req = match kafka_protocol::messages::OffsetCommitRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::OffsetCommitRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -252,7 +273,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::OffsetFetch => {
-                let req = match kafka_protocol::messages::OffsetFetchRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::OffsetFetchRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -265,7 +289,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::DescribeGroups => {
-                let req = match kafka_protocol::messages::DescribeGroupsRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::DescribeGroupsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -278,7 +305,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::ListGroups => {
-                let req = match kafka_protocol::messages::ListGroupsRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::ListGroupsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -291,7 +321,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::DeleteGroups => {
-                let req = match kafka_protocol::messages::DeleteGroupsRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::DeleteGroupsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -304,7 +337,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::DescribeConfigs => {
-                let req = match kafka_protocol::messages::DescribeConfigsRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::DescribeConfigsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -317,7 +353,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::DescribeCluster => {
-                let req = match kafka_protocol::messages::DescribeClusterRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::DescribeClusterRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -330,7 +369,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::OffsetForLeaderEpoch => {
-                let req = match kafka_protocol::messages::OffsetForLeaderEpochRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::OffsetForLeaderEpochRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -343,7 +385,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::AddPartitionsToTxn => {
-                let req = match kafka_protocol::messages::AddPartitionsToTxnRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::AddPartitionsToTxnRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -356,7 +401,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::AddOffsetsToTxn => {
-                let req = match kafka_protocol::messages::AddOffsetsToTxnRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::AddOffsetsToTxnRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -369,7 +417,10 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::EndTxn => {
-                let req = match kafka_protocol::messages::EndTxnRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::EndTxnRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
@@ -382,11 +433,175 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 )
             }
             ApiKey::TxnOffsetCommit => {
-                let req = match kafka_protocol::messages::TxnOffsetCommitRequest::decode(&mut buf, header.request_api_version) {
+                let req = match kafka_protocol::messages::TxnOffsetCommitRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
                 let resp = engine.handle_txn_offset_commit(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::AlterConfigs => {
+                let req = match kafka_protocol::messages::AlterConfigsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_alter_configs(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::IncrementalAlterConfigs => {
+                let req = match kafka_protocol::messages::IncrementalAlterConfigsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp =
+                    engine.handle_incremental_alter_configs(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DeleteRecords => {
+                let req = match kafka_protocol::messages::DeleteRecordsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_delete_records(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::OffsetDelete => {
+                let req = match kafka_protocol::messages::OffsetDeleteRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_offset_delete(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DescribeTransactions => {
+                let req = match kafka_protocol::messages::DescribeTransactionsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_describe_transactions(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::ListTransactions => {
+                let req = match kafka_protocol::messages::ListTransactionsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_list_transactions(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DescribeProducers => {
+                let req = match kafka_protocol::messages::DescribeProducersRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_describe_producers(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DescribeLogDirs => {
+                let req = match kafka_protocol::messages::DescribeLogDirsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_describe_log_dirs(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::SaslHandshake => {
+                let req = match kafka_protocol::messages::SaslHandshakeRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_sasl_handshake(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::SaslAuthenticate => {
+                let req = match kafka_protocol::messages::SaslAuthenticateRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_sasl_authenticate(&req, header.request_api_version);
                 encode_response(
                     &header,
                     &resp,

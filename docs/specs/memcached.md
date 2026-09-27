@@ -1,4 +1,4 @@
-# Memcached: noida spec
+# Memcached: noida-db spec
 
 - **Module:** `src/memcached/` (stub exists), Cargo feature `memcached`,
   branch `svc/memcached`
@@ -116,7 +116,7 @@ Commit test apps under `tests/clients/memcached/` with a runner script.
 ## 8. Differential tests
 
 `tests/memcached_diff.rs` sends raw protocol scripts (text, meta and binary
-as byte strings) to real memcached and noida and compares responses byte
+as byte strings) to real memcached and noida-db and compares responses byte
 for byte, ignoring only values that legitimately differ (`version`, `stats`
 numbers, CAS values, which are compared for relative behaviour instead).
 Cover every command above including error and noreply paths. Print the
@@ -134,3 +134,12 @@ contents.
 2. Meta protocol; pymemcache meta mode passes.
 3. Binary protocol; memjs and Java clients pass.
 4. stats family; `memcached` in default features.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- `shutdown`, `lru_crawler`, `slabs`, `watch`, `stats slabs|items|conns`:
+  only a minimal `stats` is provided (no performance analysis).

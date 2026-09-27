@@ -1,10 +1,25 @@
 //! Command-level tests against the in-process engine. Expected replies and
 //! error strings are Redis 7.2's, byte for byte.
 
+mod auth;
+mod bitops;
+mod config;
 mod connection;
+mod devtools;
+mod geo;
 mod hashes;
+mod hll;
 mod introspection;
+mod lists;
+mod monitor;
+mod multi;
+mod pubsub;
+mod scripting;
+mod sets;
+mod sort;
+mod streams;
 mod strings_keys;
+mod zsets;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +72,7 @@ fn test_conn(n: u16) -> ClientConn {
         laddr: "127.0.0.1:6379".into(),
         fd: 7 + n as i64,
         kill: None,
+        push: None,
     }
 }
 
@@ -71,6 +87,9 @@ pub fn int(n: i64) -> Value {
 }
 pub fn bulk(s: &str) -> Value {
     Value::bulk(s)
+}
+pub fn bulk_bytes(b: &[u8]) -> Value {
+    Value::bulk(b)
 }
 pub fn simple(s: &str) -> Value {
     Value::Simple(s.into())
@@ -110,3 +129,4 @@ pub fn text(v: &Value) -> String {
 
 pub const NOT_INT: &str = "ERR value is not an integer or out of range";
 pub const SYNTAX: &str = "ERR syntax error";
+pub const WRONGTYPE: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";

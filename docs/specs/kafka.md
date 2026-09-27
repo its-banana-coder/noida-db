@@ -1,4 +1,4 @@
-# Kafka: noida spec
+# Kafka: noida-db spec
 
 - **Module:** `src/kafka/` (stub exists), Cargo feature `kafka`, branch
   `svc/kafka`
@@ -11,7 +11,7 @@
 ## 1. Purpose
 
 Producers, consumers, stream processors and admin tools work unchanged
-against noida. The project's users are largely Java/Spring developers, so
+against noida-db. The project's users are largely Java/Spring developers, so
 the Java `kafka-clients` library is the primary target, followed by
 librdkafka-based clients (confluent-kafka-python, node-rdkafka, Go
 confluent-kafka-go), kafkajs, franz-go and sarama.
@@ -25,7 +25,7 @@ confluent-kafka-go), kafkajs, franz-go and sarama.
 - Use the `kafka-protocol` crate for message encoding/decoding and record
   batches. Justify any other dependency against binary size.
 - Version negotiation: **ApiVersions** advertises exactly the (min, max)
-  ranges noida implements for each key. A request at an unsupported version
+  ranges noida-db implements for each key. A request at an unsupported version
   gets `UNSUPPORTED_VERSION` (35), and ApiVersions itself falls back to v0
   in that case, like a real broker.
 - The broker advertises the host:port it's bound to (configurable later as
@@ -131,7 +131,7 @@ Commit test apps under `tests/clients/kafka/` with a runner script.
 ## 6. Differential tests
 
 `tests/kafka_diff.rs` sends the same request sequences to the real broker
-and noida and compares decoded responses field by field, normalizing only
+and noida-db and compares decoded responses field by field, normalizing only
 what legitimately differs (cluster id, node host/port, timestamps, member
 ids, throttle times). Cover: ApiVersions at each version, Metadata with and
 without auto-create, produce/fetch at several versions with each
@@ -154,3 +154,15 @@ KRaft controller quorum behaviour.
 3. Consumer groups; scenario (b) passes with 2 Java consumers.
 4. Diff suite for P0 green in CI; `kafka` in default features.
 5. P1: configs, transactions, Kafka Streams.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- ACL APIs (DescribeAcls, CreateAcls, DeleteAcls), SCRAM, quotas APIs.
+- KRaft controller and quorum APIs, DescribeLogDirs, replica-management and
+  reassignment APIs, MirrorMaker.
+- APIs that clients call automatically (for example OffsetForLeaderEpoch)
+  still reply, with single-broker answers.

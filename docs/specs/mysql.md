@@ -1,4 +1,4 @@
-# MySQL: noida spec
+# MySQL: noida-db spec
 
 - **Module:** `src/mysql/` (to create), Cargo feature `mysql` (to add),
   branch `svc/mysql`
@@ -13,7 +13,7 @@
 ## 1. Purpose
 
 Apps written against MySQL (Java/Spring/Hibernate, Node, Python/Django,
-Rails, PHP/Laravel, Go) point at noida and work unchanged, including their
+Rails, PHP/Laravel, Go) point at noida-db and work unchanged, including their
 migration tools.
 
 The first usable target is "common dev database", not every MySQL feature:
@@ -23,7 +23,7 @@ same MySQL error class a real server would use.
 
 ## 2. Dependency on the Postgres work
 
-noida has one SQL engine. It's being built in the Postgres service
+noida-db has one SQL engine. It's being built in the Postgres service
 (`svc/postgres`, `src/postgres/`). MySQL must **reuse it**, not fork it:
 
 - Start with the protocol layer and the connection-time queries (section 5),
@@ -263,7 +263,7 @@ optimizer trace are out of scope (performance analysis).
   `CURRENT_TIMESTAMP`) is fixed for the whole statement; `SYSDATE()` returns
   the time at the moment it executes, as in real MySQL.
 
-## 7. Client matrix (each must run its scenario against noida)
+## 7. Client matrix (each must run its scenario against noida-db)
 
 Scenario for every client: connect, create schema via its migration or DDL,
 CRUD with parameters, a transaction that rolls back, a unique-violation
@@ -282,13 +282,13 @@ introspection where the tool does it.
 | Rust `mysql_async` or `sqlx` | dev-dependency in `tests/mysql_client.rs` |
 
 Commit every test app under `tests/clients/mysql/` with one runner script.
-The runner starts noida on a random port, optionally starts a real MySQL
+The runner starts noida-db on a random port, optionally starts a real MySQL
 reference, runs the same scenario against both where feasible, and prints a
 short per-client PASS/SKIP/FAIL summary.
 
 ## 8. Differential tests
 
-`tests/mysql_diff.rs` runs SQL scripts against real MySQL and noida and
+`tests/mysql_diff.rs` runs SQL scripts against real MySQL and noida-db and
 compares: result rows (as text), column metadata (type, flags, charset,
 decimals, name, org_name, table), affected rows, last insert id, warnings
 and ERR code/SQLSTATE/message. Scripts cover every P0 bullet above. Local
@@ -336,3 +336,16 @@ statistics.
    Hibernate schema validation, SQLAlchemy and Prisma scenarios pass.
 6. Differential suite for all P0 protocol, bootstrap and engine SQL is green
    in CI; add `mysql` to default features and update `COMPATIBILITY.md`.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Replication and binlog, `COM_BINLOG_DUMP`, Group Replication.
+- Users, grants and roles management (`CREATE USER`, `GRANT`, `SHOW GRANTS`):
+  statements that appear in ordinary migrations are accepted and stored but
+  never enforced; no privilege tables beyond `mysql.user` for the default
+  account.
+- `XA` transactions, events scheduler behaviour, partitioning management.

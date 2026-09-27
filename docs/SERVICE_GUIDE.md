@@ -1,4 +1,4 @@
-# Building a noida service
+# Building a noida-db service
 
 Every service follows the same shape. Redis (`src/redis/`) is the reference
 implementation; read it before starting.
@@ -19,14 +19,16 @@ implementation; read it before starting.
 - **No performance analysis:** don't build EXPLAIN ANALYZE, slow logs or
   stats. If clients may send such commands, accept them and return a minimal
   valid reply.
-- **Single node:** no clustering or replication. Where a feature needs a
-  cluster, reply as a standalone real server would.
+- **Local development only:** no replication, clustering, sharding,
+  sentinel/HA/failover, backup/restore/migration, or multi-user security
+  management: not even stubs. Those commands and APIs behave as unknown. See
+  "Scope filter" in `docs/specs/README.md`.
 
 ## Layout
 
 - `src/<service>/mod.rs` exposes `pub fn spawn(addr: &str) ->
   io::Result<SocketAddr>`: bind, serve on background threads, return the
-  bound address. `src/services.rs` already routes `noida start` to it.
+  bound address. `src/services.rs` already routes `noida-db start` to it.
 - Put the service behind its Cargo feature (already declared in Cargo.toml).
   Add it to `default` once it serves something useful.
 - Keep protocol, engine and server separate so the engine is testable
@@ -41,7 +43,7 @@ Write the tests first, watch them fail, then implement.
 3. **Real-client tests** (`tests/<service>_client.rs`): a real driver crate
    (dev-dependency only) talks to `spawn("127.0.0.1:0")`.
 4. **Differential tests** (`tests/<service>_diff.rs`): run the same script
-   against the real server and noida and require identical results. Use
+   against the real server and noida-db and require identical results. Use
    `NOIDA_<SERVICE>_REF=host:port` if set (CI), else start a local server if
    one is installed, else print `SKIPPED` and pass. See `tests/redis_diff.rs`.
 
@@ -58,3 +60,16 @@ the log shows how many results were compared.
 `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
 `cargo build --no-default-features`, `scripts/check-size.sh`. Commit messages
 end with the Co-Authored-By line used in this repo.
+
+## Reuse before you build
+
+Search GitHub and crates.io for an existing implementation first. Use a crate,
+or port the reference implementation to Rust (citing it in the module doc and
+in `THIRD_PARTY.md`), and only write from scratch when nothing suitable exists.
+Check the licence first. See "Reuse before you build" in `docs/specs/README.md`.
+
+## Say what doesn't work
+
+Update your service's section in `docs/LIMITATIONS.md` in every PR: what is
+not built yet, what is out of scope, and where behaviour knowingly differs
+from the real server. Users trust the tool more when its gaps are written down.

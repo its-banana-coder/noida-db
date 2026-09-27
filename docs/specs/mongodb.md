@@ -1,4 +1,4 @@
-# MongoDB: noida spec
+# MongoDB: noida-db spec
 
 - **Module:** `src/mongodb/`, Cargo feature `mongodb`, branch `svc/mongodb`
 - **Port:** 27017
@@ -170,7 +170,7 @@ Commit test apps under `tests/clients/mongodb/` with a runner script.
 ## 8. Differential tests
 
 `tests/mongodb_diff.rs` runs command sequences (as BSON documents) against
-real MongoDB and noida and compares replies with normalization only for
+real MongoDB and noida-db and compares replies with normalization only for
 values that legitimately differ (`$clusterTime`, `operationTime`,
 `electionId`, `localTime`, connection ids, ObjectIds generated server-side,
 cursor ids). Cover every P0 command and operator, including error replies.
@@ -192,3 +192,15 @@ auditing, `$currentOp`/profiler/`serverStatus` performance metrics.
 3. Aggregation P0 stages; driver matrix green.
 4. Auth (SCRAM), streaming hello; `mongodb` in default features.
 5. P1: transactions, change streams, validation, GridFS.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Sharding commands, replica-set management (`replSetInitiate`,
+  `replSetGetStatus`, `replSetReconfig`...), users and roles commands,
+  auditing, `$currentOp`, backup-oriented commands.
+- The single-node replica-set facade exists only in `hello` (and the
+  `topologyVersion` machinery) so transactions and change streams work.

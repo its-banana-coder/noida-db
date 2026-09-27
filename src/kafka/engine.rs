@@ -9,9 +9,7 @@ use kafka_protocol::messages::list_offsets_response::{
 use kafka_protocol::messages::metadata_response::{
     MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
 };
-use kafka_protocol::messages::produce_response::{
-    PartitionProduceResponse, TopicProduceResponse,
-};
+use kafka_protocol::messages::produce_response::{PartitionProduceResponse, TopicProduceResponse};
 use kafka_protocol::messages::{
     ApiKey, ApiVersionsResponse, CreateTopicsRequest, CreateTopicsResponse, FetchRequest,
     FetchResponse, InitProducerIdRequest, InitProducerIdResponse, ListOffsetsRequest,
@@ -95,12 +93,22 @@ impl EngineState {
             (ApiKey::ListGroups, 0, 4),
             (ApiKey::DeleteGroups, 0, 2),
             (ApiKey::DescribeConfigs, 0, 4),
+            (ApiKey::AlterConfigs, 0, 2),
+            (ApiKey::IncrementalAlterConfigs, 0, 1),
             (ApiKey::DescribeCluster, 0, 0),
             (ApiKey::OffsetForLeaderEpoch, 0, 4),
+            (ApiKey::DeleteRecords, 0, 2),
+            (ApiKey::OffsetDelete, 0, 0),
             (ApiKey::AddPartitionsToTxn, 0, 3),
             (ApiKey::AddOffsetsToTxn, 0, 3),
             (ApiKey::EndTxn, 0, 3),
             (ApiKey::TxnOffsetCommit, 0, 3),
+            (ApiKey::DescribeTransactions, 0, 0),
+            (ApiKey::ListTransactions, 0, 0),
+            (ApiKey::DescribeProducers, 0, 0),
+            (ApiKey::DescribeLogDirs, 0, 2),
+            (ApiKey::SaslHandshake, 0, 1),
+            (ApiKey::SaslAuthenticate, 0, 2),
             (ApiKey::ApiVersions, 0, 3),
             (ApiKey::CreateTopics, 0, 7),
             (ApiKey::DeleteTopics, 0, 6),
@@ -403,8 +411,7 @@ impl EngineState {
                 part_res.partition_index = partition.partition_index;
 
                 if let Some(topic_state) = self.topics.get(topic_name) {
-                    if let Some(part_state) =
-                        topic_state.partitions.get(&partition.partition_index)
+                    if let Some(part_state) = topic_state.partitions.get(&partition.partition_index)
                     {
                         part_res.error_code = 0;
                         if partition.timestamp == -2 {
@@ -670,12 +677,14 @@ impl EngineState {
 
             // Provide common default topic/broker configs
             let configs: &[(&str, &str)] = match resource.resource_type {
-                2 => &[ // Topic
+                2 => &[
+                    // Topic
                     ("cleanup.policy", "delete"),
                     ("retention.ms", "604800000"),
                     ("segment.bytes", "1073741824"),
                 ],
-                _ => &[ // Broker/other
+                _ => &[
+                    // Broker/other
                     ("auto.create.topics.enable", "true"),
                     ("num.partitions", "1"),
                     ("default.replication.factor", "1"),
@@ -836,6 +845,219 @@ impl EngineState {
             res.topics.push(topic_res);
         }
 
+        res
+    }
+
+    pub fn handle_alter_configs(
+        &self,
+        req: &kafka_protocol::messages::AlterConfigsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::AlterConfigsResponse {
+        use kafka_protocol::messages::alter_configs_response::AlterConfigsResourceResponse;
+        let mut res = kafka_protocol::messages::AlterConfigsResponse::default();
+
+        for resource in &req.resources {
+            let mut resource_res = AlterConfigsResourceResponse::default();
+            resource_res.resource_type = resource.resource_type;
+            resource_res.resource_name = resource.resource_name.clone();
+            resource_res.error_code = 0;
+            res.responses.push(resource_res);
+        }
+
+        res
+    }
+
+    pub fn handle_incremental_alter_configs(
+        &self,
+        req: &kafka_protocol::messages::IncrementalAlterConfigsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::IncrementalAlterConfigsResponse {
+        use kafka_protocol::messages::incremental_alter_configs_response::AlterConfigsResourceResponse;
+        let mut res = kafka_protocol::messages::IncrementalAlterConfigsResponse::default();
+
+        for resource in &req.resources {
+            let mut resource_res = AlterConfigsResourceResponse::default();
+            resource_res.resource_type = resource.resource_type;
+            resource_res.resource_name = resource.resource_name.clone();
+            resource_res.error_code = 0;
+            res.responses.push(resource_res);
+        }
+
+        res
+    }
+
+    pub fn handle_delete_records(
+        &mut self,
+        req: &kafka_protocol::messages::DeleteRecordsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DeleteRecordsResponse {
+        use kafka_protocol::messages::delete_records_response::{
+            DeleteRecordsPartitionResult, DeleteRecordsTopicResult,
+        };
+        let mut res = kafka_protocol::messages::DeleteRecordsResponse::default();
+
+        for topic in &req.topics {
+            let mut topic_res = DeleteRecordsTopicResult::default();
+            topic_res.name = topic.name.clone();
+
+            for part in &topic.partitions {
+                let mut part_res = DeleteRecordsPartitionResult::default();
+                part_res.partition_index = part.partition_index;
+                part_res.low_watermark = part.offset;
+                part_res.error_code = 0;
+                topic_res.partitions.push(part_res);
+            }
+
+            res.topics.push(topic_res);
+        }
+
+        res
+    }
+
+    pub fn handle_offset_delete(
+        &mut self,
+        req: &kafka_protocol::messages::OffsetDeleteRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::OffsetDeleteResponse {
+        use kafka_protocol::messages::offset_delete_response::{
+            OffsetDeleteResponsePartition, OffsetDeleteResponseTopic,
+        };
+        let mut res = kafka_protocol::messages::OffsetDeleteResponse::default();
+        let group_id = req.group_id.as_str().to_string();
+
+        for topic in &req.topics {
+            let mut topic_res = OffsetDeleteResponseTopic::default();
+            topic_res.name = topic.name.clone();
+            let topic_name = topic.name.as_str().to_string();
+
+            for part in &topic.partitions {
+                let mut part_res = OffsetDeleteResponsePartition::default();
+                part_res.partition_index = part.partition_index;
+                self.committed_offsets.remove(&(
+                    group_id.clone(),
+                    topic_name.clone(),
+                    part.partition_index,
+                ));
+                part_res.error_code = 0;
+                topic_res.partitions.push(part_res);
+            }
+
+            res.topics.push(topic_res);
+        }
+
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_describe_transactions(
+        &self,
+        req: &kafka_protocol::messages::DescribeTransactionsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DescribeTransactionsResponse {
+        use kafka_protocol::messages::describe_transactions_response::TransactionState;
+        let mut res = kafka_protocol::messages::DescribeTransactionsResponse::default();
+
+        for tx_id in &req.transactional_ids {
+            let mut tx_state = TransactionState::default();
+            tx_state.transactional_id = tx_id.clone();
+            tx_state.transaction_state = StrBytes::from_string("CompleteCommit".to_string());
+            tx_state.error_code = 0;
+            res.transaction_states.push(tx_state);
+        }
+
+        res
+    }
+
+    pub fn handle_list_transactions(
+        &self,
+        _req: &kafka_protocol::messages::ListTransactionsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::ListTransactionsResponse {
+        let mut res = kafka_protocol::messages::ListTransactionsResponse::default();
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_describe_producers(
+        &self,
+        req: &kafka_protocol::messages::DescribeProducersRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DescribeProducersResponse {
+        use kafka_protocol::messages::describe_producers_response::{
+            PartitionResponse, TopicResponse,
+        };
+        let mut res = kafka_protocol::messages::DescribeProducersResponse::default();
+
+        for topic in &req.topics {
+            let mut topic_res = TopicResponse::default();
+            topic_res.name = topic.name.clone();
+
+            for &p_id in &topic.partition_indexes {
+                let mut part_res = PartitionResponse::default();
+                part_res.partition_index = p_id;
+                part_res.error_code = 0;
+                topic_res.partitions.push(part_res);
+            }
+
+            res.topics.push(topic_res);
+        }
+
+        res
+    }
+
+    pub fn handle_describe_log_dirs(
+        &self,
+        _req: &kafka_protocol::messages::DescribeLogDirsRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::DescribeLogDirsResponse {
+        use kafka_protocol::messages::describe_log_dirs_response::{
+            DescribeLogDirsPartition, DescribeLogDirsResult, DescribeLogDirsTopic,
+        };
+        let mut res = kafka_protocol::messages::DescribeLogDirsResponse::default();
+
+        let mut log_dir = DescribeLogDirsResult::default();
+        log_dir.log_dir = StrBytes::from_string("/tmp/noida-kafka-logs".to_string());
+        log_dir.error_code = 0;
+
+        for (topic_name, topic_state) in &self.topics {
+            let mut t_dir = DescribeLogDirsTopic::default();
+            t_dir.name =
+                kafka_protocol::messages::TopicName(StrBytes::from_string(topic_name.clone()));
+
+            for &p_id in topic_state.partitions.keys() {
+                let mut p_dir = DescribeLogDirsPartition::default();
+                p_dir.partition_index = p_id;
+                p_dir.partition_size = 1024;
+                p_dir.offset_lag = 0;
+                p_dir.is_future_key = false;
+                t_dir.partitions.push(p_dir);
+            }
+
+            log_dir.topics.push(t_dir);
+        }
+
+        res.results.push(log_dir);
+        res
+    }
+
+    pub fn handle_sasl_handshake(
+        &self,
+        _req: &kafka_protocol::messages::SaslHandshakeRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::SaslHandshakeResponse {
+        let mut res = kafka_protocol::messages::SaslHandshakeResponse::default();
+        res.error_code = 0;
+        res.mechanisms.push(StrBytes::from_string("PLAIN".to_string()));
+        res
+    }
+
+    pub fn handle_sasl_authenticate(
+        &self,
+        _req: &kafka_protocol::messages::SaslAuthenticateRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::SaslAuthenticateResponse {
+        let mut res = kafka_protocol::messages::SaslAuthenticateResponse::default();
+        res.error_code = 0;
         res
     }
 }
@@ -1045,5 +1267,85 @@ impl Engine {
         version: i16,
     ) -> kafka_protocol::messages::TxnOffsetCommitResponse {
         self.state.lock().unwrap().handle_txn_offset_commit(req, version)
+    }
+
+    pub fn handle_alter_configs(
+        &self,
+        req: &kafka_protocol::messages::AlterConfigsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::AlterConfigsResponse {
+        self.state.lock().unwrap().handle_alter_configs(req, version)
+    }
+
+    pub fn handle_incremental_alter_configs(
+        &self,
+        req: &kafka_protocol::messages::IncrementalAlterConfigsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::IncrementalAlterConfigsResponse {
+        self.state.lock().unwrap().handle_incremental_alter_configs(req, version)
+    }
+
+    pub fn handle_delete_records(
+        &self,
+        req: &kafka_protocol::messages::DeleteRecordsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DeleteRecordsResponse {
+        self.state.lock().unwrap().handle_delete_records(req, version)
+    }
+
+    pub fn handle_offset_delete(
+        &self,
+        req: &kafka_protocol::messages::OffsetDeleteRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::OffsetDeleteResponse {
+        self.state.lock().unwrap().handle_offset_delete(req, version)
+    }
+
+    pub fn handle_describe_transactions(
+        &self,
+        req: &kafka_protocol::messages::DescribeTransactionsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DescribeTransactionsResponse {
+        self.state.lock().unwrap().handle_describe_transactions(req, version)
+    }
+
+    pub fn handle_list_transactions(
+        &self,
+        req: &kafka_protocol::messages::ListTransactionsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::ListTransactionsResponse {
+        self.state.lock().unwrap().handle_list_transactions(req, version)
+    }
+
+    pub fn handle_describe_producers(
+        &self,
+        req: &kafka_protocol::messages::DescribeProducersRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DescribeProducersResponse {
+        self.state.lock().unwrap().handle_describe_producers(req, version)
+    }
+
+    pub fn handle_describe_log_dirs(
+        &self,
+        req: &kafka_protocol::messages::DescribeLogDirsRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::DescribeLogDirsResponse {
+        self.state.lock().unwrap().handle_describe_log_dirs(req, version)
+    }
+
+    pub fn handle_sasl_handshake(
+        &self,
+        req: &kafka_protocol::messages::SaslHandshakeRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::SaslHandshakeResponse {
+        self.state.lock().unwrap().handle_sasl_handshake(req, version)
+    }
+
+    pub fn handle_sasl_authenticate(
+        &self,
+        req: &kafka_protocol::messages::SaslAuthenticateRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::SaslAuthenticateResponse {
+        self.state.lock().unwrap().handle_sasl_authenticate(req, version)
     }
 }

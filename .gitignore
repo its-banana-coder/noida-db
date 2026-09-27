@@ -1,3 +1,9 @@
 /target
-/.noida
+/.noida-db
 /.claude
+
+# Real-client test scratch (Gradle/Go build output living inside tests/)
+tests/clients/redis/java/.gradle/
+tests/clients/redis/java/build/
+__pycache__/
+*.pyc

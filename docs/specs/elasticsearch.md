@@ -1,4 +1,4 @@
-# Elasticsearch: noida spec
+# Elasticsearch: noida-db spec
 
 - **Module:** `src/elasticsearch/`, Cargo feature `elasticsearch`, branch
   `svc/elasticsearch`
@@ -16,7 +16,7 @@
 Apps using the official clients (Java API client, elasticsearch-py,
 @elastic/elasticsearch, Go, .NET), Spring Data Elasticsearch, and tools
 that speak the REST API (curl scripts, Logstash-style bulk loaders) work
-unchanged. Elasticsearch idles at 1–2 GB; this is one of noida's biggest
+unchanged. Elasticsearch idles at 1–2 GB; this is one of noida-db's biggest
 wins.
 
 ## 2. HTTP layer (P0)
@@ -176,7 +176,7 @@ Commit test apps under `tests/clients/elasticsearch/` with a runner script.
 ## 6. Differential tests
 
 `tests/elasticsearch_diff.rs` sends the same HTTP requests to real ES and
-noida and compares status codes and JSON bodies, normalizing only `took`,
+noida-db and compares status codes and JSON bodies, normalizing only `took`,
 `_shards` timing details, auto-generated `_id`s, `cluster_uuid`, node
 names/ids, and build hashes; `_score` compared with tolerance. Cover every
 P0 API, query type and aggregation, and the error shapes. CI: the ES 8.15
@@ -203,3 +203,13 @@ simple processors later), `_nodes/stats`/`_stats` performance metrics
 4. Scroll/PIT, templates, aliases, `_cat`/`_cluster`; client matrix green;
    `elasticsearch` in default features.
 5. P1 items.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Snapshots and repositories (`_snapshot`), ILM and data streams,
+  cross-cluster search, shard allocation and reroute, security APIs (users,
+  roles, API keys), `_nodes/stats` and other node-level performance metrics.

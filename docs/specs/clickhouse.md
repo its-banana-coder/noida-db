@@ -1,4 +1,4 @@
-# ClickHouse: noida spec
+# ClickHouse: noida-db spec
 
 - **Module:** `src/clickhouse/`, Cargo feature `clickhouse`, branch
   `svc/clickhouse`
@@ -15,7 +15,7 @@ Analytics code written against ClickHouse (clickhouse-connect/Python,
 @clickhouse/client/Node, clickhouse-java/JDBC, clickhouse-go (native),
 clickhouse-rs, Grafana-style dashboards, dbt-clickhouse) works unchanged,
 at local data sizes. ClickHouse's SQL dialect differs a lot from Postgres:
-it gets its own parser/analyzer on top of noida's shared storage and
+it gets its own parser/analyzer on top of noida-db's shared storage and
 expression machinery where that's reusable (coordinate with the SQL engine
 from `svc/postgres`), but columnar and aggregate-heavy semantics are
 ClickHouse-specific.
@@ -97,7 +97,7 @@ non-nullable columns.
   `EXCHANGE TABLES`, `DETACH/ATTACH` (P1).
 - **Merge semantics:** inserts create parts; ReplacingMergeTree,
   SummingMergeTree and Collapsing engines apply their logic when parts merge.
-  noida merges on `OPTIMIZE TABLE … [FINAL]` and in the background, and
+  noida-db merges on `OPTIMIZE TABLE … [FINAL]` and in the background, and
   `SELECT … FINAL` applies the merge logic at read time. Because a real
   server's background merge timing is nondeterministic, tests compare results
   after `OPTIMIZE … FINAL` or with `FINAL`, which are deterministic.
@@ -209,7 +209,7 @@ Commit test apps under `tests/clients/clickhouse/` with a runner script.
 ## 8. Differential tests
 
 `tests/clickhouse_diff.rs` runs SQL scripts over HTTP against real
-ClickHouse and noida in several output formats (TSVWithNamesAndTypes as the
+ClickHouse and noida-db in several output formats (TSVWithNamesAndTypes as the
 main one, plus JSON and RowBinaryWithNamesAndTypes) and compares bodies
 byte for byte, normalizing only query ids, timings in `statistics`, and
 `version()`/`uptime()` values. Queries without a deterministic order must
@@ -239,3 +239,13 @@ Play UI, MySQL/Postgres wire compatibility ports of ClickHouse itself.
    `clickhouse` in default features.
 4. Native TCP protocol; clickhouse-go and clickhouse-driver pass.
 5. P1 items.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- `BACKUP`/`RESTORE`, Keeper/ZooKeeper, replicated engines beyond being
+  accepted as plain MergeTree, distributed tables and `ON CLUSTER`
+  (accepted and ignored), user/role/quota/settings-profile management.

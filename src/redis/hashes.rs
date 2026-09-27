@@ -28,8 +28,9 @@ fn set_fields(ctx: &mut Ctx, a: &[Vec<u8>], name: &str) -> Result<i64, Value> {
     if a.len() % 2 == 1 {
         return Err(arity_error(name));
     }
+    let lim = ctx.limits("hash");
     let h = ctx.hash_or_create(&a[1])?;
-    Ok(a[2..].chunks(2).filter(|p| h.insert(&p[0], &p[1])).count() as i64)
+    Ok(a[2..].chunks(2).filter(|p| h.insert(&p[0], &p[1], lim)).count() as i64)
 }
 
 fn hset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -41,11 +42,12 @@ fn hmset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn hsetnx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("hash");
     let h = ctx.hash_or_create(&a[1])?;
     if h.map.contains(&a[2]) {
         return Ok(Value::Integer(0));
     }
-    h.insert(&a[2], &a[3]);
+    h.insert(&a[2], &a[3], lim);
     Ok(Value::Integer(1))
 }
 
@@ -107,6 +109,7 @@ fn hvals(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn hincrby(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("hash");
     let by = int_arg(&a[3])?;
     let h = ctx.hash_or_create(&a[1])?;
     let current = match h.map.get(&a[2]) {
@@ -118,11 +121,12 @@ fn hincrby(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let next = current
         .checked_add(by)
         .ok_or_else(|| Value::err("ERR increment or decrement would overflow"))?;
-    h.insert(&a[2], next.to_string().as_bytes());
+    h.insert(&a[2], next.to_string().as_bytes(), lim);
     Ok(Value::Integer(next))
 }
 
 fn hincrbyfloat(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let lim = ctx.limits("hash");
     let by = longdouble::parse(&a[3]).map_err(|_| Value::err("ERR value is not a valid float"))?;
     if !by.is_finite() {
         return Err(Value::err("ERR value is NaN or Infinity"));
@@ -133,7 +137,7 @@ fn hincrbyfloat(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         return Err(Value::err("ERR hash value is not a float"));
     }
     let next = num::add_human(&current, &a[3]).map_err(Value::err)?;
-    h.insert(&a[2], next.as_bytes());
+    h.insert(&a[2], next.as_bytes(), lim);
     Ok(Value::bulk(next))
 }
 
