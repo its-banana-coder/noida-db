@@ -1298,6 +1298,13 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 )
             })?;
             let _ = ncols;
+            if !t.matview_populated {
+                return Err(PgError::new(
+                    code::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{}\" has not been populated", t.name),
+                )
+                .hint("Use the REFRESH MATERIALIZED VIEW command."));
+            }
             // The binder numbers a table's columns without the dropped ones.
             if t.columns.iter().any(|c| c.dropped) {
                 let live: Vec<usize> = t.live_columns().map(|(i, _)| i).collect();

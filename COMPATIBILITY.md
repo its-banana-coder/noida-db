@@ -85,7 +85,8 @@ Every service is its own module:
     and CSV; verified against `pg_dump`/`psql` restore and the copy APIs of
     psycopg, node-postgres and the Rust `postgres` crate), full-text search
     (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`, `@@`,
-    `ts_rank`; verified against Django's `django.contrib.postgres.search`).
+    `ts_rank`; verified against Django's `django.contrib.postgres.search`),
+    `REFRESH MATERIALIZED VIEW`.
   - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz
     and numeric.
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,

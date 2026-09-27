@@ -449,6 +449,23 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT id FROM docs WHERE to_tsvector(body) @@ to_tsquery('fox & dog') ORDER BY id",
         "SELECT id FROM docs WHERE to_tsvector(body) @@ plainto_tsquery('lazy dog') ORDER BY id",
     ],
+    // REFRESH MATERIALIZED VIEW: stays stale until refreshed, WITH NO DATA
+    // unpopulates it, an unpopulated matview errors on read.
+    &[
+        "CREATE TABLE mvsrc (id int, v int)",
+        "INSERT INTO mvsrc VALUES (1, 10), (2, 20)",
+        "CREATE MATERIALIZED VIEW mv AS SELECT sum(v) AS s FROM mvsrc",
+        "SELECT * FROM mv",
+        "INSERT INTO mvsrc VALUES (3, 30)",
+        "SELECT * FROM mv",
+        "REFRESH MATERIALIZED VIEW mv",
+        "SELECT * FROM mv",
+        "SELECT schemaname, matviewname, ispopulated FROM pg_matviews",
+        "REFRESH MATERIALIZED VIEW mv WITH NO DATA",
+        "SELECT ispopulated FROM pg_matviews",
+        "SELECT * FROM mv",
+        "REFRESH MATERIALIZED VIEW nosuchview",
+    ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).
     &[

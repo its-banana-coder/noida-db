@@ -836,6 +836,24 @@ impl Engine {
     }
 }
 
+/// The single string-literal argument of a `CALL x('...')` synthesized by
+/// `seqddl.rs`/`refresh.rs` to carry text sqlparser can't parse directly.
+fn call_arg_text(f: &a::Function) -> String {
+    match &f.args {
+        a::FunctionArguments::List(l) => l.args.iter().find_map(|x| match x {
+            a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(a::Expr::Value(v))) => {
+                match &v.value {
+                    a::Value::SingleQuotedString(s) => Some(s.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }),
+        _ => None,
+    }
+    .unwrap_or_default()
+}
+
 fn warning(msg: &str) -> PgError {
     PgError { severity: "WARNING", ..PgError::new(code::WARNING, msg) }
 }
@@ -967,22 +985,16 @@ fn run_one(ctx: &mut Ctx, stmt: &a::Statement, info: &SessionInfo) -> PgResult<S
         }
         // CREATE and ALTER SEQUENCE arrive as a CALL (see seqddl.rs).
         S::Call(f) if f.name.to_string() == super::seqddl::CALL_NAME => {
-            let text = match &f.args {
-                a::FunctionArguments::List(l) => l.args.iter().find_map(|x| match x {
-                    a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(a::Expr::Value(v))) => {
-                        match &v.value {
-                            a::Value::SingleQuotedString(s) => Some(s.clone()),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                }),
-                _ => None,
-            }
-            .unwrap_or_default();
-            let sq = super::seqddl::parse(&text)?;
+            let sq = super::seqddl::parse(&call_arg_text(f))?;
             let mut d = ddl(ctx, info);
             let tag = if sq.create { d.create_sequence(&sq)? } else { d.alter_sequence(&sq)? };
+            Ok(StmtResult::tag(tag))
+        }
+        // REFRESH MATERIALIZED VIEW arrives as a CALL (see refresh.rs).
+        S::Call(f) if f.name.to_string() == super::refresh::CALL_NAME => {
+            let r = super::refresh::parse(&call_arg_text(f))?;
+            let mut d = ddl(ctx, info);
+            let tag = d.refresh_matview(&r)?;
             Ok(StmtResult::tag(tag))
         }
         S::CreateType { name, representation } => {

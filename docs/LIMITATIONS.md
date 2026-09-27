@@ -86,7 +86,7 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 565 results) and by psycopg,
+servers by `tests/postgres_diff.rs` (about 585 results) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx,
 GORM and JDBC (`tests/clients/postgres/run.sh`). Django's own management
 commands (`migrate`, including the built-in `auth`/`admin`/`sessions`/
@@ -121,6 +121,14 @@ own formula, which weights lexeme importance labels and document length
 nothing here tracks); GIN/GiST indexes, `ts_headline`, and
 `websearch_to_tsquery` are not implemented.
 
+`REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` works: a
+materialized view keeps its rows from `CREATE`/the last `REFRESH` until
+refreshed again (it does not silently re-run its query on every read), and
+`WITH NO DATA` unpopulates it — reading an unpopulated one gives the same
+error and hint a real server does. `pg_matviews.ispopulated` reflects this.
+`CONCURRENTLY` is accepted and has no effect (no locking to avoid; nothing
+here blocks readers while refreshing anyway).
+
 **By design**
 
 - Replication of any kind (streaming, logical, master/slave, primary/replica
@@ -138,7 +146,6 @@ nothing here tracks); GIN/GiST indexes, `ts_headline`, and
 - Range types, `CREATE PROCEDURE`/`CALL`.
 - Full-text search: GIN/GiST indexes, `ts_headline`, `websearch_to_tsquery`,
   any text search config other than `'english'`/`'simple'`.
-- `REFRESH MATERIALIZED VIEW` (a syntax error, not yet parsed).
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
 
