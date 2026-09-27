@@ -293,6 +293,15 @@ impl DbState {
         self.schemas.values().find(|s| s.name == name).map(|s| s.oid)
     }
 
+    /// How a relation prints as a `regclass`: schema-qualified unless its
+    /// schema is on the search path.
+    pub fn regclass_text(&self, schema: u32, name: &str, search_path: &[String]) -> String {
+        let q = super::funcs::quote_ident;
+        let visible = schema == PG_CATALOG_NS
+            || search_path.iter().any(|s| self.schema_by_name(s) == Some(schema));
+        if visible { q(name) } else { format!("{}.{}", q(self.schema_name(schema)), q(name)) }
+    }
+
     pub fn schema_name(&self, oid: u32) -> &str {
         self.schemas.get(&oid).map_or("?", |s| s.name.as_str())
     }

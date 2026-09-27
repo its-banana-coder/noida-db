@@ -830,7 +830,9 @@ impl Engine {
         if !cols.iter().any(|c| c.ty.is_reg()) {
             return None;
         }
-        Some(Arc::new(self.with_db(s, |db| super::exec::build_reg_names(db, &s.rt.user))))
+        Some(Arc::new(self.with_db(s, |db| {
+            super::exec::build_reg_names(db, &s.rt.user, &s.rt.settings.search_path(&s.rt.user))
+        })))
     }
 }
 

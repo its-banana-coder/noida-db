@@ -404,7 +404,18 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 out.push(pg_class_row(oid, name, schema, kind, ncols, 0, false, 0, 0));
             }
             for tb in db.tables.values() {
-                out.push(pg_class_row(
+                // Foreign keys are triggers in Postgres; psql looks for them
+                // (to print "Foreign-key constraints" and "Referenced by")
+                // only when relhastriggers is set.
+                let has_triggers = db.tables.values().any(|o| {
+                    o.constraints.iter().any(|c| match &c.kind {
+                        ConstraintKind::ForeignKey { ref_table, .. } => {
+                            o.oid == tb.oid || *ref_table == tb.oid
+                        }
+                        _ => false,
+                    })
+                });
+                let mut row = pg_class_row(
                     tb.oid,
                     &tb.name,
                     tb.schema,
@@ -417,7 +428,9 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     !tb.indexes.is_empty(),
                     tb.rows.len() as i64,
                     tb.type_oid,
-                ));
+                );
+                row[20] = b(has_triggers);
+                out.push(row);
                 for idx in &tb.indexes {
                     out.push(pg_class_row(
                         idx.oid,
@@ -1595,7 +1608,7 @@ pub fn undefined_reg(base: Base, name: &str) -> super::error::PgError {
 }
 
 /// `pg_get_constraintdef`.
-pub fn constraint_def(db: &DbState, oid: u32) -> Option<String> {
+pub fn constraint_def(db: &DbState, oid: u32, path: &[String]) -> Option<String> {
     for tb in db.tables.values() {
         let Some(c) = tb.constraints.iter().find(|c| c.oid == oid) else { continue };
         let cols = |idx: &[usize], t: &super::catalog::Table| -> String {
@@ -1613,7 +1626,7 @@ pub fn constraint_def(db: &DbState, oid: u32) -> Option<String> {
                 let mut s = format!(
                     "FOREIGN KEY ({}) REFERENCES {}({})",
                     cols(&c.cols, tb),
-                    super::funcs::quote_ident(&parent.name),
+                    db.regclass_text(parent.schema, &parent.name, path),
                     cols(ref_cols, parent)
                 );
                 if *on_update != super::catalog::FkAction::NoAction {

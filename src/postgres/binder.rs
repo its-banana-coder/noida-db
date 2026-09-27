@@ -1060,6 +1060,13 @@ impl<'a> Binder<'a> {
                 }
                 Some(a::JoinConstraint::None) | None => {}
             }
+            // Columns are numbered across the whole FROM list, but the join
+            // sees only its own item's rows.
+            if base > 0
+                && let Some(e) = on.as_mut()
+            {
+                rebase_cols(e, base);
+            }
             scope = combined;
             from = From::Join {
                 left: Box::new(from),
@@ -3438,7 +3445,10 @@ impl<'a> Binder<'a> {
             }
         }
         // Fold constant casts so errors surface at plan time like Postgres.
-        if let Expr::Const(v) = &te.e {
+        // (A reg* value printed as text needs the catalog at run time.)
+        if let Expr::Const(v) = &te.e
+            && !(te.ty.is_reg() && (target.is_string() || target.base == Base::Text))
+        {
             let folded = casts::cast(
                 v.clone(),
                 te.ty,
@@ -3750,9 +3760,10 @@ impl<'a> Binder<'a> {
         for c in &table.columns {
             let src = c.default.clone().or_else(|| {
                 c.identity.map(|(_, seq)| {
-                    let name =
-                        self.db.sequences.get(&seq).map(|s| s.name.clone()).unwrap_or_default();
-                    format!("nextval('{}'::regclass)", super::funcs::quote_ident(&name))
+                    let text = self.db.sequences.get(&seq).map_or_else(String::new, |s| {
+                        self.db.regclass_text(s.schema, &s.name, &self.sess.search_path)
+                    });
+                    format!("nextval('{text}'::regclass)")
                 })
             });
             out.push(match src {
@@ -4458,6 +4469,15 @@ fn outerize(mut e: Expr, depth: usize) -> Expr {
         other => other.children_mut(&mut |c| *c = outerize(c.clone(), depth)),
     }
     e
+}
+
+/// Renumbers columns so that the ones at `base` and beyond start at zero.
+fn rebase_cols(e: &mut Expr, base: usize) {
+    if let Expr::Col(i) = e {
+        *i = i.saturating_sub(base);
+        return;
+    }
+    e.children_mut(&mut |c| rebase_cols(c, base));
 }
 
 fn shift_winrefs(e: &mut Expr, base: usize) {

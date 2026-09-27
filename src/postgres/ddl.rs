@@ -195,8 +195,9 @@ impl Ddl<'_, '_> {
             let t = self.ctx.db.table_mut(oid).unwrap();
             if serial_cols.contains(&i) {
                 t.columns[i].identity = None;
-                t.columns[i].default =
-                    Some(format!("nextval('{}'::regclass)", super::funcs::quote_ident(&seq_name)));
+                let text = self.ctx.db.regclass_text(schema, &seq_name, &self.info.search_path);
+                let t = self.ctx.db.table_mut(oid).unwrap();
+                t.columns[i].default = Some(format!("nextval('{text}'::regclass)"));
             } else {
                 t.columns[i].identity = Some((t.columns[i].identity.unwrap().0, seq_oid));
             }

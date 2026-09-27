@@ -369,6 +369,34 @@ const SCRIPTS: &[&[&str]] = &[
         "DROP SEQUENCE sq1b",
         "DROP SEQUENCE IF EXISTS sq1b",
     ],
+    // What psql's \d and other tools rely on: schema-qualified serials, joins
+    // after a comma in FROM, relhastriggers, qualified reg* output.
+    &[
+        "CREATE SCHEMA app",
+        "CREATE TYPE app.mood AS ENUM ('sad', 'ok')",
+        "CREATE TABLE app.authors (id serial PRIMARY KEY, name varchar(40) NOT NULL UNIQUE)",
+        "CREATE TABLE app.books (id bigserial PRIMARY KEY, author_id int REFERENCES app.authors (id) ON DELETE CASCADE, m app.mood)",
+        "INSERT INTO app.authors (name) VALUES ('ann')",
+        "INSERT INTO app.books (author_id, m) VALUES (1, 'ok')",
+        "SELECT column_default FROM information_schema.columns WHERE table_schema = 'app' AND column_default IS NOT NULL ORDER BY table_name",
+        "SELECT relname, relhastriggers FROM pg_class WHERE relnamespace = 'app'::regnamespace AND relkind = 'r' ORDER BY 1",
+        "SELECT 'app.authors'::regclass::text, 'app.mood'::regtype::text, format_type(atttypid, atttypmod) FROM pg_attribute WHERE attrelid = 'app.books'::regclass AND attname = 'm'",
+        "SELECT conname, pg_get_constraintdef(oid, true) FROM pg_constraint WHERE conrelid = 'app.books'::regclass AND contype = 'f'",
+        "SET search_path = app",
+        "SELECT 'authors'::regclass::text, 'mood'::regtype::text, pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'books'::regclass AND contype = 'f'",
+        "RESET search_path",
+        "SELECT i.indexrelid::regclass::text, con.contype FROM pg_class c, pg_index i LEFT JOIN pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ('p','u','x')) WHERE c.oid = 'app.authors'::regclass AND c.oid = i.indrelid ORDER BY 1",
+        "CREATE TABLE ja (id int)",
+        "CREATE TABLE jb (id int, v text)",
+        "CREATE TABLE jc (id int, w text)",
+        "INSERT INTO ja VALUES (1), (2)",
+        "INSERT INTO jb VALUES (1, 'b1'), (2, 'b2')",
+        "INSERT INTO jc VALUES (1, 'c1')",
+        "SELECT ja.id, jb.v, jc.w FROM ja, jb LEFT JOIN jc ON (jc.id = jb.id) ORDER BY 1, 2",
+        "SELECT ja.id, jb.v, jc.w FROM ja, jb JOIN jc USING (id) ORDER BY 1, 2",
+        "SELECT ja.id, jb.v, jc.w FROM ja CROSS JOIN jb, jc WHERE jc.id = jb.id ORDER BY 1, 2",
+        "SELECT getdatabaseencoding()",
+    ],
 ];
 
 fn main_test_body() {}

@@ -406,21 +406,20 @@ fn run_subquery(q: &Query, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
 
 /// Names for reg* values, built from the live catalog.
 fn reg_names(ctx: &Ctx) -> types::RegNames {
-    build_reg_names(ctx.db, &ctx.rt.user)
+    build_reg_names(ctx.db, &ctx.rt.user, &ctx.rt.settings.search_path(&ctx.rt.user))
 }
 
 /// Names `reg*` values print as: identifiers quoted the way Postgres does.
-pub fn build_reg_names(db: &DbState, user: &str) -> types::RegNames {
-    let q = super::funcs::quote_ident;
+pub fn build_reg_names(db: &DbState, user: &str, path: &[String]) -> types::RegNames {
     let mut r = types::RegNames::default();
     for t in db.tables.values() {
-        r.class.insert(t.oid, q(&t.name));
+        r.class.insert(t.oid, db.regclass_text(t.schema, &t.name, path));
         for i in &t.indexes {
-            r.class.insert(i.oid, q(&i.name));
+            r.class.insert(i.oid, db.regclass_text(t.schema, &i.name, path));
         }
     }
     for s in db.sequences.values() {
-        r.class.insert(s.oid, q(&s.name));
+        r.class.insert(s.oid, db.regclass_text(s.schema, &s.name, path));
     }
     for ti in types::TYPES {
         r.types.insert(ti.oid, Type::of(ti.base).display(-1));
@@ -429,7 +428,7 @@ pub fn build_reg_names(db: &DbState, user: &str) -> types::RegNames {
         }
     }
     for e in db.enums.values() {
-        r.types.insert(e.oid, q(&e.name));
+        r.types.insert(e.oid, db.regclass_text(e.schema, &e.name, path));
     }
     for sig in super::sigs::all_sigs() {
         r.procs.insert(sig.oid, sig.name.to_string());
@@ -522,7 +521,10 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             match Type::from_oid(oid) {
                 Some(t) => Value::text(t.display(typmod)),
                 None => match ctx.db.enums.get(&oid) {
-                    Some(e) => Value::text(e.name.clone()),
+                    Some(e) => {
+                        let path = ctx.rt.settings.search_path(&ctx.rt.user);
+                        Value::text(ctx.db.regclass_text(e.schema, &e.name, &path))
+                    }
                     None => Value::text(format!("???({oid})")),
                 },
             }
@@ -568,7 +570,7 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
         | "pg_ts_config_is_visible"
         | "pg_ts_dict_is_visible" => Value::Bool(true),
         "pg_get_userbyid" => Value::text(ctx.rt.user.clone()),
-        "pg_encoding_to_char" => Value::text("UTF8"),
+        "pg_encoding_to_char" | "getdatabaseencoding" => Value::text("UTF8"),
         "pg_char_to_encoding" => Value::Int(6),
         "pg_client_encoding" => Value::text("UTF8"),
         "pg_is_in_recovery" => Value::Bool(false),
@@ -648,7 +650,8 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
         }
         "pg_get_constraintdef" => {
             let oid = a[0].as_int().unwrap_or(0) as u32;
-            pgcatalog::constraint_def(ctx.db, oid).map_or(Value::Null, Value::text)
+            pgcatalog::constraint_def(ctx.db, oid, &ctx.rt.settings.search_path(&ctx.rt.user))
+                .map_or(Value::Null, Value::text)
         }
         "pg_get_indexdef" => {
             let oid = a[0].as_int().unwrap_or(0) as u32;
@@ -1499,6 +1502,8 @@ fn srf_rows(
                 .collect(),
             _ => vec![],
         },
+        // No partitioned tables, so a relation is its own only ancestor.
+        "pg_partition_ancestors" => one(vec![a[0].clone()]),
         "generate_subscripts" => {
             let dim = a[1].as_int().unwrap_or(1) as usize;
             match &a[0] {

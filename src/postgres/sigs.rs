@@ -113,7 +113,7 @@ array_ndims(anyarray)int4 array_dims(anyarray)text
 !array_remove(anyarray,anyelement)anyarray !array_replace(anyarray,anyelement,anyelement)anyarray
 !array_position(anyarray,anyelement)int4 !array_positions(anyarray,anyelement)_int4
 array_fill(anyelement,_int4)anyarray trim_array(anyarray,int4)anyarray
-s:unnest(anyarray)anyelement s:generate_subscripts(anyarray,int4)int4
+s:unnest(anyarray)anyelement s:generate_subscripts(anyarray,int4)int4 s:pg_partition_ancestors(regclass)regclass
 s:generate_series(int4,int4)int4 s:generate_series(int4,int4,int4)int4
 s:generate_series(int8,int8)int8 s:generate_series(int8,int8,int8)int8
 s:generate_series(numeric,numeric)numeric s:generate_series(numeric,numeric,numeric)numeric
@@ -129,7 +129,7 @@ has_schema_privilege(text,text)bool has_schema_privilege(text,text,text)bool has
 has_database_privilege(text,text)bool has_database_privilege(text,text,text)bool has_column_privilege(text,text,text)bool has_column_privilege(oid,int2,text)bool
 has_sequence_privilege(text,text)bool has_function_privilege(oid,text)bool has_any_column_privilege(oid,text)bool
 pg_has_role(name,text)bool pg_has_role(name,name,text)bool pg_has_role(oid,text)bool
-pg_get_userbyid(oid)name pg_encoding_to_char(int4)name pg_char_to_encoding(name)int4
+pg_get_userbyid(oid)name pg_encoding_to_char(int4)name getdatabaseencoding()name pg_char_to_encoding(name)int4
 !obj_description(oid,name)text !obj_description(oid)text !col_description(oid,int4)text !shobj_description(oid,name)text
 pg_get_constraintdef(oid)text pg_get_constraintdef(oid,bool)text pg_get_indexdef(oid)text pg_get_indexdef(oid,int4,bool)text
 pg_get_viewdef(oid)text pg_get_viewdef(oid,bool)text pg_get_viewdef(text)text pg_get_viewdef(text,bool)text
