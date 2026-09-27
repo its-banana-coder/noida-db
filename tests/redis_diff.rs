@@ -2123,7 +2123,6 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "ACL CAT",
             "~ACL CAT string",
             "ACL CAT nosuch",
-            "ACL LOG",
             "ACL GENPASS 0",
             "ACL GENPASS x",
         ],

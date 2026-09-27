@@ -187,3 +187,14 @@ fn script_cache() {
         err("ERR Error compiling script (new function): user_script:1: '=' expected near 'is'")
     );
 }
+
+#[test]
+fn an_undefined_global_reports_the_scripts_own_line() {
+    let mut t = T::new();
+    let Value::Error(e) = t.run("EVAL \"return nosuchglobal\" 0") else { panic!() };
+    assert!(
+        e.starts_with("ERR user_script:1: Script attempted to access nonexistent global variable 'nosuchglobal' script: "),
+        "{e}"
+    );
+    assert!(e.ends_with(", on @user_script:1."), "{e}");
+}

@@ -37,9 +37,13 @@ static SCRIPT: &[Command] = &[
 const ERR_HANDLER: &str = r#"
 local dbg = debug
 return function (err)
-  local i = dbg.getinfo(2,'nSl')
-  if i and i.what == 'C' then
-    i = dbg.getinfo(3,'nSl')
+  -- Report the script's own frame: skip C functions (like `error`) and our
+  -- Lua nonexistent-global guard (@protect), which in Redis is a C function.
+  local level = 2
+  local i = dbg.getinfo(level,'nSl')
+  while i and (i.what == 'C' or i.source == '@protect') do
+    level = level + 1
+    i = dbg.getinfo(level,'nSl')
   end
   if type(err) ~= 'table' then
     err = {err='ERR ' .. tostring(err)}

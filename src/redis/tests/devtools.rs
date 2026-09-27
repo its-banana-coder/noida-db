@@ -131,7 +131,7 @@ fn acl_knows_only_the_default_user() {
     assert_eq!(
         t.run("ACL GETUSER default"),
         map(vec![
-            ("flags", simples(&["on", "nopass", "sanitize-payload"])),
+            ("flags", Value::Set(vec![bulk("on"), bulk("nopass"), bulk("sanitize-payload")])),
             ("passwords", arr(vec![])),
             ("commands", bulk("+@all")),
             ("keys", bulk("~*")),
