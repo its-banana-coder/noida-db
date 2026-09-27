@@ -99,7 +99,8 @@ similar were compared by hand against a real server.
 
 **By design**
 
-- Replication of any kind. A connection with the `replication` startup
+- Replication of any kind (streaming, logical, master/slave, primary/replica
+  — whatever it's called). A connection with the `replication` startup
   parameter is treated as an ordinary one, so `pg_basebackup` and
   `pg_recvlogical` do not work.
 - Roles and privileges are not enforced: `GRANT`, `REVOKE` and
