@@ -61,6 +61,11 @@ left(text,int4)text right(text,int4)text repeat(text,int4)text reverse(text)text
 !concat(...any)text !concat_ws(text,...any)text split_part(text,text,int4)text
 md5(text)text md5(bytea)text sha256(bytea)bytea ascii(text)int4 chr(int4)text
 !format(text)text !format(text,...any)text quote_ident(text)text quote_literal(anyelement)text !quote_nullable(anyelement)text
+to_tsvector(text)tsvector to_tsvector(text,text)tsvector
+to_tsquery(text)tsquery to_tsquery(text,text)tsquery
+plainto_tsquery(text)tsquery plainto_tsquery(text,text)tsquery
+phraseto_tsquery(text)tsquery phraseto_tsquery(text,text)tsquery
+ts_rank(tsvector,tsquery)float4
 regexp_replace(text,text,text)text regexp_replace(text,text,text,text)text
 regexp_match(text,text)_text regexp_match(text,text,text)_text
 regexp_like(text,text)bool regexp_like(text,text,text)bool regexp_count(text,text)int4

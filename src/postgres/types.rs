@@ -240,6 +240,8 @@ impl Type {
     pub const JSONB: Type = Type::of(Base::Jsonb);
     pub const BYTEA: Type = Type::of(Base::Bytea);
     pub const UUID: Type = Type::of(Base::Uuid);
+    pub const TSVECTOR: Type = Type::of(Base::Tsvector);
+    pub const TSQUERY: Type = Type::of(Base::Tsquery);
     pub const VOID: Type = Type::of(Base::Void);
     pub const RECORD: Type = Type::of(Base::Record);
     pub const CHAR: Type = Type::of(Base::Char);
@@ -1111,6 +1113,11 @@ pub fn from_text(s: &str, ty: Type, ctx: &Ctx) -> PgResult<Value> {
             ));
         }
         Base::Void => Value::Null,
+        Base::Tsvector => Value::Text(super::fts::format_vector(&super::fts::parse_vector(s)?)),
+        Base::Tsquery => Value::Text(match super::fts::parse_query_text(s)? {
+            Some(q) => super::fts::format_query(&q),
+            None => String::new(),
+        }),
         _ => Value::Text(s.to_string()),
     })
 }

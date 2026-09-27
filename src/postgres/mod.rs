@@ -15,6 +15,7 @@ pub mod dml;
 pub mod engine;
 pub mod error;
 pub mod exec;
+pub mod fts;
 pub mod funcs;
 pub mod keywords;
 pub mod pgcatalog;

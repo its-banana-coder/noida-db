@@ -3,6 +3,7 @@
 use super::casts;
 use super::datetime::{self, USECS_PER_DAY, USECS_PER_SEC};
 use super::error::{PgError, PgResult, code};
+use super::fts;
 use super::json::{self, Json};
 use super::numeric::{NumError, Numeric};
 use super::types::{self, Array, Base, FmtCtx, Type, Value};
@@ -72,6 +73,18 @@ pub fn as_f64(v: &Value) -> f64 {
 fn int_result(v: Option<i64>, ty: Type) -> PgResult<Value> {
     let v = v.ok_or_else(|| err(code::NUMERIC_VALUE_OUT_OF_RANGE, types::int_range_msg(ty)))?;
     types::check_int_range(v, ty).map(Value::Int)
+}
+
+/// `(config, text)` for `to_tsvector`/`to_tsquery`/`plainto_tsquery`/
+/// `phraseto_tsquery`, which all take an optional leading config name
+/// (default `'english'`, matching this project's `--locale=C` reference
+/// servers' own `default_text_search_config`).
+fn fts_args(a: &[Value]) -> (String, String) {
+    match a {
+        [txt] => ("english".to_string(), text(txt).to_string()),
+        [config, txt, ..] => (text(config).to_string(), text(txt).to_string()),
+        [] => ("english".to_string(), String::new()),
+    }
 }
 
 fn text(v: &Value) -> &str {
@@ -273,6 +286,16 @@ pub fn binop(
             Jsonb(Box::new(j))
         }
         ("#-", Jsonb(x), Array(p)) => Jsonb(Box::new(jsonb_delete_path(x, &text_items(p))?)),
+        // Full-text search: whichever operand resolved to tsquery names
+        // the query side, the other is the tsvector side (Postgres allows
+        // either order, `tsvector @@ tsquery` and `tsquery @@ tsvector`).
+        ("@@", Text(x), Text(y)) => {
+            let (vec_text, q_text) = if tys[0].base == Base::Tsquery { (y, x) } else { (x, y) };
+            let vec = fts::parse_vector(vec_text)?;
+            let q =
+                fts::parse_query_text(q_text)?.unwrap_or(fts::Query::Lexeme(String::new(), false));
+            Bool(fts::matches(&vec, &q))
+        }
         // Arrays.
         ("@>", Array(x), Array(y)) => Bool(
             y.items
@@ -1628,6 +1651,38 @@ pub fn call(
         }
         "quote_ident" => Text(quote_ident(text(&a[0]))),
         "quote_literal" => Text(quote_literal(&to_str(&a[0], tys[0], env))),
+        // --- full-text search
+        "to_tsvector" => {
+            let (config, txt) = fts_args(a);
+            return Ok(Some(Text(fts::format_vector(&fts::to_tsvector(&txt, &config)))));
+        }
+        "to_tsquery" => {
+            let (config, txt) = fts_args(a);
+            return Ok(Some(Text(match fts::to_tsquery(&txt, &config)? {
+                Some(q) => fts::format_query(&q),
+                None => String::new(),
+            })));
+        }
+        "plainto_tsquery" => {
+            let (config, txt) = fts_args(a);
+            return Ok(Some(Text(
+                fts::plainto_tsquery(&txt, &config)
+                    .map_or_else(String::new, |q| fts::format_query(&q)),
+            )));
+        }
+        "phraseto_tsquery" => {
+            let (config, txt) = fts_args(a);
+            return Ok(Some(Text(
+                fts::phraseto_tsquery(&txt, &config)
+                    .map_or_else(String::new, |q| fts::format_query(&q)),
+            )));
+        }
+        "ts_rank" => {
+            let vec = fts::parse_vector(text(&a[0]))?;
+            let q = fts::parse_query_text(text(&a[1]))?
+                .unwrap_or(fts::Query::Lexeme(String::new(), false));
+            return Ok(Some(Float(fts::rank(&vec, &q) as f64)));
+        }
         "quote_nullable" => {
             if a[0].is_null() {
                 Text("NULL".into())

@@ -86,7 +86,7 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 535 results) and by psycopg,
+servers by `tests/postgres_diff.rs` (about 565 results) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx,
 GORM and JDBC (`tests/clients/postgres/run.sh`). Django's own management
 commands (`migrate`, including the built-in `auth`/`admin`/`sessions`/
@@ -108,6 +108,19 @@ server-side file or program, and `FORMAT BINARY` (used by pgx's `CopyFrom`
 fast path), are not implemented; a client always has STDIN/STDOUT
 alternatives.
 
+Full-text search (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/
+`phraseto_tsquery`, the `@@` match operator, `ts_rank`) works for the
+`'english'` and `'simple'` configs (any other config name runs as
+`'simple'`). `to_tsvector`/`to_tsquery`'s canonical text output and `@@`'s
+boolean result match a real server exactly, including phrase (`<->`/`<N>`)
+and prefix (`:*`) matching; verified against Django's
+`django.contrib.postgres.search` (`SearchVector`/`SearchQuery`/
+`SearchRank`) end to end. `ts_rank`'s exact number is a documented
+approximation (it orders matches sensibly but doesn't reproduce Postgres's
+own formula, which weights lexeme importance labels and document length
+nothing here tracks); GIN/GiST indexes, `ts_headline`, and
+`websearch_to_tsquery` are not implemented.
+
 **By design**
 
 - Replication of any kind (streaming, logical, master/slave, primary/replica
@@ -122,8 +135,9 @@ alternatives.
 **Not yet**
 
 - PL/pgSQL and stored procedures (so no triggers either), extensions.
-- Full-text search (`tsvector`/`tsquery` have no functions or operators),
-  range types, `CREATE PROCEDURE`/`CALL`.
+- Range types, `CREATE PROCEDURE`/`CALL`.
+- Full-text search: GIN/GiST indexes, `ts_headline`, `websearch_to_tsquery`,
+  any text search config other than `'english'`/`'simple'`.
 - `REFRESH MATERIALIZED VIEW` (a syntax error, not yet parsed).
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.

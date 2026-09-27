@@ -83,15 +83,17 @@ Every service is its own module:
     transactions, `ON CONFLICT`, `RETURNING`, sequences and identity columns,
     constraints, `LISTEN`/`NOTIFY`, `COPY ... FROM/TO STDIN/STDOUT` (text
     and CSV; verified against `pg_dump`/`psql` restore and the copy APIs of
-    psycopg, node-postgres and the Rust `postgres` crate).
+    psycopg, node-postgres and the Rust `postgres` crate), full-text search
+    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`, `@@`,
+    `ts_rank`; verified against Django's `django.contrib.postgres.search`).
   - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz
     and numeric.
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
     Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
 - **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
-  extensions, full-text search, range types, logical replication, `COPY`
-  to/from a server-side file or program, `FORMAT BINARY`. Concurrency is
-  one writer at a time.
+  extensions, range types, logical replication, `COPY` to/from a
+  server-side file or program, `FORMAT BINARY`, full-text search GIN/GiST
+  indexes and `ts_headline`. Concurrency is one writer at a time.
 - **Known gap:** enum values order and compare by label text, not by the
   order they were declared in (`<`, `ORDER BY`, `min`/`max`).
 - **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema

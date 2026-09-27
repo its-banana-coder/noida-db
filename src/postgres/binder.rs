@@ -2383,6 +2383,7 @@ impl<'a> Binder<'a> {
             B::HashLongArrow => "#>>",
             B::AtArrow => "@>",
             B::ArrowAt => "<@",
+            B::AtAt => "@@",
             B::Question => "?",
             B::QuestionPipe => "?|",
             B::QuestionAnd => "?&",
@@ -2513,6 +2514,16 @@ impl<'a> Binder<'a> {
             "?" => (Type::JSONB, Type::TEXT, Type::BOOL),
             "?|" | "?&" => (Type::JSONB, Type::array_of(Base::Text), Type::BOOL),
             "#-" => (Type::JSONB, Type::array_of(Base::Text), Type::JSONB),
+            // Either order (`tsvector @@ tsquery` or `tsquery @@ tsvector`);
+            // whichever side already resolved to tsquery decides which is
+            // which, defaulting to (tsvector, tsquery) when neither has.
+            "@@" => {
+                if lt.base == Base::Tsquery || rt.base == Base::Tsvector {
+                    (Type::TSQUERY, Type::TSVECTOR, Type::BOOL)
+                } else {
+                    (Type::TSVECTOR, Type::TSQUERY, Type::BOOL)
+                }
+            }
             _ => return Err(unsupported(&format!("operator {op}"))),
         };
         // jsonb - text / jsonb - int
@@ -3257,6 +3268,8 @@ impl<'a> Binder<'a> {
             D::JSON => (Type::JSON, -1),
             D::JSONB => (Type::JSONB, -1),
             D::Uuid => (Type::UUID, -1),
+            D::TsVector => (Type::TSVECTOR, -1),
+            D::TsQuery => (Type::TSQUERY, -1),
             D::Regclass => (Type::of(Base::Regclass), -1),
             D::Array(def) => {
                 let inner = match def {

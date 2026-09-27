@@ -428,6 +428,27 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT a.id, b.id, x FROM lt a, lt b, unnest(ARRAY[a.id, b.id]) x WHERE a.id < b.id ORDER BY 1, 2, 3",
         "SELECT unnest(ARRAY[1,2], ARRAY['a','b']), unnest(ARRAY[9], ARRAY['z','w'])",
     ],
+    // Full-text search: to_tsvector/to_tsquery/plainto_tsquery/
+    // phraseto_tsquery's canonical text, and @@ matching. ts_rank's exact
+    // number is a documented approximation, so it isn't compared here.
+    &[
+        "SELECT to_tsvector('The quick brown foxes are jumping')",
+        "SELECT to_tsvector('english', 'The quick brown foxes are jumping')",
+        "SELECT to_tsvector('simple', 'The quick brown foxes are jumping')",
+        "SELECT to_tsquery('fox & quick'), to_tsquery('fox | !slow'), to_tsquery('(fox | dog) & quick')",
+        "SELECT to_tsquery('quick <-> brown'), to_tsquery('quick <2> fox'), to_tsquery('jump:*')",
+        "SELECT plainto_tsquery('the quick foxes'), phraseto_tsquery('quick brown fox')",
+        "SELECT '''fox'':2,4 ''quick'':1'::tsvector",
+        "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & quick')",
+        "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & slow')",
+        "SELECT to_tsquery('fox') @@ to_tsvector('a quick fox')",
+        "SELECT to_tsvector('quick brown fox') @@ to_tsquery('quick <-> brown')",
+        "SELECT to_tsvector('brown quick fox') @@ to_tsquery('quick <-> brown')",
+        "CREATE TABLE docs (id int, body text)",
+        "INSERT INTO docs VALUES (1, 'The quick brown fox jumps over the lazy dog'), (2, 'A completely unrelated sentence about cats')",
+        "SELECT id FROM docs WHERE to_tsvector(body) @@ to_tsquery('fox & dog') ORDER BY id",
+        "SELECT id FROM docs WHERE to_tsvector(body) @@ plainto_tsquery('lazy dog') ORDER BY id",
+    ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).
     &[
