@@ -134,3 +134,12 @@ contents.
 2. Meta protocol; pymemcache meta mode passes.
 3. Binary protocol; memjs and Java clients pass.
 4. stats family; `memcached` in default features.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- `shutdown`, `lru_crawler`, `slabs`, `watch`, `stats slabs|items|conns`:
+  only a minimal `stats` is provided (no performance analysis).
