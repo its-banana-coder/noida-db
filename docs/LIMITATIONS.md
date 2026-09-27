@@ -68,8 +68,6 @@ current count).
 - Persistence. All data lives in memory and is gone when noida stops.
   `SAVE`, `BGSAVE` and `BGREWRITEAOF` succeed but write nothing. `--data-dir`
   is not used by Redis yet.
-- Password protection: `requirepass` is stored but not enforced, and
-  `AUTH default <anything>` succeeds.
 
 **Differs**
 

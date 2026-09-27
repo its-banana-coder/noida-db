@@ -1,6 +1,7 @@
 //! Command-level tests against the in-process engine. Expected replies and
 //! error strings are Redis 7.2's, byte for byte.
 
+mod auth;
 mod bitops;
 mod config;
 mod connection;

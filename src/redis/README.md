@@ -27,7 +27,7 @@ and **3 are not built yet**. Subcommands are counted separately below.
 | Pub/sub | channels, patterns, sharded channels, RESP3 push messages |
 | Transactions | `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` |
 | Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`), with Redis's error positions |
-| Connection | `HELLO` (RESP3), `CLIENT` (id, name, info, list, kill, pause, reply, no-evict...), `RESET`, `AUTH` |
+| Connection | `HELLO` (RESP3), `CLIENT` (id, name, info, list, kill, pause, reply, no-evict...), `RESET`, `AUTH`. `requirepass` is enforced (`CONFIG SET requirepass x`, or `NOIDA_REDIS_PASSWORD` at startup); there is one user, `default` |
 | Debugging | `MONITOR` (a live stream of every command), `COMMAND` (info, docs, getkeys, list), `INFO`, `CONFIG GET/SET` |
 | Tool probes | `SLOWLOG`, `LATENCY`, `MEMORY`, `MODULE LIST`, read-only `ACL`. These return empty or estimated data (noida does no performance analysis) |
 
@@ -57,7 +57,6 @@ noida is a local development tool. These commands answer as *unknown command*.
 | Keyspace notifications | `notify-keyspace-events` can be set, but no `__keyspace@*__` / `__keyevent@*__` messages are published, so listening for expired-key events sees nothing |
 | Persistence | all data lives in memory and is gone when noida stops. `SAVE`, `BGSAVE`, `BGREWRITEAOF` succeed but write nothing; `--data-dir` is unused by Redis |
 | `maxmemory` and eviction | the setting is stored, not enforced: no eviction policies, no OOM error |
-| Passwords | `requirepass` is stored, not enforced; `AUTH default <anything>` succeeds |
 | Lua libraries `cmsgpack`, `struct`, `bit` | `cjson` and the `redis` table are available |
 
 ### Differences

@@ -179,6 +179,8 @@ pub struct Client {
     pub no_touch: bool,
     /// In MONITOR mode.
     pub monitor: bool,
+    /// Passed the `requirepass` check (true from the start when none is set).
+    pub authenticated: bool,
     pub reply_off: bool,
     reply_skip: bool,
     pub reply_skip_next: bool,
@@ -472,6 +474,7 @@ impl Engine {
     }
 
     pub fn connect(&mut self, conn: ClientConn) -> Session {
+        let open = self.requirepass().is_empty();
         let id = self.next_client_id;
         self.next_client_id += 1;
         let now = self.now();
@@ -491,6 +494,7 @@ impl Engine {
                 no_evict: false,
                 no_touch: false,
                 monitor: false,
+                authenticated: open,
                 reply_off: false,
                 reply_skip: false,
                 reply_skip_next: false,
@@ -504,6 +508,16 @@ impl Engine {
             },
         );
         Session { id, resp: 2, closing: false, blocked: false }
+    }
+
+    /// The default user's password (`requirepass`); empty means none.
+    pub(crate) fn requirepass(&self) -> String {
+        self.config.get("requirepass").unwrap_or_default()
+    }
+
+    /// `authRequired`: a password is set and this client hasn't given it.
+    fn auth_required(&self, id: u64) -> bool {
+        self.clients.get(&id).is_some_and(|c| !c.authenticated) && !self.requirepass().is_empty()
     }
 
     pub fn disconnect(&mut self, session: &Session) {
@@ -553,6 +567,14 @@ impl Engine {
             Err(e) if in_multi => return self.multi_reject(session.id, &name, e),
             Err(e) => return e,
         };
+        // Commands flagged no_auth (AUTH, HELLO, QUIT, RESET) work before
+        // authenticating; everything else is refused. Unknown commands and bad
+        // arity were already reported above, as in Redis.
+        let no_auth = command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("no_auth"));
+        if !no_auth && self.auth_required(session.id) {
+            let e = Value::err("NOAUTH Authentication required.");
+            return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
+        }
         let now = self.now();
         let client = self.clients.get_mut(&session.id).unwrap();
         client.last_interaction = now;
