@@ -192,3 +192,15 @@ auditing, `$currentOp`/profiler/`serverStatus` performance metrics.
 3. Aggregation P0 stages; driver matrix green.
 4. Auth (SCRAM), streaming hello; `mongodb` in default features.
 5. P1: transactions, change streams, validation, GridFS.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Sharding commands, replica-set management (`replSetInitiate`,
+  `replSetGetStatus`, `replSetReconfig`...), users and roles commands,
+  auditing, `$currentOp`, backup-oriented commands.
+- The single-node replica-set facade exists only in `hello` (and the
+  `topologyVersion` machinery) so transactions and change streams work.

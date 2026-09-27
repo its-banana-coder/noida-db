@@ -203,3 +203,13 @@ simple processors later), `_nodes/stats`/`_stats` performance metrics
 4. Scroll/PIT, templates, aliases, `_cat`/`_cluster`; client matrix green;
    `elasticsearch` in default features.
 5. P1 items.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Snapshots and repositories (`_snapshot`), ILM and data streams,
+  cross-cluster search, shard allocation and reroute, security APIs (users,
+  roles, API keys), `_nodes/stats` and other node-level performance metrics.

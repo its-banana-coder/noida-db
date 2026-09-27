@@ -46,24 +46,30 @@ Every service is its own module:
 
 ## Rules for every system
 
-- **Every command and API works.** Where a feature makes no sense on one local
-  node (clustering, replication, sharding), noida replies exactly as a
-  standalone real server would. That counts as compatible.
+- **Every command and API a developer uses locally works.** Production-only
+  operations are out of scope and answer as *unknown*, not as stubs: no
+  replication, clustering, sharding, sentinel/HA/failover, backup/restore/
+  migration (DUMP/RESTORE/MIGRATE, snapshots), or multi-user security
+  management. See "Scope filter" in `docs/specs/README.md`.
 - **No performance analysis.** noida never implements EXPLAIN ANALYZE,
   SLOWLOG, LATENCY, profilers or query statistics. Where clients or tools may
   send these, noida accepts them and returns an empty or minimal reply so
   nothing breaks.
-- **Not in scope:** real clustering, replication, high availability,
-  performance tuning, plugins and extensions.
+- **Not in scope:** clustering, replication, sharding, sentinel, high
+  availability, failover, backup/restore/migration, performance tuning,
+  plugins and extensions.
 
 ## Per system
 
 ### Redis (port 6379), target Redis 7.2
 - **In scope:** all 242 commands and their subcommands
   (`tests/data/redis-7.2-commands.txt`, tracked by a coverage test), RESP2
-  and RESP3, Lua scripting and functions. Cluster, replication and Sentinel
-  commands reply as a standalone Redis does.
-- **Out of scope:** modules (RedisJSON, RediSearch).
+  and RESP3, Lua scripting and functions.
+- **Out of scope:** modules (RedisJSON, RediSearch), and the production-only
+  commands `DUMP` `RESTORE` `RESTORE-ASKING` `MIGRATE` `PSYNC` `SYNC`
+  `REPLCONF` `REPLICAOF` `SLAVEOF` `ROLE` `WAIT` `WAITAOF` `FAILOVER`
+  `SENTINEL` `CLUSTER` `ASKING` `READONLY` `READWRITE` `DEBUG` `SHUTDOWN`
+  `PFDEBUG` `PFSELFTEST` `LOLWUT`; they answer as unknown commands.
 
 ### Postgres (port 5432)
 - **In scope:**
@@ -82,7 +88,7 @@ Every service is its own module:
 ### Kafka (port 9092, native binary protocol)
 - **In scope:**
   - Every API key a single-node KRaft broker advertises in ApiVersions:
-    produce, fetch, offsets, topic and config admin, ACLs.
+    produce, fetch, offsets, topic and config admin.
   - Full consumer groups: join, sync, heartbeat, offset commit and fetch.
   - Idempotent producers, transactions and exactly-once.
   - Spring Kafka and Kafka Streams.

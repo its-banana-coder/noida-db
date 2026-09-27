@@ -239,3 +239,13 @@ Play UI, MySQL/Postgres wire compatibility ports of ClickHouse itself.
    `clickhouse` in default features.
 4. Native TCP protocol; clickhouse-go and clickhouse-driver pass.
 5. P1 items.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- `BACKUP`/`RESTORE`, Keeper/ZooKeeper, replicated engines beyond being
+  accepted as plain MergeTree, distributed tables and `ON CLUSTER`
+  (accepted and ignored), user/role/quota/settings-profile management.

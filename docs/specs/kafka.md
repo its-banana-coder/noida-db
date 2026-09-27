@@ -154,3 +154,15 @@ KRaft controller quorum behaviour.
 3. Consumer groups; scenario (b) passes with 2 Java consumers.
 4. Diff suite for P0 green in CI; `kafka` in default features.
 5. P1: configs, transactions, Kafka Streams.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- ACL APIs (DescribeAcls, CreateAcls, DeleteAcls), SCRAM, quotas APIs.
+- KRaft controller and quorum APIs, DescribeLogDirs, replica-management and
+  reassignment APIs, MirrorMaker.
+- APIs that clients call automatically (for example OffsetForLeaderEpoch)
+  still reply, with single-broker answers.

@@ -166,3 +166,14 @@ policies and operator policies (P2: accept and store), memory/disk alarms
    priority, exclusive/auto-delete; client matrix green.
 4. Management API P0; `rabbitmq` in default features.
 5. P1: direct reply-to, quorum args, definitions import/export, Celery.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- Clustering, federation, shovel, policies and operator policies, quorum and
+  stream queue *implementations* (arguments accepted, behave as classic
+  queues), user/permission management (read-only listings only),
+  memory/disk alarms.
