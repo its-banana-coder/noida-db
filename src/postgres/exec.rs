@@ -528,9 +528,15 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             Value::text(v)
         }
         "pg_get_expr" => a[0].clone(),
-        "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible" => {
-            Value::Bool(true)
-        }
+        "pg_table_is_visible"
+        | "pg_type_is_visible"
+        | "pg_function_is_visible"
+        | "pg_collation_is_visible"
+        | "pg_operator_is_visible"
+        | "pg_opclass_is_visible"
+        | "pg_conversion_is_visible"
+        | "pg_ts_config_is_visible"
+        | "pg_ts_dict_is_visible" => Value::Bool(true),
         "pg_get_userbyid" => Value::text(ctx.rt.user.clone()),
         "pg_encoding_to_char" => Value::text("UTF8"),
         "pg_char_to_encoding" => Value::Int(6),

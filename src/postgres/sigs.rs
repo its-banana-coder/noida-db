@@ -123,6 +123,7 @@ s:generate_series(timestamp,timestamp,interval)timestamp s:generate_series(times
 pg_backend_pid()int4 pg_typeof(any)regtype
 !pg_get_expr(pg_node_tree,oid)text !pg_get_expr(pg_node_tree,oid,bool)text pg_get_expr(text,oid)text pg_get_expr(text,oid,bool)text
 pg_table_is_visible(oid)bool pg_type_is_visible(oid)bool pg_function_is_visible(oid)bool
+pg_collation_is_visible(oid)bool pg_operator_is_visible(oid)bool pg_opclass_is_visible(oid)bool pg_conversion_is_visible(oid)bool pg_ts_config_is_visible(oid)bool pg_ts_dict_is_visible(oid)bool
 has_table_privilege(text,text)bool has_table_privilege(oid,text)bool has_table_privilege(text,text,text)bool has_table_privilege(name,oid,text)bool
 has_schema_privilege(text,text)bool has_schema_privilege(text,text,text)bool has_schema_privilege(oid,text)bool has_schema_privilege(name,oid,text)bool
 has_database_privilege(text,text)bool has_database_privilege(text,text,text)bool has_column_privilege(text,text,text)bool has_column_privilege(oid,int2,text)bool
