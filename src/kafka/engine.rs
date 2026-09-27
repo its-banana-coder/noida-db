@@ -464,6 +464,15 @@ impl EngineState {
                         if let Some(records) = &partition.records {
                             // Check if this is a Kafka record batch v2
                             let is_batch_v2 = records.len() >= 61 && records[16] == 2;
+                            // `lastOffsetDelta` = number of records in the batch minus
+                            // one; every batch (idempotent or not) needs it to advance
+                            // the high watermark by the right amount, not just to track
+                            // idempotent producer sequences.
+                            let last_offset_delta_v2 = if is_batch_v2 {
+                                i32::from_be_bytes(records[23..27].try_into().unwrap())
+                            } else {
+                                -1
+                            };
                             if is_batch_v2 {
                                 let producer_id =
                                     i64::from_be_bytes(records[43..51].try_into().unwrap());
@@ -471,8 +480,7 @@ impl EngineState {
                                     i16::from_be_bytes(records[51..53].try_into().unwrap());
                                 let base_sequence =
                                     i32::from_be_bytes(records[53..57].try_into().unwrap());
-                                let last_offset_delta =
-                                    i32::from_be_bytes(records[23..27].try_into().unwrap());
+                                let last_offset_delta = last_offset_delta_v2;
 
                                 if producer_id >= 0 {
                                     if let Some(&(last_seq, prev_base_offset)) =
@@ -498,37 +506,35 @@ impl EngineState {
                                         continue;
                                     }
 
-                                    let base_offset = part_state.high_watermark;
-                                    let mut batch_bytes = records.to_vec();
-                                    if batch_bytes.len() >= 8 {
-                                        batch_bytes[0..8]
-                                            .copy_from_slice(&base_offset.to_be_bytes());
-                                    }
-                                    part_state.record_batches.push(batch_bytes);
                                     let last_seq = base_sequence + last_offset_delta;
                                     part_state.producer_seqs.insert(
                                         (producer_id, producer_epoch),
-                                        (last_seq, base_offset),
+                                        (last_seq, part_state.high_watermark),
                                     );
-                                    let delta = if last_offset_delta >= 0 {
-                                        last_offset_delta as i64 + 1
-                                    } else {
-                                        1
-                                    };
-                                    part_state.high_watermark += delta;
-
-                                    part_res.error_code = 0;
-                                    part_res.base_offset = base_offset;
-                                    part_res.log_append_time_ms = now;
-                                    topic_res.partition_responses.push(part_res);
-                                    continue;
                                 }
                             }
 
-                            // Non-idempotent or raw payload
+                            // A record batch (v2) carries `last_offset_delta` =
+                            // number of records in it minus one; every record
+                            // in the batch gets its own offset, so the log's
+                            // high watermark must advance by the record count,
+                            // not by one per Produce call. Getting this wrong
+                            // silently drops every record in a batch after the
+                            // first whenever a producer batches more than one
+                            // record per partition (the common case, not just
+                            // an idempotent-producer edge case).
+                            let delta = if is_batch_v2 && last_offset_delta_v2 >= 0 {
+                                last_offset_delta_v2 as i64 + 1
+                            } else {
+                                1
+                            };
                             let base_offset = part_state.high_watermark;
-                            part_state.record_batches.push(records.to_vec());
-                            part_state.high_watermark += 1;
+                            let mut batch_bytes = records.to_vec();
+                            if is_batch_v2 && batch_bytes.len() >= 8 {
+                                batch_bytes[0..8].copy_from_slice(&base_offset.to_be_bytes());
+                            }
+                            part_state.record_batches.push(batch_bytes);
+                            part_state.high_watermark += delta;
 
                             part_res.error_code = 0;
                             part_res.base_offset = base_offset;

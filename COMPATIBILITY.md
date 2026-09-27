@@ -92,9 +92,12 @@ Every service is its own module:
   order they were declared in (`<`, `ORDER BY`, `min`/`max`).
 - **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
   migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
-  `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported.
-  Replication, backup and physical/logical streaming are not implemented and
-  do not work: a connection with the `replication` startup parameter is
+  `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported
+  (all performance-analysis tooling is by design, not a gap — see "Scope
+  filter" in `docs/specs/README.md`).
+  Replication (streaming, logical, master/slave, primary/replica — whatever
+  it's called), backup and physical/logical streaming are not implemented
+  and do not work: a connection with the `replication` startup parameter is
   treated as an ordinary connection, so replication commands and
   `pg_basebackup`/`pg_recvlogical` will not function.
 
