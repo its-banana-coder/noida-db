@@ -11,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use std::io::{Read, Write};
+use std::sync::Mutex;
 
 use postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -609,8 +610,16 @@ fn describe(client: &mut Client, sql: &str) -> Option<Vec<String>> {
     Some(stmt.columns().iter().map(|c| c.type_().name().to_string()).collect())
 }
 
+/// Both #[test] fns below may talk to the SAME external reference server
+/// (NOIDA_POSTGRES_REF, in CI): cargo runs test functions concurrently by
+/// default, and one test's schema-wide reset would otherwise be able to
+/// drop the table another test is mid-COPY into. This makes the two take
+/// turns.
+static REF_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn differential() {
+    let _guard = REF_LOCK.lock().unwrap();
     main_test_body();
     let Some(mut reference) = reference() else {
         println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
@@ -717,6 +726,7 @@ fn directives(raw: &str) -> (&str, bool, u32) {
 /// jsonb, and both directions, byte-for-byte against a real server.
 #[test]
 fn copy_matches_real_postgres() {
+    let _guard = REF_LOCK.lock().unwrap();
     let Some(mut reference) = reference() else {
         println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
         return;
