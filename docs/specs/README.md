@@ -78,6 +78,47 @@ transactions and change streams work; Kafka advertises one broker.
 Litmus test: *would a developer on a laptop use this while building or
 debugging an app?* If not, skip it.
 
+## Reuse before you build
+
+Re-inventing costs time and adds bugs. Before writing any non-trivial
+component (a protocol codec, parser, algorithm, data structure, function
+library, catalog of built-ins), **search GitHub and crates.io for an existing
+implementation and use it**:
+
+1. **Use a maintained Rust crate** if it fits: check the licence, `cargo tree`
+   for what it drags in, and the binary-size cost with `scripts/check-size.sh`.
+2. **Otherwise port a reference implementation to Rust**: the real server's own
+   source, or a good open-source project in C, Go or Java. Keep behaviour
+   identical, and cite the upstream file and version in the module doc
+   (`//! Ported from redis/src/sort.c, 7.2`).
+3. **Write from scratch only if nothing suitable exists.** Say in the pull
+   request what you searched and why it didn't fit.
+
+The differential tests against the real server are what make porting safe:
+port, then compare.
+
+**Licences matter.** noida is MIT. Port or copy only code under a permissive
+licence (MIT, Apache-2.0, BSD, ISC, PostgreSQL). Never copy GPL, AGPL, SSPL,
+Elastic-licence or RSAL code. Record every ported source in `THIRD_PARTY.md`
+with its licence, keeping the upstream copyright notice. Verify the licence
+of the exact version you read; these change between releases. What we know:
+
+| Project | Source you may port from | Avoid |
+|---|---|---|
+| Redis | 7.2 and earlier (BSD-3-Clause) | 7.4 and later (RSAL/SSPL, later AGPL) |
+| PostgreSQL | any version (PostgreSQL licence) | |
+| Kafka | Apache-2.0 | |
+| Memcached | BSD-3-Clause | |
+| ClickHouse | Apache-2.0 | |
+| Elasticsearch | 7.10 and earlier (Apache-2.0); Lucene (Apache-2.0) | 7.11 and later (SSPL/Elastic licence) |
+| RabbitMQ | check each file's header (MPL-2.0 is file-level copyleft; prefer Apache-2.0 client libraries) | |
+| MySQL | | server source is GPL: use protocol documentation, MIT/Apache crates (for example `opensrv-mysql`) and client behaviour instead |
+| MongoDB | drivers and `bson` (Apache-2.0) | server source is SSPL: use the public wire-protocol docs and driver behaviour |
+
+Behaviour is not copyrightable: reading how a real server responds and writing
+your own code that behaves the same is always allowed. What is restricted is
+copying source.
+
 ## Working agreement
 
 - Branch `svc/<service>` from the latest `main`. Push often; CI runs on

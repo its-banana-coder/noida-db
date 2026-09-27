@@ -60,3 +60,10 @@ the log shows how many results were compared.
 `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
 `cargo build --no-default-features`, `scripts/check-size.sh`. Commit messages
 end with the Co-Authored-By line used in this repo.
+
+## Reuse before you build
+
+Search GitHub and crates.io for an existing implementation first. Use a crate,
+or port the reference implementation to Rust (citing it in the module doc and
+in `THIRD_PARTY.md`), and only write from scratch when nothing suitable exists.
+Check the licence first. See "Reuse before you build" in `docs/specs/README.md`.
