@@ -28,6 +28,7 @@ pub(crate) mod scripting;
 pub mod server;
 mod sets;
 mod sha1;
+mod sort;
 mod streams;
 mod strings;
 #[cfg(test)]
