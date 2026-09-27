@@ -84,6 +84,10 @@ Every service is its own module:
     Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
 - **Out of scope (for now):** PL/pgSQL and stored procedures, extensions,
   logical replication. Concurrency is one writer at a time.
+- **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
+  migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
+  `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported.
+  Replication, backup and physical/logical streaming are not implemented.
 
 ### Kafka (port 9092, native binary protocol)
 - **In scope:**
