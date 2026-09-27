@@ -653,9 +653,29 @@ fn differential() {
 
 fn reset(client: &mut Client) {
     let _ = client.simple_query("ROLLBACK");
-    let _ = client.simple_query(
-        "DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public; RESET ALL",
-    );
+    // Drop every schema a script may have created, not just a hardcoded
+    // name: the reference server (NOIDA_POSTGRES_REF) is one long-lived
+    // process shared by every test binary in a CI job, and by this test's
+    // own multiple invocations against a local server, so anything a script
+    // leaves behind must not leak into the next one.
+    if let Ok(rows) = client.query(
+        "SELECT nspname FROM pg_namespace WHERE nspname !~ '^pg_' AND nspname NOT IN ('information_schema', 'public')",
+        &[],
+    ) {
+        for row in rows {
+            let name: String = row.get(0);
+            let _ = client.simple_query(&format!(
+                "DROP SCHEMA IF EXISTS {} CASCADE",
+                quote_ident(&name)
+            ));
+        }
+    }
+    let _ = client.simple_query("DROP SCHEMA public CASCADE; CREATE SCHEMA public; RESET ALL");
+}
+
+/// Double-quotes an identifier the way Postgres would need it.
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
 }
 
 /// Strips `!` (run but don't compare) and `@NN` (minimum server version).
