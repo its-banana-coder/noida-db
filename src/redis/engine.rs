@@ -8,8 +8,8 @@ use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
 use super::{
-    admin, bitops, config, connection, geo, hashes, keys, lists, multi, pubsub, scripting, sets,
-    streams, strings, zsets,
+    admin, bitops, config, connection, devtools, geo, hashes, keys, lists, multi, pubsub,
+    scripting, sets, streams, strings, zsets,
 };
 
 /// Milliseconds since the Unix epoch. Injected so tests control time.
@@ -259,6 +259,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
     connection::COMMANDS
         .iter()
         .chain(admin::COMMANDS)
+        .chain(devtools::COMMANDS)
         .chain(keys::COMMANDS)
         .chain(strings::COMMANDS)
         .chain(hashes::COMMANDS)

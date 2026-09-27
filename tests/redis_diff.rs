@@ -2089,6 +2089,45 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "EVAL return(error('boom')) 0",
         ],
     ),
+    // Dev-tool probes: the logs are empty on a fresh server.
+    (
+        (6, 0),
+        &[
+            "SLOWLOG RESET",
+            "SLOWLOG LEN",
+            "SLOWLOG GET",
+            "SLOWLOG GET 5",
+            "LATENCY LATEST",
+            "LATENCY HISTORY x",
+            "LATENCY GRAPH x",
+            "LATENCY RESET",
+            "@7.0 LATENCY DOCTOR",
+            "MODULE LIST",
+            "MEMORY USAGE nokey",
+            "MEMORY PURGE",
+            "MEMORY DOCTOR",
+        ],
+    ),
+    (
+        (7, 0),
+        &[
+            "SLOWLOG GET -2",
+            "SLOWLOG GET x",
+            "MEMORY USAGE nokey SAMPLES -1",
+            "MEMORY USAGE nokey FOO 1",
+            "ACL WHOAMI",
+            "ACL USERS",
+            "ACL LIST",
+            "ACL GETUSER default",
+            "ACL GETUSER nobody",
+            "ACL CAT",
+            "~ACL CAT string",
+            "ACL CAT nosuch",
+            "ACL LOG",
+            "ACL GENPASS 0",
+            "ACL GENPASS x",
+        ],
+    ),
 ];
 
 fn parse_version(v: &str) -> (u32, u32) {

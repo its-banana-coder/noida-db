@@ -8,6 +8,7 @@ mod command_meta;
 mod config;
 mod config_table;
 mod connection;
+mod devtools;
 mod double;
 mod engine;
 mod geo;

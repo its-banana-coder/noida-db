@@ -4,6 +4,7 @@
 mod bitops;
 mod config;
 mod connection;
+mod devtools;
 mod geo;
 mod hashes;
 mod introspection;

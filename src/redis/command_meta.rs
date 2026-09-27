@@ -130,6 +130,11 @@ const ACL_ORDER: &[&str] = &[
     "scripting",
 ];
 
+/// Names of the ACL categories, in Redis's table order.
+pub fn acl_category_names() -> &'static [&'static str] {
+    ACL_ORDER
+}
+
 /// Key-spec flags: (generated name, reported name), in report order.
 const KEY_FLAG_ORDER: &[(&str, &str)] = &[
     ("ro", "RO"),

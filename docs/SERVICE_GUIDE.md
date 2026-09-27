@@ -60,3 +60,9 @@ the log shows how many results were compared.
 `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
 `cargo build --no-default-features`, `scripts/check-size.sh`. Commit messages
 end with the Co-Authored-By line used in this repo.
+
+## Say what doesn't work
+
+Update your service's section in `docs/LIMITATIONS.md` in every PR: what is
+not built yet, what is out of scope, and where behaviour knowingly differs
+from the real server. Users trust the tool more when its gaps are written down.
