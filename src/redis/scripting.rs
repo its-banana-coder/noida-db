@@ -479,7 +479,9 @@ fn do_call(lua: &Lua, ctx: &mut Ctx, args: Variadic<Lv>, read_only: bool, resp: 
         return fail(lua, "Write commands are not allowed from read-only scripts.");
     }
     let Ctx { engine, session, .. } = ctx;
+    engine.lua_calls += 1;
     let reply = engine.call(session, handler, &argv, true, None);
+    engine.lua_calls -= 1;
     reply_to_lua(lua, &reply, resp)
 }
 

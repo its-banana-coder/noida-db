@@ -246,6 +246,9 @@ fn client_id(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 /// performance analysis.
 fn info_line(c: &Client, now: u64) -> String {
     let mut flags = String::new();
+    if c.monitor {
+        flags.push('O');
+    }
     if c.subs.active() {
         flags.push('P');
     }

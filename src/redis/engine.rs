@@ -8,7 +8,7 @@ use super::command_meta::{self, CommandMeta};
 use super::ordered::OrderedMap;
 use super::resp::Value;
 use super::{
-    admin, bitops, config, connection, devtools, geo, hashes, keys, lists, multi, pubsub,
+    admin, bitops, config, connection, devtools, geo, hashes, keys, lists, monitor, multi, pubsub,
     scripting, sets, streams, strings, zsets,
 };
 
@@ -177,6 +177,8 @@ pub struct Client {
     pub last_cmd: Option<String>,
     pub no_evict: bool,
     pub no_touch: bool,
+    /// In MONITOR mode.
+    pub monitor: bool,
     pub reply_off: bool,
     reply_skip: bool,
     pub reply_skip_next: bool,
@@ -229,6 +231,10 @@ pub struct Engine {
     pub(crate) watchers: HashMap<(usize, Vec<u8>), Vec<u64>>,
     pub(crate) pubsub: super::pubsub::PubSub,
     pub(crate) config: super::config::Config,
+    /// Clients in MONITOR mode.
+    pub(crate) monitors: Vec<u64>,
+    /// Depth of script-issued calls (monitors show those as `lua`).
+    pub(crate) lua_calls: u32,
     next_client_id: u64,
     clock: Clock,
     rng: u64,
@@ -260,6 +266,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .iter()
         .chain(admin::COMMANDS)
         .chain(devtools::COMMANDS)
+        .chain(monitor::COMMANDS)
         .chain(keys::COMMANDS)
         .chain(strings::COMMANDS)
         .chain(hashes::COMMANDS)
@@ -443,6 +450,8 @@ impl Engine {
             watchers: HashMap::new(),
             pubsub: Default::default(),
             config: Default::default(),
+            monitors: Vec::new(),
+            lua_calls: 0,
             next_client_id: 1,
             clock,
             rng: now | 1,
@@ -479,6 +488,7 @@ impl Engine {
                 last_cmd: None,
                 no_evict: false,
                 no_touch: false,
+                monitor: false,
                 reply_off: false,
                 reply_skip: false,
                 reply_skip_next: false,
@@ -503,6 +513,7 @@ impl Engine {
         self.unblock(id);
         self.unwatch_all(id);
         self.unsubscribe_everything(id);
+        self.monitors.retain(|m| *m != id);
         self.replies.remove(&id);
         self.clients.remove(&id)
     }
@@ -583,6 +594,15 @@ impl Engine {
         let now = self.now();
         let db = self.clients.get(&session.id).map_or(0, |c| c.db);
         let before = self.watch_snapshot(args, db);
+        // A command retried after being unblocked is not shown a second time.
+        let feed = if reprocess_deadline.is_none() && !self.monitors.is_empty() {
+            super::monitor::feed_mode(args)
+        } else {
+            super::monitor::Feed::Never
+        };
+        if feed == super::monitor::Feed::Before {
+            self.feed_monitors(session.id, args);
+        }
         let mut ctx = Ctx {
             engine: self,
             session,
@@ -595,7 +615,11 @@ impl Engine {
         let reply = match handler(&mut ctx, args) {
             Ok(v) | Err(v) => v,
         };
-        if let Some(req) = ctx.block.take() {
+        let block = ctx.block.take();
+        if feed == super::monitor::Feed::After {
+            self.feed_monitors(session.id, args);
+        }
+        if let Some(req) = block {
             self.block_client(session, req, args);
             return Value::NoReply;
         }

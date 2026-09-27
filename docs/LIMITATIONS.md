@@ -36,7 +36,7 @@ answer as *unknown*.
 ## Redis
 
 Target: Redis 7.2 behaviour, RESP2 and RESP3. Of Redis 7.2's 242 commands,
-211 are implemented, 22 are out of scope (below) and 9 are not built yet (as of
+212 are implemented, 22 are out of scope (below) and 8 are not built yet (as of
 this writing; `cargo test --test redis_coverage -- --nocapture` prints the
 current count).
 
@@ -58,7 +58,6 @@ current count).
 - `PFADD` `PFCOUNT` `PFMERGE` (HyperLogLog).
 - `FUNCTION` `FCALL` `FCALL_RO` (Redis Functions). `EVAL`/`EVALSHA`/`SCRIPT`
   work.
-- `MONITOR`.
 - Keyspace notifications: `notify-keyspace-events` can be set, but no
   `__keyspace@*__` / `__keyevent@*__` messages are published, so apps that
   listen for expired-key events see nothing.

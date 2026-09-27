@@ -9,6 +9,7 @@ mod geo;
 mod hashes;
 mod introspection;
 mod lists;
+mod monitor;
 mod multi;
 mod pubsub;
 mod scripting;
