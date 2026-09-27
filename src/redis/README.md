@@ -1,8 +1,7 @@
 # Redis in noida
 
 A Redis-compatible server on port **6379** (RESP2 and RESP3), targeting
-**Redis 7.2**. Real clients (redis-rs today; see "Not tested yet") work
-unchanged.
+**Redis 7.2**. Real clients work unchanged (see "Client coverage").
 
 ```
 noida start --only redis            # just Redis
@@ -72,11 +71,17 @@ noida is a local development tool. These commands answer as *unknown command*.
 - `PFCOUNT` on a hand-corrupted HyperLogLog follows 7.2 (it reports the
   corruption); Redis 6.x overran its register array.
 
-### Not tested yet
+### Client coverage
 
-Only the `redis-rs` client is exercised against noida. Jedis, Lettuce, redis-py,
-ioredis, Spring Data Redis, Redisson and script-heavy libraries (BullMQ,
-Sidekiq, Celery) are not, so client-specific gaps may exist.
+Tested against noida-db, each over RESP2 and RESP3 (`tests/clients/redis/run.sh`):
+**redis-py** (84 checks) and **ioredis** (56 checks), plus `redis-rs` in
+`tests/redis_client.rs`. The checks cover strings, hashes, lists, sets, sorted
+sets, `SCAN`, pipelines, `MULTI`/`WATCH`, Lua scripts, pub/sub, streams and
+consumer groups, HyperLogLog, `SORT`, geo, bitmaps, errors, binary data and
+blocking pops.
+
+Not tried yet: Jedis, Lettuce, Spring Data Redis, Redisson, and script-heavy
+libraries (BullMQ, Sidekiq, Celery), so client-specific gaps may exist there.
 
 ## How it is verified
 
@@ -91,8 +96,8 @@ the real thing:
    skipping lines that need a newer version. Examples: HyperLogLog is compared
    on 511 commands including the raw stored bytes; `MONITOR` output is
    compared line by line.
-3. **Real-client tests** (`tests/redis_client.rs`): the `redis` crate over TCP,
-   RESP2 and RESP3.
+3. **Real-client tests** (`tests/redis_client.rs`, `tests/clients/redis/`):
+   the `redis` crate, redis-py and ioredis over TCP, RESP2 and RESP3.
 
 `tests/redis_coverage.rs` fails if the implemented count ever drops, and
 lists out-of-scope commands explicitly.

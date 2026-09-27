@@ -39,3 +39,5 @@ jobs:
       # Modularity: the binary must build with any service set, even none.
       - run: cargo build --no-default-features
       - run: scripts/check-size.sh
+      # Real Redis client libraries (redis-py, ioredis) against the server.
+      - run: tests/clients/redis/run.sh
