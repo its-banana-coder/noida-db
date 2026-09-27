@@ -87,7 +87,10 @@ Every service is its own module:
 - **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
   migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
   `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported.
-  Replication, backup and physical/logical streaming are not implemented.
+  Replication, backup and physical/logical streaming are not implemented and
+  do not work: a connection with the `replication` startup parameter is
+  treated as an ordinary connection, so replication commands and
+  `pg_basebackup`/`pg_recvlogical` will not function.
 
 ### Kafka (port 9092, native binary protocol)
 - **In scope:**
