@@ -2,6 +2,12 @@
 //! one fixed order and has no `ALTER SEQUENCE` at all, while Postgres takes
 //! them in any order, so these two statements are parsed here.
 //!
+//! Written from scratch: sqlparser 0.63 (checked) has no `ALTER SEQUENCE` and
+//! fixes the `CREATE SEQUENCE` option order, and no other Rust crate parses
+//! Postgres DDL. The grammar follows PostgreSQL's `CREATE/ALTER SEQUENCE`
+//! documentation and is checked against a real server in
+//! `tests/postgres_diff.rs`; no upstream source was copied.
+//!
 //! `parse_sql` turns each one into `CALL noida_seq_ddl('<its text>')` so it
 //! travels through the engine like any other statement; the engine reparses
 //! the text with [`parse`] when it runs it.
