@@ -183,4 +183,86 @@ fn test_kafka_milestone_1_and_2() {
         &del_topics_req,
     );
     assert_eq!(del_topics_resp.responses[0].error_code, 0);
+
+    // 10. FindCoordinator
+    let mut find_coord_req = kafka_protocol::messages::FindCoordinatorRequest::default();
+    find_coord_req.key = StrBytes::from_string("test-consumer-group".to_string());
+
+    let find_coord_resp: kafka_protocol::messages::FindCoordinatorResponse = send_request(
+        &mut stream,
+        ApiKey::FindCoordinator,
+        3,
+        10,
+        Some("test-client"),
+        &find_coord_req,
+    );
+    assert_eq!(find_coord_resp.error_code, 0);
+
+    // 11. JoinGroup
+    let mut join_req = kafka_protocol::messages::JoinGroupRequest::default();
+    join_req.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
+    join_req.protocol_type = StrBytes::from_string("consumer".to_string());
+
+    let join_resp: kafka_protocol::messages::JoinGroupResponse = send_request(
+        &mut stream,
+        ApiKey::JoinGroup,
+        5,
+        11,
+        Some("test-client"),
+        &join_req,
+    );
+    assert_eq!(join_resp.error_code, 0);
+
+    // 12. SyncGroup
+    let mut sync_req = kafka_protocol::messages::SyncGroupRequest::default();
+    sync_req.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
+    sync_req.member_id = join_resp.member_id;
+
+    let sync_resp: kafka_protocol::messages::SyncGroupResponse = send_request(
+        &mut stream,
+        ApiKey::SyncGroup,
+        3,
+        12,
+        Some("test-client"),
+        &sync_req,
+    );
+    assert_eq!(sync_resp.error_code, 0);
+
+    // 13. OffsetCommit & OffsetFetch
+    let mut commit_req = kafka_protocol::messages::OffsetCommitRequest::default();
+    commit_req.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
+    let mut oc_topic = kafka_protocol::messages::offset_commit_request::OffsetCommitRequestTopic::default();
+    oc_topic.name = topic_name.clone();
+    let mut oc_part = kafka_protocol::messages::offset_commit_request::OffsetCommitRequestPartition::default();
+    oc_part.partition_index = 0;
+    oc_part.committed_offset = 42;
+    oc_topic.partitions.push(oc_part);
+    commit_req.topics.push(oc_topic);
+
+    let commit_resp: kafka_protocol::messages::OffsetCommitResponse = send_request(
+        &mut stream,
+        ApiKey::OffsetCommit,
+        5,
+        13,
+        Some("test-client"),
+        &commit_req,
+    );
+    assert_eq!(commit_resp.topics[0].partitions[0].error_code, 0);
+
+    let mut fetch_off_req = kafka_protocol::messages::OffsetFetchRequest::default();
+    fetch_off_req.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
+    let mut of_topic = kafka_protocol::messages::offset_fetch_request::OffsetFetchRequestTopic::default();
+    of_topic.name = topic_name.clone();
+    of_topic.partition_indexes.push(0);
+    fetch_off_req.topics = Some(vec![of_topic]);
+
+    let fetch_off_resp: kafka_protocol::messages::OffsetFetchResponse = send_request(
+        &mut stream,
+        ApiKey::OffsetFetch,
+        5,
+        14,
+        Some("test-client"),
+        &fetch_off_req,
+    );
+    assert_eq!(fetch_off_resp.topics[0].partitions[0].committed_offset, 42);
 }

@@ -58,6 +58,8 @@ pub struct EngineState {
     pub port: i32,
     pub cluster_id: String,
     pub next_producer_id: i64,
+    // (group_id, topic_name, partition) -> offset
+    pub committed_offsets: HashMap<(String, String, i32), i64>,
 }
 
 impl EngineState {
@@ -70,6 +72,7 @@ impl EngineState {
             // Stable base64 UUID style string for cluster id
             cluster_id: "MkU3OEVBNTctOEUyRi00".to_string(),
             next_producer_id: 1000,
+            committed_offsets: HashMap::new(),
         }
     }
 
@@ -81,6 +84,13 @@ impl EngineState {
             (ApiKey::Fetch, 0, 13),
             (ApiKey::ListOffsets, 0, 8),
             (ApiKey::Metadata, 0, 12),
+            (ApiKey::OffsetCommit, 0, 8),
+            (ApiKey::OffsetFetch, 0, 8),
+            (ApiKey::FindCoordinator, 0, 4),
+            (ApiKey::JoinGroup, 0, 7),
+            (ApiKey::Heartbeat, 0, 4),
+            (ApiKey::LeaveGroup, 0, 5),
+            (ApiKey::SyncGroup, 0, 5),
             (ApiKey::ApiVersions, 0, 3),
             (ApiKey::CreateTopics, 0, 7),
             (ApiKey::DeleteTopics, 0, 6),
@@ -409,6 +419,167 @@ impl EngineState {
 
         res
     }
+
+    pub fn handle_find_coordinator(
+        &self,
+        _req: &kafka_protocol::messages::FindCoordinatorRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::FindCoordinatorResponse {
+        let mut res = kafka_protocol::messages::FindCoordinatorResponse::default();
+        res.node_id = kafka_protocol::messages::BrokerId(self.broker_id);
+        res.host = StrBytes::from_string(self.host.clone());
+        res.port = self.port;
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_join_group(
+        &self,
+        req: &kafka_protocol::messages::JoinGroupRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::JoinGroupResponse {
+        use kafka_protocol::messages::join_group_response::JoinGroupResponseMember;
+        let mut res = kafka_protocol::messages::JoinGroupResponse::default();
+
+        let member_id = if req.member_id.is_empty() {
+            format!("noida-client-{}", uuid_simple())
+        } else {
+            req.member_id.as_str().to_string()
+        };
+
+        res.error_code = 0;
+        res.generation_id = 1;
+        res.protocol_name = req.protocols.first().map(|p| p.name.clone());
+        res.leader = StrBytes::from_string(member_id.clone());
+        res.member_id = StrBytes::from_string(member_id.clone());
+
+        let mut member = JoinGroupResponseMember::default();
+        member.member_id = StrBytes::from_string(member_id);
+        if let Some(first_protocol) = req.protocols.first() {
+            member.metadata = first_protocol.metadata.clone();
+        }
+        res.members.push(member);
+
+        res
+    }
+
+    pub fn handle_sync_group(
+        &self,
+        req: &kafka_protocol::messages::SyncGroupRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::SyncGroupResponse {
+        let mut res = kafka_protocol::messages::SyncGroupResponse::default();
+        res.error_code = 0;
+
+        if let Some(assignment) = req.assignments.first() {
+            res.assignment = assignment.assignment.clone();
+        }
+
+        res
+    }
+
+    pub fn handle_heartbeat(
+        &self,
+        _req: &kafka_protocol::messages::HeartbeatRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::HeartbeatResponse {
+        let mut res = kafka_protocol::messages::HeartbeatResponse::default();
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_leave_group(
+        &self,
+        _req: &kafka_protocol::messages::LeaveGroupRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::LeaveGroupResponse {
+        let mut res = kafka_protocol::messages::LeaveGroupResponse::default();
+        res.error_code = 0;
+        res
+    }
+
+    pub fn handle_offset_commit(
+        &mut self,
+        req: &kafka_protocol::messages::OffsetCommitRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::OffsetCommitResponse {
+        use kafka_protocol::messages::offset_commit_response::{
+            OffsetCommitResponsePartition, OffsetCommitResponseTopic,
+        };
+        let mut res = kafka_protocol::messages::OffsetCommitResponse::default();
+        let group_id = req.group_id.as_str().to_string();
+
+        for topic in &req.topics {
+            let mut topic_res = OffsetCommitResponseTopic::default();
+            topic_res.name = topic.name.clone();
+            let topic_name = topic.name.as_str().to_string();
+
+            for part in &topic.partitions {
+                let mut part_res = OffsetCommitResponsePartition::default();
+                part_res.partition_index = part.partition_index;
+
+                self.committed_offsets.insert(
+                    (group_id.clone(), topic_name.clone(), part.partition_index),
+                    part.committed_offset,
+                );
+
+                part_res.error_code = 0;
+                topic_res.partitions.push(part_res);
+            }
+
+            res.topics.push(topic_res);
+        }
+
+        res
+    }
+
+    pub fn handle_offset_fetch(
+        &self,
+        req: &kafka_protocol::messages::OffsetFetchRequest,
+        _version: i16,
+    ) -> kafka_protocol::messages::OffsetFetchResponse {
+        use kafka_protocol::messages::offset_fetch_response::{
+            OffsetFetchResponsePartition, OffsetFetchResponseTopic,
+        };
+        let mut res = kafka_protocol::messages::OffsetFetchResponse::default();
+        let group_id = req.group_id.as_str().to_string();
+
+        if let Some(topics) = &req.topics {
+            for topic in topics {
+                let mut topic_res = OffsetFetchResponseTopic::default();
+                topic_res.name = topic.name.clone();
+                let topic_name = topic.name.as_str().to_string();
+
+                for &partition_index in &topic.partition_indexes {
+                    let mut part_res = OffsetFetchResponsePartition::default();
+                    part_res.partition_index = partition_index;
+
+                    if let Some(&offset) = self.committed_offsets.get(&(
+                        group_id.clone(),
+                        topic_name.clone(),
+                        partition_index,
+                    )) {
+                        part_res.committed_offset = offset;
+                        part_res.error_code = 0;
+                    } else {
+                        part_res.committed_offset = -1;
+                        part_res.error_code = 0;
+                    }
+
+                    topic_res.partitions.push(part_res);
+                }
+
+                res.topics.push(topic_res);
+            }
+        }
+
+        res
+    }
+}
+
+fn uuid_simple() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -475,5 +646,61 @@ impl Engine {
         version: i16,
     ) -> kafka_protocol::messages::CreatePartitionsResponse {
         self.state.lock().unwrap().handle_create_partitions(req, version)
+    }
+
+    pub fn handle_find_coordinator(
+        &self,
+        req: &kafka_protocol::messages::FindCoordinatorRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::FindCoordinatorResponse {
+        self.state.lock().unwrap().handle_find_coordinator(req, version)
+    }
+
+    pub fn handle_join_group(
+        &self,
+        req: &kafka_protocol::messages::JoinGroupRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::JoinGroupResponse {
+        self.state.lock().unwrap().handle_join_group(req, version)
+    }
+
+    pub fn handle_sync_group(
+        &self,
+        req: &kafka_protocol::messages::SyncGroupRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::SyncGroupResponse {
+        self.state.lock().unwrap().handle_sync_group(req, version)
+    }
+
+    pub fn handle_heartbeat(
+        &self,
+        req: &kafka_protocol::messages::HeartbeatRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::HeartbeatResponse {
+        self.state.lock().unwrap().handle_heartbeat(req, version)
+    }
+
+    pub fn handle_leave_group(
+        &self,
+        req: &kafka_protocol::messages::LeaveGroupRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::LeaveGroupResponse {
+        self.state.lock().unwrap().handle_leave_group(req, version)
+    }
+
+    pub fn handle_offset_commit(
+        &self,
+        req: &kafka_protocol::messages::OffsetCommitRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::OffsetCommitResponse {
+        self.state.lock().unwrap().handle_offset_commit(req, version)
+    }
+
+    pub fn handle_offset_fetch(
+        &self,
+        req: &kafka_protocol::messages::OffsetFetchRequest,
+        version: i16,
+    ) -> kafka_protocol::messages::OffsetFetchResponse {
+        self.state.lock().unwrap().handle_offset_fetch(req, version)
     }
 }

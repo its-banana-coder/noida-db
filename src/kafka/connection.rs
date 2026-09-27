@@ -173,6 +173,97 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     header.request_api_version,
                 )
             }
+            ApiKey::FindCoordinator => {
+                let req = match kafka_protocol::messages::FindCoordinatorRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_find_coordinator(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::JoinGroup => {
+                let req = match kafka_protocol::messages::JoinGroupRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_join_group(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::SyncGroup => {
+                let req = match kafka_protocol::messages::SyncGroupRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_sync_group(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::Heartbeat => {
+                let req = match kafka_protocol::messages::HeartbeatRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_heartbeat(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::LeaveGroup => {
+                let req = match kafka_protocol::messages::LeaveGroupRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_leave_group(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::OffsetCommit => {
+                let req = match kafka_protocol::messages::OffsetCommitRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_offset_commit(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::OffsetFetch => {
+                let req = match kafka_protocol::messages::OffsetFetchRequest::decode(&mut buf, header.request_api_version) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let resp = engine.handle_offset_fetch(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
             _ => break,
         };
 
