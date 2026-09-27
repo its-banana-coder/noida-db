@@ -1,0 +1,14 @@
+// Jedis and Lettuce against noida-db. Run through tests/clients/redis/run.sh,
+// which starts the server, sets NOIDA_REDIS_PORT and picks a Gradle cache
+// under target/ (nothing global).
+plugins {
+    id "application"
+}
+repositories { mavenCentral() }
+dependencies {
+    implementation "redis.clients:jedis:5.2.0"
+    implementation "io.lettuce:lettuce-core:6.5.1.RELEASE"
+}
+application {
+    mainClass = System.getProperty("mainClass", "JedisTest")
+}

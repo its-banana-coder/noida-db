@@ -41,7 +41,7 @@ return function (err)
   -- Lua nonexistent-global guard (@protect), which in Redis is a C function.
   local level = 2
   local i = dbg.getinfo(level,'nSl')
-  while i and (i.what == 'C' or i.source == '@protect') do
+  while i and (i.what == 'C' or i.source == '@protect' or i.source == '@wrap_lib') do
     level = level + 1
     i = dbg.getinfo(level,'nSl')
   end
@@ -53,6 +53,31 @@ return function (err)
     if err['line'] == nil then err['line'] = i.currentline end
   end
   return err
+end
+"#;
+
+/// C library functions in Redis fail with `luaL_error`, whose message starts
+/// with the position of the calling Lua function ("user_script:1: ...") and is
+/// a plain string. Errors from our Rust functions arrive as opaque values, so
+/// wrap each function to re-raise them the same way: one level up, which
+/// gives no position when the caller is `pcall`, as in Redis.
+const WRAP_LIB_ERRORS: &str = r#"
+local pcall, tostring, error, type, select, unpack = pcall, tostring, error, type, select, unpack
+local function pack(...) return {n = select('#', ...), ...} end
+return function (lib)
+  for name, f in pairs(lib) do
+    if type(f) == 'function' then
+      lib[name] = function (...)
+        local r = pack(pcall(f, ...))
+        if r[1] then return unpack(r, 2, r.n) end
+        local e = tostring(r[2])
+        e = e:match('^runtime error: (.-)\nstack traceback:') or e:match('^runtime error: (.*)$') or e
+        -- Not a tail call, so level 2 is the script (or pcall) that called us.
+        error(e, 2)
+      end
+    end
+  end
+  return lib
 end
 "#;
 
@@ -404,7 +429,9 @@ fn build_env(
 
     globals.raw_set("KEYS", string_array(lua, keys)?)?;
     globals.raw_set("ARGV", string_array(lua, args)?)?;
-    globals.raw_set("cjson", super::cjson::table(lua)?)?;
+    let wrap: mlua::Function = lua.load(WRAP_LIB_ERRORS).set_name("@wrap_lib").call(())?;
+    globals.raw_set("cjson", wrap.call::<Table>(super::cjson::table(lua)?)?)?;
+    globals.raw_set("cmsgpack", wrap.call::<Table>(super::cmsgpack::table(lua)?)?)?;
 
     // Globals Redis doesn't expose to scripts.
     for name in ["print", "dofile", "loadfile", "os", "io", "package", "require", "module"] {
@@ -449,16 +476,12 @@ fn do_call(lua: &Lua, ctx: &mut Ctx, args: Variadic<Lv>, read_only: bool, resp: 
         match v {
             Lv::String(s) => argv.push(s.as_bytes().to_vec()),
             Lv::Integer(_) | Lv::Number(_) => {
-                let s = lua.coerce_string(v.clone()).ok().flatten();
-                match s {
-                    Some(s) => argv.push(s.as_bytes().to_vec()),
-                    None => {
-                        return fail(
-                            lua,
-                            "Lua redis lib command arguments must be strings or integers",
-                        );
-                    }
-                }
+                let n = match v {
+                    Lv::Integer(n) => *n as f64,
+                    Lv::Number(n) => *n,
+                    _ => unreachable!(),
+                };
+                argv.push(number_arg(n).into_bytes());
             }
             _ => {
                 return fail(lua, "Lua redis lib command arguments must be strings or integers");
@@ -484,7 +507,13 @@ fn do_call(lua: &Lua, ctx: &mut Ctx, args: Variadic<Lv>, read_only: bool, resp: 
     }
     let Ctx { engine, session, .. } = ctx;
     engine.lua_calls += 1;
+    // A script talks RESP2 unless it called redis.setresp(3), whatever the
+    // calling client speaks; command handlers shape replies by the client's.
+    let saved = engine.clients.get_mut(&session.id).map(|c| std::mem::replace(&mut c.resp, resp));
     let reply = engine.call(session, handler, &argv, true, None);
+    if let (Some(saved), Some(c)) = (saved, engine.clients.get_mut(&session.id)) {
+        c.resp = saved;
+    }
     engine.lua_calls -= 1;
     reply_to_lua(lua, &reply, resp)
 }
@@ -620,4 +649,41 @@ fn table_to_reply(t: &Table, resp: u8) -> Value {
         }
     }
     Value::Array(items)
+}
+
+/// A Lua number as a command argument (`luaArgsToRedisArgv`): integers that
+/// fit an int64 print as integers, the rest as the shortest string that reads
+/// back exactly. Lua's own conversion (`%.14g`) would round large values such
+/// as millisecond timestamps.
+fn number_arg(n: f64) -> String {
+    if let Some(i) = super::cmsgpack::double_to_i64(n) {
+        return i.to_string();
+    }
+    super::double::d2string(n)
+}
+
+#[cfg(test)]
+mod number_format_tests {
+    use super::*;
+
+    #[test]
+    fn matches_redis_7_2() {
+        // Expected strings are what a real Redis 7.2.5 stores.
+        for (n, want) in [
+            (1790482289286.0, "1790482289286"),
+            (3.7, "3.7"),
+            (0.1, "0.1"),
+            (1e19, "1e+19"),
+            (1e17, "100000000000000000"),
+            (1.5e300, "1.5e+300"),
+            (2.5e-7, "2.5e-7"),
+            (1e-5, "0.00001"),
+            (-0.0, "0"),
+            (0.30000000000000004, "0.30000000000000004"),
+            (12345678901234567890.0, "12345678901234567000"),
+            (5e-324, "5e-324"),
+        ] {
+            assert_eq!(number_arg(n), want, "{n:e}");
+        }
+    }
 }

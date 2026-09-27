@@ -50,22 +50,88 @@ if command -v python3 >/dev/null; then
   else
     skip "redis-py" "could not install"
   fi
+  # RQ: a job queue, in the same venv as redis-py.
+  if [ -x "$work/venv/bin/python" ] && ! "$work/venv/bin/python" -c 'import rq' 2>/dev/null; then
+    "$work/venv/bin/pip" install -q rq >/dev/null 2>&1
+  fi
+  if [ -x "$work/venv/bin/python" ] && "$work/venv/bin/python" -c 'import rq' 2>/dev/null; then
+    run "rq" "$work/venv/bin/python" "$here/rq_test.py"
+  else
+    skip "rq" "could not install"
+  fi
+  # Celery: broker and result backend both on noida-db, run against a
+  # real worker process.
+  if [ -x "$work/venv/bin/python" ] && ! "$work/venv/bin/python" -c 'import celery' 2>/dev/null; then
+    "$work/venv/bin/pip" install -q celery >/dev/null 2>&1
+  fi
+  if [ -x "$work/venv/bin/python" ] && "$work/venv/bin/python" -c 'import celery' 2>/dev/null; then
+    (cd "$here" && "$OLDPWD/$work/venv/bin/celery" -A celery_tasks worker --loglevel=warning --pool=solo -c 1        >"$OLDPWD/$work/celery-worker.log" 2>&1 &
+     echo $! >"$OLDPWD/$work/celery-worker.pid")
+    sleep 3
+    run "celery" "$work/venv/bin/python" "$here/celery_test.py"
+    kill "$(cat "$work/celery-worker.pid")" 2>/dev/null
+  else
+    skip "celery" "could not install"
+  fi
 else
   skip "redis-py" "no python3"
+  skip "rq" "no python3"
+  skip "celery" "no python3"
 fi
 
-# ioredis
+# Node clients: node-redis (the official client), ioredis, and BullMQ (the
+# job queue, which is Lua-script heavy)
 if command -v node >/dev/null && command -v npm >/dev/null; then
-  if [ ! -d "$work/node/node_modules/ioredis" ]; then
-    mkdir -p "$work/node" && (cd "$work/node" && npm init -y >/dev/null 2>&1 && npm install --silent ioredis >/dev/null 2>&1)
+  if [ ! -d "$work/node/node_modules/bullmq" ] || [ ! -d "$work/node/node_modules/redis" ]; then
+    mkdir -p "$work/node" && (cd "$work/node" && npm init -y >/dev/null 2>&1 && npm install --silent redis ioredis bullmq >/dev/null 2>&1)
+  fi
+  if [ -d "$work/node/node_modules/redis" ]; then
+    run "node-redis" env NODE_PATH="$PWD/$work/node/node_modules" node "$here/node_redis_test.js"
+  else
+    skip "node-redis" "could not install"
   fi
   if [ -d "$work/node/node_modules/ioredis" ]; then
     run "ioredis" env NODE_PATH="$PWD/$work/node/node_modules" node "$here/ioredis_test.js"
   else
     skip "ioredis" "could not install"
   fi
+  if [ -d "$work/node/node_modules/bullmq" ]; then
+    run "bullmq" env NODE_PATH="$PWD/$work/node/node_modules" node "$here/bullmq_test.js"
+  else
+    skip "bullmq" "could not install"
+  fi
 else
+  skip "node-redis" "no node"
   skip "ioredis" "no node"
+  skip "bullmq" "no node"
+fi
+
+# Java clients: Jedis and Lettuce (Gradle, self-fetched wrapper; nothing
+# global, cache under target/)
+if command -v java >/dev/null; then
+  export GRADLE_USER_HOME="$PWD/$work/gradle-home"
+  if (cd "$here/java" && ./gradlew --console=plain -q compileJava >/dev/null 2>&1); then
+    run "jedis" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=JedisTest"
+    run "lettuce" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=LettuceTest"
+  else
+    skip "jedis" "could not build"
+    skip "lettuce" "could not build"
+  fi
+else
+  skip "jedis" "no java"
+  skip "lettuce" "no java"
+fi
+
+# go-redis (speaks RESP3 by default)
+if command -v go >/dev/null; then
+  if (cd "$here/go" && GOMODCACHE="$PWD/../../../../$work/gomod" GOFLAGS=-modcacherw GOTOOLCHAIN=local \
+        go build -o "$OLDPWD/$work/go-redis-test" . >/dev/null 2>&1); then
+    run "go-redis" "$work/go-redis-test"
+  else
+    skip "go-redis" "could not build"
+  fi
+else
+  skip "go-redis" "no go"
 fi
 
 echo

@@ -63,7 +63,7 @@ current count).
   listen for expired-key events see nothing.
 - `maxmemory`, eviction policies and the OOM error. The setting is stored; it
   is not enforced.
-- Lua libraries `cmsgpack`, `struct` and `bit`. `cjson` and the `redis` table
+- Lua libraries `struct` and `bit`. `cjson`, `cmsgpack` and the `redis` table
   are available.
 - Persistence. All data lives in memory and is gone when noida-db stops.
   `SAVE`, `BGSAVE` and `BGREWRITEAOF` succeed but write nothing. `--data-dir`
