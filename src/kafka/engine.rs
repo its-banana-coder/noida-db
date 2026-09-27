@@ -1297,29 +1297,38 @@ impl EngineState {
             result.resource_type = resource.resource_type;
             result.resource_name = resource.resource_name.clone();
 
+            // `ConfigSource` (org.apache.kafka.clients.admin.ConfigEntry):
+            // real clients (kafka-topics.sh's admin client included) reject
+            // an id outside the enum, and the crate's own default (-1) is
+            // exactly that — every config entry needs a real source.
+            const DYNAMIC_TOPIC_CONFIG: i8 = 1;
+            const STATIC_BROKER_CONFIG: i8 = 4;
+            const DEFAULT_CONFIG: i8 = 5;
+
             if resource.resource_type == 2 {
                 // Topic
                 let topic_name = resource.resource_name.as_str();
                 if let Some(topic_state) = self.topics.get(topic_name) {
                     result.error_code = 0;
 
-                    let mut configs_map: HashMap<String, String> = [
-                        ("cleanup.policy".to_string(), "delete".to_string()),
-                        ("retention.ms".to_string(), "604800000".to_string()),
-                        ("segment.bytes".to_string(), "1073741824".to_string()),
+                    let mut configs_map: HashMap<String, (String, i8)> = [
+                        ("cleanup.policy".to_string(), ("delete".to_string(), DEFAULT_CONFIG)),
+                        ("retention.ms".to_string(), ("604800000".to_string(), DEFAULT_CONFIG)),
+                        ("segment.bytes".to_string(), ("1073741824".to_string(), DEFAULT_CONFIG)),
                     ]
                     .into_iter()
                     .collect();
 
                     for (k, v) in &topic_state.configs {
-                        configs_map.insert(k.clone(), v.clone());
+                        configs_map.insert(k.clone(), (v.clone(), DYNAMIC_TOPIC_CONFIG));
                     }
 
-                    for (k, v) in configs_map {
+                    for (k, (v, source)) in configs_map {
                         let mut conf = DescribeConfigsResourceResult::default();
                         conf.name = StrBytes::from_string(k);
                         conf.value = Some(StrBytes::from_string(v));
                         conf.read_only = false;
+                        conf.config_source = source;
                         result.configs.push(conf);
                     }
                 } else {
@@ -1337,9 +1346,12 @@ impl EngineState {
                 for &(k, v) in configs {
                     let mut conf = DescribeConfigsResourceResult::default();
                     conf.name = StrBytes::from_string(k.to_string());
-                    let val = self.broker_configs.get(k).map(|s| s.as_str()).unwrap_or(v);
+                    let overridden = self.broker_configs.get(k);
+                    let val = overridden.map(|s| s.as_str()).unwrap_or(v);
                     conf.value = Some(StrBytes::from_string(val.to_string()));
                     conf.read_only = false;
+                    conf.config_source =
+                        if overridden.is_some() { STATIC_BROKER_CONFIG } else { DEFAULT_CONFIG };
                     result.configs.push(conf);
                 }
             }
