@@ -15,8 +15,8 @@ but not identical to the real server.
 |---|---|---|
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
+| Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
 | MySQL | early scaffolding, not merged | no |
-| Kafka | early scaffolding, not merged | no |
 | Memcached, MongoDB, RabbitMQ, Elasticsearch, ClickHouse | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
@@ -86,18 +86,65 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 520 results) and by psycopg,
-SQLAlchemy, Django, node-postgres and JDBC (`tests/clients/postgres/run.sh`).
-Django's own management commands (`migrate`, including the built-in
-`auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a schema
-change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M, transactions and
-savepoints, introspection) pass end to end. The introspection queries Prisma
-and Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
+servers by `tests/postgres_diff.rs` (about 615 results) and by psycopg,
+SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx,
+GORM and JDBC (`tests/clients/postgres/run.sh`). Django's own management
+commands (`migrate`, including the built-in `auth`/`admin`/`sessions`/
+`contenttypes` apps, `makemigrations` for a schema change, `bulk_create`,
+joins, aggregates, `F()`/`Q()`, M2M, transactions and savepoints,
+introspection) pass end to end. The introspection queries Prisma and
+Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
 similar were compared by hand against a real server.
+
+`COPY ... FROM/TO STDIN/STDOUT` (text and CSV) works: `pg_dump`/`psql`
+restoring a real dump (the standard "seed my dev DB from a snapshot"
+workflow), psycopg's and node-postgres's dedicated `copy()`/`copy-from`
+APIs, and the `postgres`/`tokio-postgres` Rust crate's `copy_in`/`copy_out`
+(over the extended query protocol, which is what that crate actually uses)
+all round-trip byte-for-byte against a real server, including nulls,
+arrays, jsonb and embedded newlines/tabs/backslashes — see
+`tests/postgres_diff.rs`'s `copy_matches_real_postgres`. `COPY` to/from a
+server-side file or program, and `FORMAT BINARY` (used by pgx's `CopyFrom`
+fast path), are not implemented; a client always has STDIN/STDOUT
+alternatives.
+
+Full-text search (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/
+`phraseto_tsquery`, the `@@` match operator, `ts_rank`) works for the
+`'english'` and `'simple'` configs (any other config name runs as
+`'simple'`). `to_tsvector`/`to_tsquery`'s canonical text output and `@@`'s
+boolean result match a real server exactly, including phrase (`<->`/`<N>`)
+and prefix (`:*`) matching; verified against Django's
+`django.contrib.postgres.search` (`SearchVector`/`SearchQuery`/
+`SearchRank`) end to end. `ts_rank`'s exact number is a documented
+approximation (it orders matches sensibly but doesn't reproduce Postgres's
+own formula, which weights lexeme importance labels and document length
+nothing here tracks); GIN/GiST indexes, `ts_headline`, and
+`websearch_to_tsquery` are not implemented.
+
+`REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` works: a
+materialized view keeps its rows from `CREATE`/the last `REFRESH` until
+refreshed again (it does not silently re-run its query on every read), and
+`WITH NO DATA` unpopulates it — reading an unpopulated one gives the same
+error and hint a real server does. `pg_matviews.ispopulated` reflects this.
+`CONCURRENTLY` is accepted and has no effect (no locking to avoid; nothing
+here blocks readers while refreshing anyway).
+
+Range types (`int4range`/`int8range`/`numrange`/`daterange`/`tsrange`/
+`tstzrange`) work: canonical text (discrete ranges always canonicalize to
+`[lower,upper)`, continuous ones keep whatever bounds were given; a
+lower bound greater than the upper is a real error, equal bounds are
+`empty` unless both are inclusive, in which case it's a genuine
+single-point range — all matching a real server exactly), the
+constructor functions, `@>`/`<@`/`&&`, and `lower`/`upper`/`isempty`.
+Not implemented: `lower_inc`/`upper_inc`, the union/difference/
+intersection operators (`+`/`-`/`*`), the adjacency and positional
+operators (`-|-`, `<<`, `>>`, `&<`, `&>`), multiranges, and exclusion
+constraints.
 
 **By design**
 
-- Replication of any kind. A connection with the `replication` startup
+- Replication of any kind (streaming, logical, master/slave, primary/replica
+  — whatever it's called). A connection with the `replication` startup
   parameter is treated as an ordinary one, so `pg_basebackup` and
   `pg_recvlogical` do not work.
 - Roles and privileges are not enforced: `GRANT`, `REVOKE` and
@@ -107,7 +154,11 @@ similar were compared by hand against a real server.
 
 **Not yet**
 
-- PL/pgSQL and stored procedures, extensions, `LISTEN`/`NOTIFY`, `COPY`.
+- PL/pgSQL and stored procedures (so no triggers either), extensions.
+- `CREATE PROCEDURE`/`CALL`.
+- Full-text search: GIN/GiST indexes, `ts_headline`, `websearch_to_tsquery`,
+  any text search config other than `'english'`/`'simple'`.
+- `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
 
 **Differs**
@@ -121,11 +172,19 @@ similar were compared by hand against a real server.
   scans all of `pg_index` sees fewer rows than on a real server; one that
   names a user table works the same).
 
-## MySQL and Kafka
+## Kafka
 
-Early scaffolding only: the real `mysql` CLI cannot run queries, and standard
-Kafka clients cannot produce or list topics yet. Do not point applications at
-them. The specs in `docs/specs/` describe the target.
+Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported: topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`), and transactions (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`).
+
+**By design**
+- Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
+
+**Not yet**
+- Disk segment persistence (records live in-memory).
+
+## MySQL
+
+Early scaffolding only: the real `mysql` CLI cannot run queries yet.
 
 ## Elasticsearch
 

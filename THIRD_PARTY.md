@@ -11,6 +11,7 @@ Add a row whenever you port code, and keep the upstream copyright notice.
 | Command implementations, error texts, encodings and algorithms: strings, keys, hashes, lists, sets, sorted sets, streams, geo, bitmaps, HyperLogLog (including MurmurHash64A), SORT, MONITOR, scripting glue, CONFIG, ACL/SLOWLOG/LATENCY/MEMORY replies, command metadata (`src/redis/meta.rs` is generated from `commands.def`) | Redis 7.2, `src/*.c` | BSD-3-Clause | `src/redis/` |
 | `cmsgpack` Lua library (`pack`, `unpack`, `unpack_one`, `unpack_limit`) | lua-cmsgpack 0.4.0 as shipped in Redis 7.2, `deps/lua/src/lua_cmsgpack.c` | BSD-2-Clause, Copyright (C) 2012 Salvatore Sanfilippo | `src/redis/cmsgpack.rs` |
 | BM25 relevance scoring and the lossy per-document field-length norm encoding (`SmallFloat.intToByte4`/`byte4ToInt`, `BM25Similarity`'s score formula) | Apache Lucene 9.x, `lucene/core/src/java/org/apache/lucene/{util/SmallFloat.java,search/similarities/BM25Similarity.java}` | Apache License 2.0 | `src/elasticsearch/scoring.rs` |
+| English stopword list for `to_tsvector`/`to_tsquery`'s `'english'` text search config | PostgreSQL 16, `src/backend/snowball/stopwords/english.stop` | PostgreSQL Licence | `src/postgres/fts.rs` |
 
 ## Redis (BSD-3-Clause)
 
@@ -79,3 +80,25 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
 ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## PostgreSQL (PostgreSQL Licence)
+
+Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+Portions Copyright (c) 1994, The Regents of the University of California
+
+Permission to use, copy, modify, and distribute this software and its
+documentation for any purpose, without fee, and without a written agreement
+is hereby granted, provided that the above copyright notice and this
+paragraph and the following two paragraphs appear in all copies.
+
+IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR
+DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION,
+EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+
+THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS FOR A PARTICULAR PURPOSE. THE SOFTWARE PROVIDED HEREUNDER IS ON AN
+"AS IS" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO
+PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.

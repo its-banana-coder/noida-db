@@ -81,20 +81,37 @@ Every service is its own module:
     declining SSL cleanly.
   - SQL: DDL, DML, joins, subqueries, CTEs, window functions, aggregates,
     transactions, `ON CONFLICT`, `RETURNING`, sequences and identity columns,
-    constraints.
-  - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz
-    and numeric.
+    constraints, `LISTEN`/`NOTIFY`, `COPY ... FROM/TO STDIN/STDOUT` (text
+    and CSV; verified against `pg_dump`/`psql` restore and the copy APIs of
+    psycopg, node-postgres and the Rust `postgres` crate), full-text search
+    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`, `@@`,
+    `ts_rank`; verified against Django's `django.contrib.postgres.search`),
+    `REFRESH MATERIALIZED VIEW`.
+  - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz,
+    numeric and the range types (`int4range`/`int8range`/`numrange`/
+    `daterange`/`tsrange`/`tstzrange`: canonical text, `@>`/`<@`/`&&`,
+    `lower`/`upper`/`isempty`).
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
-    Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
-- **Out of scope (for now):** PL/pgSQL and stored procedures, extensions,
-  logical replication. Concurrency is one writer at a time.
+    Flyway, Liquibase, Prisma, Django and Rails to look up the schema,
+    including old-style comma-separated joins across them (what Sequelize's
+    own index introspection sends).
+  - Clients verified: psycopg, SQLAlchemy, Django, asyncpg, Alembic,
+    node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, the JDBC
+    driver.
+- **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
+  extensions, logical replication, `COPY` to/from a server-side file or
+  program, `FORMAT BINARY`, full-text search GIN/GiST
+  indexes and `ts_headline`. Concurrency is one writer at a time.
 - **Known gap:** enum values order and compare by label text, not by the
   order they were declared in (`<`, `ORDER BY`, `min`/`max`).
 - **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
   migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
-  `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported.
-  Replication, backup and physical/logical streaming are not implemented and
-  do not work: a connection with the `replication` startup parameter is
+  `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported
+  (all performance-analysis tooling is by design, not a gap — see "Scope
+  filter" in `docs/specs/README.md`).
+  Replication (streaming, logical, master/slave, primary/replica — whatever
+  it's called), backup and physical/logical streaming are not implemented
+  and do not work: a connection with the `replication` startup parameter is
   treated as an ordinary connection, so replication commands and
   `pg_basebackup`/`pg_recvlogical` will not function.
 

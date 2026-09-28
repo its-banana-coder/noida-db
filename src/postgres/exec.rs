@@ -1298,6 +1298,13 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 )
             })?;
             let _ = ncols;
+            if !t.matview_populated {
+                return Err(PgError::new(
+                    code::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{}\" has not been populated", t.name),
+                )
+                .hint("Use the REFRESH MATERIALIZED VIEW command."));
+            }
             // The binder numbers a table's columns without the dropped ones.
             if t.columns.iter().any(|c| c.dropped) {
                 let live: Vec<usize> = t.live_columns().map(|(i, _)| i).collect();
@@ -1385,6 +1392,12 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
 /// function's arguments refer to.
 fn exec_func(f: &From, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     let From::Func { name, args, arg_tys, ordinality, .. } = f else { return Ok(vec![]) };
+    // A scalar function in FROM (`SELECT * FROM current_schema()`) is valid
+    // Postgres and returns one row of one column, not a set.
+    if super::sigs::kind_of(name) != Some(super::sigs::Kind::Srf) {
+        let ret = super::sigs::resolve(name, arg_tys).map(|r| r.ret).unwrap_or(Type::TEXT);
+        return Ok(vec![vec![call_function(name, args, arg_tys, ret, row, ctx)?]]);
+    }
     let mut vals = vec![];
     for a in args {
         vals.push(eval(a, row, ctx)?);

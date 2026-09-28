@@ -160,6 +160,9 @@ pub struct Table {
     pub type_oid: u32,
     pub temp: bool,
     pub owner_session: Option<u32>,
+    /// A materialized view populated by its own `CREATE`/`REFRESH`
+    /// (always `true` for an ordinary table or view).
+    pub matview_populated: bool,
 }
 
 impl Table {

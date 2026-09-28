@@ -54,7 +54,8 @@ building or debugging an app. **Do not implement, not even as stubs or cheap
 error replies**, anything whose purpose is running or operating production:
 
 - **Replication, clustering, sharding, sentinel, HA, failover, leader
-  election**, and the commands that manage or inspect such topologies.
+  election** (primary/replica, master/slave, whatever a service calls it),
+  and the commands that manage or inspect such topologies.
 - **Backup, restore, snapshot, migration and bulk-transfer machinery**
   (Redis DUMP/RESTORE/MIGRATE, Elasticsearch snapshots, ClickHouse
   BACKUP/RESTORE, MongoDB replica-set management, MirrorMaker...).

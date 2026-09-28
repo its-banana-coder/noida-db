@@ -79,6 +79,28 @@ else
   skip "celery" "no python3"
 fi
 
+# Sidekiq (Ruby): gems install into target/, not the system gem home.
+if command -v ruby >/dev/null && command -v gem >/dev/null; then
+  export GEM_HOME="$PWD/$work/gems"
+  export GEM_PATH="$GEM_HOME"
+  export PATH="$GEM_HOME/bin:$PATH"
+  if [ ! -x "$GEM_HOME/bin/sidekiq" ]; then
+    gem install -N sidekiq redis >/dev/null 2>&1
+  fi
+  if [ -x "$GEM_HOME/bin/sidekiq" ]; then
+    (cd "$here" && "$GEM_HOME/bin/sidekiq" -r ./sidekiq_jobs.rb -c 2 -q default \
+       >"$OLDPWD/$work/sidekiq-worker.log" 2>&1 &
+     echo $! >"$OLDPWD/$work/sidekiq-worker.pid")
+    sleep 2
+    run "sidekiq" ruby "$here/sidekiq_test.rb"
+    kill "$(cat "$work/sidekiq-worker.pid")" 2>/dev/null
+  else
+    skip "sidekiq" "could not install"
+  fi
+else
+  skip "sidekiq" "no ruby"
+fi
+
 # Node clients: node-redis (the official client), ioredis, and BullMQ (the
 # job queue, which is Lua-script heavy)
 if command -v node >/dev/null && command -v npm >/dev/null; then
@@ -106,20 +128,26 @@ else
   skip "bullmq" "no node"
 fi
 
-# Java clients: Jedis and Lettuce (Gradle, self-fetched wrapper; nothing
-# global, cache under target/)
+# Java clients: Jedis, Lettuce, Spring Data Redis and Redisson (Gradle,
+# self-fetched wrapper; nothing global, cache under target/)
 if command -v java >/dev/null; then
   export GRADLE_USER_HOME="$PWD/$work/gradle-home"
   if (cd "$here/java" && ./gradlew --console=plain -q compileJava >/dev/null 2>&1); then
     run "jedis" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=JedisTest"
     run "lettuce" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=LettuceTest"
+    run "spring-data-redis" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=SpringDataRedisTest"
+    run "redisson" bash -c "cd '$here/java' && NOIDA_REDIS_PORT=$NOIDA_REDIS_PORT ./gradlew --console=plain -q run -DmainClass=RedissonTest"
   else
     skip "jedis" "could not build"
     skip "lettuce" "could not build"
+    skip "spring-data-redis" "could not build"
+    skip "redisson" "could not build"
   fi
 else
   skip "jedis" "no java"
   skip "lettuce" "no java"
+  skip "spring-data-redis" "no java"
+  skip "redisson" "no java"
 fi
 
 # go-redis (speaks RESP3 by default)

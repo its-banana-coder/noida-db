@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use std::io::{Read, Write};
+use std::sync::Mutex;
+
 use postgres::{Client, NoTls, SimpleQueryMessage};
 
 /// Scripts to compare. `@16` marks a statement that only matches on
@@ -425,6 +428,109 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT a.id, b.id, x FROM lt a, lt b, unnest(ARRAY[a.id, b.id]) x WHERE a.id < b.id ORDER BY 1, 2, 3",
         "SELECT unnest(ARRAY[1,2], ARRAY['a','b']), unnest(ARRAY[9], ARRAY['z','w'])",
     ],
+    // Full-text search: to_tsvector/to_tsquery/plainto_tsquery/
+    // phraseto_tsquery's canonical text, and @@ matching. ts_rank's exact
+    // number is a documented approximation, so it isn't compared here.
+    &[
+        "SELECT to_tsvector('The quick brown foxes are jumping')",
+        "SELECT to_tsvector('english', 'The quick brown foxes are jumping')",
+        "SELECT to_tsvector('simple', 'The quick brown foxes are jumping')",
+        "SELECT to_tsquery('fox & quick'), to_tsquery('fox | !slow'), to_tsquery('(fox | dog) & quick')",
+        "SELECT to_tsquery('quick <-> brown'), to_tsquery('quick <2> fox'), to_tsquery('jump:*')",
+        "SELECT plainto_tsquery('the quick foxes'), phraseto_tsquery('quick brown fox')",
+        "SELECT '''fox'':2,4 ''quick'':1'::tsvector",
+        "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & quick')",
+        "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & slow')",
+        "SELECT to_tsquery('fox') @@ to_tsvector('a quick fox')",
+        "SELECT to_tsvector('quick brown fox') @@ to_tsquery('quick <-> brown')",
+        "SELECT to_tsvector('brown quick fox') @@ to_tsquery('quick <-> brown')",
+        "CREATE TABLE docs (id int, body text)",
+        "INSERT INTO docs VALUES (1, 'The quick brown fox jumps over the lazy dog'), (2, 'A completely unrelated sentence about cats')",
+        "SELECT id FROM docs WHERE to_tsvector(body) @@ to_tsquery('fox & dog') ORDER BY id",
+        "SELECT id FROM docs WHERE to_tsvector(body) @@ plainto_tsquery('lazy dog') ORDER BY id",
+    ],
+    // REFRESH MATERIALIZED VIEW: stays stale until refreshed, WITH NO DATA
+    // unpopulates it, an unpopulated matview errors on read.
+    &[
+        "CREATE TABLE mvsrc (id int, v int)",
+        "INSERT INTO mvsrc VALUES (1, 10), (2, 20)",
+        "CREATE MATERIALIZED VIEW mv AS SELECT sum(v) AS s FROM mvsrc",
+        "SELECT * FROM mv",
+        "INSERT INTO mvsrc VALUES (3, 30)",
+        "SELECT * FROM mv",
+        "REFRESH MATERIALIZED VIEW mv",
+        "SELECT * FROM mv",
+        "SELECT schemaname, matviewname, ispopulated FROM pg_matviews",
+        "REFRESH MATERIALIZED VIEW mv WITH NO DATA",
+        "SELECT ispopulated FROM pg_matviews",
+        "SELECT * FROM mv",
+        "REFRESH MATERIALIZED VIEW nosuchview",
+    ],
+    // Range types: canonical text (discrete canonicalization, unbounded
+    // sides, quoting), constructors, @>/<@/&&, lower/upper/isempty, and the
+    // lower>upper / lower==upper (empty vs single-point) edge cases.
+    &[
+        "SELECT '[1,10)'::int4range, '[1,10]'::int4range, '(,10)'::int4range, '(1,)'::int4range",
+        "SELECT 'empty'::int4range, '[5,5)'::int4range, '[5,5]'::numrange, '(5,5]'::numrange",
+        "SELECT '(1.5,10.5]'::numrange, '[2020-01-01,2020-02-01)'::daterange",
+        "SELECT '[2020-01-01 10:00:00,2020-01-01 12:00:00)'::tsrange",
+        "SELECT '[10,5)'::int4range",
+        "SELECT '(10,5]'::numrange",
+        "SELECT int4range(1, 10), int4range(1, 10, '[]'), int8range(1, 10)",
+        "SELECT numrange(1.5, 10.5), daterange('2020-01-01', '2020-02-01')",
+        "SELECT '[1,10)'::int4range @> 5, '[1,10)'::int4range @> 15, 5 <@ '[1,10)'::int4range",
+        "SELECT '[1,5)'::int4range @> '[2,4)'::int4range, '[1,5)'::int4range @> '[0,4)'::int4range",
+        "SELECT '[1,5)'::int4range && '[3,8)'::int4range, '[1,5)'::int4range && '[8,10)'::int4range",
+        "SELECT '[1,5)'::int4range && '[5,8)'::int4range",
+        "SELECT lower('[1,10)'::int4range), upper('[1,10)'::int4range), isempty('[1,10)'::int4range)",
+        "SELECT isempty('empty'::int4range)",
+        "CREATE TABLE bookings (id int, span daterange)",
+        "INSERT INTO bookings VALUES (1, '[2024-01-01,2024-01-10)'), (2, '[2024-02-01,2024-02-05)')",
+        "SELECT id FROM bookings WHERE span @> '2024-01-05'::date ORDER BY id",
+        "SELECT id FROM bookings WHERE span && '[2024-01-05,2024-01-15)'::daterange ORDER BY id",
+    ],
+    // `SET TIME ZONE INTERVAL '...' HOUR TO MINUTE` (what Sequelize sends
+    // for a fixed-offset zone that isn't a named one): must not error, and
+    // the offset itself must take effect (SHOW TimeZone's exact string is
+    // a documented, cosmetic-only gap, so this doesn't compare it).
+    &[
+        "SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE",
+        "!SHOW TimeZone",
+        "SELECT '2020-01-01 00:00:00+00'::timestamptz",
+        "RESET TimeZone",
+    ],
+    // Comma-separated ("implicit") joins: `FROM a, b, c` is the old-style
+    // equivalent of `a JOIN b ON ... JOIN c ON ...`, and several ORMs'
+    // catalog-introspection queries still use it (e.g. Sequelize's index
+    // lookup: `pg_class, pg_index, pg_class, pg_attribute` joined only via
+    // a WHERE clause). Left unfiltered, that plans as a fully unfiltered
+    // N-way cross product before WHERE ever applies, which is correct but
+    // must not be evaluated as one (it previously blew up memory/time on a
+    // catalog with enough tables/columns); this checks it still returns
+    // the right rows.
+    &[
+        "CREATE TABLE cja (id int, x int)",
+        "CREATE TABLE cjb (id int, a_id int, y int)",
+        "CREATE TABLE cjc (id int, b_id int, z int)",
+        "INSERT INTO cja VALUES (1, 10), (2, 20)",
+        "INSERT INTO cjb VALUES (1, 1, 100), (2, 2, 200), (3, 2, 300)",
+        "INSERT INTO cjc VALUES (1, 1, 1000), (2, 2, 2000)",
+        "SELECT cja.id, cjb.id, cjc.id FROM cja, cjb, cjc \
+         WHERE cjb.a_id = cja.id AND cjc.b_id = cjb.id ORDER BY cja.id, cjb.id, cjc.id",
+        "SELECT t.relname, i.relname FROM pg_class t, pg_class i, pg_index ix \
+         WHERE t.oid = ix.indrelid AND i.oid = ix.indexrelid AND t.relname = 'cja'",
+    ],
+    // A scalar function in FROM returns one row (TypeORM, and other ORMs,
+    // probe the connection with SELECT * FROM current_schema()/version()).
+    &[
+        "SELECT * FROM current_schema()",
+        "SELECT * FROM current_database()",
+        "SELECT * FROM pg_typeof(1)",
+        "SELECT * FROM nosuchfunc()",
+        "CREATE TABLE fr (id int)",
+        "INSERT INTO fr VALUES (1), (2)",
+        "SELECT id, s FROM fr, current_schema() s ORDER BY id",
+    ],
 ];
 
 fn main_test_body() {}
@@ -596,8 +702,16 @@ fn describe(client: &mut Client, sql: &str) -> Option<Vec<String>> {
     Some(stmt.columns().iter().map(|c| c.type_().name().to_string()).collect())
 }
 
+/// Both #[test] fns below may talk to the SAME external reference server
+/// (NOIDA_POSTGRES_REF, in CI): cargo runs test functions concurrently by
+/// default, and one test's schema-wide reset would otherwise be able to
+/// drop the table another test is mid-COPY into. This makes the two take
+/// turns.
+static REF_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn differential() {
+    let _guard = REF_LOCK.lock().unwrap();
     main_test_body();
     let Some(mut reference) = reference() else {
         println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
@@ -698,4 +812,73 @@ fn directives(raw: &str) -> (&str, bool, u32) {
         break;
     }
     (sql, compare, min_version)
+}
+
+/// `COPY ... FROM/TO STDIN/STDOUT`, text and CSV: escapes, nulls, arrays,
+/// jsonb, and both directions, byte-for-byte against a real server.
+#[test]
+fn copy_matches_real_postgres() {
+    let _guard = REF_LOCK.lock().unwrap();
+    let Some(mut reference) = reference() else {
+        println!("SKIPPED: no reference Postgres (set NOIDA_POSTGRES_REF or install postgresql)");
+        return;
+    };
+    let addr = noida::postgres::spawn("127.0.0.1:0").expect("start noida");
+    let noida_url = format!("host=127.0.0.1 port={} user=postgres dbname=postgres", addr.port());
+    let mut mine = Client::connect(&noida_url, NoTls).expect("connect to noida");
+    for c in [&mut reference.client, &mut mine] {
+        c.simple_query(
+            "DROP TABLE IF EXISTS ct; CREATE TABLE ct (id int PRIMARY KEY, v text, tags text[], meta jsonb, n numeric(8,2))",
+        )
+        .unwrap();
+    }
+
+    let rows: &[&str] = &[
+        "1\tplain\t{a,b}\t{\"k\": 1}\t9.50\n",
+        "2\t\\N\t{}\t{}\t0.00\n",
+        "3\twith\\ttab and \\\\backslash\t{x}\t[1,2]\t-3.25\n",
+        "4\tline1\\nline2\t{}\t{}\t\\N\n",
+    ];
+    for c in [&mut reference.client, &mut mine] {
+        let mut w = c.copy_in("COPY ct (id, v, tags, meta, n) FROM STDIN").unwrap();
+        for r in rows {
+            w.write_all(r.as_bytes()).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    let want: Vec<Outcome> =
+        vec![run(&mut reference.client, "SELECT id, v, tags, meta, n FROM ct ORDER BY id")];
+    let got: Vec<Outcome> = vec![run(&mut mine, "SELECT id, v, tags, meta, n FROM ct ORDER BY id")];
+    assert_eq!(want, got, "rows loaded by COPY FROM STDIN (text format) differ");
+
+    // COPY TO STDOUT must produce the identical byte stream, in both formats.
+    for (label, sql) in [
+        ("text", "COPY ct TO STDOUT"),
+        (
+            "csv+header",
+            "COPY (SELECT id, v, n FROM ct ORDER BY id) TO STDOUT WITH (FORMAT csv, HEADER)",
+        ),
+    ] {
+        let mut want_bytes = vec![];
+        reference.client.copy_out(sql).unwrap().read_to_end(&mut want_bytes).unwrap();
+        let mut got_bytes = vec![];
+        mine.copy_out(sql).unwrap().read_to_end(&mut got_bytes).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&want_bytes),
+            String::from_utf8_lossy(&got_bytes),
+            "COPY TO STDOUT ({label}) differs"
+        );
+    }
+
+    // A row that fails a constraint rolls back the whole COPY, not just
+    // that row - and reports it as a real Postgres COPY failure would.
+    for c in [&mut reference.client, &mut mine] {
+        let mut w = c.copy_in("COPY ct (id, v) FROM STDIN").unwrap();
+        w.write_all(b"1\tduplicate\n").unwrap();
+        let err = w.finish().is_err();
+        assert!(err, "a COPY violating a constraint must fail");
+        let n: i64 = c.query_one("SELECT count(*) FROM ct", &[]).unwrap().get(0);
+        assert_eq!(n, 4, "a failed COPY must not partially apply");
+    }
 }

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the committed Postgres client apps (psycopg, SQLAlchemy, Django,
-# node-postgres, JDBC) against a server.
+# asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx, GORM, sqlx, Sequelize, JDBC)
+# against a server.
 #
 #   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
@@ -52,9 +53,9 @@ run_client() {
 # --- Python: psycopg 3 and SQLAlchemy -------------------------------------
 pylibs="$cache/pylibs"
 if [ ! -d "$pylibs/psycopg" ]; then
-  echo "== installing psycopg, SQLAlchemy and Django"
+  echo "== installing psycopg, SQLAlchemy, Django, asyncpg and Alembic"
   pip install --quiet --disable-pip-version-check --target "$pylibs" \
-    "psycopg[binary]" sqlalchemy django >/dev/null 2>&1
+    "psycopg[binary]" sqlalchemy django asyncpg alembic >/dev/null 2>&1
 fi
 if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import psycopg" 2>/dev/null; then
   export PYTHONPATH="$pylibs"
@@ -69,23 +70,63 @@ if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import psycopg" 2>/dev
   else
     echo "-- django SKIPPED (not installed)"
   fi
+  if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import asyncpg" 2>/dev/null; then
+    run_client "asyncpg" python3 "$here/python/asyncpg_test.py"
+  else
+    echo "-- asyncpg SKIPPED (not installed)"
+  fi
+  if python3 -c "import sys; sys.path.insert(0, '$pylibs'); import alembic" 2>/dev/null; then
+    run_client "alembic" python3 "$here/python/alembic_test.py"
+  else
+    echo "-- alembic SKIPPED (not installed)"
+  fi
 else
   echo "-- psycopg SKIPPED (not installed)"
 fi
 
-# --- Node: node-postgres ---------------------------------------------------
+# --- Node: node-postgres, Knex, TypeORM and Sequelize -----------------------
 if command -v node >/dev/null && command -v npm >/dev/null; then
   if [ ! -d "$cache/node_modules/pg" ]; then
-    echo "== installing node-postgres"
-    (cd "$cache" && npm install --silent --no-package-lock pg >/dev/null 2>&1)
+    echo "== installing node-postgres, Knex, TypeORM and Sequelize"
+    (cd "$cache" && npm install --silent --no-package-lock pg knex typeorm reflect-metadata sequelize >/dev/null 2>&1)
   fi
   if [ -d "$cache/node_modules/pg" ]; then
     run_client "node-postgres" env NODE_PATH="$cache/node_modules" node "$here/node/pg_test.js"
   else
     echo "-- node-postgres SKIPPED (npm install failed)"
   fi
+  if [ -d "$cache/node_modules/knex" ]; then
+    run_client "knex" env NODE_PATH="$cache/node_modules" node "$here/node/knex_test.js"
+  else
+    echo "-- knex SKIPPED (npm install failed)"
+  fi
+  if [ -d "$cache/node_modules/typeorm" ]; then
+    run_client "typeorm" env NODE_PATH="$cache/node_modules" node "$here/node/typeorm_test.js"
+  else
+    echo "-- typeorm SKIPPED (npm install failed)"
+  fi
+  if [ -d "$cache/node_modules/sequelize" ]; then
+    run_client "sequelize" env NODE_PATH="$cache/node_modules" node "$here/node/sequelize_test.js"
+  else
+    echo "-- sequelize SKIPPED (npm install failed)"
+  fi
 else
-  echo "-- node-postgres SKIPPED (no node)"
+  echo "-- node-postgres, knex, typeorm, sequelize SKIPPED (no node)"
+fi
+
+# --- Go: pgx and GORM -------------------------------------------------------
+if command -v go >/dev/null; then
+  run_client "pgx" env -C "$here/go" go run ./pgx
+  run_client "gorm" env -C "$here/go" go run ./gorm
+else
+  echo "-- pgx, gorm SKIPPED (no go)"
+fi
+
+# --- Rust: sqlx -------------------------------------------------------------
+if command -v cargo >/dev/null; then
+  run_client "sqlx" env -C "$here/rust" cargo run -q
+else
+  echo "-- sqlx SKIPPED (no cargo)"
 fi
 
 # --- Java: the PostgreSQL JDBC driver --------------------------------------

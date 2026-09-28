@@ -7,6 +7,7 @@ use super::catalog::*;
 use super::error::{PgError, PgResult, code};
 use super::exec::Ctx;
 use super::plan::Expr;
+use super::refresh::Refresh;
 use super::seqddl::SeqDdl;
 use super::types::{self, Base, Type, Value};
 
@@ -91,6 +92,7 @@ impl Ddl<'_, '_> {
             type_oid,
             temp: ct.temporary,
             owner_session: None,
+            matview_populated: true,
         };
         // CREATE TABLE AS SELECT
         if let Some(q) = &ct.query {
@@ -676,6 +678,7 @@ impl Ddl<'_, '_> {
             type_oid,
             temp: false,
             owner_session: None,
+            matview_populated: true,
         };
         self.ctx.db.tables.insert(oid, std::sync::Arc::new(table));
         if materialized {
@@ -683,10 +686,48 @@ impl Ddl<'_, '_> {
             let mut b = Binder::new(&db, &info, &[]);
             let (plan, _) = b.bind_query(query)?;
             let rows = super::exec::run_query(&plan, self.ctx)?;
+            let n = rows.len();
             self.ctx.db.table_mut(oid).unwrap().rows = rows;
-            return Ok("SELECT".into());
+            return Ok(format!("SELECT {n}"));
         }
         Ok("CREATE VIEW".into())
+    }
+
+    /// `REFRESH MATERIALIZED VIEW`.
+    pub fn refresh_matview(&mut self, r: &Refresh) -> PgResult<String> {
+        let (schema, name) = (
+            (r.name.len() > 1).then(|| r.name[r.name.len() - 2].clone()),
+            r.name.last().cloned().unwrap_or_default(),
+        );
+        let (db, info) = self.binder();
+        let b = Binder::new(&db, &info, &[]);
+        let oid = b.lookup_table_oid(schema.as_deref(), &name)?;
+        let t = self.ctx.db.table(oid).unwrap();
+        if t.kind != RelKind::MaterializedView {
+            return Err(PgError::new(
+                code::WRONG_OBJECT_TYPE,
+                format!("\"{name}\" is not a materialized view"),
+            ));
+        }
+        if !r.with_data {
+            let t = self.ctx.db.table_mut(oid).unwrap();
+            t.rows.clear();
+            t.matview_populated = false;
+            return Ok("REFRESH MATERIALIZED VIEW".into());
+        }
+        let query = t.view_sql.clone().unwrap_or_default();
+        let stmts = super::parse_sql(&query)?;
+        let a::Statement::Query(q) = &stmts[0] else {
+            return Err(PgError::new(code::INTERNAL_ERROR, "bad view definition"));
+        };
+        let (db, info) = self.binder();
+        let mut b = Binder::new(&db, &info, &[]);
+        let (plan, _) = b.bind_query(q)?;
+        let rows = super::exec::run_query(&plan, self.ctx)?;
+        let t = self.ctx.db.table_mut(oid).unwrap();
+        t.rows = rows;
+        t.matview_populated = true;
+        Ok("REFRESH MATERIALIZED VIEW".into())
     }
 
     pub fn create_index(&mut self, ci: &a::CreateIndex) -> PgResult<String> {

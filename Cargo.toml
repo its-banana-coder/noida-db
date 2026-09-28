@@ -8,6 +8,9 @@ license = "MIT"
 # Its own workspace root, so cargo never reads the manifest of an enclosing
 # checkout (as when this repo is a worktree nested inside another).
 [workspace]
+# A client-test crate under tests/clients has its own dependencies (tokio,
+# sqlx...) that don't belong in noida-db's own build.
+exclude = ["tests/clients/postgres/rust"]
 
 [lib]
 name = "noida"
@@ -22,8 +25,8 @@ default = ["redis", "postgres"]
 redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
 sql = []
-postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
-kafka = []
+postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
+kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
 elasticsearch = ["dep:serde_json"]
 
@@ -35,10 +38,14 @@ bytes = { version = "1", optional = true }
 regex-lite = { version = "0.1", optional = true }
 # Postgres: SQL parsing.
 sqlparser = { version = "0.63", default-features = false, features = ["std"], optional = true }
+# Postgres: Snowball stemming for to_tsvector/to_tsquery's 'english' config.
+rust-stemmers = { version = "1.2", optional = true }
 # Redis: EVAL and friends run in Lua 5.1, the version Redis embeds. The
 # vendored interpreter is compiled in (~250KB), which is the whole feature.
 mlua = { version = "0.12", default-features = false, features = ["lua51", "vendored"], optional = true }
 serde_json = { version = "1", optional = true }
+# Kafka: wire protocol message encoding/decoding.
+kafka-protocol = { version = "0.18.0", optional = true }
 
 # The whole point of noida is a small footprint: tune release builds for size.
 [profile.release]
@@ -82,3 +89,11 @@ required-features = ["postgres"]
 [[test]]
 name = "elasticsearch_diff"
 required-features = ["elasticsearch"]
+
+[[test]]
+name = "kafka_client"
+required-features = ["kafka"]
+
+[[test]]
+name = "kafka_diff"
+required-features = ["kafka"]

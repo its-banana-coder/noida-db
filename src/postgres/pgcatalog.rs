@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 
 use super::catalog::{
-    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, Row, SeqValue,
+    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, RelKind, Row, SeqValue,
 };
 use super::error::PgResult;
 use super::exec::Ctx;
@@ -898,7 +898,19 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 ]);
             }
         }
-        "pg_matviews" => {}
+        "pg_matviews" => {
+            for tb in db.tables.values().filter(|t| t.kind == RelKind::MaterializedView) {
+                out.push(vec![
+                    t(db.schema_name(tb.schema)),
+                    t(&tb.name),
+                    t(&user),
+                    NULL,
+                    b(!tb.indexes.is_empty()),
+                    b(tb.matview_populated),
+                    tb.view_sql.clone().map_or(NULL, t),
+                ]);
+            }
+        }
         "pg_indexes" => {
             for tb in db.tables.values() {
                 for idx in &tb.indexes {
