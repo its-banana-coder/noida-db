@@ -3546,8 +3546,13 @@ impl<'a> Binder<'a> {
                     let i = *i;
                     if self.params[i].is_unknown() {
                         self.params[i] = target;
-                        return Ok(Expr::Param(i));
                     }
+                    // Re-run through the ordinary (now not-unknown) path
+                    // below rather than returning bare `Expr::Param(i)`:
+                    // even when the locked type already equals `target`,
+                    // this still needs to apply `typmod` (e.g. a
+                    // `numeric(8,2)` column's scale), which only the
+                    // `Expr::Cast` wrapping below does.
                     let from = self.params[i];
                     return self.coerce(TE::new(Expr::Param(i), from), target, typmod, ctx, what);
                 }

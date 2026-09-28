@@ -13,7 +13,7 @@ use super::error::{PgError, PgResult, code};
 use super::exec::{self, Ctx, Runtime};
 use super::plan::{OutCol, Planned, Query};
 use super::session::Settings;
-use super::types::{self, RegNames, Type, Value};
+use super::types::{RegNames, Type, Value};
 
 /// A statement's result.
 pub struct StmtResult {
@@ -259,12 +259,23 @@ impl Engine {
         }
     }
 
-    /// Runs one statement, managing the transaction around it.
+    /// Runs one statement, managing the transaction around it. `param_types`
+    /// are the types `params` were already decoded with (from `Prepared`,
+    /// see `prepare`) — re-binding the statement here (see `run_one`) must
+    /// reuse them rather than re-deriving types from the decoded values:
+    /// a client-declared parameter type is authoritative and doesn't
+    /// change just because this statement uses it in a different context
+    /// (e.g. an `int2`-declared parameter assigned into a `numeric`
+    /// column stays `int2`, cast to `numeric` at the point of use, the
+    /// same way `prepare` itself resolved it), and some values (e.g. a
+    /// `json` parameter, stored as `Value::Text`) can't be told apart
+    /// from a same-shaped value of a different type at all once decoded.
     pub fn execute(
         &self,
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         if s.status == TxStatus::Failed && !is_transaction_control(stmt) {
             return Err(PgError::new(
@@ -276,7 +287,7 @@ impl Engine {
         if s.txn.is_none() {
             s.rt.now = s.rt.stmt_now;
         }
-        let result = self.run_statement(s, stmt, params);
+        let result = self.run_statement(s, stmt, params, param_types);
         match &result {
             Err(e) if e.severity != "NOTICE" => {
                 if s.status == TxStatus::InTransaction {
@@ -296,6 +307,7 @@ impl Engine {
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         use a::Statement as S;
         match stmt {
@@ -496,7 +508,7 @@ impl Engine {
                     }
                 }
                 let Some(inner) = prep.stmt.clone() else { return Ok(StmtResult::tag("EXECUTE")) };
-                self.run_statement(s, &inner, &vals)
+                self.run_statement(s, &inner, &vals, &prep.param_types)
             }
             S::Deallocate { name, .. } => {
                 if name.value.eq_ignore_ascii_case("all") {
@@ -530,7 +542,7 @@ impl Engine {
             S::CreateRole { .. } => Ok(StmtResult::tag("CREATE ROLE")),
             S::CreateExtension { .. } => Ok(StmtResult::tag("CREATE EXTENSION")),
             S::DropExtension { .. } => Ok(StmtResult::tag("DROP EXTENSION")),
-            other => self.run_data_statement(s, other, params),
+            other => self.run_data_statement(s, other, params, param_types),
         }
     }
 
@@ -540,6 +552,7 @@ impl Engine {
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         let writes = statement_writes(stmt);
         let implicit = s.txn.is_none();
@@ -549,7 +562,7 @@ impl Engine {
         if writes {
             self.acquire_writer(s)?;
         }
-        let out = self.run_in_txn(s, stmt, params);
+        let out = self.run_in_txn(s, stmt, params, param_types);
         match (&out, implicit) {
             (Ok(_), true) => self.commit(s)?,
             (Err(_), true) => self.rollback(s),
@@ -563,6 +576,7 @@ impl Engine {
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         let mut g = self.global.lock().unwrap();
         let global = &mut *g;
@@ -584,7 +598,7 @@ impl Engine {
             fmt: ctx.rt.settings.fmt(),
             now: ctx.rt.now,
         };
-        let result = run_one(&mut ctx, stmt, &info);
+        let result = run_one(&mut ctx, stmt, &info, param_types);
         let notifies = std::mem::take(&mut ctx.notifies);
         drop(g);
         for (chan, payload) in notifies {
@@ -964,12 +978,28 @@ fn set_value_text(values: &[a::Expr]) -> PgResult<String> {
 }
 
 /// Runs a query, DML or DDL statement inside an open transaction.
-fn run_one(ctx: &mut Ctx, stmt: &a::Statement, info: &SessionInfo) -> PgResult<StmtResult> {
+fn run_one(
+    ctx: &mut Ctx,
+    stmt: &a::Statement,
+    info: &SessionInfo,
+    param_types: &[Type],
+) -> PgResult<StmtResult> {
     use a::Statement as S;
     match stmt {
         S::Query(_) | S::Insert(_) | S::Update(_) | S::Delete(_) => {
             let db = ctx.db.clone();
-            let mut b = Binder::new(&db, info, &param_types(ctx));
+            // Re-binding here needs hints for `ctx.params`; reuse the ones
+            // `Prepared::param_types` already resolved (see `execute`'s
+            // doc comment) rather than re-guessing from the decoded
+            // values, falling back to `Unknown` (safe: this binder's own
+            // "resolve `Unknown` from context" handling is exactly what
+            // `prepare` itself used) only if the caller genuinely has none.
+            let hints: Vec<Type> = if param_types.len() == ctx.params.len() {
+                param_types.to_vec()
+            } else {
+                vec![Type::UNKNOWN; ctx.params.len()]
+            };
+            let mut b = Binder::new(&db, info, &hints);
             let planned = b.bind_statement(stmt)?;
             run_planned(ctx, planned, stmt)
         }
@@ -1052,10 +1082,6 @@ fn ddl<'a, 'b>(ctx: &'a mut Ctx<'b>, info: &SessionInfo) -> Ddl<'a, 'b> {
             now: info.now,
         },
     }
-}
-
-fn param_types(ctx: &Ctx) -> Vec<Type> {
-    ctx.params.iter().map(types::value_type_guess).collect()
 }
 
 fn run_planned(ctx: &mut Ctx, planned: Planned, stmt: &a::Statement) -> PgResult<StmtResult> {

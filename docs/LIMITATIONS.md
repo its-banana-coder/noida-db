@@ -95,7 +95,9 @@ schema change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M,
 transactions and savepoints, introspection) pass end to end. Gitea (a real,
 unmodified Go application with a ~115-table production schema, using the
 xorm ORM) migrates and starts its actual schema successfully, including
-xorm's own per-table column-metadata self-check. The introspection queries
+xorm's own per-table column-metadata self-check, and real usage against
+it (creating a repository via its API, which round-trips a JSON column
+through an extended-protocol parameter) works. The introspection queries
 Prisma and
 Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
 similar were compared by hand against a real server.
