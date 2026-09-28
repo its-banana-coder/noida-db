@@ -154,8 +154,13 @@ constraints.
 
 **Not yet**
 
-- PL/pgSQL and stored procedures (so no triggers either), extensions.
-- `CREATE PROCEDURE`/`CALL`.
+- PL/pgSQL, stored procedures, `CREATE PROCEDURE`/`CALL` and triggers,
+  and extensions. Deliberately deferred: unlike everything else on this
+  list, PL/pgSQL is a real procedural language embedded in SQL (its own
+  grammar, control flow, exception handling, `NEW`/`OLD` row access) that
+  needs its own interpreter wired into the binder/executor, not a bounded
+  parse-and-evaluate addition — it's planned as its own dedicated effort
+  once the rest of the compatibility work here is done.
 - Full-text search: GIN/GiST indexes, `ts_headline`, `websearch_to_tsquery`,
   any text search config other than `'english'`/`'simple'`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
