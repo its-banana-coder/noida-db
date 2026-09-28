@@ -92,7 +92,12 @@ Every service is its own module:
     `daterange`/`tsrange`/`tstzrange`: canonical text, `@>`/`<@`/`&&`,
     `lower`/`upper`/`isempty`).
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
-    Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
+    Flyway, Liquibase, Prisma, Django and Rails to look up the schema,
+    including old-style comma-separated joins across them (what Sequelize's
+    own index introspection sends).
+  - Clients verified: psycopg, SQLAlchemy, Django, asyncpg, Alembic,
+    node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, the JDBC
+    driver.
 - **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
   extensions, logical replication, `COPY` to/from a server-side file or
   program, `FORMAT BINARY`, full-text search GIN/GiST

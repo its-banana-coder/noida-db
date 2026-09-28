@@ -540,11 +540,11 @@ impl<'a> Binder<'a> {
         &mut self,
         sel: &a::Select,
         q: &a::Query,
-        from: From,
+        mut from: From,
     ) -> PgResult<(Query, Vec<OutCol>)> {
         let input_width = self.scopes.last().unwrap().width();
         // WHERE
-        let filter = match &sel.selection {
+        let mut filter = match &sel.selection {
             Some(e) => {
                 self.frames.push(AggFrame { forbid: Some("WHERE"), ..Default::default() });
                 let te = self.bind_expr(e);
@@ -553,6 +553,19 @@ impl<'a> Binder<'a> {
             }
             None => None,
         };
+        // A comma-separated `FROM a, b, c` binds to a chain of `Cross`
+        // joins with no `on`, which without this would run as a fully
+        // unfiltered nested-loop join at every step (many ORMs' catalog
+        // queries still use this older join style, and it blows up
+        // memory/time on wide implicit joins once WHERE is the only
+        // filter). Push down whichever WHERE conjuncts become fully
+        // evaluable once a join's columns are all in scope.
+        if let Some(f) = filter.take() {
+            let mut remaining = vec![];
+            flatten_and(f, &mut remaining);
+            push_cross_predicates(&mut from, &mut remaining);
+            filter = if remaining.is_empty() { None } else { Some(and_all(remaining)) };
+        }
         // Everything below may contain aggregates and window functions.
         self.frames.push(AggFrame::default());
         let r = self.bind_select_rest(sel, q, from, filter, input_width);
@@ -4396,6 +4409,64 @@ fn apply_alias_columns(
 
 fn rename_cols(cols: &mut [OutCol], names: &[a::TableAliasColumnDef], rel: &str) -> PgResult<()> {
     apply_alias_columns(cols, names, rel)
+}
+
+/// Flattens top-level (and nested) `AND`s into a flat conjunct list, the
+/// inverse of [`and_all`].
+fn flatten_and(e: Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::And(items) => items.into_iter().for_each(|i| flatten_and(i, out)),
+        other => out.push(other),
+    }
+}
+
+/// The highest column index a bound expression references in the current
+/// row, ignoring outer-query references (which are always "in scope").
+/// `None` means the expression references no row column at all.
+fn max_col(e: &Expr) -> Option<usize> {
+    let mut m = match e {
+        Expr::Col(i) => Some(*i),
+        _ => None,
+    };
+    let mut e = e.clone();
+    e.children_mut(&mut |c| {
+        if let Some(cm) = max_col(c) {
+            m = Some(m.map_or(cm, |x| x.max(cm)));
+        }
+    });
+    m
+}
+
+/// A comma-separated `FROM a, b, c` binds to a left-deep chain of `Cross`
+/// joins with no `on`, which without this runs as a fully unfiltered
+/// nested-loop join at every step (many ORMs' catalog-introspection
+/// queries still use this older join style, and it blows up memory/time
+/// on wide implicit joins once the WHERE clause is the only filter). Real
+/// Postgres treats a comma join and `JOIN ... ON` as equivalent, so it's
+/// correct to push a WHERE conjunct down onto whichever join makes all of
+/// its columns available first. Only ever descends through `left`, since
+/// that's the only side `bind_from`'s chain guarantees starts at column 0
+/// (a `right` item can itself be an arbitrary join subtree at some other
+/// column offset, which this deliberately leaves untouched).
+fn push_cross_predicates(from: &mut From, remaining: &mut Vec<Expr>) {
+    let From::Join { left, kind, on, left_cols, right_cols, .. } = from else { return };
+    push_cross_predicates(left, remaining);
+    if *kind != JoinKind::Cross || on.is_some() || remaining.is_empty() {
+        return;
+    }
+    let width = *left_cols + *right_cols;
+    let mut mine = vec![];
+    let mut i = 0;
+    while i < remaining.len() {
+        if max_col(&remaining[i]).is_none_or(|m| m < width) {
+            mine.push(remaining.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    if !mine.is_empty() {
+        *on = Some(and_all(mine));
+    }
 }
 
 fn and_all(mut conds: Vec<Expr>) -> Expr {

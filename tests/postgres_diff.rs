@@ -489,6 +489,37 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT id FROM bookings WHERE span @> '2024-01-05'::date ORDER BY id",
         "SELECT id FROM bookings WHERE span && '[2024-01-05,2024-01-15)'::daterange ORDER BY id",
     ],
+    // `SET TIME ZONE INTERVAL '...' HOUR TO MINUTE` (what Sequelize sends
+    // for a fixed-offset zone that isn't a named one): must not error, and
+    // the offset itself must take effect (SHOW TimeZone's exact string is
+    // a documented, cosmetic-only gap, so this doesn't compare it).
+    &[
+        "SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE",
+        "!SHOW TimeZone",
+        "SELECT '2020-01-01 00:00:00+00'::timestamptz",
+        "RESET TimeZone",
+    ],
+    // Comma-separated ("implicit") joins: `FROM a, b, c` is the old-style
+    // equivalent of `a JOIN b ON ... JOIN c ON ...`, and several ORMs'
+    // catalog-introspection queries still use it (e.g. Sequelize's index
+    // lookup: `pg_class, pg_index, pg_class, pg_attribute` joined only via
+    // a WHERE clause). Left unfiltered, that plans as a fully unfiltered
+    // N-way cross product before WHERE ever applies, which is correct but
+    // must not be evaluated as one (it previously blew up memory/time on a
+    // catalog with enough tables/columns); this checks it still returns
+    // the right rows.
+    &[
+        "CREATE TABLE cja (id int, x int)",
+        "CREATE TABLE cjb (id int, a_id int, y int)",
+        "CREATE TABLE cjc (id int, b_id int, z int)",
+        "INSERT INTO cja VALUES (1, 10), (2, 20)",
+        "INSERT INTO cjb VALUES (1, 1, 100), (2, 2, 200), (3, 2, 300)",
+        "INSERT INTO cjc VALUES (1, 1, 1000), (2, 2, 2000)",
+        "SELECT cja.id, cjb.id, cjc.id FROM cja, cjb, cjc \
+         WHERE cjb.a_id = cja.id AND cjc.b_id = cjb.id ORDER BY cja.id, cjb.id, cjc.id",
+        "SELECT t.relname, i.relname FROM pg_class t, pg_class i, pg_index ix \
+         WHERE t.oid = ix.indrelid AND i.oid = ix.indexrelid AND t.relname = 'cja'",
+    ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).
     &[

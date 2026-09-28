@@ -630,6 +630,17 @@ impl Engine {
                         a::Value::SingleQuotedString(s) => s.clone(),
                         o => o.to_string(),
                     },
+                    // `SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE`
+                    // (what some drivers send for a fixed-offset zone that
+                    // isn't a named one): the offset is the interval's own
+                    // literal text, which already parses as one.
+                    a::Expr::Interval(iv) => match &*iv.value {
+                        a::Expr::Value(v) => match &v.value {
+                            a::Value::SingleQuotedString(s) => s.clone(),
+                            other => other.to_string(),
+                        },
+                        other => other.to_string(),
+                    },
                     other => other.to_string(),
                 };
                 let v = if v.eq_ignore_ascii_case("default") || v.eq_ignore_ascii_case("local") {

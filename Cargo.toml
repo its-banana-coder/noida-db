@@ -8,6 +8,9 @@ license = "MIT"
 # Its own workspace root, so cargo never reads the manifest of an enclosing
 # checkout (as when this repo is a worktree nested inside another).
 [workspace]
+# A client-test crate under tests/clients has its own dependencies (tokio,
+# sqlx...) that don't belong in noida-db's own build.
+exclude = ["tests/clients/postgres/rust"]
 
 [lib]
 name = "noida"

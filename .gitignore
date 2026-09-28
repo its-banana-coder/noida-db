@@ -1,5 +1,6 @@
 /target
 tests/clients/target
+tests/clients/postgres/rust/target/
 /.noida-db
 /.claude
 
