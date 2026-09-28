@@ -1,22 +1,28 @@
 //! Executes parsed statements: `SELECT` (scalar, `system.one`/`numbers(N)`/
 //! `system.tables`, and real tables, with `WHERE`/`GROUP BY`/`ORDER BY`/
-//! `LIMIT`), `CREATE TABLE`, `INSERT` and `DROP TABLE`. One `Engine` per
-//! server, shared by every connection behind a `Mutex` — same shape as
-//! `redis::engine`, since noida-db's services all trade throughput for
-//! simplicity (see docs/specs/README.md).
+//! `LIMIT`/`FINAL`), `CREATE TABLE`, `CREATE MATERIALIZED VIEW ... TO`,
+//! `INSERT` (literal `VALUES` or a `FORMAT`-encoded body), `DROP TABLE` and
+//! `OPTIMIZE TABLE ... FINAL`. One `Engine` per server, shared by every
+//! connection behind a `Mutex` — same shape as `redis::engine`, since
+//! noida-db's services all trade throughput for simplicity (see
+//! docs/specs/README.md).
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use super::catalog::{self, Catalog};
+use super::catalog::{self, Catalog, MaterializedView};
 use super::error::ChError;
-use super::sql::{self, BinOp, CreateTable, DropTable, Expr, Insert, Select, Statement, Table};
+use super::rowbinary;
+use super::sql::{
+    self, BinOp, CreateMaterializedView, CreateTable, DropTable, Expr, Insert, InsertSource,
+    OptimizeTable, Select, Statement, Table,
+};
 use super::types::{self, Type, Val};
 
 pub const SERVER_VERSION: &str = "24.8.4.13";
 
-type Columns = Vec<(String, Type)>;
-type Rows = Vec<Vec<Val>>;
+pub(crate) type Columns = Vec<(String, Type)>;
+pub(crate) type Rows = Vec<Vec<Val>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryResult {
@@ -44,8 +50,14 @@ impl Engine {
     }
 
     /// Parses and runs `sql`, returning the result and the `FORMAT` clause
-    /// (if any) so the caller can pick an output format.
-    pub fn execute(&self, sql: &str) -> Result<(QueryResult, Option<String>), ChError> {
+    /// (if any) so the caller can pick an output format. `body` is the raw
+    /// HTTP request body, used only by `INSERT ... FORMAT <fmt>` (the rows
+    /// are `<fmt>`-encoded data there, not SQL).
+    pub fn execute(
+        &self,
+        sql: &str,
+        body: &[u8],
+    ) -> Result<(QueryResult, Option<String>), ChError> {
         match sql::parse(sql)? {
             Statement::Select(s) => {
                 let format = s.format.clone();
@@ -56,19 +68,36 @@ impl Engine {
                 let mut catalog = self.catalog.lock().unwrap();
                 Ok((do_create(&mut catalog, c)?, None))
             }
+            Statement::CreateMaterializedView(m) => {
+                let mut catalog = self.catalog.lock().unwrap();
+                Ok((do_create_mv(&mut catalog, m)?, None))
+            }
             Statement::Insert(i) => {
                 let mut catalog = self.catalog.lock().unwrap();
-                Ok((do_insert(&mut catalog, i)?, None))
+                Ok((do_insert(&mut catalog, i, body)?, None))
             }
             Statement::DropTable(d) => {
                 let mut catalog = self.catalog.lock().unwrap();
                 Ok((do_drop(&mut catalog, d)?, None))
+            }
+            Statement::OptimizeTable(o) => {
+                let mut catalog = self.catalog.lock().unwrap();
+                Ok((do_optimize(&mut catalog, o)?, None))
             }
         }
     }
 }
 
 // ---- DDL / DML -------------------------------------------------------
+
+fn expr_to_ident(e: &Expr) -> Result<String, ChError> {
+    match e {
+        Expr::Ident(name) => Ok(name.clone()),
+        other => {
+            Err(ChError::not_implemented(&format!("engine argument {}", other.default_name())))
+        }
+    }
+}
 
 fn do_create(catalog: &mut Catalog, c: CreateTable) -> Result<QueryResult, ChError> {
     let database = c.database.clone().unwrap_or_else(|| "default".into());
@@ -86,10 +115,21 @@ fn do_create(catalog: &mut Catalog, c: CreateTable) -> Result<QueryResult, ChErr
     }
     let engine = match c.engine.as_str() {
         "Memory" => catalog::Engine::Memory,
-        // Merge semantics (dedup/summing on merge, FINAL) aren't built yet;
-        // rows behave like a plain MergeTree until then. See
-        // docs/LIMITATIONS.md.
-        "MergeTree" | "ReplacingMergeTree" | "SummingMergeTree" => catalog::Engine::MergeTree,
+        "MergeTree" => catalog::Engine::MergeTree,
+        "ReplacingMergeTree" => {
+            let mut args = c.engine_args.iter();
+            let ver = args.next().map(expr_to_ident).transpose()?;
+            let is_deleted = args.next().map(expr_to_ident).transpose()?;
+            catalog::Engine::ReplacingMergeTree { ver, is_deleted }
+        }
+        "SummingMergeTree" => {
+            let sum_columns = if c.engine_args.is_empty() {
+                None
+            } else {
+                Some(c.engine_args.iter().map(expr_to_ident).collect::<Result<Vec<_>, _>>()?)
+            };
+            catalog::Engine::SummingMergeTree { sum_columns }
+        }
         other => return Err(ChError::not_implemented(&format!("ENGINE = {other}"))),
     };
     catalog.create(
@@ -100,14 +140,45 @@ fn do_create(catalog: &mut Catalog, c: CreateTable) -> Result<QueryResult, ChErr
     Ok(empty_result())
 }
 
-fn do_insert(catalog: &mut Catalog, i: Insert) -> Result<QueryResult, ChError> {
-    let database = i.database.clone().unwrap_or_else(|| "default".into());
-    let schema = catalog
-        .get(&database, &i.table)
-        .ok_or_else(|| ChError::unknown_table(&database, &i.table))?
-        .columns
-        .clone();
-    let col_idxs: Vec<usize> = match &i.columns {
+fn do_create_mv(catalog: &mut Catalog, m: CreateMaterializedView) -> Result<QueryResult, ChError> {
+    let database = m.database.clone().unwrap_or_else(|| "default".into());
+    if catalog.mv_exists(&database, &m.name) {
+        if m.if_not_exists {
+            return Ok(empty_result());
+        }
+        return Err(ChError::table_already_exists(&database, &m.name));
+    }
+    let Table::Named { database: src_db, table: src_table } = &m.select.table else {
+        return Err(ChError::not_implemented(
+            "CREATE MATERIALIZED VIEW over a table function or system table",
+        ));
+    };
+    let source_db = src_db.clone().unwrap_or_else(|| "default".into());
+    if !catalog.exists(&source_db, src_table) {
+        return Err(ChError::unknown_table(&source_db, src_table));
+    }
+    let to_database = m.to_database.clone().unwrap_or_else(|| "default".into());
+    if !catalog.exists(&to_database, &m.to_table) {
+        // The "TO" form writes into a table that must already exist.
+        return Err(ChError::unknown_table(&to_database, &m.to_table));
+    }
+    catalog.create_mv(
+        &database,
+        &m.name,
+        MaterializedView {
+            source: (source_db, src_table.clone()),
+            target: (to_database, m.to_table.clone()),
+            select: m.select,
+        },
+    );
+    Ok(empty_result())
+}
+
+fn resolve_col_idxs(
+    schema: &Columns,
+    columns: &Option<Vec<String>>,
+) -> Result<Vec<usize>, ChError> {
+    match columns {
         Some(names) => names
             .iter()
             .map(|n| {
@@ -116,23 +187,85 @@ fn do_insert(catalog: &mut Catalog, i: Insert) -> Result<QueryResult, ChError> {
                     .position(|(cn, _)| cn == n)
                     .ok_or_else(|| ChError::unknown_identifier(n))
             })
-            .collect::<Result<_, _>>()?,
-        None => (0..schema.len()).collect(),
-    };
-    let mut new_rows = Vec::with_capacity(i.rows.len());
-    for values in &i.rows {
-        if values.len() != col_idxs.len() {
-            return Err(ChError::syntax("INSERT: wrong number of values in a row"));
-        }
-        let mut row: Vec<Val> = schema.iter().map(|(_, t)| types::zero_value(*t)).collect();
-        for (pos, expr) in values.iter().enumerate() {
-            let (_, v) = eval_row_expr(expr, &[], &[])?;
-            let col_idx = col_idxs[pos];
-            row[col_idx] = types::coerce(&v, schema[col_idx].1)?;
-        }
-        new_rows.push(row);
+            .collect(),
+        None => Ok((0..schema.len()).collect()),
     }
-    catalog.get_mut(&database, &i.table).unwrap().rows.extend(new_rows);
+}
+
+fn do_insert(catalog: &mut Catalog, i: Insert, body: &[u8]) -> Result<QueryResult, ChError> {
+    let database = i.database.clone().unwrap_or_else(|| "default".into());
+    let schema = catalog
+        .get(&database, &i.table)
+        .ok_or_else(|| ChError::unknown_table(&database, &i.table))?
+        .columns
+        .clone();
+    let col_idxs = resolve_col_idxs(&schema, &i.columns)?;
+
+    let new_rows: Rows = match &i.source {
+        InsertSource::Values(value_rows) => {
+            let mut rows = Vec::with_capacity(value_rows.len());
+            for values in value_rows {
+                if values.len() != col_idxs.len() {
+                    return Err(ChError::syntax("INSERT: wrong number of values in a row"));
+                }
+                let mut row: Vec<Val> = schema.iter().map(|(_, t)| types::zero_value(*t)).collect();
+                for (pos, expr) in values.iter().enumerate() {
+                    let (_, v) = eval_row_expr(expr, &[], &[])?;
+                    row[col_idxs[pos]] = types::coerce(&v, schema[col_idxs[pos]].1)?;
+                }
+                rows.push(row);
+            }
+            rows
+        }
+        InsertSource::Format(fmt) => {
+            let target_schema: Columns = col_idxs.iter().map(|&idx| schema[idx].clone()).collect();
+            let decoded = match fmt.as_str() {
+                "RowBinary" => rowbinary::decode_rows(body, &target_schema, false, false)?,
+                "RowBinaryWithNames" => rowbinary::decode_rows(body, &target_schema, true, false)?,
+                "RowBinaryWithNamesAndTypes" => {
+                    rowbinary::decode_rows(body, &target_schema, true, true)?
+                }
+                other => {
+                    return Err(ChError::not_implemented(&format!("INSERT ... FORMAT {other}")));
+                }
+            };
+            decoded
+                .into_iter()
+                .map(|values| {
+                    let mut row: Vec<Val> =
+                        schema.iter().map(|(_, t)| types::zero_value(*t)).collect();
+                    for (pos, v) in values.into_iter().enumerate() {
+                        row[col_idxs[pos]] = types::coerce(&v, schema[col_idxs[pos]].1)?;
+                    }
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>, ChError>>()?
+        }
+    };
+
+    catalog.get_mut(&database, &i.table).unwrap().rows.extend(new_rows.clone());
+
+    // Materialized views watching this table get just the newly inserted
+    // block, the way ClickHouse's "TO" form works — not the whole table.
+    for mv in catalog.mvs_for_source(&database, &i.table) {
+        let transformed = transform_select(&mv.select, &schema, new_rows.clone())?;
+        let (tdb, ttable) = &mv.target;
+        let target_schema = catalog
+            .get(tdb, ttable)
+            .ok_or_else(|| ChError::unknown_table(tdb, ttable))?
+            .columns
+            .clone();
+        let mut out_rows = Vec::with_capacity(transformed.rows.len());
+        for row in transformed.rows {
+            let mut coerced = Vec::with_capacity(target_schema.len());
+            for (idx, (_, ty)) in target_schema.iter().enumerate() {
+                let v = row.get(idx).cloned().unwrap_or_else(|| types::zero_value(*ty));
+                coerced.push(types::coerce(&v, *ty)?);
+            }
+            out_rows.push(coerced);
+        }
+        catalog.get_mut(tdb, ttable).unwrap().rows.extend(out_rows);
+    }
     Ok(empty_result())
 }
 
@@ -144,15 +277,166 @@ fn do_drop(catalog: &mut Catalog, d: DropTable) -> Result<QueryResult, ChError> 
     Ok(empty_result())
 }
 
+fn do_optimize(catalog: &mut Catalog, o: OptimizeTable) -> Result<QueryResult, ChError> {
+    let database = o.database.clone().unwrap_or_else(|| "default".into());
+    // No background merges exist to trigger, so a bare OPTIMIZE (no FINAL)
+    // is a no-op; it still checks the table exists, the way real
+    // ClickHouse would refuse an unknown one.
+    let t = catalog
+        .get(&database, &o.table)
+        .ok_or_else(|| ChError::unknown_table(&database, &o.table))?;
+    if !o.final_ {
+        return Ok(empty_result());
+    }
+    let merged = merge_final(&t.engine, &t.order_by, &t.columns, &t.rows)?;
+    catalog.get_mut(&database, &o.table).unwrap().rows = merged;
+    Ok(empty_result())
+}
+
+// ---- ReplacingMergeTree / SummingMergeTree merge semantics --------------
+//
+// Real ClickHouse stores each INSERT as a part and merges parts in the
+// background (nondeterministic timing); `SELECT ... FINAL` and `OPTIMIZE
+// TABLE ... FINAL` are the deterministic ways to observe the merged state,
+// so that's what's built here — applied on demand over the whole table,
+// since there are no parts to merge incrementally. See docs/LIMITATIONS.md.
+
+fn merge_final(
+    engine: &catalog::Engine,
+    order_by: &[String],
+    columns: &Columns,
+    rows: &Rows,
+) -> Result<Rows, ChError> {
+    match engine {
+        catalog::Engine::ReplacingMergeTree { ver, is_deleted } => {
+            replacing_final(order_by, ver.as_deref(), is_deleted.as_deref(), columns, rows)
+        }
+        catalog::Engine::SummingMergeTree { sum_columns } => {
+            summing_final(order_by, sum_columns.as_deref(), columns, rows)
+        }
+        catalog::Engine::Memory | catalog::Engine::MergeTree => Ok(rows.clone()),
+    }
+}
+
+fn column_index(columns: &Columns, name: &str) -> Result<usize, ChError> {
+    columns.iter().position(|(n, _)| n == name).ok_or_else(|| ChError::unknown_identifier(name))
+}
+
+fn group_key_text(row: &[Val], key_idxs: &[usize]) -> String {
+    key_idxs.iter().map(|&i| val_text(&row[i])).collect::<Vec<_>>().join("\u{1}")
+}
+
+/// Keeps, per `ORDER BY` key, the row with the greatest `ver` (or the last
+/// inserted if there's no `ver` column), then drops rows where `is_deleted`
+/// is true.
+fn replacing_final(
+    order_by: &[String],
+    ver: Option<&str>,
+    is_deleted: Option<&str>,
+    columns: &Columns,
+    rows: &Rows,
+) -> Result<Rows, ChError> {
+    if order_by.is_empty() {
+        return Ok(rows.clone());
+    }
+    let key_idxs: Vec<usize> =
+        order_by.iter().map(|n| column_index(columns, n)).collect::<Result<_, _>>()?;
+    let ver_idx = ver.map(|n| column_index(columns, n)).transpose()?;
+    let deleted_idx = is_deleted.map(|n| column_index(columns, n)).transpose()?;
+
+    let mut pos_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Rows = Vec::new();
+    for row in rows {
+        let key = group_key_text(row, &key_idxs);
+        match pos_of.get(&key) {
+            Some(&pos) => {
+                let replace = match ver_idx {
+                    Some(vi) => {
+                        !matches!(compare(&row[vi], &out[pos][vi]), Some(std::cmp::Ordering::Less))
+                    }
+                    None => true, // no version column: last inserted wins
+                };
+                if replace {
+                    out[pos] = row.clone();
+                }
+            }
+            None => {
+                pos_of.insert(key, out.len());
+                out.push(row.clone());
+            }
+        }
+    }
+    if let Some(di) = deleted_idx {
+        out.retain(|r| !r[di].is_truthy());
+    }
+    Ok(out)
+}
+
+/// Sums numeric columns (all of them, or just `sum_columns` if given) that
+/// aren't part of the `ORDER BY` key, grouped by that key; other columns
+/// keep the first row's value, the way ClickHouse picks an arbitrary one.
+fn summing_final(
+    order_by: &[String],
+    sum_columns: Option<&[String]>,
+    columns: &Columns,
+    rows: &Rows,
+) -> Result<Rows, ChError> {
+    if order_by.is_empty() {
+        return Ok(rows.clone());
+    }
+    let key_idxs: Vec<usize> =
+        order_by.iter().map(|n| column_index(columns, n)).collect::<Result<_, _>>()?;
+    let sum_idxs: Vec<usize> = match sum_columns {
+        Some(names) => names.iter().map(|n| column_index(columns, n)).collect::<Result<_, _>>()?,
+        None => columns
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, t))| !key_idxs.contains(i) && (t.is_integer() || t.is_float()))
+            .map(|(i, _)| i)
+            .collect(),
+    };
+
+    let mut pos_of: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut out: Rows = Vec::new();
+    for row in rows {
+        let key = group_key_text(row, &key_idxs);
+        match pos_of.get(&key) {
+            Some(&pos) => {
+                for &si in &sum_idxs {
+                    let a = out[pos][si].as_f64().unwrap_or(0.0);
+                    let b = row[si].as_f64().unwrap_or(0.0);
+                    out[pos][si] = match &out[pos][si] {
+                        Val::UInt(_) => Val::UInt((a + b) as u64),
+                        Val::Int(_) => Val::Int((a + b) as i64),
+                        _ => Val::Float(a + b),
+                    };
+                }
+            }
+            None => {
+                pos_of.insert(key, out.len());
+                out.push(row.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---- SELECT ------------------------------------------------------------
 
-fn base_rows(catalog: &Catalog, table: &Table) -> Result<(Columns, Rows), ChError> {
+/// A real table's engine and `ORDER BY`, so `FINAL` can be applied. `None`
+/// for `system.*` and the `FROM`-less scalar case, where `FINAL` doesn't
+/// apply.
+type TableMeta = Option<(catalog::Engine, Vec<String>)>;
+
+fn base_rows(catalog: &Catalog, table: &Table) -> Result<(Columns, Rows, TableMeta), ChError> {
     match table {
-        Table::None => Ok((vec![], vec![vec![]])),
-        Table::SystemOne => Ok((vec![("dummy".into(), Type::UInt8)], vec![vec![Val::UInt(0)]])),
+        Table::None => Ok((vec![], vec![vec![]], None)),
+        Table::SystemOne => {
+            Ok((vec![("dummy".into(), Type::UInt8)], vec![vec![Val::UInt(0)]], None))
+        }
         Table::SystemNumbers(n) => {
             let rows = (0..*n).map(|i| vec![Val::UInt(i)]).collect();
-            Ok((vec![("number".into(), Type::UInt64)], rows))
+            Ok((vec![("number".into(), Type::UInt64)], rows, None))
         }
         Table::SystemTables => {
             let columns = vec![
@@ -173,25 +457,36 @@ fn base_rows(catalog: &Catalog, table: &Table) -> Result<(Columns, Rows), ChErro
                     ]
                 })
                 .collect();
-            Ok((columns, rows))
+            Ok((columns, rows, None))
         }
         Table::Named { database, table } => {
             let database = database.clone().unwrap_or_else(|| "default".into());
             let t = catalog
                 .get(&database, table)
                 .ok_or_else(|| ChError::unknown_table(&database, table))?;
-            Ok((t.columns.clone(), t.rows.clone()))
+            Ok((t.columns.clone(), t.rows.clone(), Some((t.engine.clone(), t.order_by.clone()))))
         }
     }
 }
 
 fn run_select(catalog: &Catalog, s: &Select) -> Result<QueryResult, ChError> {
-    let (columns, mut rows) = base_rows(catalog, &s.table)?;
+    let (columns, mut rows, meta) = base_rows(catalog, &s.table)?;
+    if s.select_final
+        && let Some((engine, order_by)) = &meta
+    {
+        rows = merge_final(engine, order_by, &columns, &rows)?;
+    }
+    transform_select(s, &columns, rows)
+}
 
+/// `WHERE` → aggregation-or-projection → `ORDER BY` → `LIMIT`. Shared by
+/// `run_select` and materialized views, which run the same pipeline over
+/// just the newly inserted block instead of a table's full rows.
+fn transform_select(s: &Select, columns: &Columns, mut rows: Rows) -> Result<QueryResult, ChError> {
     if let Some(w) = &s.where_ {
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
-            if eval_row_expr(w, &row, &columns)?.1.is_truthy() {
+            if eval_row_expr(w, &row, columns)?.1.is_truthy() {
                 kept.push(row);
             }
         }
@@ -199,9 +494,9 @@ fn run_select(catalog: &Catalog, s: &Select) -> Result<QueryResult, ChError> {
     }
 
     let mut result = if is_aggregate_query(s) {
-        run_aggregate(s, &columns, rows)?
+        run_aggregate(s, columns, rows)?
     } else {
-        run_projection(s, &columns, rows)?
+        run_projection(s, columns, rows)?
     };
 
     if !s.order_by.is_empty() {
@@ -695,7 +990,7 @@ mod tests {
     }
 
     fn run(e: &Engine, sql: &str) -> QueryResult {
-        e.execute(sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")).0
+        e.execute(sql, b"").unwrap_or_else(|err| panic!("{sql}: {err:?}")).0
     }
 
     fn run_sql(sql: &str) -> QueryResult {
@@ -750,31 +1045,31 @@ mod tests {
     #[test]
     fn unknown_table_errors() {
         let e = engine();
-        let err = e.execute("SELECT * FROM nope").unwrap_err();
+        let err = e.execute("SELECT * FROM nope", b"").unwrap_err();
         assert_eq!(err.code, 60);
     }
 
     #[test]
     fn unknown_function_errors() {
-        let err = engine().execute("SELECT nosuchfn()").unwrap_err();
+        let err = engine().execute("SELECT nosuchfn()", b"").unwrap_err();
         assert_eq!(err.code, 46);
     }
 
     #[test]
     fn bare_column_name_with_no_from_is_unknown_identifier() {
-        let err = engine().execute("SELECT FROM").unwrap_err();
+        let err = engine().execute("SELECT FROM", b"").unwrap_err();
         assert_eq!(err.code, 47);
     }
 
     #[test]
     fn syntax_error_propagates() {
-        let err = engine().execute("not sql").unwrap_err();
+        let err = engine().execute("not sql", b"").unwrap_err();
         assert_eq!(err.code, 62);
     }
 
     #[test]
     fn format_clause_is_returned() {
-        let (_, format) = engine().execute("SELECT 1 FORMAT JSON").unwrap();
+        let (_, format) = engine().execute("SELECT 1 FORMAT JSON", b"").unwrap();
         assert_eq!(format, Some("JSON".into()));
     }
 
@@ -805,7 +1100,7 @@ mod tests {
     fn create_table_twice_errors_without_if_not_exists() {
         let e = engine();
         run(&e, "CREATE TABLE t (id UInt32) ENGINE = Memory");
-        let err = e.execute("CREATE TABLE t (id UInt32) ENGINE = Memory").unwrap_err();
+        let err = e.execute("CREATE TABLE t (id UInt32) ENGINE = Memory", b"").unwrap_err();
         assert_eq!(err.code, 57);
         // IF NOT EXISTS makes the same statement a no-op.
         run(&e, "CREATE TABLE IF NOT EXISTS t (id UInt32) ENGINE = Memory");
@@ -813,7 +1108,7 @@ mod tests {
 
     #[test]
     fn insert_into_missing_table_errors() {
-        let err = engine().execute("INSERT INTO nope VALUES (1)").unwrap_err();
+        let err = engine().execute("INSERT INTO nope VALUES (1)", b"").unwrap_err();
         assert_eq!(err.code, 60);
     }
 
@@ -821,7 +1116,7 @@ mod tests {
     fn insert_range_checks_declared_type() {
         let e = engine();
         run(&e, "CREATE TABLE t (n UInt8) ENGINE = Memory");
-        let err = e.execute("INSERT INTO t VALUES (300)").unwrap_err();
+        let err = e.execute("INSERT INTO t VALUES (300)", b"").unwrap_err();
         assert_eq!(err.code, 69);
     }
 
@@ -880,7 +1175,7 @@ mod tests {
         let e = engine();
         run(&e, "CREATE TABLE t (n UInt32) ENGINE = Memory");
         run(&e, "DROP TABLE t");
-        let err = e.execute("SELECT * FROM t").unwrap_err();
+        let err = e.execute("SELECT * FROM t", b"").unwrap_err();
         assert_eq!(err.code, 60);
         // IF EXISTS makes dropping an already-gone table a no-op.
         run(&e, "DROP TABLE IF EXISTS t");
@@ -906,7 +1201,137 @@ mod tests {
 
     #[test]
     fn to_int_range_checks() {
-        let err = engine().execute("SELECT toUInt8(300)").unwrap_err();
+        let err = engine().execute("SELECT toUInt8(300)", b"").unwrap_err();
         assert_eq!(err.code, 69);
+    }
+
+    #[test]
+    fn replacing_merge_tree_final_dedups_by_order_by_and_ver() {
+        let e = engine();
+        run(
+            &e,
+            "CREATE TABLE t (id UInt32, v String, ver UInt32) ENGINE = ReplacingMergeTree(ver) ORDER BY (id)",
+        );
+        run(&e, "INSERT INTO t VALUES (1, 'old', 1), (1, 'new', 2), (2, 'x', 1)");
+        let r = run(&e, "SELECT id, v FROM t FINAL ORDER BY id");
+        assert_eq!(
+            r.rows,
+            [[Val::UInt(1), Val::Str("new".into())], [Val::UInt(2), Val::Str("x".into())]]
+        );
+        // Without FINAL, both rows for id=1 are still there.
+        let r = run(&e, "SELECT count(*) FROM t");
+        assert_eq!(r.rows, [[Val::UInt(3)]]);
+    }
+
+    #[test]
+    fn replacing_merge_tree_without_ver_keeps_last_inserted() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32, v String) ENGINE = ReplacingMergeTree ORDER BY (id)");
+        run(&e, "INSERT INTO t VALUES (1, 'first')");
+        run(&e, "INSERT INTO t VALUES (1, 'second')");
+        let r = run(&e, "SELECT v FROM t FINAL");
+        assert_eq!(r.rows, [[Val::Str("second".into())]]);
+    }
+
+    #[test]
+    fn replacing_merge_tree_is_deleted_drops_rows() {
+        let e = engine();
+        run(
+            &e,
+            "CREATE TABLE t (id UInt32, deleted Bool) ENGINE = ReplacingMergeTree(id, deleted) ORDER BY (id)",
+        );
+        run(&e, "INSERT INTO t VALUES (1, false)");
+        run(&e, "INSERT INTO t VALUES (1, true)");
+        let r = run(&e, "SELECT * FROM t FINAL");
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
+    fn summing_merge_tree_final_sums_numeric_columns() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (k String, amount UInt32) ENGINE = SummingMergeTree ORDER BY (k)");
+        run(&e, "INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10)");
+        let r = run(&e, "SELECT k, amount FROM t FINAL ORDER BY k");
+        assert_eq!(
+            r.rows,
+            [[Val::Str("a".into()), Val::UInt(3)], [Val::Str("b".into()), Val::UInt(10)]]
+        );
+    }
+
+    #[test]
+    fn optimize_table_final_persists_the_merge() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (k String, amount UInt32) ENGINE = SummingMergeTree ORDER BY (k)");
+        run(&e, "INSERT INTO t VALUES ('a', 1), ('a', 2)");
+        run(&e, "OPTIMIZE TABLE t FINAL");
+        // Now merged even without FINAL, since OPTIMIZE rewrote storage.
+        let r = run(&e, "SELECT amount FROM t");
+        assert_eq!(r.rows, [[Val::UInt(3)]]);
+    }
+
+    #[test]
+    fn optimize_without_final_is_a_no_op() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (k String, amount UInt32) ENGINE = SummingMergeTree ORDER BY (k)");
+        run(&e, "INSERT INTO t VALUES ('a', 1), ('a', 2)");
+        run(&e, "OPTIMIZE TABLE t");
+        let r = run(&e, "SELECT count(*) FROM t");
+        assert_eq!(r.rows, [[Val::UInt(2)]]);
+    }
+
+    #[test]
+    fn materialized_view_to_form_aggregates_on_insert() {
+        let e = engine();
+        run(&e, "CREATE TABLE src (k String, v UInt32) ENGINE = Memory");
+        run(
+            &e,
+            "CREATE TABLE target (k String, total UInt64) ENGINE = SummingMergeTree ORDER BY (k)",
+        );
+        run(
+            &e,
+            "CREATE MATERIALIZED VIEW mv TO target AS SELECT k, sum(v) AS total FROM src GROUP BY k",
+        );
+        run(&e, "INSERT INTO src VALUES ('a', 1), ('a', 2), ('b', 10)");
+        let r = run(&e, "SELECT k, total FROM target FINAL ORDER BY k");
+        assert_eq!(
+            r.rows,
+            [[Val::Str("a".into()), Val::UInt(3)], [Val::Str("b".into()), Val::UInt(10)]]
+        );
+        // A second insert only processes the new block, not the whole table.
+        run(&e, "INSERT INTO src VALUES ('a', 100)");
+        let r = run(&e, "SELECT k, total FROM target FINAL ORDER BY k");
+        assert_eq!(
+            r.rows,
+            [[Val::Str("a".into()), Val::UInt(103)], [Val::Str("b".into()), Val::UInt(10)]]
+        );
+    }
+
+    #[test]
+    fn materialized_view_target_must_already_exist() {
+        let e = engine();
+        run(&e, "CREATE TABLE src (k String) ENGINE = Memory");
+        let err =
+            e.execute("CREATE MATERIALIZED VIEW mv TO nope AS SELECT k FROM src", b"").unwrap_err();
+        assert_eq!(err.code, 60);
+    }
+
+    #[test]
+    fn insert_via_row_binary_with_names_and_types() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32, name String) ENGINE = Memory");
+        let payload = crate::clickhouse::engine::QueryResult {
+            columns: vec![("id".to_string(), Type::UInt32), ("name".to_string(), Type::String)],
+            rows: vec![
+                vec![Val::UInt(1), Val::Str("a".into())],
+                vec![Val::UInt(2), Val::Str("b".into())],
+            ],
+        };
+        let body = crate::clickhouse::rowbinary::encode(&payload, true, true).unwrap();
+        e.execute("INSERT INTO t FORMAT RowBinaryWithNamesAndTypes", &body).unwrap();
+        let r = run(&e, "SELECT id, name FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            [[Val::UInt(1), Val::Str("a".into())], [Val::UInt(2), Val::Str("b".into())]]
+        );
     }
 }

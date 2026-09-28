@@ -76,14 +76,15 @@ fn run_query(req: &Request, engine: &Engine) -> Response {
         .cloned()
         .unwrap_or_else(|| format!("noida-{}", QUERY_ID.fetch_add(1, Ordering::Relaxed)));
 
-    match engine.execute(&query) {
+    match engine.execute(&query, &req.body) {
         Ok((result, fmt_from_query)) => {
             let format = fmt_from_query
                 .or_else(|| req.query.get("default_format").cloned())
                 .unwrap_or_else(|| "TabSeparated".to_string());
             match format::render(&result, &format) {
-                Some(body) => success_response(&result, &format, query_id, body),
-                None => error_response(&ChError::not_implemented(&format!("Format {format}"))),
+                Ok(Some(body)) => success_response(&result, &format, query_id, body),
+                Ok(None) => error_response(&ChError::not_implemented(&format!("Format {format}"))),
+                Err(e) => error_response(&e),
             }
         }
         Err(e) => error_response(&e),

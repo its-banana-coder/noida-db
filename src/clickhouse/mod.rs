@@ -6,6 +6,7 @@ pub mod engine;
 pub mod error;
 pub mod format;
 pub mod http;
+pub mod rowbinary;
 pub mod server;
 pub mod sql;
 pub mod types;

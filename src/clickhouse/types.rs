@@ -73,6 +73,10 @@ impl Type {
         matches!(self, Type::Float32 | Type::Float64)
     }
 
+    pub fn is_integer(self) -> bool {
+        self.is_unsigned() || matches!(self, Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64)
+    }
+
     /// `(min, max)`, wide enough (`i128`) for both signed and unsigned
     /// ranges. Only meaningful for integer types.
     fn int_range(self) -> (i128, i128) {
@@ -171,7 +175,14 @@ pub fn coerce(v: &Val, t: Type) -> Result<Val, ChError> {
             v.as_f64().map(Val::Float).ok_or_else(|| ChError::type_mismatch(t.name()))
         }
         t => {
-            let n = v.as_i128().ok_or_else(|| ChError::type_mismatch(t.name()))?;
+            // Aggregates like sum()/avg() are computed in f64 (see the
+            // module doc), so a value bound for an integer column may
+            // arrive as a Float that's numerically a whole number — round
+            // it rather than rejecting it as a type mismatch.
+            let n = v
+                .as_i128()
+                .or_else(|| v.as_f64().map(|f| f.round() as i128))
+                .ok_or_else(|| ChError::type_mismatch(t.name()))?;
             let (min, max) = t.int_range();
             if n < min || n > max {
                 return Err(ChError::out_of_range(t.name()));
@@ -208,5 +219,14 @@ mod tests {
     #[test]
     fn coerce_int_to_float() {
         assert_eq!(coerce(&Val::Int(3), Type::Float64).unwrap(), Val::Float(3.0));
+    }
+
+    #[test]
+    fn coerce_float_to_int_rounds() {
+        // sum()/avg() are computed in f64 (see the module doc); a whole
+        // number arriving as a Float must still fit an integer column.
+        assert_eq!(coerce(&Val::Float(3.0), Type::UInt64).unwrap(), Val::UInt(3));
+        assert_eq!(coerce(&Val::Float(2.6), Type::Int32).unwrap(), Val::Int(3));
+        assert!(coerce(&Val::Float(1e30), Type::UInt64).is_err());
     }
 }

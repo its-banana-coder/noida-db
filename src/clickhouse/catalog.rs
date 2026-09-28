@@ -1,25 +1,40 @@
-//! In-memory table storage. One `Table` per (database, name); real
-//! ClickHouse's parts/merges/background-merge semantics aren't built yet
-//! (`OPTIMIZE ... FINAL` and `SELECT ... FINAL` land with
-//! ReplacingMergeTree support — see docs/LIMITATIONS.md). Rows live in a
-//! plain `Vec`, evaluated row-at-a-time: performance is not a goal for
-//! local-dev data sizes (see docs/specs/README.md).
+//! In-memory table storage. One `Table` per (database, name). Rows live in
+//! a plain `Vec`, evaluated row-at-a-time: performance is not a goal for
+//! local-dev data sizes (see docs/specs/README.md). There are no parts or
+//! background merges — `ReplacingMergeTree`/`SummingMergeTree` semantics
+//! are applied on demand by `engine::merge_final`, for `SELECT ... FINAL`
+//! and `OPTIMIZE TABLE ... FINAL` (see docs/LIMITATIONS.md).
 
 use std::collections::HashMap;
 
+use super::sql;
 use super::types::{Type, Val};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Engine {
     Memory,
     MergeTree,
+    /// `ver`/`is_deleted` name the columns `ReplacingMergeTree(ver[,
+    /// is_deleted])` was created with, if any.
+    ReplacingMergeTree {
+        ver: Option<String>,
+        is_deleted: Option<String>,
+    },
+    /// `sum_columns` names `SummingMergeTree(col, ...)`'s explicit columns;
+    /// `None` means "every numeric column not in `ORDER BY`", same as real
+    /// ClickHouse's default.
+    SummingMergeTree {
+        sum_columns: Option<Vec<String>>,
+    },
 }
 
 impl Engine {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &'static str {
         match self {
             Engine::Memory => "Memory",
             Engine::MergeTree => "MergeTree",
+            Engine::ReplacingMergeTree { .. } => "ReplacingMergeTree",
+            Engine::SummingMergeTree { .. } => "SummingMergeTree",
         }
     }
 }
@@ -32,9 +47,20 @@ pub struct Table {
     pub rows: Vec<Vec<Val>>,
 }
 
+/// A `CREATE MATERIALIZED VIEW name TO target AS SELECT ... FROM source`:
+/// every `INSERT` into `source` re-runs `select` over just the inserted
+/// block and appends the result to `target`.
+#[derive(Debug, Clone)]
+pub struct MaterializedView {
+    pub source: (String, String),
+    pub target: (String, String),
+    pub select: sql::Select,
+}
+
 #[derive(Debug, Default)]
 pub struct Catalog {
     tables: HashMap<(String, String), Table>,
+    mvs: HashMap<(String, String), MaterializedView>,
 }
 
 impl Catalog {
@@ -72,6 +98,25 @@ impl Catalog {
             .collect();
         out.sort();
         out
+    }
+
+    pub fn mv_exists(&self, database: &str, name: &str) -> bool {
+        self.mvs.contains_key(&(database.to_string(), name.to_string()))
+    }
+
+    pub fn create_mv(&mut self, database: &str, name: &str, mv: MaterializedView) {
+        self.mvs.insert((database.to_string(), name.to_string()), mv);
+    }
+
+    /// The materialized views whose source is `(database, table)`, in
+    /// creation order isn't tracked (`HashMap`) — fine, since each only
+    /// ever writes to its own target.
+    pub fn mvs_for_source(&self, database: &str, table: &str) -> Vec<MaterializedView> {
+        self.mvs
+            .values()
+            .filter(|mv| mv.source == (database.to_string(), table.to_string()))
+            .cloned()
+            .collect()
     }
 }
 

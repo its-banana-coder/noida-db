@@ -105,6 +105,9 @@ pub enum Table {
 pub struct Select {
     pub items: Vec<Item>,
     pub table: Table,
+    /// `FROM t FINAL`: applies `ReplacingMergeTree`/`SummingMergeTree`
+    /// merge semantics at read time.
+    pub select_final: bool,
     pub where_: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub order_by: Vec<(Expr, bool)>,
@@ -119,7 +122,29 @@ pub struct CreateTable {
     pub table: String,
     pub columns: Vec<(String, String)>,
     pub engine: String,
+    /// `ENGINE = Name(arg, ...)` — e.g. `ReplacingMergeTree(ver, is_deleted)`
+    /// or `SummingMergeTree(col, ...)`. Idents only; the engine resolves
+    /// them against the column list.
+    pub engine_args: Vec<Expr>,
     pub order_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateMaterializedView {
+    pub if_not_exists: bool,
+    pub database: Option<String>,
+    pub name: String,
+    pub to_database: Option<String>,
+    pub to_table: String,
+    pub select: Select,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    Values(Vec<Vec<Expr>>),
+    /// `INSERT INTO t [(cols)] FORMAT <fmt>`: rows follow as `<fmt>`-encoded
+    /// data in the request body, decoded against `t`'s (or `cols`') schema.
+    Format(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,7 +152,7 @@ pub struct Insert {
     pub database: Option<String>,
     pub table: String,
     pub columns: Option<Vec<String>>,
-    pub rows: Vec<Vec<Expr>>,
+    pub source: InsertSource,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -138,11 +163,20 @@ pub struct DropTable {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OptimizeTable {
+    pub database: Option<String>,
+    pub table: String,
+    pub final_: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Select(Select),
     CreateTable(CreateTable),
+    CreateMaterializedView(CreateMaterializedView),
     Insert(Insert),
     DropTable(DropTable),
+    OptimizeTable(OptimizeTable),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -262,6 +296,30 @@ fn tokenize(sql: &str) -> Result<Vec<Token>, SqlError> {
                     j += 1;
                 }
                 tokens.push(Token::Str(s));
+                i = j + 1;
+            }
+            // Backtick-quoted identifiers, ClickHouse's escaping for names
+            // that aren't bare words (reserved words, names with spaces,
+            // client libraries that quote defensively).
+            '`' => {
+                let mut j = i + 1;
+                let mut s = String::new();
+                loop {
+                    if j >= chars.len() {
+                        return Err(SqlError("unterminated quoted identifier".into()));
+                    }
+                    if chars[j] == '`' {
+                        if chars.get(j + 1) == Some(&'`') {
+                            s.push('`');
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    s.push(chars[j]);
+                    j += 1;
+                }
+                tokens.push(Token::Ident(s));
                 i = j + 1;
             }
             c if c.is_ascii_digit() => {
@@ -579,6 +637,7 @@ impl Parser<'_> {
     fn parse_select(&mut self) -> Result<Select, SqlError> {
         let items = self.parse_items()?;
         let table = if self.eat_keyword("FROM") { self.parse_table()? } else { Table::None };
+        let select_final = self.eat_keyword("FINAL");
         let where_ = if self.eat_keyword("WHERE") { Some(self.parse_expr()?) } else { None };
         let group_by = if self.eat_keyword("GROUP") {
             self.expect_keyword("BY")?;
@@ -594,7 +653,7 @@ impl Parser<'_> {
         };
         let limit = if self.eat_keyword("LIMIT") { Some(self.parse_uint()?) } else { None };
         let format = if self.eat_keyword("FORMAT") { Some(self.parse_ident()?) } else { None };
-        Ok(Select { items, table, where_, group_by, order_by, limit, format })
+        Ok(Select { items, table, select_final, where_, group_by, order_by, limit, format })
     }
 
     fn parse_create_table(&mut self) -> Result<CreateTable, SqlError> {
@@ -620,9 +679,7 @@ impl Parser<'_> {
         self.expect_keyword("ENGINE")?;
         self.expect(&Token::Eq)?;
         let engine = self.parse_ident()?;
-        if self.eat(&Token::LParen) {
-            let _ = self.parse_arg_list()?;
-        }
+        let engine_args = if self.eat(&Token::LParen) { self.parse_arg_list()? } else { vec![] };
         let order_by = if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             if self.eat(&Token::LParen) {
@@ -641,7 +698,26 @@ impl Parser<'_> {
         } else {
             vec![]
         };
-        Ok(CreateTable { if_not_exists, database, table, columns, engine, order_by })
+        Ok(CreateTable { if_not_exists, database, table, columns, engine, engine_args, order_by })
+    }
+
+    /// `CREATE MATERIALIZED VIEW` has already been consumed up through
+    /// `MATERIALIZED`.
+    fn parse_create_materialized_view(&mut self) -> Result<CreateMaterializedView, SqlError> {
+        self.expect_keyword("VIEW")?;
+        let mut if_not_exists = false;
+        if self.eat_keyword("IF") {
+            self.expect_keyword("NOT")?;
+            self.expect_keyword("EXISTS")?;
+            if_not_exists = true;
+        }
+        let (database, name) = self.parse_qualified_name()?;
+        self.expect_keyword("TO")?;
+        let (to_database, to_table) = self.parse_qualified_name()?;
+        self.expect_keyword("AS")?;
+        self.expect_keyword("SELECT")?;
+        let select = self.parse_select()?;
+        Ok(CreateMaterializedView { if_not_exists, database, name, to_database, to_table, select })
     }
 
     fn parse_insert(&mut self) -> Result<Insert, SqlError> {
@@ -660,24 +736,29 @@ impl Parser<'_> {
         } else {
             None
         };
-        self.expect_keyword("VALUES")?;
-        let mut rows = Vec::new();
-        loop {
-            self.expect(&Token::LParen)?;
-            let mut row = Vec::new();
+        let source = if self.eat_keyword("FORMAT") {
+            InsertSource::Format(self.parse_ident()?)
+        } else {
+            self.expect_keyword("VALUES")?;
+            let mut rows = Vec::new();
             loop {
-                row.push(self.parse_expr()?);
+                self.expect(&Token::LParen)?;
+                let mut row = Vec::new();
+                loop {
+                    row.push(self.parse_expr()?);
+                    if !self.eat(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Token::RParen)?;
+                rows.push(row);
                 if !self.eat(&Token::Comma) {
                     break;
                 }
             }
-            self.expect(&Token::RParen)?;
-            rows.push(row);
-            if !self.eat(&Token::Comma) {
-                break;
-            }
-        }
-        Ok(Insert { database, table, columns, rows })
+            InsertSource::Values(rows)
+        };
+        Ok(Insert { database, table, columns, source })
     }
 
     fn parse_drop_table(&mut self) -> Result<DropTable, SqlError> {
@@ -690,6 +771,13 @@ impl Parser<'_> {
         let (database, table) = self.parse_qualified_name()?;
         Ok(DropTable { if_exists, database, table })
     }
+
+    fn parse_optimize_table(&mut self) -> Result<OptimizeTable, SqlError> {
+        self.expect_keyword("TABLE")?;
+        let (database, table) = self.parse_qualified_name()?;
+        let final_ = self.eat_keyword("FINAL");
+        Ok(OptimizeTable { database, table, final_ })
+    }
 }
 
 /// Parses a single statement.
@@ -699,13 +787,22 @@ pub fn parse(sql: &str) -> Result<Statement, SqlError> {
     let stmt = if p.eat_keyword("SELECT") {
         Statement::Select(p.parse_select()?)
     } else if p.eat_keyword("CREATE") {
-        Statement::CreateTable(p.parse_create_table()?)
+        if p.eat_keyword("MATERIALIZED") {
+            Statement::CreateMaterializedView(p.parse_create_materialized_view()?)
+        } else {
+            Statement::CreateTable(p.parse_create_table()?)
+        }
     } else if p.eat_keyword("INSERT") {
         Statement::Insert(p.parse_insert()?)
     } else if p.eat_keyword("DROP") {
         Statement::DropTable(p.parse_drop_table()?)
+    } else if p.eat_keyword("OPTIMIZE") {
+        Statement::OptimizeTable(p.parse_optimize_table()?)
     } else {
-        return Err(SqlError("expected SELECT, CREATE TABLE, INSERT or DROP TABLE".into()));
+        return Err(SqlError(
+            "expected SELECT, CREATE [MATERIALIZED VIEW] TABLE, INSERT, DROP TABLE or OPTIMIZE TABLE"
+                .into(),
+        ));
     };
     if p.pos != p.tokens.len() {
         return Err(SqlError("unexpected trailing input".into()));
@@ -890,8 +987,9 @@ mod tests {
         let Statement::Insert(i) = stmt else { panic!("expected INSERT") };
         assert_eq!(i.table, "t");
         assert_eq!(i.columns, Some(vec!["id".to_string(), "name".to_string()]));
-        assert_eq!(i.rows.len(), 2);
-        assert_eq!(i.rows[0], [Expr::Int(1), Expr::Str("a".into())]);
+        let InsertSource::Values(rows) = &i.source else { panic!("expected VALUES") };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], [Expr::Int(1), Expr::Str("a".into())]);
     }
 
     #[test]
@@ -902,10 +1000,75 @@ mod tests {
     }
 
     #[test]
+    fn insert_format() {
+        let stmt = parse("INSERT INTO t FORMAT RowBinaryWithNamesAndTypes").unwrap();
+        let Statement::Insert(i) = stmt else { panic!("expected INSERT") };
+        assert_eq!(i.source, InsertSource::Format("RowBinaryWithNamesAndTypes".to_string()));
+    }
+
+    #[test]
     fn drop_table() {
         let stmt = parse("DROP TABLE IF EXISTS t").unwrap();
         let Statement::DropTable(d) = stmt else { panic!("expected DROP TABLE") };
         assert!(d.if_exists);
         assert_eq!(d.table, "t");
+    }
+
+    #[test]
+    fn optimize_table_final() {
+        let stmt = parse("OPTIMIZE TABLE t FINAL").unwrap();
+        let Statement::OptimizeTable(o) = stmt else { panic!("expected OPTIMIZE TABLE") };
+        assert!(o.final_);
+        assert_eq!(o.table, "t");
+    }
+
+    #[test]
+    fn select_final() {
+        let s = select("SELECT * FROM t FINAL");
+        assert!(s.select_final);
+    }
+
+    #[test]
+    fn backtick_quoted_identifiers() {
+        let s = select("SELECT `id`, `weird name` FROM `my table`");
+        assert_eq!(
+            s.items,
+            [
+                Item { expr: Expr::Ident("id".into()), alias: None },
+                Item { expr: Expr::Ident("weird name".into()), alias: None },
+            ]
+        );
+        assert_eq!(s.table, Table::Named { database: None, table: "my table".into() });
+    }
+
+    #[test]
+    fn doubled_backtick_is_an_escaped_backtick() {
+        let s = select("SELECT `a``b`");
+        assert_eq!(s.items, [Item { expr: Expr::Ident("a`b".into()), alias: None }]);
+    }
+
+    #[test]
+    fn create_table_with_engine_args() {
+        let stmt = parse(
+            "CREATE TABLE t (id UInt32, ver UInt32) ENGINE = ReplacingMergeTree(ver) ORDER BY (id)",
+        )
+        .unwrap();
+        let Statement::CreateTable(c) = stmt else { panic!("expected CREATE TABLE") };
+        assert_eq!(c.engine, "ReplacingMergeTree");
+        assert_eq!(c.engine_args, [Expr::Ident("ver".into())]);
+    }
+
+    #[test]
+    fn create_materialized_view_to_form() {
+        let stmt = parse(
+            "CREATE MATERIALIZED VIEW mv TO target AS SELECT k, count(*) FROM src GROUP BY k",
+        )
+        .unwrap();
+        let Statement::CreateMaterializedView(m) = stmt else {
+            panic!("expected CREATE MATERIALIZED VIEW")
+        };
+        assert_eq!(m.name, "mv");
+        assert_eq!(m.to_table, "target");
+        assert_eq!(m.select.table, Table::Named { database: None, table: "src".into() });
     }
 }

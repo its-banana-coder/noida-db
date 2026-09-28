@@ -60,10 +60,13 @@ serde_json = "1"
 uuid = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 # ClickHouse: a real HTTP client library against the HTTP interface, the
-# same way clickhouse-connect/@clickhouse/client work. The official
-# `clickhouse` Rust crate needs RowBinaryWithNamesAndTypes (milestone 3);
-# its client test lands once that format exists.
+# same way clickhouse-connect/@clickhouse/client work.
 ureq = { version = "3", default-features = false }
+# ClickHouse: the official Rust client, now that RowBinaryWithNamesAndTypes
+# (which it requires) is implemented. Async (hyper/tokio), dev-only.
+clickhouse = "0.15"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # Service test suites only build when their service is compiled in.
 [[test]]
@@ -104,5 +107,9 @@ required-features = ["clickhouse"]
 
 [[test]]
 name = "clickhouse_diff"
+required-features = ["clickhouse"]
+
+[[test]]
+name = "clickhouse_official_client"
 required-features = ["clickhouse"]
 

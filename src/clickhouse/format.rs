@@ -1,9 +1,12 @@
 //! Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
-//! `JSON` and `JSONEachRow`. The rest of the P0 list in
-//! docs/specs/clickhouse.md (`CSV`, `RowBinary`, `Native`, ...) isn't built
+//! `JSON`, `JSONEachRow` and `RowBinary` (+`WithNames`,
+//! +`WithNamesAndTypes`). The rest of the P0 list in
+//! docs/specs/clickhouse.md (`CSV`, `Native`, `Pretty`, ...) isn't built
 //! yet — see docs/LIMITATIONS.md.
 
 use super::engine::QueryResult;
+use super::error::ChError;
+use super::rowbinary;
 use super::types::{Type, Val};
 
 /// The `Content-Type` header ClickHouse sends for `format`.
@@ -11,6 +14,9 @@ pub fn content_type(format: &str) -> &'static str {
     match format {
         "JSON" | "JSONCompact" | "JSONEachRow" | "JSONCompactEachRow" => {
             "application/json; charset=UTF-8"
+        }
+        "RowBinary" | "RowBinaryWithNames" | "RowBinaryWithNamesAndTypes" => {
+            "application/octet-stream"
         }
         _ => "text/tab-separated-values; charset=UTF-8",
     }
@@ -141,9 +147,9 @@ fn json(r: &QueryResult) -> Vec<u8> {
 }
 
 /// Renders `r` in `format` (ClickHouse's exact, case-sensitive format
-/// names). `None` if the format isn't implemented yet.
-pub fn render(r: &QueryResult, format: &str) -> Option<Vec<u8>> {
-    match format {
+/// names). `Ok(None)` if the format isn't implemented yet.
+pub fn render(r: &QueryResult, format: &str) -> Result<Option<Vec<u8>>, ChError> {
+    Ok(match format {
         "TabSeparated" | "TSV" => Some(tab_separated(r, false, false)),
         "TabSeparatedWithNames" | "TSVWithNames" => Some(tab_separated(r, true, false)),
         "TabSeparatedWithNamesAndTypes" | "TSVWithNamesAndTypes" => {
@@ -151,8 +157,11 @@ pub fn render(r: &QueryResult, format: &str) -> Option<Vec<u8>> {
         }
         "JSON" => Some(json(r)),
         "JSONEachRow" => Some(json_each_row(r)),
+        "RowBinary" => Some(rowbinary::encode(r, false, false)?),
+        "RowBinaryWithNames" => Some(rowbinary::encode(r, true, false)?),
+        "RowBinaryWithNamesAndTypes" => Some(rowbinary::encode(r, true, true)?),
         _ => None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -171,12 +180,12 @@ mod tests {
         // Column separator is a real tab; the string field's own tab is
         // escaped as the two characters `\` `t`.
         let want: &[u8] = b"1\ta\\tb\n";
-        assert_eq!(render(&one_row(), "TabSeparated").unwrap(), want.to_vec());
+        assert_eq!(render(&one_row(), "TabSeparated").unwrap().unwrap(), want.to_vec());
     }
 
     #[test]
     fn tab_separated_with_names_and_types() {
-        let body = render(&one_row(), "TSVWithNamesAndTypes").unwrap();
+        let body = render(&one_row(), "TSVWithNamesAndTypes").unwrap().unwrap();
         let text = String::from_utf8(body).unwrap();
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some("n\ts"));
@@ -185,7 +194,7 @@ mod tests {
 
     #[test]
     fn json_each_row_quotes_strings_and_leaves_small_ints_bare() {
-        let body = render(&one_row(), "JSONEachRow").unwrap();
+        let body = render(&one_row(), "JSONEachRow").unwrap().unwrap();
         assert_eq!(String::from_utf8(body).unwrap(), "{\"n\":1,\"s\":\"a\\tb\"}\n");
     }
 
@@ -195,12 +204,22 @@ mod tests {
             columns: vec![("number".into(), Type::UInt64)],
             rows: vec![vec![Val::UInt(42)]],
         };
-        let body = String::from_utf8(render(&r, "JSON").unwrap()).unwrap();
+        let body = String::from_utf8(render(&r, "JSON").unwrap().unwrap()).unwrap();
         assert!(body.contains("\"number\": \"42\""), "{body}");
     }
 
     #[test]
+    fn row_binary_with_names_and_types() {
+        let body = render(&one_row(), "RowBinaryWithNamesAndTypes").unwrap().unwrap();
+        // 2 columns, name "n" (1 byte), name "s" (1 byte), type "UInt8" (5
+        // bytes), type "String" (6 bytes), then the row: 1u8, then "a\tb"
+        // length-prefixed.
+        assert_eq!(body[0], 2); // column count varint
+        assert!(body.len() > 10);
+    }
+
+    #[test]
     fn unknown_format_returns_none() {
-        assert_eq!(render(&one_row(), "Parquet"), None);
+        assert_eq!(render(&one_row(), "Parquet").unwrap(), None);
     }
 }

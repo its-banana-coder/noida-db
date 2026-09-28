@@ -17,7 +17,7 @@ but not identical to the real server.
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
 | MySQL | early scaffolding, not merged | no |
-| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree` tables, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow, errors (see below); not merged | yes, for these |
+| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below); not merged | yes, for these — the official Rust client works end to end |
 | Memcached, MongoDB, RabbitMQ, Elasticsearch | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
@@ -185,22 +185,42 @@ Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Ka
 
 ## ClickHouse
 
-Target: ClickHouse 24.8 LTS, HTTP interface on port 8123. Through milestone 2
+Target: ClickHouse 24.8 LTS, HTTP interface on port 8123. Through milestone 3
 of `docs/specs/clickhouse.md`:
 
-- `GET`/`POST /` with `query` as a URL param or the request body; `GET /ping`
-  and `GET /replicas_status`.
+- `GET`/`POST /` with `query` as a URL param or the request body (plain or
+  `Transfer-Encoding: chunked`, which the official Rust client's streaming
+  `INSERT` uses); `GET /ping` and `GET /replicas_status`.
 - `CREATE TABLE [IF NOT EXISTS] [db.]t (col type, ...) ENGINE = Memory |
-  MergeTree | ReplacingMergeTree | SummingMergeTree [ORDER BY (...)]`,
-  `INSERT INTO ... [(cols)] VALUES (...), ...`, `DROP TABLE [IF EXISTS]`.
-  Column types: `UInt8/16/32/64`, `Int8/16/32/64`, `Float32/64`, `String`,
-  `Bool`. A type given with arguments (`Nullable(String)`, `Decimal(10,2)`)
-  parses but is rejected as `NOT_IMPLEMENTED` — never silently accepted as
-  something else.
-- `SELECT` with `WHERE`, `GROUP BY`, `ORDER BY` (only by a selected column
-  or alias), `LIMIT`, on `system.one`, `numbers(N)`, `system.tables` and real
-  tables. Expressions: arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/
-  `NOT`, parentheses, unary minus, string/int/float/bool literals.
+  MergeTree | ReplacingMergeTree[(ver[, is_deleted])] |
+  SummingMergeTree[(col, ...)] [ORDER BY (...)]`, `CREATE MATERIALIZED VIEW
+  [IF NOT EXISTS] name TO target AS SELECT ... FROM source` (the `TO` form;
+  `target` must already exist), `INSERT INTO ... [(cols)] VALUES (...), ...`
+  or `INSERT INTO ... [(cols)] FORMAT RowBinary[WithNames[AndTypes]]` with
+  the rows as `<fmt>`-encoded request-body data, `DROP TABLE [IF EXISTS]`,
+  `OPTIMIZE TABLE [db.]t [FINAL]`. Column types: `UInt8/16/32/64`,
+  `Int8/16/32/64`, `Float32/64`, `String`, `Bool`. A type given with
+  arguments (`Nullable(String)`, `Decimal(10,2)`) parses but is rejected as
+  `NOT_IMPLEMENTED` — never silently accepted as something else.
+- `SELECT ... [FINAL]` with `WHERE`, `GROUP BY`, `ORDER BY` (only by a
+  selected column or alias), `LIMIT`, on `system.one`, `numbers(N)`,
+  `system.tables` and real tables. Expressions: arithmetic (`+ - * / %`),
+  comparisons, `AND`/`OR`/`NOT`, parentheses, unary minus, string/int/
+  float/bool literals, backtick-quoted identifiers (`` `weird name` ``).
+- **`ReplacingMergeTree`/`SummingMergeTree` merge semantics**, applied on
+  demand (there are no parts or background merges to apply them
+  incrementally — see **Differs**): `SELECT ... FINAL` computes the merged
+  view at read time; `OPTIMIZE TABLE ... FINAL` computes it once and
+  overwrites the table's rows; a bare `OPTIMIZE` (no `FINAL`) is a no-op.
+  `ReplacingMergeTree` keeps, per `ORDER BY` key, the row with the greatest
+  `ver` (or the last inserted if there's no `ver`), then drops rows where
+  `is_deleted` is true. `SummingMergeTree` sums numeric columns (all of
+  them, or just the ones named in `ENGINE = SummingMergeTree(...)`) grouped
+  by the `ORDER BY` key.
+- **Materialized views (`TO` form)**: every `INSERT` into the source table
+  re-runs the view's `SELECT` (`WHERE`/`GROUP BY`/aggregates included) over
+  just the newly inserted rows and appends the result to the target table —
+  not the whole table, so repeated inserts don't reprocess old data.
 - ~25 functions: `version()`, `currentDatabase()`, `hostName()`,
   `timezone()`, `uptime()`, `toString`, `toInt8..64`/`toUInt8..64` (range
   checked), `toFloat32/64`, `length`, `upper`, `lower`, `concat`,
@@ -210,36 +230,55 @@ of `docs/specs/clickhouse.md`:
 - Aggregates: `count`/`count(*)`, `sum`, `avg`, `min`, `max`, `any`,
   `uniqExact`.
 - Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
-  `JSON`, `JSONEachRow`.
+  `JSON`, `JSONEachRow`, `RowBinary` (+`WithNames`, +`WithNamesAndTypes`) —
+  both directions (`SELECT` output and `INSERT` input).
 - Errors in ClickHouse's HTTP body format (`Code: N. DB::Exception: ...`)
   with `X-ClickHouse-Exception-Code` and real error codes/names for unknown
   table/database/function/identifier, syntax errors, table-already-exists,
   type mismatches and out-of-range values.
+- **Verified against the official Rust `clickhouse` crate**
+  (`tests/clickhouse_official_client.rs`): `fetch`/`fetch_all`/`fetch_one`
+  (which require `RowBinaryWithNamesAndTypes`) and a streaming `insert`
+  (with `.with_validation(false)`, since validated inserts issue a
+  `DESCRIBE TABLE` first — see **Not yet**), and with response compression
+  disabled (`.with_compression(Compression::None)` — ClickHouse's own
+  lz4/zstd block compression isn't built).
 
 **Differs**
 - Storage is row-at-a-time (`Vec<Vec<Val>>`), not columnar; performance is
   not a goal for local-dev data sizes (see docs/specs/README.md).
-- `MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` all behave like a
-  plain `MergeTree`: no parts, no background merges, no merge-time dedup or
-  summing, no `FINAL`/`OPTIMIZE ... FINAL`.
+- No parts or background merges: `ReplacingMergeTree`/`SummingMergeTree`
+  rows sit unmerged until `FINAL`/`OPTIMIZE ... FINAL` asks for the merged
+  view, computed over the whole table each time rather than incrementally.
 - Arithmetic result types are an approximation of ClickHouse's real
   per-width promotion/overflow rules (e.g. `UInt8 + UInt8` doesn't widen to
-  `UInt16`); see `src/clickhouse/types.rs`. Float formatting isn't verified
-  byte-for-byte against a real server (none is installed here).
+  `UInt16`); see `src/clickhouse/types.rs`. `sum()`/`avg()` are always
+  `Float64` (real ClickHouse keeps `sum(UInt32)` as `UInt64`); inserting
+  that into an integer column rounds rather than erroring, since the
+  underlying value is still numerically exact for realistic local-dev
+  sums. Float formatting isn't verified byte-for-byte against a real server
+  (none is installed here).
 - Persistent connections: every response closes the socket
   (`Connection: close`); real clients reconnect cleanly, but this differs
   from ClickHouse's keep-alive default.
 
-**Not yet (milestones 3–5, tracked in the spec)**
-- Joins, window functions, subqueries, views, the wider function/type
-  library (`Date`/`DateTime`, `Decimal`, `UUID`, `Array`, `Tuple`, `Map`,
-  `Nullable`), `HAVING`, `WITH`/CTEs, `UNION`, parameterized queries,
-  sessions, compression.
-- `RowBinary`/`Native`/`CSV`/`Pretty` output formats and the native TCP
-  protocol (port 9000) — needed by clickhouse-go, clickhouse-driver and the
-  official Rust `clickhouse` crate (which requires `RowBinaryWithNamesAndTypes`
-  even over HTTP).
-- `ALTER TABLE`, `SHOW`/`DESCRIBE`/`EXISTS`, non-`SELECT` `system.*` writes.
+**Not yet (milestones 4–5, tracked in the spec)**
+- Joins, window functions, subqueries, views (the non-materialized kind),
+  the wider function/type library (`Date`/`DateTime`, `Decimal`, `UUID`,
+  `Array`, `Tuple`, `Map`, `Nullable`), `HAVING`, `WITH`/CTEs, `UNION`,
+  parameterized queries, sessions, response compression.
+- `DESCRIBE TABLE`/`system.columns` introspection — so a client's
+  *validated* insert path (which queries the target schema first) doesn't
+  work yet; the client matrix uses unvalidated/explicit-schema inserts
+  until this lands.
+- `Native` format and the native TCP protocol (port 9000) — needed by
+  clickhouse-go and clickhouse-driver (Python), and by the official Rust
+  client's `fetch_native`.
+- `CSV`/`Pretty` output formats, `ALTER TABLE`, `SHOW`/`EXISTS`, non-`SELECT`
+  `system.*` writes.
+- The wider client matrix (clickhouse-connect, @clickhouse/client, JDBC) and
+  flipping `clickhouse` into `default` — the Rust client is the only one
+  verified so far.
 
 **By design**
 - `BACKUP`/`RESTORE`, Keeper/ZooKeeper, replicated engines beyond being

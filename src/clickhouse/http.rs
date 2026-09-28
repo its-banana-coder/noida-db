@@ -1,7 +1,10 @@
 //! A minimal HTTP/1.1 codec: just enough for ClickHouse's HTTP interface
-//! (`GET`/`POST /` with a `query` param and/or body, `GET /ping`). No
-//! chunked transfer or keep-alive: every response closes the connection,
-//! same as noida-db does for real clients that always reconnect cleanly.
+//! (`GET`/`POST /` with a `query` param and/or body, `GET /ping`),
+//! including `Transfer-Encoding: chunked` request bodies (streaming
+//! `INSERT`s, e.g. from the official Rust client, use it instead of
+//! `Content-Length`). No keep-alive on the response side: every response
+//! closes the connection, same as noida-db does for real clients that
+//! always reconnect cleanly.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -30,6 +33,7 @@ pub fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
     let (path, query) = split_target(target);
 
     let mut content_length = 0usize;
+    let mut chunked = false;
     loop {
         let mut hline = String::new();
         if reader.read_line(&mut hline)? == 0 {
@@ -39,19 +43,63 @@ pub fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Request>> {
         if hline.is_empty() {
             break;
         }
-        if let Some((k, v)) = hline.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = v.trim().parse().unwrap_or(0);
+        if let Some((k, v)) = hline.split_once(':') {
+            let k = k.trim();
+            let v = v.trim();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("transfer-encoding")
+                && v.eq_ignore_ascii_case("chunked")
+            {
+                chunked = true;
+            }
         }
     }
 
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
+    let body = if chunked {
+        read_chunked_body(reader)?
+    } else {
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+        body
+    };
 
     Ok(Some(Request { method, path, query, body }))
+}
+
+/// Reads a `Transfer-Encoding: chunked` body: a size line (hex, ignoring any
+/// `;extension`), that many bytes, a trailing CRLF, repeated until a
+/// zero-size chunk: `0\r\n\r\n` (trailer headers, if any, are discarded).
+fn read_chunked_body(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        reader.read_line(&mut size_line)?;
+        let size_line = size_line.trim_end();
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if size == 0 {
+            // Trailer headers (rare, and none of ClickHouse's clients send
+            // any), up to the final blank line.
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line)? == 0 || line.trim_end().is_empty() {
+                    break;
+                }
+            }
+            break;
+        }
+        let mut chunk = vec![0u8; size];
+        reader.read_exact(&mut chunk)?;
+        body.extend_from_slice(&chunk);
+        // Each chunk's data is followed by a CRLF that isn't part of it.
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+    }
+    Ok(body)
 }
 
 fn split_target(target: &str) -> (String, HashMap<String, String>) {
@@ -145,6 +193,22 @@ mod tests {
         let req = read_request(&mut Cursor::new(raw)).unwrap().unwrap();
         assert_eq!(req.method, "POST");
         assert_eq!(req.body, body.as_bytes());
+    }
+
+    #[test]
+    fn parses_chunked_body() {
+        let raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let req = read_request(&mut Cursor::new(raw)).unwrap().unwrap();
+        assert_eq!(req.body, b"hello world");
+    }
+
+    #[test]
+    fn chunked_body_with_trailer_headers() {
+        let raw = "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n\
+                    3\r\nabc\r\n0\r\nX-Trailer: ignored\r\n\r\n";
+        let req = read_request(&mut Cursor::new(raw)).unwrap().unwrap();
+        assert_eq!(req.body, b"abc");
     }
 
     #[test]
