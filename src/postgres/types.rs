@@ -244,6 +244,9 @@ impl Type {
     pub const NAME: Type = Type::of(Base::Name);
     pub const UNKNOWN: Type = Type::of(Base::Unknown);
     pub const OID: Type = Type::of(Base::Oid);
+    pub const TID: Type = Type::of(Base::Tid);
+    pub const XID: Type = Type::of(Base::Xid);
+    pub const CID: Type = Type::of(Base::Cid);
     pub const DATE: Type = Type::of(Base::Date);
     pub const TIMESTAMP: Type = Type::of(Base::Timestamp);
     pub const TIMESTAMPTZ: Type = Type::of(Base::Timestamptz);

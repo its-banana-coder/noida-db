@@ -86,7 +86,10 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             Ok(out)
         }
         Dml::Update { table, from, filter, sets, defaults, returning } => {
-            let base = table_of(ctx, *table)?.rows.clone();
+            let t = table_of(ctx, *table)?;
+            let base = t.rows.clone();
+            let sys_cols: Vec<[Value; 6]> =
+                (0..base.len()).map(|i| t.system_col_values(i)).collect();
             let extra = match from {
                 Some(f) => exec_from_rows(f, ctx)?,
                 None => vec![vec![]],
@@ -96,6 +99,7 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             for (i, r) in base.iter().enumerate() {
                 for e in &extra {
                     let mut row = r.clone();
+                    row.extend(sys_cols[i].clone());
                     row.extend(e.clone());
                     if let Some(f) = filter
                         && !matches!(exec::eval(f, &row, ctx)?, Value::Bool(true))
@@ -135,7 +139,10 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             Ok(out)
         }
         Dml::Delete { table, using, filter, returning } => {
-            let base = table_of(ctx, *table)?.rows.clone();
+            let t = table_of(ctx, *table)?;
+            let base = t.rows.clone();
+            let sys_cols: Vec<[Value; 6]> =
+                (0..base.len()).map(|i| t.system_col_values(i)).collect();
             let extra = match using {
                 Some(f) => exec_from_rows(f, ctx)?,
                 None => vec![vec![]],
@@ -145,6 +152,7 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             for (i, r) in base.iter().enumerate() {
                 for e in &extra {
                     let mut row = r.clone();
+                    row.extend(sys_cols[i].clone());
                     row.extend(e.clone());
                     if let Some(f) = filter
                         && !matches!(exec::eval(f, &row, ctx)?, Value::Bool(true))

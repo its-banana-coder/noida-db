@@ -174,6 +174,22 @@ impl Table {
         self.columns.iter().enumerate().filter(|(_, c)| !c.dropped)
     }
 
+    /// The values of `ctid`/`xmin`/`cmin`/`xmax`/`cmax`/`tableoid` for a row
+    /// at scan/storage position `pos`, in the same order as
+    /// `binder::SYSTEM_COLS`. There's no MVCC here, so only `ctid` (the
+    /// position itself) and `tableoid` are real; the rest are fixed
+    /// placeholders (see docs/LIMITATIONS.md).
+    pub fn system_col_values(&self, pos: usize) -> [Value; 6] {
+        [
+            Value::Text(format!("(0,{})", pos + 1)),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(self.oid as i64),
+        ]
+    }
+
     pub fn primary_key(&self) -> Option<&Constraint> {
         self.constraints.iter().find(|c| matches!(c.kind, ConstraintKind::PrimaryKey))
     }

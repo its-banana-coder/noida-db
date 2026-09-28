@@ -520,6 +520,29 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT t.relname, i.relname FROM pg_class t, pg_class i, pg_index ix \
          WHERE t.oid = ix.indrelid AND i.oid = ix.indexrelid AND t.relname = 'cja'",
     ],
+    // `ctid`/`xmin`/`xmax`/`cmin`/`cmax`/`tableoid`: per-row system columns.
+    // Comparable across servers: ctid position for freshly inserted rows,
+    // ctid as a WHERE/UPDATE/DELETE key, tableoid's identity (not its raw
+    // OID, which differs per server), pg_attribute listing them, `SELECT *`
+    // still excluding them, and the "ambiguous" error for a bare reference
+    // across two tables. xmin/xmax/cmin/cmax have no MVCC behind them here
+    // (documented gap), so their exact values aren't compared.
+    &[
+        "CREATE TABLE syscols (id int, name text)",
+        "INSERT INTO syscols VALUES (1, 'a'), (2, 'b')",
+        "SELECT ctid FROM syscols ORDER BY id",
+        "!SELECT xmin, xmax, cmin, cmax FROM syscols",
+        "SELECT tableoid = 'syscols'::regclass FROM syscols LIMIT 1",
+        "SELECT id FROM syscols WHERE ctid = '(0,2)'",
+        "UPDATE syscols SET name = 'z' WHERE ctid = '(0,1)'",
+        "SELECT id, name FROM syscols ORDER BY id",
+        "DELETE FROM syscols WHERE ctid = '(0,2)'",
+        "SELECT id FROM syscols",
+        "SELECT attname, attnum FROM pg_attribute WHERE attrelid = 'syscols'::regclass ORDER BY attnum",
+        "SELECT * FROM syscols",
+        "CREATE TABLE syscols2 (id int)",
+        "SELECT ctid FROM syscols, syscols2",
+    ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).
     &[

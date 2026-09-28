@@ -30,8 +30,13 @@ struct SCol {
     idx: usize,
     table_oid: u32,
     attnum: i16,
-    /// USING/NATURAL hides the underlying columns behind a merged one.
+    /// USING/NATURAL hides the underlying columns behind a merged one, or
+    /// (with `system`) this is a system column hidden from `SELECT *`.
     hidden: bool,
+    /// A system column (`ctid`/`xmin`/...): still resolves by bare name
+    /// (unlike other `hidden` columns, e.g. a pre-merge USING/NATURAL join
+    /// column or `excluded.*` in `ON CONFLICT`, which must be qualified).
+    system: bool,
     /// Field names of a record-typed column.
     rec: Option<Vec<(String, Type)>>,
 }
@@ -1232,8 +1237,12 @@ impl<'a> Binder<'a> {
                         table_oid: c.table_oid,
                         attnum: c.attnum,
                         hidden: false,
+                        system: false,
                         rec: None,
                     });
+                }
+                if let From::Table { oid, .. } = &from {
+                    push_system_cols(&mut scope, &rel, *oid, base + cols.len());
                 }
                 scope.rels.push(rel);
                 Ok((from, scope))
@@ -1266,6 +1275,7 @@ impl<'a> Binder<'a> {
                         table_oid: 0,
                         attnum: 0,
                         hidden: false,
+                        system: false,
                         rec: c.rec.clone(),
                     });
                 }
@@ -1394,6 +1404,7 @@ impl<'a> Binder<'a> {
                 table_oid: 0,
                 attnum: 0,
                 hidden: false,
+                system: false,
                 rec: None,
             });
         }
@@ -1477,7 +1488,7 @@ impl<'a> Binder<'a> {
             return Ok((From::Sub(Box::new(query)), cols, name));
         }
         let cols = table_out_cols(t);
-        Ok((From::Table { oid, ncols: t.columns.len() }, cols, name))
+        Ok((From::Table { oid, ncols: t.live_columns().count() + SYSTEM_COLS.len() }, cols, name))
     }
 
     /// The oid of the sequence `schema.name` (or found on the search path).
@@ -1542,7 +1553,7 @@ impl<'a> Binder<'a> {
                 .iter()
                 .filter(|c| {
                     c.name == name
-                        && (rel.is_none() && !c.hidden
+                        && (rel.is_none() && (!c.hidden || c.system)
                             || rel.is_some_and(|r| c.rel.as_deref() == Some(r)))
                 })
                 .collect();
@@ -1569,7 +1580,7 @@ impl<'a> Binder<'a> {
             if scope.merged.iter().any(|m| m.name == name) {
                 return false;
             }
-            let n = scope.cols.iter().filter(|c| c.name == name && !c.hidden).count();
+            let n = scope.cols.iter().filter(|c| c.name == name && (!c.hidden || c.system)).count();
             if n > 0 {
                 return n > 1;
             }
@@ -3967,6 +3978,7 @@ impl<'a> Binder<'a> {
                         table_oid: oid,
                         attnum: i as i16 + 1,
                         hidden: false,
+                        system: false,
                         rec: None,
                     });
                 }
@@ -3981,6 +3993,7 @@ impl<'a> Binder<'a> {
                         table_oid: 0,
                         attnum: i as i16 + 1,
                         hidden: true,
+                        system: false,
                         rec: None,
                     });
                 }
@@ -4051,6 +4064,7 @@ impl<'a> Binder<'a> {
                 table_oid: oid,
                 attnum: i as i16 + 1,
                 hidden: false,
+                system: false,
                 rec: None,
             });
         }
@@ -4349,6 +4363,39 @@ pub fn table_out_cols(t: &Table) -> Vec<OutCol> {
         .collect()
 }
 
+/// `ctid`, `xmin`, `cmin`, `xmax`, `cmax`, `tableoid`: Postgres's per-row
+/// system columns, in the same order as their real (negative) attnums.
+/// noida-db has no MVCC, so only `ctid` (scan position) and `tableoid`
+/// reflect real per-row state; the transaction/command ids are fixed
+/// placeholders (see docs/LIMITATIONS.md) so a client that blindly selects
+/// them (some ORMs' optimistic-locking or catalog-introspection code does)
+/// gets a plausible value instead of a hard "column does not exist" error.
+pub(super) const SYSTEM_COLS: &[(&str, Type, i16)] = &[
+    ("ctid", Type::TID, -1),
+    ("xmin", Type::XID, -3),
+    ("cmin", Type::CID, -4),
+    ("xmax", Type::XID, -5),
+    ("cmax", Type::CID, -6),
+    ("tableoid", Type::OID, -7),
+];
+
+fn push_system_cols(scope: &mut Scope, rel: &str, oid: u32, base: usize) {
+    for (i, (name, ty, attnum)) in SYSTEM_COLS.iter().enumerate() {
+        scope.cols.push(SCol {
+            rel: Some(rel.to_string()),
+            name: (*name).to_string(),
+            ty: *ty,
+            typmod: -1,
+            idx: base + i,
+            table_oid: oid,
+            attnum: *attnum,
+            hidden: true,
+            system: true,
+            rec: None,
+        });
+    }
+}
+
 fn table_scope(t: &Table, oid: u32, rel: &str, base: usize) -> Scope {
     let mut scope = Scope::default();
     for (i, c) in t.live_columns() {
@@ -4361,9 +4408,11 @@ fn table_scope(t: &Table, oid: u32, rel: &str, base: usize) -> Scope {
             table_oid: oid,
             attnum: i as i16 + 1,
             hidden: false,
+            system: false,
             rec: None,
         });
     }
+    push_system_cols(&mut scope, rel, oid, base + t.columns.len());
     scope.rels.push(rel.to_string());
     scope
 }

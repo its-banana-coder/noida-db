@@ -170,7 +170,10 @@ constraints.
 
 - Enum values order and compare by label text, not declaration order (`<`,
   `ORDER BY`, `min`/`max`).
-- `pg_attribute` has no system columns (`ctid`, `xmin`, ...).
+- `ctid`/`xmin`/`cmin`/`xmax`/`cmax`/`tableoid` are selectable and listed in
+  `pg_attribute`, but there's no MVCC: `xmin`/`cmin`/`xmax`/`cmax` are fixed
+  placeholder values, not real transaction/command ids (`ctid`, the scan
+  position, and `tableoid` are real).
 - `server_version` reports 16.4.
 - `pg_class`/`pg_index`/`pg_attribute` and friends list only user relations,
   not the indexes and columns of the system catalogs themselves (a query that
