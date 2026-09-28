@@ -104,3 +104,76 @@ fn explicit_mapping_and_settings_round_trip() {
     let (_, settings) = call(&engine, "GET", "/catalog/_settings", "");
     assert_eq!(settings["catalog"]["settings"]["index"]["refresh_interval"], "5s");
 }
+
+#[test]
+fn search_is_near_real_time_until_refresh() {
+    let engine = Engine::default();
+    assert_eq!(call(&engine, "PUT", "/books", "").0, 200);
+    call(&engine, "PUT", "/books/_doc/1", r#"{"title":"Dune"}"#);
+
+    // Not yet refreshed: the doc exists (real-time GET) but isn't searchable.
+    assert_eq!(call(&engine, "GET", "/books/_doc/1", "").0, 200);
+    let (_, before) = call(&engine, "POST", "/books/_search", r#"{"query":{"match_all":{}}}"#);
+    assert_eq!(before["hits"]["total"]["value"], 0);
+
+    assert_eq!(call(&engine, "POST", "/books/_refresh", "").0, 200);
+    let (_, after) = call(&engine, "POST", "/books/_search", r#"{"query":{"match_all":{}}}"#);
+    assert_eq!(after["hits"]["total"]["value"], 1);
+    assert_eq!(after["hits"]["hits"][0]["_id"], "1");
+    assert_eq!(after["hits"]["hits"][0]["_source"], json!({"title":"Dune"}));
+}
+
+#[test]
+fn write_with_refresh_true_is_immediately_searchable() {
+    let engine = Engine::default();
+    assert_eq!(call(&engine, "PUT", "/books", "").0, 200);
+    engine.dispatch("PUT", "/books/_doc/1", "refresh=true", br#"{"title":"Dune"}"#);
+    let (_, resp) = call(&engine, "GET", "/books/_search", "");
+    assert_eq!(resp["hits"]["total"]["value"], 1);
+}
+
+#[test]
+fn search_ranks_by_bm25_and_supports_bool_range_and_count() {
+    let engine = Engine::default();
+    assert_eq!(call(&engine, "PUT", "/books", "").0, 200);
+    call(&engine, "PUT", "/books/_doc/1", r#"{"title":"A quick fox","pages":100,"tag":"a"}"#);
+    call(
+        &engine,
+        "PUT",
+        "/books/_doc/2",
+        r#"{"title":"quick quick fox fox","pages":300,"tag":"a"}"#,
+    );
+    call(&engine, "PUT", "/books/_doc/3", r#"{"title":"an unrelated book","pages":50,"tag":"b"}"#);
+    assert_eq!(call(&engine, "POST", "/books/_refresh", "").0, 200);
+
+    let (_, resp) =
+        call(&engine, "POST", "/books/_search", r#"{"query":{"match":{"title":"quick"}}}"#);
+    let hits = resp["hits"]["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0]["_id"], "2");
+    assert!(hits[0]["_score"].as_f64().unwrap() > hits[1]["_score"].as_f64().unwrap());
+
+    let (_, resp) = call(
+        &engine,
+        "POST",
+        "/books/_search",
+        r#"{"query":{"bool":{"filter":[{"term":{"tag":"a"}}],"must_not":[{"range":{"pages":{"gt":200}}}]}}}"#,
+    );
+    assert_eq!(resp["hits"]["total"]["value"], 1);
+    assert_eq!(resp["hits"]["hits"][0]["_id"], "1");
+
+    let (status, resp) =
+        call(&engine, "POST", "/books/_count", r#"{"query":{"exists":{"field":"tag"}}}"#);
+    assert_eq!(status, 200);
+    assert_eq!(resp["count"], 3);
+}
+
+#[test]
+fn analyze_uses_the_standard_analyzer_by_default() {
+    let engine = Engine::default();
+    let (status, resp) = call(&engine, "POST", "/_analyze", r#"{"text":"The Quick Fox!"}"#);
+    assert_eq!(status, 200);
+    let tokens: Vec<&str> =
+        resp["tokens"].as_array().unwrap().iter().map(|t| t["token"].as_str().unwrap()).collect();
+    assert_eq!(tokens, vec!["the", "quick", "fox"]);
+}

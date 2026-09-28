@@ -121,3 +121,65 @@ fn p0_index_management_matches_real_elasticsearch() {
     );
     println!("compared {compared} Elasticsearch P0 replies");
 }
+
+/// BM25 relevance is the part of the spec most likely to be subtly wrong
+/// (Lucene's lossy field-length norm encoding, 32-bit float arithmetic) —
+/// eyeballing the formula doesn't catch that, comparing `_score` against a
+/// real node does.
+#[test]
+fn p0_search_bm25_scoring_matches_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_search";
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    let create = br#"{"settings":{"index":{"number_of_shards":"1","number_of_replicas":"0"}}}"#;
+    request(real_addr, "PUT", index, create);
+    request(ours_addr, "PUT", index, create);
+
+    let docs: [&[u8]; 4] = [
+        br#"{"title":"the quick brown fox","pages":100}"#,
+        br#"{"title":"quick quick fox fox jumps","pages":220}"#,
+        br#"{"title":"an entirely unrelated book","pages":50}"#,
+        br#"{"title":"fox fox fox fox fox","pages":400}"#,
+    ];
+    for (i, d) in docs.iter().enumerate() {
+        let path = format!("{index}/_doc/{}", i + 1);
+        request(real_addr, "PUT", &path, d);
+        request(ours_addr, "PUT", &path, d);
+    }
+    request(real_addr, "POST", &format!("{index}/_refresh"), b"");
+    request(ours_addr, "POST", &format!("{index}/_refresh"), b"");
+
+    let query = br#"{"query":{"match":{"title":"quick fox"}}}"#;
+    let real = request(real_addr, "POST", &format!("{index}/_search"), query);
+    let ours = request(ours_addr, "POST", &format!("{index}/_search"), query);
+    assert_eq!(ours.status, real.status);
+    assert_eq!(ours.body["hits"]["total"]["value"], real.body["hits"]["total"]["value"]);
+
+    let real_hits = real.body["hits"]["hits"].as_array().expect("real hits");
+    let ours_hits = ours.body["hits"]["hits"].as_array().expect("our hits");
+    assert_eq!(real_hits.len(), ours_hits.len());
+    let mut compared = 0;
+    for (r, o) in real_hits.iter().zip(ours_hits.iter()) {
+        assert_eq!(r["_id"], o["_id"], "ranking order must match");
+        let rs = r["_score"].as_f64().unwrap();
+        let os = o["_score"].as_f64().unwrap();
+        let tolerance = (rs.abs() * 1e-5).max(1e-6);
+        assert!(
+            (rs - os).abs() <= tolerance,
+            "_score mismatch for id {:?}: real={rs} ours={os}",
+            r["_id"]
+        );
+        compared += 1;
+    }
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!("compared BM25 _score for {compared} hits against real Elasticsearch");
+}

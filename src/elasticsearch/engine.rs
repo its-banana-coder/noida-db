@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use super::analysis;
+use super::search::{self, CommittedDoc};
+
 #[derive(Clone)]
 pub struct Engine(Arc<Mutex<State>>);
 
@@ -21,6 +24,26 @@ struct Index {
     order: Vec<String>,
     seq: i64,
     opened: bool,
+    /// The last-refreshed, searchable snapshot (near-real-time semantics:
+    /// `_search` sees this, real-time GET reads `docs` directly).
+    committed: Vec<CommittedDoc>,
+}
+
+impl Index {
+    fn refresh(&mut self, name: &str) {
+        self.committed = self
+            .order
+            .iter()
+            .filter_map(|id| {
+                self.docs.get(id).map(|d| CommittedDoc {
+                    index: name.to_string(),
+                    id: id.clone(),
+                    source: d.source.clone(),
+                    version: d.version,
+                })
+            })
+            .collect();
+    }
 }
 
 struct Document {
@@ -60,6 +83,12 @@ impl Engine {
         if segments.first() == Some(&"_alias") {
             return self.get_alias(&segments);
         }
+        if segments.first() == Some(&"_search") || segments.first() == Some(&"_count") {
+            return self.search_or_count(method, segments[0], "*", body);
+        }
+        if segments.first() == Some(&"_analyze") {
+            return self.analyze(body);
+        }
         if segments.len() == 1 && segments[0].starts_with('_') {
             return (404, error("not_found", "no handler found for uri", 404));
         }
@@ -76,17 +105,117 @@ impl Engine {
             "_refresh" | "_flush" | "_open" | "_close" => {
                 self.index_action(method, index_name, segments[1])
             }
+            "_search" | "_count" => self.search_or_count(method, segments[1], index_name, body),
+            "_analyze" => self.analyze(body),
             "_doc" | "_create" | "_source" if segments.len() >= 3 => {
                 self.document_api(method, index_name, segments[2], segments[1], &q, body)
             }
             "_doc" if method == "POST" => {
                 self.document_api(method, index_name, "", "_doc", &q, body)
             }
-            "_bulk" => self.bulk(method, index_name, body),
+            "_bulk" => self.bulk(method, index_name, &q, body),
             "_update" if segments.len() >= 3 => self.update(method, index_name, segments[2], body),
             "_mget" => self.mget(method, index_name, body),
             _ => (404, error("not_found", "no handler found for uri", 404)),
         }
+    }
+
+    /// Index names/patterns matching Elasticsearch's rules for `_search`
+    /// targets: an exact name, a comma-separated list, a `name*` prefix
+    /// wildcard, or `_all`/`*` for every index.
+    fn resolve_indices(s: &State, pattern: &str) -> Vec<String> {
+        if pattern == "_all" || pattern == "*" {
+            let mut names: Vec<String> = s.indices.keys().cloned().collect();
+            names.sort();
+            return names;
+        }
+        let mut names = Vec::new();
+        for part in pattern.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(prefix) = part.strip_suffix('*') {
+                names.extend(s.indices.keys().filter(|k| k.starts_with(prefix)).cloned());
+            } else if s.indices.contains_key(part) {
+                names.push(part.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn search_or_count(
+        &self,
+        method: &str,
+        action: &str,
+        index_pattern: &str,
+        body: &[u8],
+    ) -> (u16, Value) {
+        if method != "GET" && method != "POST" {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        let req = parse_json(body).unwrap_or_else(|| json!({}));
+        let s = self.0.lock().unwrap();
+        let is_wildcard = index_pattern == "_all" || index_pattern == "*";
+        let names = Self::resolve_indices(&s, index_pattern);
+        if names.is_empty() && !is_wildcard {
+            return missing_index(index_pattern);
+        }
+        if action == "_count" {
+            let total: u64 = names
+                .iter()
+                .filter_map(|n| s.indices.get(n))
+                .map(|i| search::count(&i.mappings, &i.committed, &req))
+                .sum();
+            let shards = names.len().max(1);
+            return (
+                200,
+                json!({"count": total, "_shards": {"total": shards, "successful": shards, "skipped": 0, "failed": 0}}),
+            );
+        }
+        // A query spanning more than one index may mix mappings, so fields
+        // fall back to runtime type inference rather than any one index's
+        // explicit mapping (see `search::tokens_for`).
+        let (mappings, docs): (Value, Vec<CommittedDoc>) = if names.len() == 1 {
+            let i = &s.indices[&names[0]];
+            (i.mappings.clone(), i.committed.clone())
+        } else {
+            let mut docs = Vec::new();
+            for n in &names {
+                docs.extend(s.indices[n].committed.iter().cloned());
+            }
+            (json!({"properties": {}}), docs)
+        };
+        (200, search::search(&mappings, &docs, &req))
+    }
+
+    fn analyze(&self, body: &[u8]) -> (u16, Value) {
+        let req = parse_json(body).unwrap_or_else(|| json!({}));
+        let Some(text) = req.get("text").and_then(|t| {
+            t.as_str().map(str::to_string).or_else(|| {
+                t.as_array()
+                    .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
+            })
+        }) else {
+            return (400, error("x_content_parse_exception", "text is required", 400));
+        };
+        let analyzer = req.get("analyzer").and_then(Value::as_str).unwrap_or("standard");
+        let tokens = analysis::analyze(analyzer, &text);
+        let mut position = 0i64;
+        let mut offset = 0usize;
+        let out: Vec<Value> = tokens
+            .into_iter()
+            .map(|t| {
+                let start = offset;
+                offset += t.chars().count();
+                let v = json!({"token": t, "start_offset": start, "end_offset": offset, "type": "<ALPHANUM>", "position": position});
+                position += 1;
+                v
+            })
+            .collect();
+        (200, json!({"tokens": out}))
     }
 
     fn index_api(&self, method: &str, name: &str, body: &[u8]) -> (u16, Value) {
@@ -198,7 +327,10 @@ impl Engine {
             return missing_index(name);
         };
         match action {
-            "_refresh" => (200, json!({"_shards":{"total":1,"successful":1,"failed":0}})),
+            "_refresh" => {
+                i.refresh(name);
+                (200, json!({"_shards":{"total":1,"successful":1,"failed":0}}))
+            }
             "_flush" => (200, json!({"_shards":{"total":1,"successful":1,"failed":0}})),
             "_open" => {
                 i.opened = true;
@@ -218,7 +350,7 @@ impl Engine {
         index: &str,
         id: &str,
         kind: &str,
-        _q: &HashMap<String, String>,
+        q: &HashMap<String, String>,
         body: &[u8],
     ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
@@ -268,18 +400,23 @@ impl Engine {
                 d.source = src;
                 d.version += 1;
                 d.seq = seq;
-                (
+                let result = (
                     if exists { 200 } else { 201 },
                     doc_response(index, &id, d, if exists { "updated" } else { "created" }),
-                )
+                );
+                maybe_refresh(i, index, q);
+                result
             }
             "DELETE" => {
                 if let Some(d) = i.docs.remove(&id) {
+                    i.order.retain(|x| x != &id);
                     i.seq += 1;
-                    (
+                    let result = (
                         200,
                         json!({"_index":index,"_id":id,"_version":d.version+1,"result":"deleted","_shards":{"total":2,"successful":1,"failed":0},"_seq_no":i.seq,"_primary_term":1}),
-                    )
+                    );
+                    maybe_refresh(i, index, q);
+                    result
                 } else {
                     missing_doc(index, &id)
                 }
@@ -322,7 +459,13 @@ impl Engine {
         (404, error("document_missing_exception", &format!("[{}]: document missing", id), 404))
     }
 
-    fn bulk(&self, method: &str, index: &str, body: &[u8]) -> (u16, Value) {
+    fn bulk(
+        &self,
+        method: &str,
+        index: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
         if method != "POST" && method != "PUT" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
@@ -330,6 +473,8 @@ impl Engine {
         let mut lines = text.lines().filter(|l| !l.trim().is_empty());
         let mut items = Vec::new();
         let mut errors = false;
+        let no_refresh = HashMap::new();
+        let mut touched: Vec<String> = Vec::new();
         while let Some(meta) = lines.next() {
             let Ok(m) = serde_json::from_str::<Value>(meta) else {
                 errors = true;
@@ -342,9 +487,10 @@ impl Engine {
             let ix = opts.get("_index").and_then(Value::as_str).unwrap_or(index);
             let id =
                 opts.get("_id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(auto_id);
+            touched.push(ix.to_string());
             if action == "delete" {
                 let (status, mut res) =
-                    self.document_api("DELETE", ix, &id, "_doc", &HashMap::new(), b"");
+                    self.document_api("DELETE", ix, &id, "_doc", &no_refresh, b"");
                 errors |= status >= 300;
                 res["status"] = json!(status);
                 let mut item = Map::new();
@@ -354,13 +500,22 @@ impl Engine {
                 let data = lines.next().unwrap_or("").as_bytes();
                 let verb = if action == "create" { "POST" } else { "PUT" };
                 let kind = if action == "create" { "_create" } else { "_doc" };
-                let (status, mut res) =
-                    self.document_api(verb, ix, &id, kind, &HashMap::new(), data);
+                let (status, mut res) = self.document_api(verb, ix, &id, kind, &no_refresh, data);
                 errors |= status >= 300;
                 res["status"] = json!(status);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
+            }
+        }
+        if wants_refresh(q) {
+            let mut s = self.0.lock().unwrap();
+            touched.sort();
+            touched.dedup();
+            for ix in touched {
+                if let Some(i) = s.indices.get_mut(&ix) {
+                    i.refresh(&ix);
+                }
             }
         }
         (200, json!({"took":0,"errors":errors,"items":items}))
@@ -503,6 +658,16 @@ fn auto_id() -> String {
         })
         .collect()
 }
+fn wants_refresh(q: &HashMap<String, String>) -> bool {
+    matches!(q.get("refresh").map(String::as_str), Some("true") | Some("wait_for") | Some(""))
+}
+
+fn maybe_refresh(i: &mut Index, name: &str, q: &HashMap<String, String>) {
+    if wants_refresh(q) {
+        i.refresh(name);
+    }
+}
+
 fn query_params(q: &str) -> HashMap<String, String> {
     q.split('&')
         .filter_map(|p| p.split_once('='))
