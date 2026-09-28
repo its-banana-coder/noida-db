@@ -98,8 +98,13 @@ Every service is its own module:
     ordinary column.
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
     Flyway, Liquibase, Prisma, Django and Rails to look up the schema,
-    including old-style comma-separated joins across them (what Sequelize's
-    own index introspection sends).
+    including old-style comma-separated joins and long explicit
+    `JOIN ... ON` chains filtered to one row only in `WHERE` across them
+    (Sequelize's own index introspection and Gitea/xorm's own per-table
+    column-metadata query, respectively — both real, unmodified real-app
+    schemas verified end to end against `tests/clients/postgres/run.sh`
+    and, for Gitea specifically, by migrating and starting its actual
+    ~115-table production schema).
   - Clients verified: psycopg, SQLAlchemy, Django, asyncpg, Alembic,
     node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, the
     JDBC driver.

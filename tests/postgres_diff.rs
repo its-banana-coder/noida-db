@@ -562,6 +562,29 @@ const SCRIPTS: &[&[&str]] = &[
         "INSERT INTO obB VALUES (10, 'x')",
         "SELECT obA.oid, v FROM obA, obB ORDER BY oid",
     ],
+    // An explicit `JOIN ... ON` chain filtered down to one row only in
+    // WHERE (not any join's own ON): without pushing WHERE conjuncts down
+    // into the earliest safe (Inner/Cross) join, the whole chain runs
+    // fully unfiltered before WHERE ever applies. This is exactly the
+    // shape of Gitea's own startup schema-introspection query (a long
+    // pg_attribute/pg_class/pg_type/pg_attrdef/... LEFT JOIN chain,
+    // filtered to one table by name only in WHERE) — real ClickHouse-scale
+    // catalogs made it take 11+ seconds per table there, which is what
+    // caught this.
+    &[
+        "CREATE TABLE jwA (id int, aname text)",
+        "CREATE TABLE jwB (id int, a_id int, bname text)",
+        "CREATE TABLE jwC (id int, b_id int, cname text)",
+        "INSERT INTO jwA VALUES (1, 'x'), (2, 'y')",
+        "INSERT INTO jwB VALUES (1, 1, 'p'), (2, 2, 'q'), (3, 2, 'r')",
+        "INSERT INTO jwC VALUES (1, 1, 'm'), (2, 2, 'n')",
+        "SELECT jwA.id, jwB.id, jwC.id \
+         FROM jwA JOIN jwB ON jwB.a_id = jwA.id LEFT JOIN jwC ON jwC.b_id = jwB.id \
+         WHERE jwA.aname = 'y' ORDER BY jwA.id, jwB.id, jwC.id",
+        "SELECT t.relname, i.relname FROM pg_class t \
+         JOIN pg_index ix ON t.oid = ix.indrelid JOIN pg_class i ON i.oid = ix.indexrelid \
+         WHERE t.relname = 'jwa'",
+    ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).
     &[

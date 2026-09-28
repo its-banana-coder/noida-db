@@ -4493,20 +4493,30 @@ fn max_col(e: &Expr) -> Option<usize> {
 }
 
 /// A comma-separated `FROM a, b, c` binds to a left-deep chain of `Cross`
-/// joins with no `on`, which without this runs as a fully unfiltered
-/// nested-loop join at every step (many ORMs' catalog-introspection
-/// queries still use this older join style, and it blows up memory/time
-/// on wide implicit joins once the WHERE clause is the only filter). Real
-/// Postgres treats a comma join and `JOIN ... ON` as equivalent, so it's
-/// correct to push a WHERE conjunct down onto whichever join makes all of
-/// its columns available first. Only ever descends through `left`, since
-/// that's the only side `bind_from`'s chain guarantees starts at column 0
-/// (a `right` item can itself be an arbitrary join subtree at some other
-/// column offset, which this deliberately leaves untouched).
+/// joins with no `on`, and an explicit `a JOIN b ON ... JOIN c ON ...`
+/// binds to the same left-deep shape with `Inner` joins that already have
+/// one. Either way, without this a WHERE-clause condition on an early
+/// table only applies after every later join has already run against the
+/// *whole* earlier result — many ORMs' catalog-introspection queries send
+/// exactly this shape (a long explicit-join chain filtered down to one
+/// specific row only in WHERE), and it blows up memory/time once the
+/// tables involved aren't tiny. Real Postgres has no such distinction
+/// (comma joins, `JOIN...ON` and WHERE conditions on an inner join are
+/// all equivalent), so it's correct to push a WHERE conjunct down onto
+/// (or, for an `Inner`/`Cross` join that already has one, AND it onto)
+/// whichever join makes all of its columns available first. `Left`/
+/// `Right`/`Full` joins are never touched (doing so would change which
+/// rows get null-padded), but a chain's own accumulation is always
+/// through `left` — see `bind_table_with_joins_at` — so descending only
+/// through `left` still reaches every `Inner`/`Cross` node nested inside
+/// an outer join's left-hand side. Only ever descends through `left` on
+/// the other axis too: a `right` item can itself be an arbitrary join
+/// subtree at some other column offset (a later comma-joined item), which
+/// this deliberately leaves untouched.
 fn push_cross_predicates(from: &mut From, remaining: &mut Vec<Expr>) {
     let From::Join { left, kind, on, left_cols, right_cols, .. } = from else { return };
     push_cross_predicates(left, remaining);
-    if *kind != JoinKind::Cross || on.is_some() || remaining.is_empty() {
+    if !matches!(kind, JoinKind::Cross | JoinKind::Inner) || remaining.is_empty() {
         return;
     }
     let width = *left_cols + *right_cols;
@@ -4519,9 +4529,14 @@ fn push_cross_predicates(from: &mut From, remaining: &mut Vec<Expr>) {
             i += 1;
         }
     }
-    if !mine.is_empty() {
-        *on = Some(and_all(mine));
+    if mine.is_empty() {
+        return;
     }
+    let extra = and_all(mine);
+    *on = Some(match on.take() {
+        Some(existing) => Expr::And(vec![existing, extra]),
+        None => extra,
+    });
 }
 
 fn and_all(mut conds: Vec<Expr>) -> Expr {

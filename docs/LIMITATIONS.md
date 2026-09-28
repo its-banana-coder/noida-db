@@ -86,13 +86,17 @@ current count).
 ## Postgres
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 615 results) and by psycopg,
-SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx,
-GORM and JDBC (`tests/clients/postgres/run.sh`). Django's own management
-commands (`migrate`, including the built-in `auth`/`admin`/`sessions`/
-`contenttypes` apps, `makemigrations` for a schema change, `bulk_create`,
-joins, aggregates, `F()`/`Q()`, M2M, transactions and savepoints,
-introspection) pass end to end. The introspection queries Prisma and
+servers by `tests/postgres_diff.rs` (about 665 results) and by psycopg,
+SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM,
+Sequelize, pgx, GORM, sqlx, Npgsql and JDBC (`tests/clients/postgres/run.sh`).
+Django's own management commands (`migrate`, including the built-in
+`auth`/`admin`/`sessions`/`contenttypes` apps, `makemigrations` for a
+schema change, `bulk_create`, joins, aggregates, `F()`/`Q()`, M2M,
+transactions and savepoints, introspection) pass end to end. Gitea (a real,
+unmodified Go application with a ~115-table production schema, using the
+xorm ORM) migrates and starts its actual schema successfully, including
+xorm's own per-table column-metadata self-check. The introspection queries
+Prisma and
 Hibernate send are in the diff tests; `psql`'s `\d`, `\di`, `\dT` and
 similar were compared by hand against a real server.
 
@@ -154,6 +158,17 @@ constraints.
 
 **Not yet**
 
+- `CREATE DATABASE`/`DROP DATABASE`: there's one database per data dir
+  (named whatever the client connects to first), so a client that expects
+  to provision its own database as part of setup (Gitea's own `gitea
+  migrate`, for one) needs to be pointed at an existing database name
+  instead (e.g. the default `postgres`).
+- Some `information_schema.columns`/`pg_attrdef` default-value text
+  doesn't always match a real server's exact formatting (e.g. boolean
+  literal case, or a numeric column default reported as empty instead of
+  its value) — cosmetic in most cases, but an ORM that compares its own
+  expected schema against the live one column-by-column (xorm, which
+  Gitea uses, does) may log a spurious mismatch warning for it.
 - PL/pgSQL, stored procedures, `CREATE PROCEDURE`/`CALL` and triggers,
   and extensions. Deliberately deferred: unlike everything else on this
   list, PL/pgSQL is a real procedural language embedded in SQL (its own
