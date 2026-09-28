@@ -542,6 +542,22 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT * FROM syscols",
         "CREATE TABLE syscols2 (id int)",
         "SELECT ctid FROM syscols, syscols2",
+        "SELECT syscols.* FROM syscols",
+        "SELECT syscols FROM syscols",
+    ],
+    // ORDER BY resolves a bare name against the SELECT list's output
+    // columns first, even when the name also matches (unambiguously or,
+    // as here, ambiguously) an input column: two joined tables both named
+    // `oid`-like columns, selected unaliased so the output column takes
+    // that name, must not make `ORDER BY` on that name "ambiguous" (found
+    // via Npgsql's own connection-startup catalog query, which relies on
+    // exactly this precedence and otherwise fails to connect at all).
+    &[
+        "CREATE TABLE obA (oid int, v text)",
+        "CREATE TABLE obB (oid int, w text)",
+        "INSERT INTO obA VALUES (2, 'a'), (1, 'b')",
+        "INSERT INTO obB VALUES (10, 'x')",
+        "SELECT obA.oid, v FROM obA, obB ORDER BY oid",
     ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).

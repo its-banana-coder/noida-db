@@ -1,6 +1,8 @@
 /target
 tests/clients/target
 tests/clients/postgres/rust/target/
+tests/clients/postgres/dotnet/npgsql/bin/
+tests/clients/postgres/dotnet/npgsql/obj/
 /.noida-db
 /.claude
 

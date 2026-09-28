@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the committed Postgres client apps (psycopg, SQLAlchemy, Django,
-# asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx, GORM, sqlx, Sequelize, JDBC)
-# against a server.
+# asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx,
+# Npgsql, JDBC) against a server.
 #
 #   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
@@ -127,6 +127,13 @@ if command -v cargo >/dev/null; then
   run_client "sqlx" env -C "$here/rust" cargo run -q
 else
   echo "-- sqlx SKIPPED (no cargo)"
+fi
+
+# --- .NET: Npgsql -----------------------------------------------------------
+if command -v dotnet >/dev/null; then
+  run_client "npgsql" env -C "$here/dotnet/npgsql" dotnet run
+else
+  echo "-- npgsql SKIPPED (no dotnet)"
 fi
 
 # --- Java: the PostgreSQL JDBC driver --------------------------------------

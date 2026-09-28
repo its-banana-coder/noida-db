@@ -661,25 +661,27 @@ impl<'a> Binder<'a> {
                     order_specs.push((proj[idx - 1].clone(), desc, nulls_first, Some(idx - 1)));
                     continue;
                 }
+                // A simple name that matches an output column is always
+                // taken as that output column, even when it also matches
+                // (unambiguously or not) an input column: real Postgres
+                // resolves ORDER BY names against the select list first.
                 if let a::Expr::Identifier(id) = &o.expr {
                     let n = ident(id);
-                    if self.lookup_column(&n, None).is_none() {
-                        let hits: Vec<usize> = out_cols
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, c)| c.name == n)
-                            .map(|(i, _)| i)
-                            .collect();
-                        if hits.len() > 1 {
-                            return Err(PgError::new(
-                                code::AMBIGUOUS_COLUMN,
-                                format!("ORDER BY \"{n}\" is ambiguous"),
-                            ));
-                        }
-                        if let Some(&p) = hits.first() {
-                            order_specs.push((proj[p].clone(), desc, nulls_first, Some(p)));
-                            continue;
-                        }
+                    let hits: Vec<usize> = out_cols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.name == n)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if hits.len() > 1 {
+                        return Err(PgError::new(
+                            code::AMBIGUOUS_COLUMN,
+                            format!("ORDER BY \"{n}\" is ambiguous"),
+                        ));
+                    }
+                    if let Some(&p) = hits.first() {
+                        order_specs.push((proj[p].clone(), desc, nulls_first, Some(p)));
+                        continue;
                     }
                 }
                 let te = self.bind_expr(&o.expr)?;
@@ -946,7 +948,11 @@ impl<'a> Binder<'a> {
                     if !scope.rels.contains(&rel) {
                         return Err(missing_from(&rel));
                     }
-                    for c in scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel.as_str())) {
+                    for c in scope
+                        .cols
+                        .iter()
+                        .filter(|c| c.rel.as_deref() == Some(rel.as_str()) && !c.hidden)
+                    {
                         cols.push(OutCol {
                             name: c.name.clone(),
                             ty: c.ty,
@@ -2045,7 +2051,7 @@ impl<'a> Binder<'a> {
     fn whole_row(&mut self, rel: &str) -> PgResult<TE> {
         let scope = self.scopes.last().cloned().unwrap_or_default();
         let cols: Vec<&SCol> =
-            scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel)).collect();
+            scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel) && !c.hidden).collect();
         if cols.is_empty() {
             return Err(missing_from(rel));
         }
@@ -2881,7 +2887,7 @@ impl<'a> Binder<'a> {
                     .map(|s| {
                         s.cols
                             .iter()
-                            .filter(|c| c.rel.as_deref() == Some(rel.as_str()))
+                            .filter(|c| c.rel.as_deref() == Some(rel.as_str()) && !c.hidden)
                             .map(|c| c.name.clone())
                             .collect()
                     })
@@ -4372,11 +4378,11 @@ pub fn table_out_cols(t: &Table) -> Vec<OutCol> {
 /// gets a plausible value instead of a hard "column does not exist" error.
 pub(super) const SYSTEM_COLS: &[(&str, Type, i16)] = &[
     ("ctid", Type::TID, -1),
-    ("xmin", Type::XID, -3),
-    ("cmin", Type::CID, -4),
-    ("xmax", Type::XID, -5),
-    ("cmax", Type::CID, -6),
-    ("tableoid", Type::OID, -7),
+    ("xmin", Type::XID, -2),
+    ("cmin", Type::CID, -3),
+    ("xmax", Type::XID, -4),
+    ("cmax", Type::CID, -5),
+    ("tableoid", Type::OID, -6),
 ];
 
 fn push_system_cols(scope: &mut Scope, rel: &str, oid: u32, base: usize) {

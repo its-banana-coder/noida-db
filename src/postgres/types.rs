@@ -1620,6 +1620,11 @@ pub fn to_binary(v: &Value, ty: Type, f: &FmtCtx) -> Vec<u8> {
             out.push(1);
             out.extend_from_slice(s.as_bytes());
         }
+        (Base::Tid, Value::Text(s)) => {
+            let (blk, off) = tid_from_text(s).unwrap_or((0, 0));
+            out.extend_from_slice(&blk.to_be_bytes());
+            out.extend_from_slice(&off.to_be_bytes());
+        }
         (_, Value::Text(s)) => out.extend_from_slice(s.as_bytes()),
         (_, Value::Bytes(b)) => out.extend_from_slice(b),
         (_, Value::Date(d)) => out.extend_from_slice(&d.to_be_bytes()),
@@ -1754,8 +1759,21 @@ pub fn from_binary(b: &[u8], ty: Type) -> PgResult<Value> {
             Value::Text(s)
         }
         Base::Char => Value::Text(b.first().map(|&c| (c as char).to_string()).unwrap_or_default()),
+        Base::Tid => {
+            let x = arr(6)?;
+            let blk = u32::from_be_bytes(x[..4].try_into().unwrap());
+            let off = u16::from_be_bytes(x[4..6].try_into().unwrap());
+            Value::Text(format!("({blk},{off})"))
+        }
         _ => Value::Text(text()?),
     })
+}
+
+/// Parses a `tid`'s canonical `(block,offset)` text form.
+fn tid_from_text(s: &str) -> Option<(u32, u16)> {
+    let s = s.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let (a, b) = s.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 #[cfg(test)]
