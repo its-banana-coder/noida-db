@@ -288,6 +288,34 @@ pub fn format_vector(v: &Vector) -> String {
         .join(" ")
 }
 
+/// `setweight(vector, weight)`: labels every position in `vector`'s own
+/// text form with `weight` (`A`/`B`/`C`/`D`), e.g. `'cat':1` becomes
+/// `'cat':1A`. The label round-trips through the vector's text form but
+/// isn't otherwise used here — `rank`'s label-weighting is a documented
+/// approximation (see its own doc comment) — so this works directly on
+/// text (reusing `parse_vector` for the position numbers only) rather
+/// than threading a weight field through `Vector` itself.
+pub fn set_weight(s: &str, weight: char) -> PgResult<String> {
+    if !matches!(weight, 'A' | 'B' | 'C' | 'D') {
+        return Err(PgError::new(
+            code::INVALID_PARAMETER_VALUE,
+            format!("unrecognized weight: \"{weight}\""),
+        ));
+    }
+    let v = parse_vector(s)?;
+    Ok(v.iter()
+        .map(|(l, ps)| {
+            if ps.is_empty() {
+                quote_lexeme(l)
+            } else {
+                let list: Vec<String> = ps.iter().map(|p| format!("{p}{weight}")).collect();
+                format!("{}:{}", quote_lexeme(l), list.join(","))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 /// Parses a `tsvector`'s own text form (`'cat':2 'fox':4,9`), the input
 /// syntax for `'...'::tsvector` and what `format_vector` round-trips.
 pub fn parse_vector(s: &str) -> PgResult<Vector> {
@@ -362,6 +390,128 @@ fn merge_or_push(out: &mut Vector, lexeme: String, positions: Vec<u16>) {
     }
 }
 
+/// A lexeme's positions with an optional weight label (`'\0'` = none), used
+/// only by `concat_vectors`/`parse_weighted`/`format_weighted`.
+type WeightedVector = Vec<(String, Vec<(u16, char)>)>;
+
+/// `vector1 || vector2`: unlike matching/ranking, concatenation must keep
+/// each side's weight labels (Postgres's own docs: "the positional
+/// information... is preserved"), which `Vector`/`parse_vector` don't
+/// track at all (see `rank`'s doc comment) — so this parses each side
+/// itself, capturing a `'\0'`-for-none weight char per position instead
+/// of discarding it. The right side's positions are shifted past the
+/// left side's highest position, matching Postgres's own behavior for
+/// combining e.g. a title vector and a body vector into one document.
+pub fn concat_vectors(a: &str, b: &str) -> PgResult<String> {
+    let va = parse_weighted(a)?;
+    let vb = parse_weighted(b)?;
+    let offset = va.iter().flat_map(|(_, ps)| ps.iter().map(|(p, _)| *p)).max().unwrap_or(0);
+    let mut out = va;
+    for (lexeme, positions) in vb {
+        let shifted: Vec<(u16, char)> =
+            positions.into_iter().map(|(p, w)| (p.saturating_add(offset), w)).collect();
+        match out.iter_mut().find(|(l, _)| *l == lexeme) {
+            Some((_, ps)) => {
+                for pw in shifted {
+                    if !ps.contains(&pw) {
+                        ps.push(pw);
+                    }
+                }
+                ps.sort_unstable();
+            }
+            None => out.push((lexeme, shifted)),
+        }
+    }
+    out.sort_by(|x, y| x.0.cmp(&y.0));
+    Ok(format_weighted(&out))
+}
+
+fn parse_weighted(s: &str) -> PgResult<WeightedVector> {
+    let mut out: WeightedVector = vec![];
+    let mut chars = s.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(&c) = chars.peek() else { break };
+        let lexeme = if c == '\'' {
+            chars.next();
+            let mut l = String::new();
+            loop {
+                match chars.next() {
+                    Some('\'') if chars.peek() == Some(&'\'') => {
+                        chars.next();
+                        l.push('\'');
+                    }
+                    Some('\'') | None => break,
+                    Some(c) => l.push(c),
+                }
+            }
+            l
+        } else {
+            let mut l = String::new();
+            while chars.peek().is_some_and(|c| !c.is_whitespace()) {
+                l.push(chars.next().unwrap());
+            }
+            l
+        };
+        let mut positions = vec![];
+        if chars.peek() == Some(&':') {
+            chars.next();
+            loop {
+                let mut n = String::new();
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    n.push(chars.next().unwrap());
+                }
+                let weight = if chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    chars.next().unwrap()
+                } else {
+                    '\0'
+                };
+                if let Ok(p) = n.parse() {
+                    positions.push((p, weight));
+                }
+                if chars.peek() == Some(&',') {
+                    chars.next();
+                    continue;
+                }
+                break;
+            }
+            positions.sort_unstable();
+        }
+        match out.iter_mut().find(|(l, _)| *l == lexeme) {
+            Some((_, ps)) => {
+                for pw in positions {
+                    if !ps.contains(&pw) {
+                        ps.push(pw);
+                    }
+                }
+                ps.sort_unstable();
+            }
+            None => out.push((lexeme, positions)),
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn format_weighted(v: &WeightedVector) -> String {
+    v.iter()
+        .map(|(l, ps)| {
+            if ps.is_empty() {
+                quote_lexeme(l)
+            } else {
+                let list: Vec<String> = ps
+                    .iter()
+                    .map(|(p, w)| if *w == '\0' { p.to_string() } else { format!("{p}{w}") })
+                    .collect();
+                format!("{}:{}", quote_lexeme(l), list.join(","))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// A parsed `tsquery`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Query {
@@ -386,6 +536,70 @@ pub fn phraseto_tsquery(text: &str, config: &str) -> Option<Query> {
     let mut acc = Query::Lexeme(it.next()?.0, false);
     for (l, _) in it {
         acc = Query::Phrase(Box::new(acc), Box::new(Query::Lexeme(l, false)), 1);
+    }
+    Some(acc)
+}
+
+/// `websearch_to_tsquery`: web-search-engine-like syntax. Unquoted words
+/// are ANDed (each stemmed like `plainto_tsquery`), `"quoted phrases"`
+/// become phrase searches (like `phraseto_tsquery`), a leading `-` on a
+/// word or phrase excludes it, and the literal word `OR` between two
+/// terms makes that one connector an OR instead of an AND. Unlike
+/// `to_tsquery`, malformed input (an unmatched quote, a bare `-` or `OR`)
+/// never errors — it degrades gracefully, the same way real Postgres's
+/// own parser does.
+pub fn websearch_to_tsquery(text: &str, config: &str) -> Option<Query> {
+    let mut terms: Vec<(Query, bool)> = vec![];
+    let mut want_or = false;
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let Some(&c) = chars.peek() else { break };
+        let negate = c == '-';
+        if negate {
+            chars.next();
+        }
+        let term = if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut phrase = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') | None => break,
+                    Some(c) => phrase.push(c),
+                }
+            }
+            phraseto_tsquery(&phrase, config)
+        } else {
+            let mut word = String::new();
+            while chars.peek().is_some_and(|c| !c.is_whitespace()) {
+                word.push(chars.next().unwrap());
+            }
+            if word.is_empty() {
+                continue;
+            }
+            if !negate && word.eq_ignore_ascii_case("or") {
+                want_or = true;
+                continue;
+            }
+            plainto_tsquery(&word, config)
+        };
+        if let Some(q) = term {
+            let q = if negate { Query::Not(Box::new(q)) } else { q };
+            terms.push((q, want_or));
+        }
+        want_or = false;
+    }
+    let mut it = terms.into_iter();
+    let (acc0, _) = it.next()?;
+    let mut acc = acc0;
+    for (q, is_or) in it {
+        acc = if is_or {
+            Query::Or(Box::new(acc), Box::new(q))
+        } else {
+            Query::And(Box::new(acc), Box::new(q))
+        };
     }
     Some(acc)
 }

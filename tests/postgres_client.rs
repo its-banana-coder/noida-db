@@ -410,6 +410,27 @@ fn concretely_typed_param_gets_column_typmod_on_every_rebind() {
     assert_eq!(row.get::<_, String>(0), "7.00");
 }
 
+/// `INSERT INTO t (...) SELECT $1, $2, ...` (as opposed to `VALUES`): an
+/// unspecified-type parameter directly in the target list must resolve
+/// against that column's own type, the same way one in a `VALUES` row
+/// already does. Found via Miniflux's own entry-insert query, which uses
+/// exactly this shape (`INSERT ... SELECT $1, ... WHERE NOT EXISTS (...)`,
+/// an atomicity idiom) with a `time.Time` parameter headed for a
+/// `timestamptz` column.
+#[test]
+fn unspecified_param_in_insert_select_resolves_against_target_column() {
+    let mut c = client();
+    c.batch_execute("CREATE TABLE t (id serial primary key, ts timestamptz, body text)").unwrap();
+    let now = std::time::SystemTime::now();
+    c.execute(
+        "INSERT INTO t (ts, body) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM t WHERE body = $2)",
+        &[&now, &"hello"],
+    )
+    .unwrap();
+    let row = c.query_one("SELECT body FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(row.get::<_, String>(0), "hello");
+}
+
 #[test]
 fn two_connections_share_data() {
     let addr = start();

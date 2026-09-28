@@ -2470,7 +2470,9 @@ impl<'a> Binder<'a> {
                 }
             }
             "||" => {
-                if lt.array || rt.array {
+                if lt.base == Base::Tsvector && rt.base == Base::Tsvector {
+                    (Type::TSVECTOR, Type::TSVECTOR, Type::TSVECTOR)
+                } else if lt.array || rt.array {
                     let elem = if lt.array { lt.elem() } else { lt };
                     let relem = if rt.array { rt.elem() } else { rt };
                     let e = self
@@ -3830,6 +3832,35 @@ impl<'a> Binder<'a> {
                 })
                 .collect();
             return Ok((Query::Values { rows, order: vec![], limit: None, offset: None }, ocols));
+        }
+        // `INSERT INTO t (...) SELECT $1, $2, ... WHERE ...` (as opposed to
+        // `VALUES`): a still-unspecified parameter directly in target-list
+        // position resolves against that column's own type, the same way
+        // one in a `VALUES` row already does (see `coerce_assign` above) —
+        // real Postgres does this too. Since a bare `SELECT $1` alone has
+        // no such context, resolving it defaults to `text` (postponing
+        // the unknown to the whole query, see `resolve_unknown_output`),
+        // which then permanently locks the parameter's type before this
+        // function ever sees it — so this has to pre-seed the still-open
+        // parameters before `bind_query` runs, not fix them up after.
+        if q.with.is_none()
+            && let a::SetExpr::Select(sel) = q.body.as_ref()
+            && sel.projection.len() == targets.len()
+        {
+            for (item, (ty, _)) in sel.projection.iter().zip(targets) {
+                if let a::SelectItem::UnnamedExpr(a::Expr::Value(vws)) = item
+                    && let a::Value::Placeholder(p) = &vws.value
+                    && let Some(idx) = p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok())
+                    && idx >= 1
+                {
+                    if self.params.len() < idx {
+                        self.params.resize(idx, Type::UNKNOWN);
+                    }
+                    if self.params[idx - 1].is_unknown() {
+                        self.params[idx - 1] = *ty;
+                    }
+                }
+            }
         }
         let (plan, cols_out) = self.bind_query(q)?;
         // Cast the query's columns to the target types.

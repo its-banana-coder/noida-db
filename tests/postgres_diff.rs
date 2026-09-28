@@ -438,6 +438,12 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT to_tsquery('fox & quick'), to_tsquery('fox | !slow'), to_tsquery('(fox | dog) & quick')",
         "SELECT to_tsquery('quick <-> brown'), to_tsquery('quick <2> fox'), to_tsquery('jump:*')",
         "SELECT plainto_tsquery('the quick foxes'), phraseto_tsquery('quick brown fox')",
+        "SELECT websearch_to_tsquery('rust programming')",
+        "SELECT websearch_to_tsquery('\"exact phrase\" here')",
+        "SELECT websearch_to_tsquery('cats or dogs')",
+        "SELECT websearch_to_tsquery('cats -dogs')",
+        "SELECT websearch_to_tsquery('-\"exact phrase\"')",
+        "SELECT websearch_to_tsquery('   ')",
         "SELECT '''fox'':2,4 ''quick'':1'::tsvector",
         "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & quick')",
         "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & slow')",
@@ -448,6 +454,28 @@ const SCRIPTS: &[&[&str]] = &[
         "INSERT INTO docs VALUES (1, 'The quick brown fox jumps over the lazy dog'), (2, 'A completely unrelated sentence about cats')",
         "SELECT id FROM docs WHERE to_tsvector(body) @@ to_tsquery('fox & dog') ORDER BY id",
         "SELECT id FROM docs WHERE to_tsvector(body) @@ plainto_tsquery('lazy dog') ORDER BY id",
+        "SELECT setweight(to_tsvector('a cat sat'), 'A')",
+        "SELECT setweight(to_tsvector('cat sat'), 'A') || setweight(to_tsvector('a dog ran'), 'B')",
+        "SELECT setweight(to_tsvector(''), 'A') || to_tsvector('fox')",
+        "SELECT setweight(to_tsvector('cat'), 'X')",
+    ],
+    // DECLARE/FETCH/CLOSE cursors: the query runs at DECLARE time, FETCH
+    // returns NEXT/N/ALL rows from where the cursor left off, and CLOSE
+    // (or COMMIT) ends it. Found via Miniflux's own schema migration,
+    // which uses exactly this shape (`... FOR UPDATE`, `FETCH NEXT`, a
+    // deferred `CLOSE`) to walk a table in a loop.
+    &[
+        "CREATE TABLE cur_items (id int)",
+        "INSERT INTO cur_items VALUES (1), (2), (3), (4), (5)",
+        "BEGIN",
+        "DECLARE cur_c CURSOR FOR SELECT id FROM cur_items WHERE id > 0 FOR UPDATE",
+        "FETCH NEXT FROM cur_c",
+        "FETCH NEXT FROM cur_c",
+        "FETCH 2 FROM cur_c",
+        "FETCH NEXT FROM cur_c",
+        "FETCH NEXT FROM cur_c",
+        "CLOSE cur_c",
+        "COMMIT",
     ],
     // REFRESH MATERIALIZED VIEW: stays stale until refreshed, WITH NO DATA
     // unpopulates it, an unpopulated matview errors on read.

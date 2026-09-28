@@ -32,12 +32,31 @@ results are compared byte-for-byte against the real server. See
 every service follows, and [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for
 exactly what does not work yet or is intentionally out of scope.
 
+## Tested against real applications
+
+Beyond the compatibility test suite (real client libraries, ORMs and CLIs
+compared byte-for-byte against the real server), noida-db is validated by
+running actual, unmodified open-source applications against it as their
+database — not a synthetic client, a real app doing real work.
+
+| App | What it exercises | Result |
+|---|---|---|
+| [Gitea](https://about.gitea.com/) (Postgres + Redis) | Full production schema (~115 tables) via the xorm ORM; creating a repository, `git clone`/`git push` over HTTP, issues and comments, and a full pull-request workflow (branch push → PR → merge) via the REST API | ✅ All of the above works end to end |
+| [Miniflux](https://miniflux.app/) (Postgres) | Full schema migration (134 migrations, including a `DECLARE`/`FETCH`/`CLOSE` cursor); adding a real RSS feed, fetching and parsing its entries, marking one read, and full-text search over entry titles/content (a `setweight`+`||`-combined index, queried with `websearch_to_tsquery`) | ✅ All of the above works end to end |
+
+**RAM usage while running these workflows:** as low as 2MB idle after
+boot, peaking at 15MB during the heaviest activity (Gitea's schema-check
+phase), settling in the 5–15MB range at rest — well under the [footprint
+targets](COMPATIBILITY.md#footprint-targets).
+
+More applications are being added over time.
+
 ## Status
 
 | Service | State |
 |---|---|
 | **Redis** | most of the protocol implemented and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq) — see [`src/redis/README.md`](src/redis/README.md) |
-| **Postgres** | wire protocol, catalogs, DDL/DML, tested against psycopg, SQLAlchemy, node-postgres and JDBC |
+| **Postgres** | wire protocol, catalogs, DDL/DML, tested against psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql and JDBC, plus real applications (see above) |
 | **MySQL, Kafka** | in progress, not yet merged — see `docs/specs/mysql.md` and `docs/specs/kafka.md` |
 | **Elasticsearch, ClickHouse, Memcached, MongoDB, RabbitMQ** | specs written, implementation not started — see `docs/specs/` |
 

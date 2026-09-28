@@ -84,9 +84,13 @@ Every service is its own module:
     constraints, `LISTEN`/`NOTIFY`, `COPY ... FROM/TO STDIN/STDOUT` (text
     and CSV; verified against `pg_dump`/`psql` restore and the copy APIs of
     psycopg, node-postgres and the Rust `postgres` crate), full-text search
-    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`, `@@`,
-    `ts_rank`; verified against Django's `django.contrib.postgres.search`),
-    `REFRESH MATERIALIZED VIEW`.
+    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`/
+    `websearch_to_tsquery`, `@@`, `ts_rank`, `setweight`,
+    `tsvector || tsvector`; verified against Django's
+    `django.contrib.postgres.search` and Miniflux's own search index),
+    `REFRESH MATERIALIZED VIEW`, `DECLARE`/`FETCH`/`CLOSE` cursors
+    (forward-only: `NEXT`, a row count, `ALL`/`FORWARD ALL`; verified
+    against Miniflux's own schema-migration cursor usage).
   - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz,
     numeric and the range types (`int4range`/`int8range`/`numrange`/
     `daterange`/`tsrange`/`tstzrange`: canonical text, `@>`/`<@`/`&&`,
@@ -110,8 +114,10 @@ Every service is its own module:
     JDBC driver.
 - **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
   extensions, logical replication, `COPY` to/from a server-side file or
-  program, `FORMAT BINARY`, full-text search GIN/GiST
-  indexes and `ts_headline`. Concurrency is one writer at a time.
+  program, `FORMAT BINARY`, full-text search GIN/GiST indexes and
+  `ts_headline`, backward-moving cursors (`PRIOR`/`BACKWARD`/`ABSOLUTE`/
+  `RELATIVE`) and `WITH HOLD` (a cursor is closed at the end of its
+  transaction like an ordinary one). Concurrency is one writer at a time.
 - **Known gap:** enum values order and compare by label text, not by the
   order they were declared in (`<`, `ORDER BY`, `min`/`max`).
 - **Known gap:** there's no MVCC, so `xmin`/`cmin`/`xmax`/`cmax` are fixed

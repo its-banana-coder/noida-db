@@ -65,7 +65,8 @@ to_tsvector(text)tsvector to_tsvector(text,text)tsvector
 to_tsquery(text)tsquery to_tsquery(text,text)tsquery
 plainto_tsquery(text)tsquery plainto_tsquery(text,text)tsquery
 phraseto_tsquery(text)tsquery phraseto_tsquery(text,text)tsquery
-ts_rank(tsvector,tsquery)float4
+websearch_to_tsquery(text)tsquery websearch_to_tsquery(text,text)tsquery
+ts_rank(tsvector,tsquery)float4 setweight(tsvector,char)tsvector
 int4range(int4,int4)int4range int4range(int4,int4,text)int4range
 int8range(int8,int8)int8range int8range(int8,int8,text)int8range
 numrange(numeric,numeric)numrange numrange(numeric,numeric,text)numrange

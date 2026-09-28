@@ -115,17 +115,22 @@ fast path), are not implemented; a client always has STDIN/STDOUT
 alternatives.
 
 Full-text search (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/
-`phraseto_tsquery`, the `@@` match operator, `ts_rank`) works for the
-`'english'` and `'simple'` configs (any other config name runs as
-`'simple'`). `to_tsvector`/`to_tsquery`'s canonical text output and `@@`'s
-boolean result match a real server exactly, including phrase (`<->`/`<N>`)
-and prefix (`:*`) matching; verified against Django's
+`phraseto_tsquery`/`websearch_to_tsquery`, the `@@` match operator,
+`ts_rank`, `setweight`, `tsvector || tsvector`) works for the `'english'`
+and `'simple'` configs (any other config name runs as `'simple'`).
+`to_tsvector`/`to_tsquery`'s canonical text output and `@@`'s boolean
+result match a real server exactly, including phrase (`<->`/`<N>`) and
+prefix (`:*`) matching, weight labels (`setweight`'s `A`/`B`/`C`/`D`, kept
+through `||` concatenation with the right side's positions correctly
+shifted), and `websearch_to_tsquery`'s web-search syntax (`"phrases"`,
+`word1 OR word2`, `-excluded`); verified against Django's
 `django.contrib.postgres.search` (`SearchVector`/`SearchQuery`/
-`SearchRank`) end to end. `ts_rank`'s exact number is a documented
+`SearchRank`) and Miniflux's own full-text index (title/content combined
+via `setweight`+`||`) end to end. `ts_rank`'s exact number is a documented
 approximation (it orders matches sensibly but doesn't reproduce Postgres's
 own formula, which weights lexeme importance labels and document length
-nothing here tracks); GIN/GiST indexes, `ts_headline`, and
-`websearch_to_tsquery` are not implemented.
+nothing here tracks); GIN/GiST indexes and `ts_headline` are not
+implemented.
 
 `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` works: a
 materialized view keeps its rows from `CREATE`/the last `REFRESH` until
@@ -178,8 +183,8 @@ constraints.
   needs its own interpreter wired into the binder/executor, not a bounded
   parse-and-evaluate addition — it's planned as its own dedicated effort
   once the rest of the compatibility work here is done.
-- Full-text search: GIN/GiST indexes, `ts_headline`, `websearch_to_tsquery`,
-  any text search config other than `'english'`/`'simple'`.
+- Full-text search: GIN/GiST indexes, `ts_headline`, any text search
+  config other than `'english'`/`'simple'`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
 

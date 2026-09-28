@@ -85,6 +85,16 @@ pub struct Portal {
     pub suspended: bool,
 }
 
+/// A `DECLARE ... CURSOR FOR` cursor: the query runs eagerly right away
+/// (this engine has no lazy/streaming execution), and `FETCH` just slices
+/// the already-materialized rows — the same shape `Portal` already uses
+/// for extended-protocol row-limited fetches.
+pub struct Cursor {
+    pub cols: Vec<OutCol>,
+    pub rows: Vec<Row>,
+    pub pos: usize,
+}
+
 pub struct Session {
     pub id: u32,
     pub pid: i32,
@@ -94,6 +104,11 @@ pub struct Session {
     txn: Option<Txn>,
     pub prepared: BTreeMap<String, Prepared>,
     pub portals: BTreeMap<String, Portal>,
+    /// `DECLARE`d cursors. Not `WITH HOLD`-aware: cleared on commit and
+    /// rollback like an ordinary (non-holdable) cursor, since that's the
+    /// common case and a `WITH HOLD` cursor surviving its transaction is
+    /// a rare, P1-scale pattern.
+    pub cursors: BTreeMap<String, Cursor>,
     pub cancel: Arc<AtomicBool>,
     pub notifications: Arc<Mutex<Vec<(i32, String, String)>>>,
     /// Statements run so far in an implicit multi-statement simple query.
@@ -183,6 +198,7 @@ impl Engine {
             txn: None,
             prepared: BTreeMap::new(),
             portals: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             cancel,
             notifications,
             in_implicit_tx: false,
@@ -510,6 +526,67 @@ impl Engine {
                 let Some(inner) = prep.stmt.clone() else { return Ok(StmtResult::tag("EXECUTE")) };
                 self.run_statement(s, &inner, &vals, &prep.param_types)
             }
+            S::Declare { stmts } => {
+                for d in stmts {
+                    let Some(for_query) = &d.for_query else {
+                        return Err(unsupported("DECLARE without CURSOR FOR"));
+                    };
+                    if d.names.len() != 1 {
+                        return Err(unsupported("DECLARE of multiple cursor names"));
+                    }
+                    let name = d.names[0].value.to_lowercase();
+                    // The engine has no lazy/streaming execution, so the
+                    // cursor's query just runs eagerly right now, in
+                    // whatever transaction is already open (an ordinary
+                    // data statement); `FETCH` below only slices the
+                    // already-materialized rows.
+                    let q_stmt = a::Statement::Query(for_query.clone());
+                    let result = self.run_data_statement(s, &q_stmt, &[], &[])?;
+                    s.cursors.insert(name, Cursor { cols: result.cols, rows: result.rows, pos: 0 });
+                }
+                Ok(StmtResult::tag("DECLARE CURSOR"))
+            }
+            S::Fetch { name, direction, into, .. } => {
+                if into.is_some() {
+                    return Err(unsupported("FETCH ... INTO"));
+                }
+                let key = name.value.to_lowercase();
+                let cur = s.cursors.get_mut(&key).ok_or_else(|| {
+                    PgError::new(
+                        code::INVALID_CURSOR_NAME,
+                        format!("cursor \"{key}\" does not exist"),
+                    )
+                })?;
+                let n = match direction {
+                    a::FetchDirection::Next => 1,
+                    a::FetchDirection::Count { limit } => fetch_count(limit)?,
+                    a::FetchDirection::Forward { limit: Some(l) } => fetch_count(l)?,
+                    a::FetchDirection::Forward { limit: None } => 1,
+                    a::FetchDirection::All | a::FetchDirection::ForwardAll => usize::MAX,
+                    _ => return Err(unsupported("FETCH direction (only forward movement is)")),
+                };
+                let end = cur.pos.saturating_add(n).min(cur.rows.len());
+                let rows = cur.rows[cur.pos..end].to_vec();
+                cur.pos = end;
+                let cols = cur.cols.clone();
+                Ok(StmtResult {
+                    cols,
+                    rows,
+                    tag: "FETCH".into(),
+                    notices: vec![],
+                    params_changed: vec![],
+                    returns_rows: true,
+                })
+            }
+            S::Close { cursor } => {
+                match cursor {
+                    a::CloseCursor::All => s.cursors.clear(),
+                    a::CloseCursor::Specific { name } => {
+                        s.cursors.remove(&name.value.to_lowercase());
+                    }
+                }
+                Ok(StmtResult::tag("CLOSE CURSOR"))
+            }
             S::Deallocate { name, .. } => {
                 if name.value.eq_ignore_ascii_case("all") {
                     s.prepared.clear();
@@ -807,6 +884,7 @@ impl Engine {
         if g.writer == Some(s.id) {
             g.writer = None;
         }
+        s.cursors.clear();
         Ok(())
     }
 
@@ -816,6 +894,7 @@ impl Engine {
         if g.writer == Some(s.id) {
             g.writer = None;
         }
+        s.cursors.clear();
     }
 
     fn rollback_to(&self, s: &mut Session, name: &str) -> PgResult<StmtResult> {
@@ -881,6 +960,14 @@ fn call_arg_text(f: &a::Function) -> String {
 
 fn warning(msg: &str) -> PgError {
     PgError { severity: "WARNING", ..PgError::new(code::WARNING, msg) }
+}
+
+/// The row count in `FETCH n FROM cursor` / `FETCH FORWARD n FROM cursor`.
+fn fetch_count(limit: &a::ValueWithSpan) -> PgResult<usize> {
+    let a::Value::Number(n, _) = &limit.value else {
+        return Err(unsupported("non-numeric FETCH count"));
+    };
+    n.parse().map_err(|_| PgError::new(code::SYNTAX_ERROR, format!("invalid FETCH count: {n}")))
 }
 
 fn is_transaction_control(stmt: &a::Statement) -> bool {
