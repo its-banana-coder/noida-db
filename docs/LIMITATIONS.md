@@ -17,7 +17,7 @@ but not identical to the real server.
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
 | MySQL | early scaffolding, not merged | no |
-| ClickHouse | HTTP interface milestone 1: `SELECT 1`/`version()`, `system.one`/`numbers(N)`, TSV/JSON/JSONEachRow, errors (see below); not merged | yes, for these |
+| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree` tables, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow, errors (see below); not merged | yes, for these |
 | Memcached, MongoDB, RabbitMQ, Elasticsearch | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
@@ -185,37 +185,67 @@ Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Ka
 
 ## ClickHouse
 
-Target: ClickHouse 24.8 LTS, HTTP interface on port 8123. Milestone 1 only
-(see `docs/specs/clickhouse.md`):
+Target: ClickHouse 24.8 LTS, HTTP interface on port 8123. Through milestone 2
+of `docs/specs/clickhouse.md`:
 
 - `GET`/`POST /` with `query` as a URL param or the request body; `GET /ping`
   and `GET /replicas_status`.
-- Scalar `SELECT` expressions (`SELECT 1`, `SELECT version()`,
-  `currentDatabase()`, `hostName()`, `timezone()`, `uptime()`), `system.one`,
-  the `numbers(N)` table function, `LIMIT`, `FORMAT`.
+- `CREATE TABLE [IF NOT EXISTS] [db.]t (col type, ...) ENGINE = Memory |
+  MergeTree | ReplacingMergeTree | SummingMergeTree [ORDER BY (...)]`,
+  `INSERT INTO ... [(cols)] VALUES (...), ...`, `DROP TABLE [IF EXISTS]`.
+  Column types: `UInt8/16/32/64`, `Int8/16/32/64`, `Float32/64`, `String`,
+  `Bool`. A type given with arguments (`Nullable(String)`, `Decimal(10,2)`)
+  parses but is rejected as `NOT_IMPLEMENTED` — never silently accepted as
+  something else.
+- `SELECT` with `WHERE`, `GROUP BY`, `ORDER BY` (only by a selected column
+  or alias), `LIMIT`, on `system.one`, `numbers(N)`, `system.tables` and real
+  tables. Expressions: arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/
+  `NOT`, parentheses, unary minus, string/int/float/bool literals.
+- ~25 functions: `version()`, `currentDatabase()`, `hostName()`,
+  `timezone()`, `uptime()`, `toString`, `toInt8..64`/`toUInt8..64` (range
+  checked), `toFloat32/64`, `length`, `upper`, `lower`, `concat`,
+  `substring`, `trim`, `replaceAll`, `abs`, `round`, `floor`, `ceil`,
+  `greatest`, `least`, `if`, `ifNull`, `coalesce`, `isNull`/`isNotNull`
+  (always false/true — no `Nullable` type yet, so nothing is ever null).
+- Aggregates: `count`/`count(*)`, `sum`, `avg`, `min`, `max`, `any`,
+  `uniqExact`.
 - Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
   `JSON`, `JSONEachRow`.
 - Errors in ClickHouse's HTTP body format (`Code: N. DB::Exception: ...`)
-  with `X-ClickHouse-Exception-Code` and the real error codes/names for
-  unknown table/database/function/identifier and syntax errors.
+  with `X-ClickHouse-Exception-Code` and real error codes/names for unknown
+  table/database/function/identifier, syntax errors, table-already-exists,
+  type mismatches and out-of-range values.
 
-**Not yet (milestones 2–5, tracked in the spec)**
-- User tables (`CREATE TABLE`/`INSERT`/`SELECT` beyond `system.one`/
-  `numbers`), `WHERE`/`GROUP BY`/joins/window functions, the wider function
-  library, `RowBinary`/`Native`/`CSV`/`Pretty` formats, the native TCP
-  protocol (port 9000, needed by clickhouse-go and clickhouse-driver and the
-  official Rust `clickhouse` crate), compression, sessions, parameterized
-  queries.
-- Every non-`SELECT` statement (`CREATE`/`INSERT`/`ALTER`/`SHOW`/...).
+**Differs**
+- Storage is row-at-a-time (`Vec<Vec<Val>>`), not columnar; performance is
+  not a goal for local-dev data sizes (see docs/specs/README.md).
+- `MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` all behave like a
+  plain `MergeTree`: no parts, no background merges, no merge-time dedup or
+  summing, no `FINAL`/`OPTIMIZE ... FINAL`.
+- Arithmetic result types are an approximation of ClickHouse's real
+  per-width promotion/overflow rules (e.g. `UInt8 + UInt8` doesn't widen to
+  `UInt16`); see `src/clickhouse/types.rs`. Float formatting isn't verified
+  byte-for-byte against a real server (none is installed here).
 - Persistent connections: every response closes the socket
   (`Connection: close`); real clients reconnect cleanly, but this differs
   from ClickHouse's keep-alive default.
 
+**Not yet (milestones 3–5, tracked in the spec)**
+- Joins, window functions, subqueries, views, the wider function/type
+  library (`Date`/`DateTime`, `Decimal`, `UUID`, `Array`, `Tuple`, `Map`,
+  `Nullable`), `HAVING`, `WITH`/CTEs, `UNION`, parameterized queries,
+  sessions, compression.
+- `RowBinary`/`Native`/`CSV`/`Pretty` output formats and the native TCP
+  protocol (port 9000) — needed by clickhouse-go, clickhouse-driver and the
+  official Rust `clickhouse` crate (which requires `RowBinaryWithNamesAndTypes`
+  even over HTTP).
+- `ALTER TABLE`, `SHOW`/`DESCRIBE`/`EXISTS`, non-`SELECT` `system.*` writes.
+
 **By design**
 - `BACKUP`/`RESTORE`, Keeper/ZooKeeper, replicated engines beyond being
-  accepted as plain `MergeTree` (not built yet either way), distributed
-  tables, `ON CLUSTER` beyond being accepted and ignored, user/role/quota
-  management, query profiling and `system.query_log`/`trace_log` contents.
+  accepted as plain `MergeTree`, distributed tables, `ON CLUSTER` beyond
+  being accepted and ignored, user/role/quota management, query profiling
+  and `system.query_log`/`trace_log` contents.
 
 ## MySQL
 

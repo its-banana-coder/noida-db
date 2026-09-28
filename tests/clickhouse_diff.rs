@@ -10,7 +10,7 @@ mod common;
 
 use std::net::SocketAddr;
 
-/// (query, format) pairs milestone 1 covers.
+/// (query, format) pairs to compare.
 const QUERIES: &[(&str, &str)] = &[
     ("SELECT 1", "TabSeparated"),
     ("SELECT 1", "TabSeparatedWithNamesAndTypes"),
@@ -18,6 +18,16 @@ const QUERIES: &[(&str, &str)] = &[
     ("SELECT * FROM system.one", "TabSeparated"),
     ("SELECT number FROM numbers(5)", "TabSeparated"),
     ("SELECT 1", "JSONEachRow"),
+    ("SELECT k, count(*), sum(v) FROM diff_t GROUP BY k ORDER BY k", "TabSeparated"),
+    ("SELECT v FROM diff_t WHERE v > 1 ORDER BY v", "TabSeparated"),
+];
+
+/// Run once against each server before comparing `QUERIES`, so the
+/// GROUP BY/WHERE queries above have a table to read.
+const SETUP: &[&str] = &[
+    "DROP TABLE IF EXISTS diff_t",
+    "CREATE TABLE diff_t (k String, v UInt32) ENGINE = Memory",
+    "INSERT INTO diff_t VALUES ('a', 1), ('a', 2), ('b', 10)",
 ];
 
 fn http_get(addr: &str, query: &str, format: &str) -> (u16, String) {
@@ -49,6 +59,11 @@ fn queries_match_real_clickhouse() {
     };
     let noida: SocketAddr = common::start_noida_clickhouse();
     let noida = noida.to_string();
+
+    for stmt in SETUP {
+        http_get(&reference, stmt, "TabSeparated");
+        http_get(&noida, stmt, "TabSeparated");
+    }
 
     let mut compared = 0;
     for (query, format) in QUERIES {

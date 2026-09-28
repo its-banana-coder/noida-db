@@ -1,11 +1,14 @@
-//! HTTP front end: one thread per connection, one query per request.
+//! HTTP front end: one thread per connection, one `Engine` shared behind an
+//! `Arc` (tables must survive across requests, same as `redis::server`'s
+//! shared, mutex-guarded engine).
 
 use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-use super::engine;
+use super::engine::{self, Engine};
 use super::error::ChError;
 use super::format;
 use super::http::{self, Request, Response};
@@ -20,35 +23,37 @@ static QUERY_ID: AtomicU64 = AtomicU64::new(1);
 pub fn spawn(addr: &str) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
+    let engine = Arc::new(Engine::new());
     thread::Builder::new().name("clickhouse-accept".into()).stack_size(STACK_SIZE).spawn(
         move || {
             for stream in listener.incoming().flatten() {
+                let engine = Arc::clone(&engine);
                 let _ = thread::Builder::new()
                     .name("clickhouse-conn".into())
                     .stack_size(STACK_SIZE)
-                    .spawn(move || handle(stream));
+                    .spawn(move || handle(stream, &engine));
             }
         },
     )?;
     Ok(local)
 }
 
-fn handle(stream: TcpStream) {
+fn handle(stream: TcpStream, engine: &Engine) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     });
     let mut writer = stream;
     if let Ok(Some(req)) = http::read_request(&mut reader) {
-        let _ = route(&req).write(&mut writer);
+        let _ = route(&req, engine).write(&mut writer);
     }
 }
 
-fn route(req: &Request) -> Response {
+fn route(req: &Request, engine: &Engine) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/ping") => text_ok("Ok.\n"),
         ("GET", "/replicas_status") => text_ok("Ok.\n"),
-        (_, "/") => run_query(req),
+        (_, "/") => run_query(req, engine),
         _ => Response { status: 404, headers: vec![], body: b"Not Found\n".to_vec() },
     }
 }
@@ -61,7 +66,7 @@ fn text_ok(body: &str) -> Response {
     }
 }
 
-fn run_query(req: &Request) -> Response {
+fn run_query(req: &Request, engine: &Engine) -> Response {
     let Some(query) = query_text(req) else {
         return error_response(&ChError::syntax("no query"));
     };
@@ -71,7 +76,7 @@ fn run_query(req: &Request) -> Response {
         .cloned()
         .unwrap_or_else(|| format!("noida-{}", QUERY_ID.fetch_add(1, Ordering::Relaxed)));
 
-    match engine::execute(&query) {
+    match engine.execute(&query) {
         Ok((result, fmt_from_query)) => {
             let format = fmt_from_query
                 .or_else(|| req.query.get("default_format").cloned())
@@ -141,47 +146,71 @@ mod tests {
 
     #[test]
     fn ping_replies_ok() {
+        let engine = Engine::new();
         let req = Request {
             method: "GET".into(),
             path: "/ping".into(),
             query: Default::default(),
             body: vec![],
         };
-        let resp = route(&req);
+        let resp = route(&req, &engine);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"Ok.\n");
     }
 
     #[test]
     fn select_one_over_get() {
+        let engine = Engine::new();
         let mut query = std::collections::HashMap::new();
         query.insert("query".to_string(), "SELECT 1".to_string());
         let req = Request { method: "GET".into(), path: "/".into(), query, body: vec![] };
-        let resp = route(&req);
+        let resp = route(&req, &engine);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"1\n");
     }
 
     #[test]
     fn unknown_table_is_404_with_exception_code_header() {
+        let engine = Engine::new();
         let mut query = std::collections::HashMap::new();
         query.insert("query".to_string(), "SELECT * FROM nope".to_string());
         let req = Request { method: "GET".into(), path: "/".into(), query, body: vec![] };
-        let resp = route(&req);
+        let resp = route(&req, &engine);
         assert_eq!(resp.status, 404);
         assert!(resp.headers.iter().any(|(k, v)| k == "X-ClickHouse-Exception-Code" && v == "60"));
     }
 
     #[test]
     fn query_via_post_body() {
+        let engine = Engine::new();
         let req = Request {
             method: "POST".into(),
             path: "/".into(),
             query: Default::default(),
             body: b"SELECT 1".to_vec(),
         };
-        let resp = route(&req);
+        let resp = route(&req, &engine);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"1\n");
+    }
+
+    /// The engine is shared across requests on the connection, so a table
+    /// created by one query is visible to the next (this is how a client
+    /// pool that reuses connections needs it to behave).
+    #[test]
+    fn create_table_persists_across_requests_on_the_same_engine() {
+        let engine = Engine::new();
+        let mut create_query = std::collections::HashMap::new();
+        create_query
+            .insert("query".to_string(), "CREATE TABLE t (n UInt32) ENGINE = Memory".to_string());
+        let create_req =
+            Request { method: "GET".into(), path: "/".into(), query: create_query, body: vec![] };
+        assert_eq!(route(&create_req, &engine).status, 200);
+
+        let mut select_query = std::collections::HashMap::new();
+        select_query.insert("query".to_string(), "SELECT * FROM t".to_string());
+        let select_req =
+            Request { method: "GET".into(), path: "/".into(), query: select_query, body: vec![] };
+        assert_eq!(route(&select_req, &engine).status, 200);
     }
 }

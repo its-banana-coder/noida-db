@@ -1,8 +1,10 @@
-//! Output formats. Milestone 1 covers `TabSeparated` (+`WithNames`,
-//! +`WithNamesAndTypes`), `JSON` and `JSONEachRow`; the rest of the P0 list
-//! in docs/specs/clickhouse.md lands with milestone 2's real tables.
+//! Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
+//! `JSON` and `JSONEachRow`. The rest of the P0 list in
+//! docs/specs/clickhouse.md (`CSV`, `RowBinary`, `Native`, ...) isn't built
+//! yet — see docs/LIMITATIONS.md.
 
-use super::engine::{QueryResult, Type, Val};
+use super::engine::QueryResult;
+use super::types::{Type, Val};
 
 /// The `Content-Type` header ClickHouse sends for `format`.
 pub fn content_type(format: &str) -> &'static str {
@@ -14,21 +16,13 @@ pub fn content_type(format: &str) -> &'static str {
     }
 }
 
-fn type_name(t: Type) -> &'static str {
-    match t {
-        Type::UInt8 => "UInt8",
-        Type::UInt64 => "UInt64",
-        Type::Int64 => "Int64",
-        Type::String => "String",
-    }
-}
-
-fn val_text(v: &Val) -> String {
+pub(crate) fn val_text(v: &Val) -> String {
     match v {
-        Val::UInt8(n) => n.to_string(),
-        Val::UInt64(n) => n.to_string(),
-        Val::Int64(n) => n.to_string(),
+        Val::UInt(n) => n.to_string(),
+        Val::Int(n) => n.to_string(),
+        Val::Float(f) => f.to_string(),
         Val::Str(s) => s.clone(),
+        Val::Bool(b) => b.to_string(),
     }
 }
 
@@ -54,7 +48,7 @@ fn tab_separated(r: &QueryResult, with_names: bool, with_types: bool) -> Vec<u8>
         out.push('\n');
     }
     if with_types {
-        let types: Vec<&str> = r.columns.iter().map(|(_, t)| type_name(*t)).collect();
+        let types: Vec<&str> = r.columns.iter().map(|(_, t)| t.name()).collect();
         out.push_str(&types.join("\t"));
         out.push('\n');
     }
@@ -120,7 +114,7 @@ fn json(r: &QueryResult) -> Vec<u8> {
         out.push_str(&format!(
             "\t\t{{\n\t\t\t\"name\": {},\n\t\t\t\"type\": {}\n\t\t}}",
             json_string(name),
-            json_string(type_name(*ty))
+            json_string(ty.name())
         ));
     }
     out.push_str("\n\t],\n\n\t\"data\":\n\t[\n");
@@ -168,7 +162,7 @@ mod tests {
     fn one_row() -> QueryResult {
         QueryResult {
             columns: vec![("n".into(), Type::UInt8), ("s".into(), Type::String)],
-            rows: vec![vec![Val::UInt8(1), Val::Str("a\tb".into())]],
+            rows: vec![vec![Val::UInt(1), Val::Str("a\tb".into())]],
         }
     }
 
@@ -199,7 +193,7 @@ mod tests {
     fn json_quotes_64bit_integers() {
         let r = QueryResult {
             columns: vec![("number".into(), Type::UInt64)],
-            rows: vec![vec![Val::UInt64(42)]],
+            rows: vec![vec![Val::UInt(42)]],
         };
         let body = String::from_utf8(render(&r, "JSON").unwrap()).unwrap();
         assert!(body.contains("\"number\": \"42\""), "{body}");

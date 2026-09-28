@@ -90,3 +90,33 @@ fn query_via_post_body() {
     assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(resp.body_mut().read_to_string().unwrap(), "1\n");
 }
+
+/// The scenario from docs/specs/clickhouse.md's client matrix: create a
+/// table, bulk insert, aggregate with GROUP BY, ORDER BY. One connection
+/// pool reusing the same server, the way a real client library does.
+#[test]
+fn create_insert_group_by_scenario() {
+    let addr = common::start_noida_clickhouse();
+    let (status, _) = get(
+        addr,
+        "CREATE TABLE events (kind String, n UInt32) ENGINE = MergeTree() ORDER BY (kind)",
+    );
+    assert_eq!(status, 200);
+    let (status, _) =
+        get(addr, "INSERT INTO events (kind, n) VALUES ('click', 1), ('click', 2), ('view', 10)");
+    assert_eq!(status, 200);
+    let (status, body) =
+        get(addr, "SELECT kind, count(*), sum(n) FROM events GROUP BY kind ORDER BY kind");
+    assert_eq!(status, 200);
+    assert_eq!(body, "click\t2\t3\nview\t1\t10\n");
+}
+
+#[test]
+fn where_clause_filters_over_http() {
+    let addr = common::start_noida_clickhouse();
+    assert_eq!(get(addr, "CREATE TABLE t (n UInt32) ENGINE = Memory").0, 200);
+    assert_eq!(get(addr, "INSERT INTO t VALUES (1), (2), (3)").0, 200);
+    let (status, body) = get(addr, "SELECT n FROM t WHERE n > 1 ORDER BY n");
+    assert_eq!(status, 200);
+    assert_eq!(body, "2\n3\n");
+}

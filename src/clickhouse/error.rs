@@ -54,6 +54,30 @@ impl ChError {
         ChError::new(48, "NOT_IMPLEMENTED", format!("{what} is not supported"))
     }
 
+    pub fn table_already_exists(database: &str, table: &str) -> ChError {
+        ChError::new(57, "TABLE_ALREADY_EXISTS", format!("Table {database}.{table} already exists"))
+    }
+
+    pub fn type_mismatch(type_name: &str) -> ChError {
+        ChError::new(53, "TYPE_MISMATCH", format!("Cannot convert value to type {type_name}"))
+    }
+
+    pub fn out_of_range(type_name: &str) -> ChError {
+        ChError::new(
+            69,
+            "ARGUMENT_OUT_OF_BOUND",
+            format!("Value is out of range of type {type_name}"),
+        )
+    }
+
+    pub fn no_common_type(a: &str, b: &str) -> ChError {
+        ChError::new(386, "NO_COMMON_TYPE", format!("Cannot compare {a} and {b}: no common type"))
+    }
+
+    pub fn division_by_zero() -> ChError {
+        ChError::new(153, "ILLEGAL_DIVISION", "Division by zero")
+    }
+
     /// The HTTP status ClickHouse's HTTP interface uses for this exception.
     pub fn http_status(&self) -> u16 {
         match self.code {
