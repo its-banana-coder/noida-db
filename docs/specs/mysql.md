@@ -23,25 +23,126 @@ same MySQL error class a real server would use.
 
 ## 2. Dependency on the Postgres work
 
-noida has one SQL engine. It's being built in the Postgres service
-(`svc/postgres`, `src/postgres/`). MySQL must **reuse it**, not fork it:
+**Status as of 2026-09-28: Postgres is done and merged to `main`.** This
+branch (`svc/mysql`) is still on an old base (commit `26a5759`, from before
+Postgres, Kafka, ClickHouse, Elasticsearch and Memcached all landed) — the
+**first thing to do is `git fetch origin main && git rebase origin/main`**,
+not write new code on the stale base. Everything below assumes you're
+starting from current `main`.
 
-- Start with the protocol layer and the connection-time queries (section 5),
-  which don't need the full engine.
-- Once the Postgres engine is on `main`, move the dialect-neutral parts
-  (storage, executor, expressions, types) into a shared module if they
-  aren't already (e.g. `src/sql/`), in coordination with the Postgres owner,
-  and put MySQL's rules behind a dialect switch.
+### 2.1 What's actually shared today (`src/sql/`)
+
+`src/sql/` exists and is real, but it's **narrower than this section used
+to assume**: `datetime.rs`, `numeric.rs`, `tz.rs`, `json.rs` — calendar
+arithmetic, arbitrary-precision numerics, IANA time zones and JSON
+parsing/formatting. Nothing about storage, the binder, the executor, casts,
+or the catalog moved out of `src/postgres/` into a shared module; that
+extraction never happened, because in practice nearly everything past
+"parse a numeric/date/JSON literal" turned out to be genuinely
+dialect-specific (Postgres's own type system, cast rules, error codes and
+catalog shape). **Use `src/sql/`'s four modules directly** for MySQL's own
+value handling — don't re-implement date/time/numeric/JSON parsing from
+scratch, that work is done and has been differential-tested hard. Do not
+expect a shared binder/executor to already exist for you to plug a MySQL
+front-end into; there isn't one.
+
+### 2.2 What to build vs. what to copy
+
+MySQL needs **its own** binder and executor (`src/mysql/binder.rs`,
+`src/mysql/exec.rs`, or however you split it) — but `src/postgres/`'s
+shape is now a mature, heavily-tested **reference architecture** worth
+mirroring closely rather than designing from scratch:
+
+- `Value` enum with exotic types (JSON, ranges, etc.) stored as `Text`
+  internally and re-parsed on demand — avoids new `Value` variants,
+  reuses NULL/array/cast machinery for free. Do the same for whatever
+  MySQL-specific types don't map cleanly onto `Value`'s existing shape.
+- A `Binder` that resolves an AST into a small internal `plan::Expr` tree
+  (`Const`/`Col`/`Call`/`Cast`/comparison/boolean nodes, etc.) *before*
+  execution — keep the same separation between "resolve types and
+  columns" and "evaluate against a row", it's what makes differential
+  testing and parameter handling tractable.
+- The differential-test harness shape (`tests/mysql_diff.rs` running a
+  script against both a real MySQL and noida-db, comparing byte for
+  byte) — `tests/postgres_diff.rs` is the reference; ~700 comparisons
+  deep now and the single most valuable file in that service.
+
+Where MySQL syntax is *genuinely* dialect-neutral (arithmetic, string
+functions with the same semantics, etc.) it's fine — even expected — to
+grow `src/sql/` with more shared pieces as you find them, the same way
+`datetime`/`numeric`/`tz`/`json` were carved out. Just don't block on that
+extraction; build MySQL's own binder first and generalize opportunistically.
+
+### 2.3 Two real bug classes to watch for from day one
+
+These cost real debugging time in Postgres and are architecture-level, not
+Postgres-specific — build MySQL's binder/executor defensively against them
+rather than rediscovering them later:
+
+1. **Comma-joins and long explicit `JOIN...ON` chains must get
+   `WHERE`-predicate pushdown**, or a multi-table query with a selective
+   `WHERE` runs as a full unfiltered cross product before filtering ever
+   applies. A real xorm-based app's own catalog-introspection query (joining
+   6+ system tables, filtered to one row only in `WHERE`) took **11+
+   seconds** before this was fixed in Postgres, projecting to ~20 minutes
+   for a full startup sequence — and it's exactly the shape ORM
+   introspection queries commonly use. If MySQL's executor does naive
+   nested-loop joins, push WHERE conjuncts down to the earliest join whose
+   columns make them available, for both comma-joins and `Inner`/`Cross`
+   joins (never into `Left`/`Right`/`Full` `ON`, that changes null-padding
+   semantics).
+2. **If prepared statements get re-bound from the raw AST on every
+   execution** (rather than caching a fully-bound plan — Postgres does
+   this, by design, for simplicity), that re-bind **must reuse the types
+   Prepare already resolved**, not re-derive parameter types by guessing
+   from the decoded runtime values. A value already decoded off the wire
+   using its real type can look indistinguishable from a different type
+   once decoded (e.g. a JSON value and a plain string both end up as
+   `Value::Text`), so re-guessing from the value silently picks the wrong
+   type and either rejects a valid value or drops a target column's
+   formatting rules (numeric scale, etc.) on every re-execution after the
+   first.
+
+### 2.4 Validate against real apps and clients, not just the protocol
+
+Both of the bugs above were found by running **real, unmodified
+applications** against noida-db as their actual database — not synthetic
+protocol tests. This is now a proven, high-value validation method for
+this project: it found 6 real bugs in the Postgres service that its own
+~700-case differential suite and 13 real-client-library test suites had
+all missed, because they don't exercise the specific multi-statement,
+real-schema, real-ORM-generated-SQL shapes a live app sends.
+
+Once MySQL's protocol + basic DML/catalog work, before calling any
+milestone "done", run it against:
+- **mysql2** (Node) and **PyMySQL**/**mysqlclient** (Python) — cheap,
+  fast client-library smoke tests, same tier as the existing Postgres
+  client matrix.
+- **WordPress** — explicitly the target real app for MySQL (see project
+  notes); it's the single most common real-world MySQL consumer and will
+  exercise `SHOW`/catalog introspection, `AUTO_INCREMENT`, transactions,
+  and a substantial real schema end to end.
+- Rails/ActiveRecord and a Laravel app if time allows — both are heavy
+  catalog-introspection users, the exact pattern that found bug class (1)
+  above in Postgres.
+
+Track RAM usage while doing this (`ps -o rss=` on the noida-db process at
+idle, during migration/schema-setup, and during normal use) — it's a good,
+concrete number for the eventual "tested against real apps" README entry,
+matching what Postgres's Gitea/Miniflux entries already show.
+
 - MySQL and Postgres have **separate catalogs and data**; a table created
   over MySQL is not visible over Postgres.
-- MySQL syntax that maps cleanly to the shared engine should be lowered into
-  dialect-neutral plan nodes. MySQL-only semantics (collation, coercion,
+- MySQL syntax that maps cleanly to the shared `src/sql/` pieces should
+  use them directly. MySQL-only semantics (collation, coercion,
   `AUTO_INCREMENT`, `ON DUPLICATE KEY UPDATE`, `SHOW`, session variables)
   stay behind a MySQL dialect boundary.
-- Do not block the protocol/client-bootstrap milestones on the full shared
-  SQL engine. Implement a small bootstrap executor for constant selects,
-  `SET`, `SHOW`, `USE` and catalog probes, then replace it with the shared
-  engine as soon as the Postgres work lands.
+- Do not block the protocol/client-bootstrap milestones on a fully-built
+  binder/executor. Implement a small bootstrap executor for constant
+  selects, `SET`, `SHOW`, `USE` and catalog probes first (this is also
+  where the existing review findings in `docs/mysql-handoff.md` apply —
+  fix those before building further on top of them), then build out the
+  real binder/executor per 2.2.
 
 ## 3. Protocol requirements
 
