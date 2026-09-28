@@ -23,6 +23,24 @@ const QUERIES: &[(&str, &str)] = &[
     ("SELECT v FROM diff_t WHERE v > 1 ORDER BY v", "TabSeparated"),
     ("SELECT id, v FROM diff_rmt FINAL ORDER BY id", "TabSeparated"),
     ("SELECT k, amount FROM diff_smt FINAL ORDER BY k", "TabSeparated"),
+    // HAVING
+    ("SELECT k, count(*) AS n FROM diff_t GROUP BY k HAVING n > 1", "TabSeparated"),
+    // UNION ALL / UNION DISTINCT
+    ("SELECT 1 AS n UNION ALL SELECT 2 AS n ORDER BY n", "TabSeparated"),
+    ("SELECT 1 AS n UNION DISTINCT SELECT 1 AS n", "TabSeparated"),
+    // DESCRIBE TABLE / system.columns
+    ("DESCRIBE TABLE diff_t", "TabSeparated"),
+    (
+        "SELECT database, table, name, type, position FROM system.columns WHERE table = 'diff_t' \
+         ORDER BY position",
+        "TabSeparated",
+    ),
+    // EXISTS
+    ("EXISTS TABLE diff_t", "TabSeparated"),
+    ("EXISTS TABLE nope_nope_nope", "TabSeparated"),
+    // CSV output
+    ("SELECT 1 AS n, 'hi' AS s", "CSV"),
+    ("SELECT 1 AS n, 'hi' AS s", "CSVWithNames"),
 ];
 
 /// (query, format) pairs compared as raw bytes (binary formats).

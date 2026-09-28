@@ -14,8 +14,8 @@ use super::catalog::{self, Catalog, MaterializedView};
 use super::error::ChError;
 use super::rowbinary;
 use super::sql::{
-    self, BinOp, CreateMaterializedView, CreateTable, DropTable, Expr, Insert, InsertSource,
-    OptimizeTable, Select, Statement, Table,
+    self, BinOp, CreateMaterializedView, CreateTable, DescribeTable, DropTable, ExistsTable, Expr,
+    Insert, InsertSource, OptimizeTable, Select, ShowCreateTable, ShowTables, Statement, Table,
 };
 use super::types::{self, Type, Val};
 
@@ -64,6 +64,11 @@ impl Engine {
                 let catalog = self.catalog.lock().unwrap();
                 Ok((run_select(&catalog, &s)?, format))
             }
+            Statement::SelectUnion(u) => {
+                let format = u.selects.last().and_then(|s| s.format.clone());
+                let catalog = self.catalog.lock().unwrap();
+                Ok((run_union(&catalog, &u)?, format))
+            }
             Statement::CreateTable(c) => {
                 let mut catalog = self.catalog.lock().unwrap();
                 Ok((do_create(&mut catalog, c)?, None))
@@ -84,6 +89,29 @@ impl Engine {
                 let mut catalog = self.catalog.lock().unwrap();
                 Ok((do_optimize(&mut catalog, o)?, None))
             }
+            Statement::DescribeTable(d) => {
+                let catalog = self.catalog.lock().unwrap();
+                Ok((do_describe_table(&catalog, d)?, None))
+            }
+            Statement::ShowDatabases => {
+                let catalog = self.catalog.lock().unwrap();
+                Ok((do_show_databases(&catalog), None))
+            }
+            Statement::ShowTables(s) => {
+                let catalog = self.catalog.lock().unwrap();
+                Ok((do_show_tables(&catalog, s), None))
+            }
+            Statement::ShowCreateTable(s) => {
+                let catalog = self.catalog.lock().unwrap();
+                Ok((do_show_create_table(&catalog, s)?, None))
+            }
+            Statement::ExistsTable(e) => {
+                let catalog = self.catalog.lock().unwrap();
+                Ok((do_exists_table(&catalog, e), None))
+            }
+            // Sessions aren't modeled (see docs/LIMITATIONS.md): both are
+            // syntax-checked no-ops.
+            Statement::UseDatabase(_) | Statement::SetSetting(_) => Ok((empty_result(), None)),
         }
     }
 }
@@ -293,6 +321,130 @@ fn do_optimize(catalog: &mut Catalog, o: OptimizeTable) -> Result<QueryResult, C
     Ok(empty_result())
 }
 
+// ---- DESCRIBE / SHOW / EXISTS -------------------------------------------
+//
+// `DESCRIBE TABLE`'s column set and order match real ClickHouse's: `name`,
+// `type`, `default_type`, `default_expression`, `comment`,
+// `codec_expression`, `ttl_expression` — the same struct the official Rust
+// client's validated-insert path deserializes
+// (`clickhouse::Client::get_insert_metadata`), which is what makes
+// `.with_validation(true)` (the crate's default) work against noida-db.
+// Column defaults, comments, codecs and TTLs aren't modeled, so those four
+// are always empty strings — same as real ClickHouse reports for a column
+// declared without any of them.
+
+fn describe_columns() -> Columns {
+    vec![
+        ("name".into(), Type::String),
+        ("type".into(), Type::String),
+        ("default_type".into(), Type::String),
+        ("default_expression".into(), Type::String),
+        ("comment".into(), Type::String),
+        ("codec_expression".into(), Type::String),
+        ("ttl_expression".into(), Type::String),
+    ]
+}
+
+fn describe_row(name: &str, ty: Type) -> Vec<Val> {
+    vec![
+        Val::Str(name.to_string()),
+        Val::Str(ty.name().to_string()),
+        Val::Str(String::new()),
+        Val::Str(String::new()),
+        Val::Str(String::new()),
+        Val::Str(String::new()),
+        Val::Str(String::new()),
+    ]
+}
+
+fn do_describe_table(catalog: &Catalog, d: DescribeTable) -> Result<QueryResult, ChError> {
+    let database = d.database.clone().unwrap_or_else(|| "default".into());
+    let t = catalog
+        .get(&database, &d.table)
+        .ok_or_else(|| ChError::unknown_table(&database, &d.table))?;
+    let rows = t.columns.iter().map(|(name, ty)| describe_row(name, *ty)).collect();
+    Ok(QueryResult { columns: describe_columns(), rows })
+}
+
+/// The databases ClickHouse always has, even with no user tables.
+const BUILTIN_DATABASES: [&str; 4] =
+    ["default", "system", "INFORMATION_SCHEMA", "information_schema"];
+
+fn do_show_databases(catalog: &Catalog) -> QueryResult {
+    let mut names: Vec<String> = BUILTIN_DATABASES.iter().map(|s| s.to_string()).collect();
+    for db in catalog.databases_with_tables() {
+        if !names.contains(&db) {
+            names.push(db);
+        }
+    }
+    names.sort();
+    QueryResult {
+        columns: vec![("name".into(), Type::String)],
+        rows: names.into_iter().map(|n| vec![Val::Str(n)]).collect(),
+    }
+}
+
+fn do_show_tables(catalog: &Catalog, s: ShowTables) -> QueryResult {
+    let database = s.database.unwrap_or_else(|| "default".into());
+    let names = catalog.tables_in(&database, s.like.as_deref());
+    QueryResult {
+        columns: vec![("name".into(), Type::String)],
+        rows: names.into_iter().map(|n| vec![Val::Str(n)]).collect(),
+    }
+}
+
+fn do_show_create_table(catalog: &Catalog, s: ShowCreateTable) -> Result<QueryResult, ChError> {
+    let database = s.database.clone().unwrap_or_else(|| "default".into());
+    let t = catalog
+        .get(&database, &s.table)
+        .ok_or_else(|| ChError::unknown_table(&database, &s.table))?;
+    let sql = t.create_table_sql(&database, &s.table);
+    Ok(QueryResult {
+        columns: vec![("statement".into(), Type::String)],
+        rows: vec![vec![Val::Str(sql)]],
+    })
+}
+
+fn do_exists_table(catalog: &Catalog, e: ExistsTable) -> QueryResult {
+    let database = e.database.unwrap_or_else(|| "default".into());
+    let exists = catalog.exists(&database, &e.table);
+    QueryResult {
+        columns: vec![("result".into(), Type::UInt8)],
+        rows: vec![vec![Val::UInt(if exists { 1 } else { 0 })]],
+    }
+}
+
+// ---- UNION ---------------------------------------------------------------
+
+fn run_union(catalog: &Catalog, u: &sql::SelectUnion) -> Result<QueryResult, ChError> {
+    let mut combined: Option<QueryResult> = None;
+    // Any UNION DISTINCT anywhere in the chain distinct-ifies the whole
+    // final result — real ClickHouse's per-branch DISTINCT/ALL semantics
+    // are more granular, but this project's simplicity rule (see
+    // docs/specs/README.md) accepts the coarser approximation, documented
+    // in docs/LIMITATIONS.md.
+    let any_distinct = u.all_flags.iter().any(|&all| !all);
+    for s in &u.selects {
+        let part = run_select(catalog, s)?;
+        combined = Some(match combined {
+            None => part,
+            Some(mut acc) => {
+                acc.rows.extend(part.rows);
+                acc
+            }
+        });
+    }
+    let mut result = combined.unwrap_or_else(empty_result);
+    if any_distinct {
+        let mut seen = HashSet::new();
+        result.rows.retain(|row| {
+            let key = row.iter().map(val_text).collect::<Vec<_>>().join("\u{1}");
+            seen.insert(key)
+        });
+    }
+    Ok(result)
+}
+
 // ---- ReplacingMergeTree / SummingMergeTree merge semantics --------------
 //
 // Real ClickHouse stores each INSERT as a part and merges parts in the
@@ -459,6 +611,71 @@ fn base_rows(catalog: &Catalog, table: &Table) -> Result<(Columns, Rows, TableMe
                 .collect();
             Ok((columns, rows, None))
         }
+        // `database`, `table`, `name`, `type`, `position` (1-based),
+        // `default_kind`, `default_expression` — matching real
+        // ClickHouse's `system.columns`, plus the storage-stats,
+        // key-membership and numeric-precision columns it also reports.
+        // Column defaults/comments/codecs aren't modeled (always empty);
+        // byte counts, precision/scale and `is_in_partition_key` aren't
+        // tracked (always 0) — real ClickHouse reports `NULL` for several
+        // of these on non-numeric columns (`character_octet_length` etc),
+        // which this project can't express without `Nullable` support, so
+        // it reports `0` there instead. See docs/LIMITATIONS.md.
+        Table::SystemColumns => {
+            let columns = vec![
+                ("database".into(), Type::String),
+                ("table".into(), Type::String),
+                ("name".into(), Type::String),
+                ("type".into(), Type::String),
+                ("position".into(), Type::UInt64),
+                ("default_kind".into(), Type::String),
+                ("default_expression".into(), Type::String),
+                ("data_compressed_bytes".into(), Type::UInt64),
+                ("data_uncompressed_bytes".into(), Type::UInt64),
+                ("marks_bytes".into(), Type::UInt64),
+                ("comment".into(), Type::String),
+                ("is_in_partition_key".into(), Type::UInt8),
+                ("is_in_sorting_key".into(), Type::UInt8),
+                ("is_in_primary_key".into(), Type::UInt8),
+                ("is_in_sampling_key".into(), Type::UInt8),
+                ("compression_codec".into(), Type::String),
+                ("character_octet_length".into(), Type::UInt64),
+                ("numeric_precision".into(), Type::UInt64),
+                ("numeric_precision_radix".into(), Type::UInt64),
+                ("numeric_scale".into(), Type::UInt64),
+                ("datetime_precision".into(), Type::UInt64),
+            ];
+            let mut rows = Vec::new();
+            for (db, table, t) in catalog.all_tables() {
+                for (pos, (name, ty)) in t.columns.iter().enumerate() {
+                    let in_key = t.order_by.iter().any(|k| k == name);
+                    rows.push(vec![
+                        Val::Str(db.clone()),
+                        Val::Str(table.clone()),
+                        Val::Str(name.clone()),
+                        Val::Str(ty.name().to_string()),
+                        Val::UInt((pos + 1) as u64),
+                        Val::Str(String::new()),
+                        Val::Str(String::new()),
+                        Val::UInt(0),
+                        Val::UInt(0),
+                        Val::UInt(0),
+                        Val::Str(String::new()),
+                        Val::UInt(0),
+                        Val::UInt(in_key as u64),
+                        Val::UInt(in_key as u64),
+                        Val::UInt(0),
+                        Val::Str(String::new()),
+                        Val::UInt(0),
+                        Val::UInt(0),
+                        Val::UInt(0),
+                        Val::UInt(0),
+                        Val::UInt(0),
+                    ]);
+                }
+            }
+            Ok((columns, rows, None))
+        }
         Table::Named { database, table } => {
             let database = database.clone().unwrap_or_else(|| "default".into());
             let t = catalog
@@ -498,6 +715,21 @@ fn transform_select(s: &Select, columns: &Columns, mut rows: Rows) -> Result<Que
     } else {
         run_projection(s, columns, rows)?
     };
+
+    // `HAVING` is evaluated against the projected/aggregated output (like
+    // `ORDER BY` below), so it can reference selected group keys, aliases
+    // and aggregate results the way real queries commonly do; referencing a
+    // `GROUP BY` key that wasn't also selected isn't supported (see
+    // docs/LIMITATIONS.md).
+    if let Some(h) = &s.having {
+        let mut kept = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            if eval_row_expr(h, &row, &result.columns)?.1.is_truthy() {
+                kept.push(row);
+            }
+        }
+        result.rows = kept;
+    }
 
     if !s.order_by.is_empty() {
         sort_rows(&mut result, &s.order_by)?;
@@ -1333,5 +1565,192 @@ mod tests {
             r.rows,
             [[Val::UInt(1), Val::Str("a".into())], [Val::UInt(2), Val::Str("b".into())]]
         );
+    }
+
+    #[test]
+    fn describe_table_matches_real_clickhouse_column_set() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32, name String) ENGINE = Memory");
+        let r = run(&e, "DESCRIBE TABLE t");
+        assert_eq!(
+            r.columns.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            [
+                "name",
+                "type",
+                "default_type",
+                "default_expression",
+                "comment",
+                "codec_expression",
+                "ttl_expression"
+            ]
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [
+                    Val::Str("id".into()),
+                    Val::Str("UInt32".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into())
+                ],
+                [
+                    Val::Str("name".into()),
+                    Val::Str("String".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into()),
+                    Val::Str("".into())
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn desc_table_is_an_alias_for_describe_table() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32) ENGINE = Memory");
+        let r = run(&e, "DESC TABLE t");
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn describe_unknown_table_errors() {
+        let err = engine().execute("DESCRIBE TABLE nope", b"").unwrap_err();
+        assert_eq!(err.code, 60);
+    }
+
+    #[test]
+    fn system_columns_lists_every_table() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32, k String) ENGINE = MergeTree() ORDER BY (k)");
+        let r = run(
+            &e,
+            "SELECT database, table, name, type, position, is_in_sorting_key FROM system.columns ORDER BY name",
+        );
+        assert_eq!(
+            r.rows,
+            [
+                [
+                    Val::Str("default".into()),
+                    Val::Str("t".into()),
+                    Val::Str("id".into()),
+                    Val::Str("UInt32".into()),
+                    Val::UInt(1),
+                    Val::UInt(0)
+                ],
+                [
+                    Val::Str("default".into()),
+                    Val::Str("t".into()),
+                    Val::Str("k".into()),
+                    Val::Str("String".into()),
+                    Val::UInt(2),
+                    Val::UInt(1)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn show_databases_lists_builtins_and_created_databases() {
+        let e = engine();
+        run(&e, "CREATE TABLE mydb.t (id UInt32) ENGINE = Memory");
+        let r = run(&e, "SHOW DATABASES");
+        let names: Vec<String> = r
+            .rows
+            .iter()
+            .map(|row| match &row[0] {
+                Val::Str(s) => s.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert!(names.contains(&"default".to_string()));
+        assert!(names.contains(&"system".to_string()));
+        assert!(names.contains(&"mydb".to_string()));
+    }
+
+    #[test]
+    fn show_tables_from_and_like() {
+        let e = engine();
+        run(&e, "CREATE TABLE events (id UInt32) ENGINE = Memory");
+        run(&e, "CREATE TABLE users (id UInt32) ENGINE = Memory");
+        let r = run(&e, "SHOW TABLES");
+        assert_eq!(r.rows, [[Val::Str("events".into())], [Val::Str("users".into())]]);
+
+        let r = run(&e, "SHOW TABLES LIKE 'ev%'");
+        assert_eq!(r.rows, [[Val::Str("events".into())]]);
+    }
+
+    #[test]
+    fn show_create_table_reproduces_the_canonical_statement() {
+        let e = engine();
+        run(
+            &e,
+            "CREATE TABLE t (id UInt32, ver UInt32) ENGINE = ReplacingMergeTree(ver) ORDER BY (id)",
+        );
+        let r = run(&e, "SHOW CREATE TABLE t");
+        let Val::Str(sql) = &r.rows[0][0] else { panic!("expected a string") };
+        assert!(sql.contains("CREATE TABLE default.t"), "{sql}");
+        assert!(sql.contains("`id` UInt32"), "{sql}");
+        assert!(sql.contains("`ver` UInt32"), "{sql}");
+        assert!(sql.contains("ENGINE = ReplacingMergeTree(ver)"), "{sql}");
+        assert!(sql.contains("ORDER BY id"), "{sql}");
+    }
+
+    #[test]
+    fn show_create_table_unknown_table_errors() {
+        let err = engine().execute("SHOW CREATE TABLE nope", b"").unwrap_err();
+        assert_eq!(err.code, 60);
+    }
+
+    #[test]
+    fn exists_table_true_and_false() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32) ENGINE = Memory");
+        assert_eq!(run(&e, "EXISTS TABLE t").rows, [[Val::UInt(1)]]);
+        assert_eq!(run(&e, "EXISTS TABLE nope").rows, [[Val::UInt(0)]]);
+    }
+
+    #[test]
+    fn use_and_set_are_accepted_no_ops() {
+        let e = engine();
+        run(&e, "USE default");
+        run(&e, "SET max_threads = 4");
+        run(&e, "SET a = 1, b = 'x'");
+    }
+
+    #[test]
+    fn having_filters_aggregated_groups() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (k String, v UInt32) ENGINE = Memory");
+        run(&e, "INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10)");
+        let r = run(&e, "SELECT k, count(*) AS n FROM t GROUP BY k HAVING n > 1 ORDER BY k");
+        assert_eq!(r.rows, [[Val::Str("a".into()), Val::UInt(2)]]);
+    }
+
+    #[test]
+    fn union_all_keeps_duplicates() {
+        let r = run_sql("SELECT 1 AS n UNION ALL SELECT 1 AS n");
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn union_distinct_dedupes() {
+        let r = run_sql("SELECT 1 AS n UNION DISTINCT SELECT 1 AS n UNION DISTINCT SELECT 2 AS n");
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn union_over_real_tables() {
+        let e = engine();
+        run(&e, "CREATE TABLE t1 (n UInt32) ENGINE = Memory");
+        run(&e, "CREATE TABLE t2 (n UInt32) ENGINE = Memory");
+        run(&e, "INSERT INTO t1 VALUES (1), (2)");
+        run(&e, "INSERT INTO t2 VALUES (2), (3)");
+        let r = run(&e, "SELECT n FROM t1 UNION ALL SELECT n FROM t2 ORDER BY n");
+        assert_eq!(r.rows.len(), 4);
     }
 }

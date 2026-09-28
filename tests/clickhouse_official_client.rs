@@ -1,8 +1,9 @@
 //! The official Rust `clickhouse` crate against noida-db's HTTP interface.
 //! It requires `RowBinaryWithNamesAndTypes` for `fetch`/`fetch_all` (added
-//! in milestone 3 — see src/clickhouse/rowbinary.rs) and plain `RowBinary`
-//! for `insert` with validation off (validated inserts first run
-//! `DESCRIBE TABLE`, which isn't built yet).
+//! in milestone 3 — see src/clickhouse/rowbinary.rs). Validated inserts
+//! (`.with_validation(true)`, the crate's default) first run `DESCRIBE
+//! TABLE` to check the target schema — see src/clickhouse/engine.rs's
+//! `do_describe_table` — so this no longer needs to disable validation.
 
 mod common;
 
@@ -58,11 +59,9 @@ async fn insert_then_select() {
         .await
         .unwrap();
 
-    // Validated inserts issue a DESCRIBE TABLE first, which isn't built
-    // yet; validation off falls back to plain RowBinary (field order must
-    // match the table's column order, which it does here).
-    let unvalidated = client.clone().with_validation(false);
-    let mut insert = unvalidated.insert::<Event>("events").await.unwrap();
+    // Validation is on by default: the client issues a DESCRIBE TABLE
+    // first to check the target schema before inserting.
+    let mut insert = client.insert::<Event>("events").await.unwrap();
     insert.write(&Event { id: 1, kind: "click".into() }).await.unwrap();
     insert.write(&Event { id: 2, kind: "view".into() }).await.unwrap();
     insert.end().await.unwrap();
@@ -73,4 +72,37 @@ async fn insert_then_select() {
     }
     let row: CountRow = client.query("SELECT count(*) AS n FROM events").fetch_one().await.unwrap();
     assert_eq!(row.n, 2);
+}
+
+/// A second validated insert into the same table, from a struct field order
+/// that doesn't match the table's declared column order — this only works
+/// because validation maps fields by name using the `DESCRIBE TABLE`
+/// response, not by position.
+#[tokio::test]
+async fn validated_insert_with_reordered_struct_fields() {
+    let client = client();
+    client
+        .query("CREATE TABLE reordered (id UInt32, kind String) ENGINE = Memory")
+        .execute()
+        .await
+        .unwrap();
+
+    #[derive(Row, Serialize, Deserialize)]
+    struct ReorderedEvent {
+        kind: String,
+        id: u32,
+    }
+
+    let mut insert = client.insert::<ReorderedEvent>("reordered").await.unwrap();
+    insert.write(&ReorderedEvent { kind: "click".into(), id: 1 }).await.unwrap();
+    insert.end().await.unwrap();
+
+    #[derive(Row, Deserialize)]
+    struct Got {
+        id: u32,
+        kind: String,
+    }
+    let row: Got = client.query("SELECT id, kind FROM reordered").fetch_one().await.unwrap();
+    assert_eq!(row.id, 1);
+    assert_eq!(row.kind, "click");
 }

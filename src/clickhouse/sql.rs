@@ -95,6 +95,7 @@ pub enum Table {
     SystemOne,
     SystemNumbers(u64),
     SystemTables,
+    SystemColumns,
     Named {
         database: Option<String>,
         table: String,
@@ -110,9 +111,23 @@ pub struct Select {
     pub select_final: bool,
     pub where_: Option<Expr>,
     pub group_by: Vec<Expr>,
+    /// `HAVING`: filters aggregated groups, evaluated the same way a
+    /// select item referencing a group key or aggregate is.
+    pub having: Option<Expr>,
     pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<u64>,
     pub format: Option<String>,
+}
+
+/// `SELECT ... UNION ALL/DISTINCT SELECT ...`: each branch is a full
+/// `Select` (so it can carry its own `WHERE`/`GROUP BY`/etc); `all_flags[i]`
+/// says whether the `UNION` between branch `i` and `i+1` was `ALL` (keep
+/// duplicates) or `DISTINCT` (dedupe). ClickHouse requires the keyword to be
+/// spelled out (no bare `UNION`), so this parser does too.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectUnion {
+    pub selects: Vec<Select>,
+    pub all_flags: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,13 +185,50 @@ pub struct OptimizeTable {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct DescribeTable {
+    pub database: Option<String>,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowTables {
+    pub database: Option<String>,
+    /// `LIKE 'pattern'`: `%`/`_` glob, matched with simple wildcard rules.
+    pub like: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowCreateTable {
+    pub database: Option<String>,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExistsTable {
+    pub database: Option<String>,
+    pub table: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Select(Select),
+    SelectUnion(SelectUnion),
     CreateTable(CreateTable),
     CreateMaterializedView(CreateMaterializedView),
     Insert(Insert),
     DropTable(DropTable),
     OptimizeTable(OptimizeTable),
+    DescribeTable(DescribeTable),
+    ShowDatabases,
+    ShowTables(ShowTables),
+    ShowCreateTable(ShowCreateTable),
+    ExistsTable(ExistsTable),
+    /// `USE db`: sessions aren't modeled (see docs/LIMITATIONS.md), so this
+    /// only validates the syntax and is otherwise a no-op.
+    UseDatabase(String),
+    /// `SET name = value[, name = value ...]`: session/query settings
+    /// aren't modeled, so this only validates the syntax and is a no-op.
+    SetSetting(Vec<(String, Expr)>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -615,6 +667,7 @@ impl Parser<'_> {
             match name.as_str() {
                 "one" => return Ok(Table::SystemOne),
                 "tables" => return Ok(Table::SystemTables),
+                "columns" => return Ok(Table::SystemColumns),
                 _ => {}
             }
         }
@@ -645,6 +698,7 @@ impl Parser<'_> {
         } else {
             vec![]
         };
+        let having = if self.eat_keyword("HAVING") { Some(self.parse_expr()?) } else { None };
         let order_by = if self.eat_keyword("ORDER") {
             self.expect_keyword("BY")?;
             self.parse_order_list()?
@@ -653,7 +707,7 @@ impl Parser<'_> {
         };
         let limit = if self.eat_keyword("LIMIT") { Some(self.parse_uint()?) } else { None };
         let format = if self.eat_keyword("FORMAT") { Some(self.parse_ident()?) } else { None };
-        Ok(Select { items, table, select_final, where_, group_by, order_by, limit, format })
+        Ok(Select { items, table, select_final, where_, group_by, having, order_by, limit, format })
     }
 
     fn parse_create_table(&mut self) -> Result<CreateTable, SqlError> {
@@ -778,6 +832,70 @@ impl Parser<'_> {
         let final_ = self.eat_keyword("FINAL");
         Ok(OptimizeTable { database, table, final_ })
     }
+
+    /// `DESCRIBE`/`DESC` has already been consumed; `TABLE` is optional
+    /// (real ClickHouse accepts both `DESCRIBE t` and `DESCRIBE TABLE t`).
+    fn parse_describe_table(&mut self) -> Result<DescribeTable, SqlError> {
+        self.eat_keyword("TABLE");
+        let (database, table) = self.parse_qualified_name()?;
+        Ok(DescribeTable { database, table })
+    }
+
+    /// `SHOW` has already been consumed.
+    fn parse_show(&mut self) -> Result<Statement, SqlError> {
+        if self.eat_keyword("DATABASES") {
+            return Ok(Statement::ShowDatabases);
+        }
+        if self.eat_keyword("TABLES") {
+            let database = if self.eat_keyword("FROM") || self.eat_keyword("IN") {
+                Some(self.parse_ident()?)
+            } else {
+                None
+            };
+            let like = if self.eat_keyword("LIKE") {
+                match self.next() {
+                    Some(Token::Str(s)) => Some(s),
+                    other => return Err(SqlError(format!("expected a string, found {other:?}"))),
+                }
+            } else {
+                None
+            };
+            return Ok(Statement::ShowTables(ShowTables { database, like }));
+        }
+        if self.eat_keyword("CREATE") {
+            self.eat_keyword("TABLE");
+            let (database, table) = self.parse_qualified_name()?;
+            return Ok(Statement::ShowCreateTable(ShowCreateTable { database, table }));
+        }
+        Err(SqlError("expected DATABASES, TABLES or CREATE TABLE after SHOW".into()))
+    }
+
+    /// `EXISTS` has already been consumed.
+    fn parse_exists(&mut self) -> Result<ExistsTable, SqlError> {
+        self.eat_keyword("TABLE");
+        let (database, table) = self.parse_qualified_name()?;
+        Ok(ExistsTable { database, table })
+    }
+
+    /// `USE` has already been consumed.
+    fn parse_use(&mut self) -> Result<String, SqlError> {
+        self.parse_ident()
+    }
+
+    /// `SET` has already been consumed. `SET a = 1, b = 'x'`.
+    fn parse_set(&mut self) -> Result<Vec<(String, Expr)>, SqlError> {
+        let mut out = Vec::new();
+        loop {
+            let name = self.parse_ident()?;
+            self.expect(&Token::Eq)?;
+            let value = self.parse_expr()?;
+            out.push((name, value));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Parses a single statement.
@@ -785,7 +903,26 @@ pub fn parse(sql: &str) -> Result<Statement, SqlError> {
     let tokens = tokenize(sql)?;
     let mut p = Parser { tokens: &tokens, pos: 0 };
     let stmt = if p.eat_keyword("SELECT") {
-        Statement::Select(p.parse_select()?)
+        let first = p.parse_select()?;
+        let mut selects = vec![first];
+        let mut all_flags = Vec::new();
+        while p.eat_keyword("UNION") {
+            let all = if p.eat_keyword("ALL") {
+                true
+            } else if p.eat_keyword("DISTINCT") {
+                false
+            } else {
+                return Err(SqlError("expected ALL or DISTINCT after UNION".into()));
+            };
+            p.expect_keyword("SELECT")?;
+            all_flags.push(all);
+            selects.push(p.parse_select()?);
+        }
+        if selects.len() == 1 {
+            Statement::Select(selects.into_iter().next().unwrap())
+        } else {
+            Statement::SelectUnion(SelectUnion { selects, all_flags })
+        }
     } else if p.eat_keyword("CREATE") {
         if p.eat_keyword("MATERIALIZED") {
             Statement::CreateMaterializedView(p.parse_create_materialized_view()?)
@@ -798,9 +935,20 @@ pub fn parse(sql: &str) -> Result<Statement, SqlError> {
         Statement::DropTable(p.parse_drop_table()?)
     } else if p.eat_keyword("OPTIMIZE") {
         Statement::OptimizeTable(p.parse_optimize_table()?)
+    } else if p.eat_keyword("DESCRIBE") || p.eat_keyword("DESC") {
+        Statement::DescribeTable(p.parse_describe_table()?)
+    } else if p.eat_keyword("SHOW") {
+        p.parse_show()?
+    } else if p.eat_keyword("EXISTS") {
+        Statement::ExistsTable(p.parse_exists()?)
+    } else if p.eat_keyword("USE") {
+        Statement::UseDatabase(p.parse_use()?)
+    } else if p.eat_keyword("SET") {
+        Statement::SetSetting(p.parse_set()?)
     } else {
         return Err(SqlError(
-            "expected SELECT, CREATE [MATERIALIZED VIEW] TABLE, INSERT, DROP TABLE or OPTIMIZE TABLE"
+            "expected SELECT, CREATE [MATERIALIZED VIEW] TABLE, INSERT, DROP TABLE, OPTIMIZE \
+             TABLE, DESCRIBE TABLE, SHOW, EXISTS, USE or SET"
                 .into(),
         ));
     };
@@ -1070,5 +1218,100 @@ mod tests {
         assert_eq!(m.name, "mv");
         assert_eq!(m.to_table, "target");
         assert_eq!(m.select.table, Table::Named { database: None, table: "src".into() });
+    }
+
+    #[test]
+    fn having_clause() {
+        let s = select("SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 1");
+        assert!(s.having.is_some());
+    }
+
+    #[test]
+    fn union_all_and_distinct() {
+        let stmt = parse("SELECT 1 UNION ALL SELECT 2 UNION DISTINCT SELECT 3").unwrap();
+        let Statement::SelectUnion(u) = stmt else { panic!("expected a UNION") };
+        assert_eq!(u.selects.len(), 3);
+        assert_eq!(u.all_flags, [true, false]);
+    }
+
+    #[test]
+    fn single_select_is_not_wrapped_in_a_union() {
+        assert!(matches!(parse("SELECT 1").unwrap(), Statement::Select(_)));
+    }
+
+    #[test]
+    fn bare_union_without_all_or_distinct_is_a_syntax_error() {
+        assert!(parse("SELECT 1 UNION SELECT 2").is_err());
+    }
+
+    #[test]
+    fn describe_table_with_and_without_the_table_keyword() {
+        let Statement::DescribeTable(d) = parse("DESCRIBE TABLE events").unwrap() else {
+            panic!("expected DESCRIBE TABLE")
+        };
+        assert_eq!(d.table, "events");
+        let Statement::DescribeTable(d) = parse("DESC db.events").unwrap() else {
+            panic!("expected DESC")
+        };
+        assert_eq!(d.database, Some("db".to_string()));
+        assert_eq!(d.table, "events");
+    }
+
+    #[test]
+    fn show_databases_tables_and_create_table() {
+        assert!(matches!(parse("SHOW DATABASES").unwrap(), Statement::ShowDatabases));
+
+        let Statement::ShowTables(s) = parse("SHOW TABLES").unwrap() else {
+            panic!("expected SHOW TABLES")
+        };
+        assert_eq!(s.database, None);
+        assert_eq!(s.like, None);
+
+        let Statement::ShowTables(s) = parse("SHOW TABLES FROM db LIKE 'ev%'").unwrap() else {
+            panic!("expected SHOW TABLES")
+        };
+        assert_eq!(s.database, Some("db".to_string()));
+        assert_eq!(s.like, Some("ev%".to_string()));
+
+        let Statement::ShowCreateTable(s) = parse("SHOW CREATE TABLE events").unwrap() else {
+            panic!("expected SHOW CREATE TABLE")
+        };
+        assert_eq!(s.table, "events");
+    }
+
+    #[test]
+    fn exists_table_with_and_without_the_table_keyword() {
+        let Statement::ExistsTable(e) = parse("EXISTS TABLE events").unwrap() else {
+            panic!("expected EXISTS TABLE")
+        };
+        assert_eq!(e.table, "events");
+        let Statement::ExistsTable(e) = parse("EXISTS events").unwrap() else {
+            panic!("expected EXISTS")
+        };
+        assert_eq!(e.table, "events");
+    }
+
+    #[test]
+    fn use_database() {
+        let Statement::UseDatabase(name) = parse("USE mydb").unwrap() else {
+            panic!("expected USE")
+        };
+        assert_eq!(name, "mydb");
+    }
+
+    #[test]
+    fn set_one_or_more_settings() {
+        let Statement::SetSetting(settings) = parse("SET a = 1, b = 'x'").unwrap() else {
+            panic!("expected SET")
+        };
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings[0].0, "a");
+        assert_eq!(settings[1].0, "b");
+    }
+
+    #[test]
+    fn select_from_system_columns() {
+        let s = select("SELECT * FROM system.columns");
+        assert_eq!(s.table, Table::SystemColumns);
     }
 }

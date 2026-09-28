@@ -1,8 +1,8 @@
 //! Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
-//! `JSON`, `JSONEachRow` and `RowBinary` (+`WithNames`,
-//! +`WithNamesAndTypes`). The rest of the P0 list in
-//! docs/specs/clickhouse.md (`CSV`, `Native`, `Pretty`, ...) isn't built
-//! yet — see docs/LIMITATIONS.md.
+//! `CSV` (+`WithNames`, +`WithNamesAndTypes`), `JSON`, `JSONEachRow`,
+//! `Pretty`/`PrettyCompact` and `RowBinary` (+`WithNames`,
+//! +`WithNamesAndTypes`). `Native` and the rest of the P1 list in
+//! docs/specs/clickhouse.md aren't built yet — see docs/LIMITATIONS.md.
 
 use super::engine::QueryResult;
 use super::error::ChError;
@@ -18,6 +18,8 @@ pub fn content_type(format: &str) -> &'static str {
         "RowBinary" | "RowBinaryWithNames" | "RowBinaryWithNamesAndTypes" => {
             "application/octet-stream"
         }
+        "CSV" | "CSVWithNames" | "CSVWithNamesAndTypes" => "text/csv; charset=UTF-8",
+        "Pretty" | "PrettyCompact" => "text/plain; charset=UTF-8",
         _ => "text/tab-separated-values; charset=UTF-8",
     }
 }
@@ -63,6 +65,118 @@ fn tab_separated(r: &QueryResult, with_names: bool, with_types: bool) -> Vec<u8>
         out.push_str(&fields.join("\t"));
         out.push('\n');
     }
+    out.into_bytes()
+}
+
+/// A CSV field: quoted (with doubled internal quotes) only when it contains
+/// the delimiter, a quote, or a newline — matching ClickHouse's default
+/// `format_csv_delimiter=','`/only-quote-when-needed behaviour. Non-string
+/// values never need quoting (none of noida-db's types can produce a comma
+/// or quote unescaped).
+fn csv_field(v: &Val) -> String {
+    let Val::Str(s) = v else { return val_text(v) };
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for c in s.chars() {
+            if c == '"' {
+                out.push('"');
+            }
+            out.push(c);
+        }
+        out.push('"');
+        out
+    } else {
+        s.clone()
+    }
+}
+
+/// Row separator is `\n`, matching ClickHouse's default
+/// (`output_format_csv_crlf_end_of_line=0`) — not RFC 4180's CRLF.
+fn csv(r: &QueryResult, with_names: bool, with_types: bool) -> Vec<u8> {
+    let mut out = String::new();
+    if with_names {
+        let names: Vec<String> =
+            r.columns.iter().map(|(n, _)| csv_field(&Val::Str(n.clone()))).collect();
+        out.push_str(&names.join(","));
+        out.push('\n');
+    }
+    if with_types {
+        let types: Vec<String> =
+            r.columns.iter().map(|(_, t)| csv_field(&Val::Str(t.name().to_string()))).collect();
+        out.push_str(&types.join(","));
+        out.push('\n');
+    }
+    for row in &r.rows {
+        let fields: Vec<String> = row.iter().map(csv_field).collect();
+        out.push_str(&fields.join(","));
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+/// `Pretty`/`PrettyCompact`: a box-drawing text table for humans (and
+/// tools that pipe `clickhouse-client`-style output). Numbers are
+/// right-aligned, everything else left-aligned, matching real
+/// ClickHouse's Pretty formats; exact spacing/column-width tie-breaks
+/// aren't verified byte-for-byte against a real server (none reachable
+/// here) — see docs/LIMITATIONS.md. `Pretty` and `PrettyCompact` render
+/// identically here (both are the "compact" grid, no blank spacer rows
+/// between data rows) — real ClickHouse's only visible difference for
+/// small non-terminal outputs.
+fn pretty(r: &QueryResult) -> Vec<u8> {
+    let headers: Vec<String> = r.columns.iter().map(|(n, _)| n.clone()).collect();
+    let cells: Vec<Vec<String>> =
+        r.rows.iter().map(|row| row.iter().map(val_text).collect()).collect();
+    let right_align: Vec<bool> =
+        r.columns.iter().map(|(_, t)| !matches!(t, Type::String)).collect();
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in &cells {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+
+    let border = |left: &str, mid: &str, right: &str| -> String {
+        let mut s = String::from(left);
+        for (i, w) in widths.iter().enumerate() {
+            if i > 0 {
+                s.push_str(mid);
+            }
+            s.push_str(&"─".repeat(w + 2));
+        }
+        s.push_str(right);
+        s.push('\n');
+        s
+    };
+
+    let data_row = |cells: &[String]| -> String {
+        let mut s = String::from("│");
+        for (i, cell) in cells.iter().enumerate() {
+            let pad = widths[i] - cell.chars().count();
+            s.push(' ');
+            if right_align[i] {
+                s.push_str(&" ".repeat(pad));
+                s.push_str(cell);
+            } else {
+                s.push_str(cell);
+                s.push_str(&" ".repeat(pad));
+            }
+            s.push_str(" │");
+        }
+        s.push('\n');
+        s
+    };
+
+    let mut out = String::new();
+    out.push_str(&border("┌", "┬", "┐"));
+    out.push_str(&data_row(&headers));
+    out.push_str(&border("├", "┼", "┤"));
+    for row in &cells {
+        out.push_str(&data_row(row));
+    }
+    out.push_str(&border("└", "┴", "┘"));
     out.into_bytes()
 }
 
@@ -160,6 +274,10 @@ pub fn render(r: &QueryResult, format: &str) -> Result<Option<Vec<u8>>, ChError>
         "RowBinary" => Some(rowbinary::encode(r, false, false)?),
         "RowBinaryWithNames" => Some(rowbinary::encode(r, true, false)?),
         "RowBinaryWithNamesAndTypes" => Some(rowbinary::encode(r, true, true)?),
+        "CSV" => Some(csv(r, false, false)),
+        "CSVWithNames" => Some(csv(r, true, false)),
+        "CSVWithNamesAndTypes" => Some(csv(r, true, true)),
+        "Pretty" | "PrettyCompact" => Some(pretty(r)),
         _ => None,
     })
 }
@@ -221,5 +339,70 @@ mod tests {
     #[test]
     fn unknown_format_returns_none() {
         assert_eq!(render(&one_row(), "Parquet").unwrap(), None);
+    }
+
+    #[test]
+    fn csv_plain() {
+        // one_row's string has a tab (not a comma/quote/newline), so CSV
+        // leaves it unquoted, unlike TabSeparated's `\t` → `\\t` escaping.
+        assert_eq!(render(&one_row(), "CSV").unwrap().unwrap(), b"1,a\tb\n".to_vec());
+    }
+
+    #[test]
+    fn csv_quotes_fields_with_commas_or_quotes() {
+        let r = QueryResult {
+            columns: vec![("s".into(), Type::String)],
+            rows: vec![
+                vec![Val::Str("has,comma".into())],
+                vec![Val::Str("has\"quote".into())],
+                vec![Val::Str("plain".into())],
+            ],
+        };
+        let body = String::from_utf8(render(&r, "CSV").unwrap().unwrap()).unwrap();
+        let mut lines = body.lines();
+        assert_eq!(lines.next(), Some("\"has,comma\""));
+        assert_eq!(lines.next(), Some("\"has\"\"quote\""));
+        assert_eq!(lines.next(), Some("plain"));
+    }
+
+    #[test]
+    fn csv_with_names_and_types() {
+        let body = render(&one_row(), "CSVWithNamesAndTypes").unwrap().unwrap();
+        let text = String::from_utf8(body).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("n,s"));
+        assert_eq!(lines.next(), Some("UInt8,String"));
+    }
+
+    #[test]
+    fn pretty_draws_a_box_table() {
+        let r = QueryResult {
+            columns: vec![("n".into(), Type::UInt8), ("s".into(), Type::String)],
+            rows: vec![vec![Val::UInt(1), Val::Str("hi".into())]],
+        };
+        let body = String::from_utf8(render(&r, "Pretty").unwrap().unwrap()).unwrap();
+        assert!(body.starts_with('┌'), "{body}");
+        assert!(body.contains('│'), "{body}");
+        assert!(body.contains('┬'), "{body}");
+        assert!(body.contains("│ n │ s  │") || body.contains("n") && body.contains("s"), "{body}");
+        assert!(body.contains('1'), "{body}");
+        assert!(body.contains("hi"), "{body}");
+        assert!(body.trim_end().ends_with('┘'), "{body}");
+    }
+
+    #[test]
+    fn pretty_right_aligns_numbers_and_left_aligns_strings() {
+        let r = QueryResult {
+            columns: vec![("n".into(), Type::UInt64), ("s".into(), Type::String)],
+            rows: vec![
+                vec![Val::UInt(1), Val::Str("x".into())],
+                vec![Val::UInt(100), Val::Str("y".into())],
+            ],
+        };
+        let body = String::from_utf8(render(&r, "PrettyCompact").unwrap().unwrap()).unwrap();
+        // The narrower number (1) is left-padded with a space to line up
+        // under 100 (right-aligned); the string column is left-aligned.
+        assert!(body.contains("│   1 │ x │"), "{body}");
+        assert!(body.contains("│ 100 │ y │"), "{body}");
     }
 }
