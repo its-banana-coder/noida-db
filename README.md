@@ -38,8 +38,8 @@ exactly what does not work yet or is intentionally out of scope.
 |---|---|
 | **Redis** | most of the protocol implemented and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq) — see [`src/redis/README.md`](src/redis/README.md) |
 | **Postgres** | wire protocol, catalogs, DDL/DML, tested against psycopg, SQLAlchemy, node-postgres and JDBC |
-| **MySQL, Kafka** | in progress, not yet merged — see `docs/specs/mysql.md` and `docs/specs/kafka.md` |
-| **Elasticsearch, ClickHouse, Memcached, MongoDB, RabbitMQ** | specs written, implementation not started — see `docs/specs/` |
+| **MySQL, Kafka, ClickHouse** | in progress, not yet merged — see `docs/specs/mysql.md`, `docs/specs/kafka.md` and `docs/specs/clickhouse.md` |
+| **Elasticsearch, Memcached, MongoDB, RabbitMQ** | specs written, implementation not started — see `docs/specs/` |
 
 Each service is its own Cargo feature (on by default once merged) and can
 be switched on or off at build time and at runtime (`--only`); a disabled

@@ -17,7 +17,8 @@ but not identical to the real server.
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
 | MySQL | early scaffolding, not merged | no |
-| Memcached, MongoDB, RabbitMQ, Elasticsearch, ClickHouse | specs only (`docs/specs/`) | no |
+| ClickHouse | HTTP interface milestone 1: `SELECT 1`/`version()`, `system.one`/`numbers(N)`, TSV/JSON/JSONEachRow, errors (see below); not merged | yes, for these |
+| Memcached, MongoDB, RabbitMQ, Elasticsearch | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
 
@@ -181,6 +182,40 @@ Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Ka
 
 **Not yet**
 - Disk segment persistence (records live in-memory).
+
+## ClickHouse
+
+Target: ClickHouse 24.8 LTS, HTTP interface on port 8123. Milestone 1 only
+(see `docs/specs/clickhouse.md`):
+
+- `GET`/`POST /` with `query` as a URL param or the request body; `GET /ping`
+  and `GET /replicas_status`.
+- Scalar `SELECT` expressions (`SELECT 1`, `SELECT version()`,
+  `currentDatabase()`, `hostName()`, `timezone()`, `uptime()`), `system.one`,
+  the `numbers(N)` table function, `LIMIT`, `FORMAT`.
+- Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
+  `JSON`, `JSONEachRow`.
+- Errors in ClickHouse's HTTP body format (`Code: N. DB::Exception: ...`)
+  with `X-ClickHouse-Exception-Code` and the real error codes/names for
+  unknown table/database/function/identifier and syntax errors.
+
+**Not yet (milestones 2–5, tracked in the spec)**
+- User tables (`CREATE TABLE`/`INSERT`/`SELECT` beyond `system.one`/
+  `numbers`), `WHERE`/`GROUP BY`/joins/window functions, the wider function
+  library, `RowBinary`/`Native`/`CSV`/`Pretty` formats, the native TCP
+  protocol (port 9000, needed by clickhouse-go and clickhouse-driver and the
+  official Rust `clickhouse` crate), compression, sessions, parameterized
+  queries.
+- Every non-`SELECT` statement (`CREATE`/`INSERT`/`ALTER`/`SHOW`/...).
+- Persistent connections: every response closes the socket
+  (`Connection: close`); real clients reconnect cleanly, but this differs
+  from ClickHouse's keep-alive default.
+
+**By design**
+- `BACKUP`/`RESTORE`, Keeper/ZooKeeper, replicated engines beyond being
+  accepted as plain `MergeTree` (not built yet either way), distributed
+  tables, `ON CLUSTER` beyond being accepted and ignored, user/role/quota
+  management, query profiling and `system.query_log`/`trace_log` contents.
 
 ## MySQL
 

@@ -11,6 +11,12 @@ pub fn start_noida_redis() -> SocketAddr {
     noida::redis::server::spawn("127.0.0.1:0").expect("start noida-db redis")
 }
 
+/// Starts a fresh noida-db ClickHouse HTTP server on a free port.
+#[cfg(feature = "clickhouse")]
+pub fn start_noida_clickhouse() -> SocketAddr {
+    noida::clickhouse::spawn("127.0.0.1:0").expect("start noida-db clickhouse")
+}
+
 /// A minimal raw RESP client, so tests see exact replies.
 pub struct RawClient {
     reader: BufReader<TcpStream>,
