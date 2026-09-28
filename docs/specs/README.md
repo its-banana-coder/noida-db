@@ -13,7 +13,7 @@ agent (or person) can pick one up without other context.
 | MongoDB | [mongodb.md](mongodb.md) | 27017 | open |
 | RabbitMQ | [rabbitmq.md](rabbitmq.md) | 5672, 15672 | open |
 | Elasticsearch | [elasticsearch.md](elasticsearch.md) | 9200 | open |
-| ClickHouse | [clickhouse.md](clickhouse.md) | 8123, 9000 | open |
+| ClickHouse | [clickhouse.md](clickhouse.md) | 8123, 9000 | building (`svc/clickhouse`) |
 
 ## Read first, in this order
 

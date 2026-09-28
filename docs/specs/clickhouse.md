@@ -329,6 +329,15 @@ timing, not after hitting the wall mid-phase.
 **Exit:** native-protocol client matrix scenario passes for both
 drivers.
 
+Done ahead of this phase, over HTTP: `DESCRIBE TABLE`/`DESC TABLE` and
+`system.columns` (unblocking the official Rust client's default
+*validated* insert path — `.with_validation(false)` is no longer
+needed), `SHOW DATABASES/TABLES/CREATE TABLE`, `EXISTS TABLE`, `USE`,
+`SET`, `CSV` (+`WithNames`/`WithNamesAndTypes`) and `Pretty`/
+`PrettyCompact` output formats, and `HAVING`/`UNION ALL`/`UNION
+DISTINCT` on `SELECT`. See docs/LIMITATIONS.md's ClickHouse section for
+exact behavior and known deviations.
+
 ### Phase 5 — P1 widening
 Remaining aggregate combinators (`-Array/-State/-Merge/-OrNull/
 -OrDefault/-Distinct`), `uniqCombined`, `topK`, `sumMap`; `ASOF/SEMI/

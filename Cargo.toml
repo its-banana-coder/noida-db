@@ -28,6 +28,9 @@ sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
+# HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
+# same as the other services' wire protocols.
+clickhouse = []
 
 [dependencies]
 # Postgres: wire-protocol message codecs only (no tokio server API).
@@ -59,6 +62,14 @@ postgres = { version = "0.19", features = ["with-serde_json-1", "with-uuid-1", "
 serde_json = "1"
 uuid = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# ClickHouse: a real HTTP client library against the HTTP interface, the
+# same way clickhouse-connect/@clickhouse/client work.
+ureq = { version = "3", default-features = false }
+# ClickHouse: the official Rust client, now that RowBinaryWithNamesAndTypes
+# (which it requires) is implemented. Async (hyper/tokio), dev-only.
+clickhouse = "0.15"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # Service test suites only build when their service is compiled in.
 [[test]]
@@ -92,4 +103,16 @@ required-features = ["kafka"]
 [[test]]
 name = "kafka_diff"
 required-features = ["kafka"]
+
+[[test]]
+name = "clickhouse_client"
+required-features = ["clickhouse"]
+
+[[test]]
+name = "clickhouse_diff"
+required-features = ["clickhouse"]
+
+[[test]]
+name = "clickhouse_official_client"
+required-features = ["clickhouse"]
 

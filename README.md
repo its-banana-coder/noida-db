@@ -57,8 +57,10 @@ More applications are being added over time.
 |---|---|
 | **Redis** | most of the protocol implemented and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq) — see [`src/redis/README.md`](src/redis/README.md) |
 | **Postgres** | wire protocol, catalogs, DDL/DML, tested against psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql and JDBC, plus real applications (see above) |
-| **MySQL, Kafka** | in progress, not yet merged — see `docs/specs/mysql.md` and `docs/specs/kafka.md` |
-| **Elasticsearch, ClickHouse, Memcached, MongoDB, RabbitMQ** | specs written, implementation not started — see `docs/specs/` |
+| **Kafka** | native binary protocol, topics, consumer groups, transactions, configs |
+| **ClickHouse** | HTTP interface: CREATE/INSERT/SELECT on Memory/MergeTree/ReplacingMergeTree/SummingMergeTree with real FINAL/OPTIMIZE merge semantics, materialized views, DESCRIBE/SHOW/EXISTS, TSV/CSV/JSON/RowBinary/Pretty formats; tested against the official Rust client — see `docs/specs/clickhouse.md` |
+| **MySQL** | in progress, not yet merged — see `docs/specs/mysql.md` |
+| **Elasticsearch, Memcached, MongoDB, RabbitMQ** | specs written, implementation not started — see `docs/specs/` |
 
 Each service is its own Cargo feature (on by default once merged) and can
 be switched on or off at build time and at runtime (`--only`); a disabled
