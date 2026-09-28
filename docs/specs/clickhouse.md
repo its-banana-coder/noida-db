@@ -237,7 +237,15 @@ Play UI, MySQL/Postgres wire compatibility ports of ClickHouse itself.
 3. RowBinary/Native formats; ReplacingMergeTree/SummingMergeTree + FINAL/
    OPTIMIZE; materialized views (TO form); HTTP client matrix green;
    `clickhouse` in default features.
-4. Native TCP protocol; clickhouse-go and clickhouse-driver pass.
+4. Native TCP protocol; clickhouse-go and clickhouse-driver pass. Done
+   ahead of the native protocol, over HTTP: `DESCRIBE TABLE`/`DESC TABLE`
+   and `system.columns` (unblocking the official Rust client's default
+   *validated* insert path — `.with_validation(false)` is no longer
+   needed), `SHOW DATABASES/TABLES/CREATE TABLE`, `EXISTS TABLE`, `USE`,
+   `SET`, `CSV` (+`WithNames`/`WithNamesAndTypes`) and `Pretty`/
+   `PrettyCompact` output formats, and `HAVING`/`UNION ALL`/`UNION
+   DISTINCT` on `SELECT`. See docs/LIMITATIONS.md's ClickHouse section for
+   exact behavior and known deviations.
 5. P1 items.
 
 ## Scope filter (project rule)

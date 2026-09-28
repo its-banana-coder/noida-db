@@ -202,11 +202,47 @@ of `docs/specs/clickhouse.md`:
   `Int8/16/32/64`, `Float32/64`, `String`, `Bool`. A type given with
   arguments (`Nullable(String)`, `Decimal(10,2)`) parses but is rejected as
   `NOT_IMPLEMENTED` — never silently accepted as something else.
-- `SELECT ... [FINAL]` with `WHERE`, `GROUP BY`, `ORDER BY` (only by a
-  selected column or alias), `LIMIT`, on `system.one`, `numbers(N)`,
-  `system.tables` and real tables. Expressions: arithmetic (`+ - * / %`),
-  comparisons, `AND`/`OR`/`NOT`, parentheses, unary minus, string/int/
-  float/bool literals, backtick-quoted identifiers (`` `weird name` ``).
+- `SELECT ... [FINAL]` with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (only
+  by a selected column or alias), `LIMIT`, on `system.one`, `numbers(N)`,
+  `system.tables`, `system.columns` and real tables. Expressions: arithmetic
+  (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`, parentheses, unary minus,
+  string/int/float/bool literals, backtick-quoted identifiers
+  (`` `weird name` ``). `HAVING` is evaluated against the query's projected
+  output (like `ORDER BY`), so it can reference selected group keys, aliases
+  and aggregate results, but not a `GROUP BY` key that wasn't also selected.
+  `SELECT ... UNION ALL/DISTINCT SELECT ...` (chained, any number of
+  branches; the keyword must be spelled out — bare `UNION` is a syntax
+  error, matching ClickHouse's own `union_default_mode` requirement):
+  branches are concatenated in order; if *any* `UNION DISTINCT` appears in
+  the chain, the whole combined result is deduped (a coarser approximation
+  of ClickHouse's more granular per-branch semantics — see **Differs**).
+- `DESCRIBE TABLE [db.]t` / `DESC [TABLE] [db.]t`: returns `name`, `type`,
+  `default_type`, `default_expression`, `comment`, `codec_expression`,
+  `ttl_expression` — the same column set and order real ClickHouse uses (and
+  the one the official Rust client's validated-insert path deserializes).
+  Column defaults/comments/codecs/TTLs aren't modeled, so those four columns
+  are always empty strings. `system.columns` populates `database`, `table`,
+  `name`, `type`, `position` (1-based), `default_kind`, `default_expression`,
+  `data_compressed_bytes`, `data_uncompressed_bytes`, `marks_bytes`,
+  `comment`, `is_in_partition_key`, `is_in_sorting_key`, `is_in_primary_key`,
+  `is_in_sampling_key`, `compression_codec`, `character_octet_length`,
+  `numeric_precision`, `numeric_precision_radix`, `numeric_scale`,
+  `datetime_precision` from table metadata — `is_in_sorting_key`/
+  `is_in_primary_key` are 1 for columns in the table's `ORDER BY`; byte
+  counts, partition-key membership and precision/scale/octet-length columns
+  are always 0 (real ClickHouse reports `NULL` for several of these on
+  non-numeric columns, which isn't expressible without `Nullable` support).
+- `SHOW DATABASES` (the fixed `default`/`system`/`INFORMATION_SCHEMA`/
+  `information_schema` union with any database that has a created table),
+  `SHOW TABLES [FROM|IN db] [LIKE 'pattern']` (`%`/`_` wildcards, no `\`
+  escaping), `SHOW CREATE TABLE [db.]t` (reproduces the canonical multi-line
+  `CREATE TABLE db.t (\`col\` Type, ...) ENGINE = ... [ORDER BY ...]
+  [SETTINGS index_granularity = 8192]` statement — the settings tail is
+  appended for every `*MergeTree` engine, matching ClickHouse's own default;
+  not verified byte-for-byte against a real server, see **Differs**),
+  `EXISTS [TABLE] [db.]t` (`1`/`0`), `USE db` and `SET name = value[, ...]`
+  (both syntax-checked no-ops — sessions and settings aren't modeled, so
+  they don't actually change anything; see **Not yet**).
 - **`ReplacingMergeTree`/`SummingMergeTree` merge semantics**, applied on
   demand (there are no parts or background merges to apply them
   incrementally — see **Differs**): `SELECT ... FINAL` computes the merged
@@ -229,20 +265,30 @@ of `docs/specs/clickhouse.md`:
   (always false/true — no `Nullable` type yet, so nothing is ever null).
 - Aggregates: `count`/`count(*)`, `sum`, `avg`, `min`, `max`, `any`,
   `uniqExact`.
-- Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`),
-  `JSON`, `JSONEachRow`, `RowBinary` (+`WithNames`, +`WithNamesAndTypes`) —
-  both directions (`SELECT` output and `INSERT` input).
+- Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`), `CSV`
+  (+`WithNames`, +`WithNamesAndTypes`; quotes a field only when it contains
+  a comma/quote/newline, doubling internal quotes; `\n` row separator,
+  matching ClickHouse's default `output_format_csv_crlf_end_of_line=0`,
+  not RFC 4180's CRLF), `JSON`, `JSONEachRow`, `Pretty`/`PrettyCompact`
+  (box-drawing text tables: numbers right-aligned, everything else
+  left-aligned; both format names render identically here — see
+  **Differs**), `RowBinary` (+`WithNames`, +`WithNamesAndTypes`) — all in
+  both directions where applicable (`SELECT` output and, for `RowBinary`,
+  `INSERT` input).
 - Errors in ClickHouse's HTTP body format (`Code: N. DB::Exception: ...`)
   with `X-ClickHouse-Exception-Code` and real error codes/names for unknown
   table/database/function/identifier, syntax errors, table-already-exists,
   type mismatches and out-of-range values.
 - **Verified against the official Rust `clickhouse` crate**
   (`tests/clickhouse_official_client.rs`): `fetch`/`fetch_all`/`fetch_one`
-  (which require `RowBinaryWithNamesAndTypes`) and a streaming `insert`
-  (with `.with_validation(false)`, since validated inserts issue a
-  `DESCRIBE TABLE` first — see **Not yet**), and with response compression
-  disabled (`.with_compression(Compression::None)` — ClickHouse's own
-  lz4/zstd block compression isn't built).
+  (which require `RowBinaryWithNamesAndTypes`) and a streaming `insert` with
+  **validation on** (`.with_validation(true)`, the crate's default) — the
+  client issues `DESCRIBE TABLE` first to check the target schema, maps
+  struct fields to columns by name (so field order doesn't need to match
+  the table's declared column order), and only then streams `RowBinary`
+  rows; response compression is disabled
+  (`.with_compression(Compression::None)` — ClickHouse's own lz4/zstd block
+  compression isn't built).
 
 **Differs**
 - Storage is row-at-a-time (`Vec<Vec<Val>>`), not columnar; performance is
@@ -261,21 +307,30 @@ of `docs/specs/clickhouse.md`:
 - Persistent connections: every response closes the socket
   (`Connection: close`); real clients reconnect cleanly, but this differs
   from ClickHouse's keep-alive default.
+- `UNION`'s `DISTINCT`-ness is chain-wide, not per-branch: `SELECT a UNION
+  ALL SELECT b UNION DISTINCT SELECT c` dedupes the whole combined result of
+  all three branches, where real ClickHouse would only dedupe going into the
+  `DISTINCT` step.
+- `SHOW CREATE TABLE`'s exact formatting (the `SETTINGS index_granularity =
+  8192` tail in particular) isn't verified byte-for-byte against a real
+  server (none reachable in this environment) — it's ClickHouse 24.8's
+  well-known default, reproduced from memory. `Pretty` and `PrettyCompact`
+  render identically (both as the compact grid, no blank spacer rows), and
+  their exact spacing/width tie-break rules aren't verified byte-for-byte
+  either.
 
 **Not yet (milestones 4–5, tracked in the spec)**
 - Joins, window functions, subqueries, views (the non-materialized kind),
   the wider function/type library (`Date`/`DateTime`, `Decimal`, `UUID`,
-  `Array`, `Tuple`, `Map`, `Nullable`), `HAVING`, `WITH`/CTEs, `UNION`,
-  parameterized queries, sessions, response compression.
-- `DESCRIBE TABLE`/`system.columns` introspection — so a client's
-  *validated* insert path (which queries the target schema first) doesn't
-  work yet; the client matrix uses unvalidated/explicit-schema inserts
-  until this lands.
+  `Array`, `Tuple`, `Map`, `Nullable`), `WITH`/CTEs, parameterized queries,
+  sessions (so `USE`/`SET` are accepted but don't change behavior),
+  response compression.
 - `Native` format and the native TCP protocol (port 9000) — needed by
   clickhouse-go and clickhouse-driver (Python), and by the official Rust
   client's `fetch_native`.
-- `CSV`/`Pretty` output formats, `ALTER TABLE`, `SHOW`/`EXISTS`, non-`SELECT`
-  `system.*` writes.
+- `ALTER TABLE`, non-`SELECT` `system.*` writes, `system.settings`/
+  `system.functions`/other `system.*` introspection tables beyond `system.one`/
+  `numbers`/`tables`/`columns`.
 - The wider client matrix (clickhouse-connect, @clickhouse/client, JDBC) and
   flipping `clickhouse` into `default` — the Rust client is the only one
   verified so far.
