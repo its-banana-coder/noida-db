@@ -17,7 +17,7 @@ fn missing_index_error_is_the_elasticsearch_shape_byte_for_byte() {
     assert_eq!(status, 404);
     assert_eq!(
         serde_json::to_string(&body).unwrap(),
-        r#"{"error":{"index":"missing","index_uuid":"_na_","reason":"no such index [missing]","resource.id":"missing","resource.type":"index_or_alias","root_cause":[{"index":"missing","index_uuid":"_na_","reason":"no such index [missing]","resource.id":"missing","resource.type":"index_or_alias","type":"index_not_found_exception"}],"type":"index_not_found_exception"},"status":404}"#,
+        r#"{"error":{"root_cause":[{"type":"index_not_found_exception","reason":"no such index [missing]","index_uuid":"_na_","resource.type":"index_or_alias","resource.id":"missing","index":"missing"}],"type":"index_not_found_exception","reason":"no such index [missing]","index_uuid":"_na_","resource.type":"index_or_alias","resource.id":"missing","index":"missing"},"status":404}"#,
     );
 }
 

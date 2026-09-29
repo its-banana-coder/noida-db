@@ -20,7 +20,8 @@ but not identical to the real server.
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
-| RabbitMQ, Elasticsearch | specs only (`docs/specs/`) | no |
+| Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
+| RabbitMQ | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
 
@@ -438,14 +439,19 @@ ASCII/word cases rather than full UAX#29 segmentation. Near-real-time
 semantics are enforced: a write is visible to real-time GET immediately but
 not to search until `_refresh` (or `refresh=true`/`wait_for` on the write).
 
+Aggregations are implemented: `terms`, `range`, `histogram`, `filter`,
+`filters`, `missing` (bucket aggregations, with recursive sub-aggregations
+via a nested `aggs`), and `avg`/`sum`/`min`/`max`/`stats`/`value_count`/
+`cardinality`/`top_hits` (metric aggregations) — see
+`src/elasticsearch/search.rs`.
+
 Not yet built: `match_phrase`/`multi_match`/`wildcard`/`regexp`/
-`query_string`, nested field mappings and nested queries, aggregations,
-highlighting, `search_after`, scroll/PIT, date-math ranges (`now-1d/d`),
-optimistic concurrency parameters (`version`, `if_seq_no`), gzip, `_cat`/
-`_cluster` endpoints, and exact Elasticsearch error/response parity for
-every path. This is not ready to replace Elasticsearch for application
-workflows that search or aggregate data with more than the query types
-above.
+`query_string`, nested field mappings and nested queries, highlighting,
+`search_after`, scroll/PIT, date-math ranges (`now-1d/d`), optimistic
+concurrency parameters (`version`, `if_seq_no`), gzip, `_cat`/`_cluster`
+endpoints, and exact Elasticsearch error/response parity for every path.
+This is not ready to replace Elasticsearch for application workflows that
+search with more than the query types above (aggregating is well covered).
 
 ## Numbers we do not claim yet
 
