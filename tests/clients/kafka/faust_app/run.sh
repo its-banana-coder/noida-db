@@ -9,11 +9,11 @@ fi
 export FAUST_BROKER_URL="kafka://127.0.0.1:${NOIDA_KAFKA_PORT}"
 
 echo "Starting Faust workers..."
-timeout 20 python3 tests/clients/kafka/faust_app/app.py worker -l info -p 6066 -A tests.clients.kafka.faust_app.app > worker1.log 2>&1 &
+timeout 20 python3 tests/clients/kafka/faust_app/app.py -A tests.clients.kafka.faust_app.app worker -l info -p 6066 > worker1.log 2>&1 &
 w1=$!
 sleep 2
 
-timeout 20 python3 tests/clients/kafka/faust_app/app.py worker -l info -p 6067 -A tests.clients.kafka.faust_app.app > worker2.log 2>&1 &
+timeout 20 python3 tests/clients/kafka/faust_app/app.py -A tests.clients.kafka.faust_app.app worker -l info -p 6067 > worker2.log 2>&1 &
 w2=$!
 sleep 5
 

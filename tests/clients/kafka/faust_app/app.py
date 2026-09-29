@@ -17,3 +17,7 @@ async def hello(greetings):
     async for greeting in greetings:
         print(f'[PID {os.getpid()}] Received greeting: {greeting.message}')
         await asyncio.sleep(0.1)
+
+
+if __name__ == '__main__':
+    app.main()

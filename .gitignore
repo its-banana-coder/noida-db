@@ -16,6 +16,10 @@ tests/clients/kafka/server-more.log
 tests/clients/kafka/node/
 tests/clients/kafka/java-gradle/.gradle/
 tests/clients/kafka/java-gradle/build/
+tests/clients/kafka/faust_app/worker*.log
+tests/clients/kafka/faust_app/received_messages.log
+tests/clients/kafka/faust_app/faust_env/
+hello-app-data/
 node_modules/
 __pycache__/
 *.pyc
