@@ -7,6 +7,8 @@ use std::net::SocketAddr;
 /// binary (its Cargo feature is off, or it isn't implemented yet).
 pub fn start(name: &str, addr: &str) -> Option<io::Result<SocketAddr>> {
     match name {
+        #[cfg(feature = "mysql")]
+        "mysql" => Some(crate::mysql::server::spawn(addr)),
         #[cfg(feature = "redis")]
         "redis" => Some(crate::redis::server::spawn(addr)),
         #[cfg(feature = "postgres")]
