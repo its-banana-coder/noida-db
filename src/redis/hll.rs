@@ -473,6 +473,7 @@ fn pfadd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     if updated > 0 {
         invalidate_cache(s);
+        ctx.notify_keyspace_event('$', "pfadd", &a[1]);
     }
     Ok(Value::Integer((updated > 0) as i64))
 }
@@ -536,5 +537,6 @@ fn pfmerge(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
     }
     invalidate_cache(s);
+    ctx.notify_keyspace_event('$', "pfmerge", &a[1]);
     Ok(Value::ok())
 }

@@ -324,6 +324,7 @@ fn xadd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     s.last_id = id;
     s.entries_added += 1;
     trim(s, args.trim);
+    ctx.notify_keyspace_event('t', "xadd", &a[1]);
     let db = ctx.db_index();
     ctx.engine.signal_ready(db, &a[1]);
     Ok(Value::bulk(fmt_id(id)))
@@ -403,6 +404,10 @@ fn xdel(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             }
         }
     }
+    if n > 0 {
+        ctx.notify_keyspace_event('t', "xdel", &a[1]);
+        ctx.drop_if_empty(&a[1]);
+    }
     Ok(Value::Integer(n))
 }
 
@@ -412,7 +417,12 @@ fn xtrim(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         return Err(syntax());
     }
     let Some(s) = ctx.get_stream(&a[1])? else { return Ok(Value::Integer(0)) };
-    Ok(Value::Integer(trim(s, args.trim) as i64))
+    let n = trim(s, args.trim);
+    if n > 0 {
+        ctx.notify_keyspace_event('t', "xtrim", &a[1]);
+        ctx.drop_if_empty(&a[1]);
+    }
+    Ok(Value::Integer(n as i64))
 }
 
 fn xsetid(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -468,6 +478,7 @@ fn xsetid(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if let Some(n) = entries_added {
         s.entries_added = n as u64;
     }
+    ctx.notify_keyspace_event('t', "xsetid", &a[1]);
     Ok(Value::ok())
 }
 
@@ -946,6 +957,7 @@ fn xgroup(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                     ..Group::default()
                 },
             );
+            ctx.notify_keyspace_event('t', "xgroup-create", &key);
             Ok(Value::ok())
         }
         b"setid" => {
@@ -957,17 +969,25 @@ fn xgroup(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             let g = group_of(ctx, &key, &name)?;
             g.last_id = id;
             g.entries_read = entries_read.filter(|n| *n != -1);
+            ctx.notify_keyspace_event('t', "xgroup-setid", &key);
             Ok(Value::ok())
         }
         b"destroy" => {
             let s = ctx.get_stream(&key)?.expect("checked");
-            Ok(Value::Integer(s.groups.remove(&name).is_some() as i64))
+            let removed = s.groups.remove(&name).is_some();
+            if removed {
+                ctx.notify_keyspace_event('t', "xgroup-destroy", &key);
+            }
+            Ok(Value::Integer(removed as i64))
         }
         b"createconsumer" => {
             let consumer = a[4].clone();
             let g = group_of(ctx, &key, &name)?;
             let created = !g.consumers.contains_key(&consumer);
             g.consumer(&consumer, now);
+            if created {
+                ctx.notify_keyspace_event('t', "xgroup-createconsumer", &key);
+            }
             Ok(Value::Integer(created as i64))
         }
         b"delconsumer" => {
@@ -976,6 +996,7 @@ fn xgroup(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             for id in &consumer.pending {
                 g.pending.remove(id);
             }
+            ctx.notify_keyspace_event('t', "xgroup-delconsumer", &key);
             Ok(Value::Integer(consumer.pending.len() as i64))
         }
         _ => Err(syntax()),
@@ -1190,6 +1211,9 @@ fn xclaim(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
         out.push(if justid { Value::bulk(fmt_id(id)) } else { entry_reply(id, &entries[&id]) });
     }
+    if !out.is_empty() {
+        ctx.notify_keyspace_event('t', "xclaim", &a[1]);
+    }
     Ok(Value::Array(out))
 }
 
@@ -1261,6 +1285,9 @@ fn xautoclaim(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
         claimed.push(if justid { Value::bulk(fmt_id(id)) } else { entry_reply(id, &entries[&id]) });
         left -= 1;
+    }
+    if !claimed.is_empty() {
+        ctx.notify_keyspace_event('t', "xautoclaim", &a[1]);
     }
     Ok(Value::Array(vec![
         Value::bulk(fmt_id(cursor)),

@@ -101,6 +101,7 @@ impl Db {
     pub fn get(&mut self, key: &[u8], now: u64) -> Option<&mut Entry> {
         if self.map.get(key).is_some_and(|e| e.is_expired(now)) {
             self.map.remove(key);
+            // NOTE: Expired event usually sent by purge or on access, handled separately for simplicity here?
         }
         self.map.get_mut(key)
     }
@@ -347,6 +348,14 @@ impl Ctx<'_> {
 
     pub fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry> {
         let now = self.now;
+        let expired = self.db().map.get(key).is_some_and(|e| e.is_expired(now));
+        if expired {
+            self.notify_keyspace_event('g', "expired", key);
+        }
+        let expired = self.db().map.get(key).is_some_and(|e| e.is_expired(now));
+        if expired {
+            self.notify_keyspace_event('g', "expired", key);
+        }
         self.db().get(key, now)
     }
 
@@ -394,7 +403,7 @@ impl Ctx<'_> {
     }
 
     /// Deletes `key` if its collection became empty, as Redis does.
-    pub fn drop_if_empty(&mut self, key: &[u8]) {
+    pub fn drop_if_empty(&mut self, key: &[u8]) -> bool {
         let empty = match self.lookup(key) {
             Some(Entry { data: Data::Hash(h), .. }) => h.map.is_empty(),
             Some(Entry { data: Data::List(l), .. }) => l.is_empty(),
@@ -405,7 +414,9 @@ impl Ctx<'_> {
         if empty {
             let now = self.now;
             self.db().remove(key, now);
+            self.notify_keyspace_event('g', "del", key);
         }
+        empty
     }
 
     /// The client's RESP version (some replies differ between 2 and 3).
@@ -468,8 +479,17 @@ impl Engine {
 
     pub fn purge_expired(&mut self) {
         let now = self.now();
-        for db in &mut self.dbs {
-            db.purge_expired(now);
+        for i in 0..self.dbs.len() {
+            let mut expired = Vec::new();
+            for (k, e) in self.dbs[i].map.iter() {
+                if e.is_expired(now) {
+                    expired.push(k.clone());
+                }
+            }
+            self.dbs[i].purge_expired(now);
+            for k in expired {
+                self.notify_keyspace_event_engine(i, 'g', "expired", &k);
+            }
         }
     }
 
@@ -737,6 +757,42 @@ pub fn invalid_expire(cmd: &str) -> Value {
     Value::err(format!("ERR invalid expire time in '{cmd}' command"))
 }
 
+impl Engine {
+    pub fn notify_keyspace_event_engine(
+        &mut self,
+        db: usize,
+        event_type: char,
+        event: &str,
+        key: &[u8],
+    ) {
+        let flags = self.config.get("notify-keyspace-events").unwrap_or_default();
+
+        if flags.is_empty() {
+            return;
+        }
+
+        let enabled = flags.contains('A')
+            || flags.contains(event_type)
+            || (event == "expired" && flags.contains('x'))
+            || (event == "evicted" && flags.contains('e'));
+
+        if !enabled {
+            return;
+        }
+
+        if flags.contains('K') {
+            let mut channel = Vec::new();
+            channel.extend_from_slice(format!("__keyspace@{}__:", db).as_bytes());
+            channel.extend_from_slice(key);
+            self.publish(&channel, event.as_bytes(), false);
+        }
+        if flags.contains('E') {
+            let channel = format!("__keyevent@{}__:{}", db, event);
+            self.publish(channel.as_bytes(), key, false);
+        }
+    }
+}
+
 pub fn db_out_of_range() -> Value {
     Value::err("ERR DB index is out of range")
 }
@@ -811,4 +867,11 @@ pub fn timeout_ms_arg(b: &[u8], now: u64) -> Result<u64, Value> {
 
 pub fn eq_ic(a: &[u8], b: &str) -> bool {
     a.eq_ignore_ascii_case(b.as_bytes())
+}
+
+impl<'a> Ctx<'a> {
+    pub fn notify_keyspace_event(&mut self, event_type: char, event: &str, key: &[u8]) {
+        let db = self.db_index();
+        self.engine.notify_keyspace_event_engine(db, event_type, event, key);
+    }
 }
