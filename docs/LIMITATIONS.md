@@ -411,6 +411,12 @@ MySQL 8.0 server (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`).
   unsupported query currently gets a silent `OK` response instead of a
   real error, which a client can't distinguish from "0 rows, no error."
 
+## Memcached
+
+The text protocol is implemented and verified against real un-modified applications. Verified against Django (`6.x`) using its built-in `django.core.cache.backends.memcached.PyMemcacheCache` and `pymemcache` (`4.x`), successfully exercising real code paths for `set`, `get`, `delete`, `incr`, `decr`, `add`, `set_many`, `get_many`, `touch` and `clear`.
+
+The modern binary/meta protocol is not implemented. Given that most major client libraries (including `pymemcache` in Django) still use or default to the text protocol, staying text-protocol-only is sufficient for the common "cache backend" use-case.
+
 ## RabbitMQ
 
 AMQP 0-9-1 core over the native binary protocol: exchange/queue declare,
