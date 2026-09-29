@@ -17,7 +17,7 @@ but not identical to the real server.
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
 | MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
-| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
+| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
 | Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
@@ -242,9 +242,13 @@ of `docs/specs/clickhouse.md`:
   or `INSERT INTO ... [(cols)] FORMAT RowBinary[WithNames[AndTypes]]` with
   the rows as `<fmt>`-encoded request-body data, `DROP TABLE [IF EXISTS]`,
   `OPTIMIZE TABLE [db.]t [FINAL]`. Column types: `UInt8/16/32/64`,
-  `Int8/16/32/64`, `Float32/64`, `String`, `Bool`. A type given with
-  arguments (`Nullable(String)`, `Decimal(10,2)`) parses but is rejected as
-  `NOT_IMPLEMENTED` — never silently accepted as something else.
+  `Int8/16/32/64`, `Float32/64`, `String`, `Bool`, and `Nullable(...)` of
+  any of these (a `NULL` literal, `isNull`/`isNotNull`/`ifNull`/`coalesce`
+  all work for real against `Nullable` columns; `RowBinary`, `TSV`
+  (`\N`), and `JSON`/`JSONEachRow` (`null`) all round-trip `NULL`
+  correctly). Any other type given with arguments (`Decimal(10,2)`,
+  `Array(String)`) parses but is rejected as `NOT_IMPLEMENTED` — never
+  silently accepted as something else.
 - `SELECT ... [FINAL]` with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY` (only
   by a selected column or alias), `LIMIT`, on `system.one`, `numbers(N)`,
   `system.tables`, `system.columns` and real tables. Expressions: arithmetic
@@ -305,7 +309,9 @@ of `docs/specs/clickhouse.md`:
   checked), `toFloat32/64`, `length`, `upper`, `lower`, `concat`,
   `substring`, `trim`, `replaceAll`, `abs`, `round`, `floor`, `ceil`,
   `greatest`, `least`, `if`, `ifNull`, `coalesce`, `isNull`/`isNotNull`
-  (always false/true — no `Nullable` type yet, so nothing is ever null).
+  (real: check a value against `Val::Null`, working correctly for
+  `Nullable` columns; `ifNull`/`coalesce` return the first non-null
+  argument, matching real ClickHouse).
 - Aggregates: `count`/`count(*)`, `sum`, `avg`, `min`, `max`, `any`,
   `uniqExact`.
 - Output formats: `TabSeparated` (+`WithNames`, +`WithNamesAndTypes`), `CSV`
@@ -365,9 +371,14 @@ of `docs/specs/clickhouse.md`:
 **Not yet (milestones 4–5, tracked in the spec)**
 - Joins, window functions, subqueries, views (the non-materialized kind),
   the wider function/type library (`Date`/`DateTime`, `Decimal`, `UUID`,
-  `Array`, `Tuple`, `Map`, `Nullable`), `WITH`/CTEs, parameterized queries,
-  sessions (so `USE`/`SET` are accepted but don't change behavior),
-  response compression.
+  `Array`, `Tuple`, `Map` — `Nullable` is done, see above), `WITH`/CTEs,
+  parameterized queries, sessions (so `USE`/`SET` are accepted but don't
+  change behavior), response compression.
+- `system.columns`' byte-count/precision/scale columns are still always 0
+  for every column, `Nullable` included — real ClickHouse reports `NULL`
+  there for non-numeric columns, which needs those columns to themselves
+  be `Nullable` in `system.columns`' own (fixed, non-`Nullable`) schema;
+  not done yet.
 - `Native` format and the native TCP protocol (port 9000) — needed by
   clickhouse-go and clickhouse-driver (Python), and by the official Rust
   client's `fetch_native`.

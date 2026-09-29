@@ -236,10 +236,10 @@ fn do_insert(catalog: &mut Catalog, i: Insert, body: &[u8]) -> Result<QueryResul
                 if values.len() != col_idxs.len() {
                     return Err(ChError::syntax("INSERT: wrong number of values in a row"));
                 }
-                let mut row: Vec<Val> = schema.iter().map(|(_, t)| types::zero_value(*t)).collect();
+                let mut row: Vec<Val> = schema.iter().map(|(_, t)| types::zero_value(t)).collect();
                 for (pos, expr) in values.iter().enumerate() {
                     let (_, v) = eval_row_expr(expr, &[], &[])?;
-                    row[col_idxs[pos]] = types::coerce(&v, schema[col_idxs[pos]].1)?;
+                    row[col_idxs[pos]] = types::coerce(&v, &schema[col_idxs[pos]].1)?;
                 }
                 rows.push(row);
             }
@@ -261,9 +261,9 @@ fn do_insert(catalog: &mut Catalog, i: Insert, body: &[u8]) -> Result<QueryResul
                 .into_iter()
                 .map(|values| {
                     let mut row: Vec<Val> =
-                        schema.iter().map(|(_, t)| types::zero_value(*t)).collect();
+                        schema.iter().map(|(_, t)| types::zero_value(t)).collect();
                     for (pos, v) in values.into_iter().enumerate() {
-                        row[col_idxs[pos]] = types::coerce(&v, schema[col_idxs[pos]].1)?;
+                        row[col_idxs[pos]] = types::coerce(&v, &schema[col_idxs[pos]].1)?;
                     }
                     Ok(row)
                 })
@@ -287,8 +287,8 @@ fn do_insert(catalog: &mut Catalog, i: Insert, body: &[u8]) -> Result<QueryResul
         for row in transformed.rows {
             let mut coerced = Vec::with_capacity(target_schema.len());
             for (idx, (_, ty)) in target_schema.iter().enumerate() {
-                let v = row.get(idx).cloned().unwrap_or_else(|| types::zero_value(*ty));
-                coerced.push(types::coerce(&v, *ty)?);
+                let v = row.get(idx).cloned().unwrap_or_else(|| types::zero_value(ty));
+                coerced.push(types::coerce(&v, ty)?);
             }
             out_rows.push(coerced);
         }
@@ -362,7 +362,7 @@ fn do_describe_table(catalog: &Catalog, d: DescribeTable) -> Result<QueryResult,
     let t = catalog
         .get(&database, &d.table)
         .ok_or_else(|| ChError::unknown_table(&database, &d.table))?;
-    let rows = t.columns.iter().map(|(name, ty)| describe_row(name, *ty)).collect();
+    let rows = t.columns.iter().map(|(name, ty)| describe_row(name, ty.clone())).collect();
     Ok(QueryResult { columns: describe_columns(), rows })
 }
 
@@ -782,7 +782,7 @@ fn run_projection(
     }
     // A probe row (columns' zero values) types the output even when `rows`
     // is empty.
-    let probe: Vec<Val> = columns.iter().map(|(_, t)| types::zero_value(*t)).collect();
+    let probe: Vec<Val> = columns.iter().map(|(_, t)| types::zero_value(t)).collect();
     let mut out_columns = Vec::with_capacity(s.items.len());
     for item in &s.items {
         if item.expr == Expr::Star {
@@ -872,7 +872,7 @@ fn run_aggregate(
     // zero output rows) — but the header still needs types, worked out
     // against a probe row instead of any real group.
     if out_columns.is_empty() {
-        let probe: Vec<Val> = columns.iter().map(|(_, t)| types::zero_value(*t)).collect();
+        let probe: Vec<Val> = columns.iter().map(|(_, t)| types::zero_value(t)).collect();
         let mut probe_key = Vec::with_capacity(s.group_by.len());
         for ge in &s.group_by {
             probe_key.push(eval_row_expr(ge, &probe, columns)?.1);
@@ -912,7 +912,7 @@ fn eval_group_item(
     match member_idxs.first() {
         Some(&ri) => eval_row_expr(e, &rows[ri], columns),
         None => {
-            let probe: Vec<Val> = columns.iter().map(|(_, t)| types::zero_value(*t)).collect();
+            let probe: Vec<Val> = columns.iter().map(|(_, t)| types::zero_value(t)).collect();
             eval_row_expr(e, &probe, columns)
         }
     }
@@ -985,6 +985,7 @@ fn val_text(v: &Val) -> String {
         Val::Float(f) => f.to_string(),
         Val::Str(s) => s.clone(),
         Val::Bool(b) => b.to_string(),
+        Val::Null => "null".to_string(),
     }
 }
 
@@ -1009,12 +1010,17 @@ fn eval_row_expr(
         Expr::Float(f) => Ok((Type::Float64, Val::Float(*f))),
         Expr::Str(s) => Ok((Type::String, Val::Str(s.clone()))),
         Expr::Bool(b) => Ok((Type::Bool, Val::Bool(*b))),
+        // Real ClickHouse reports a bare NULL literal's type as
+        // Nullable(Nothing); there's no Nothing type here, so this is an
+        // arbitrary but harmless stand-in — INSERT/coerce() already checks
+        // for Val::Null before ever consulting the source type.
+        Expr::Null => Ok((Type::Nullable(Box::new(Type::String)), Val::Null)),
         Expr::Ident(name) => {
             let idx = columns
                 .iter()
                 .position(|(n, _)| n == name)
                 .ok_or_else(|| ChError::unknown_identifier(name))?;
-            Ok((columns[idx].1, row[idx].clone()))
+            Ok((columns[idx].1.clone(), row[idx].clone()))
         }
         Expr::Star => Err(ChError::syntax("* is only valid as the sole select item")),
         Expr::Neg(inner) => {
@@ -1023,7 +1029,7 @@ fn eval_row_expr(
                 Val::Int(n) => Ok((Type::Int64, Val::Int(-n))),
                 Val::UInt(n) => Ok((Type::Int64, Val::Int(-(n as i64)))),
                 Val::Float(f) => Ok((Type::Float64, Val::Float(-f))),
-                _ => Err(ChError::type_mismatch(ty.name())),
+                _ => Err(ChError::type_mismatch(&ty.name())),
             }
         }
         Expr::Not(inner) => {
@@ -1049,7 +1055,7 @@ fn eval_binop(
         BinOp::Or => Ok((Type::Bool, Val::Bool(lv.is_truthy() || rv.is_truthy()))),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             let ord =
-                compare(&lv, &rv).ok_or_else(|| ChError::no_common_type(lt.name(), rt.name()))?;
+                compare(&lv, &rv).ok_or_else(|| ChError::no_common_type(&lt.name(), &rt.name()))?;
             use std::cmp::Ordering::*;
             let b = match op {
                 BinOp::Eq => ord == Equal,
@@ -1063,14 +1069,14 @@ fn eval_binop(
             Ok((Type::Bool, Val::Bool(b)))
         }
         BinOp::Div => {
-            let a = lv.as_f64().ok_or_else(|| ChError::type_mismatch(lt.name()))?;
-            let b = rv.as_f64().ok_or_else(|| ChError::type_mismatch(rt.name()))?;
+            let a = lv.as_f64().ok_or_else(|| ChError::type_mismatch(&lt.name()))?;
+            let b = rv.as_f64().ok_or_else(|| ChError::type_mismatch(&rt.name()))?;
             Ok((Type::Float64, Val::Float(a / b)))
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
             if lv.as_i128().is_none() || rv.as_i128().is_none() {
-                let a = lv.as_f64().ok_or_else(|| ChError::type_mismatch(lt.name()))?;
-                let b = rv.as_f64().ok_or_else(|| ChError::type_mismatch(rt.name()))?;
+                let a = lv.as_f64().ok_or_else(|| ChError::type_mismatch(&lt.name()))?;
+                let b = rv.as_f64().ok_or_else(|| ChError::type_mismatch(&rt.name()))?;
                 let f = match op {
                     BinOp::Add => a + b,
                     BinOp::Sub => a - b,
@@ -1152,9 +1158,9 @@ fn eval_call(
             Ok((Type::String, Val::Str(s.replace(from.as_str(), to))))
         }
         ("abs", [(ty, v)]) => match v {
-            Val::Int(n) => Ok((*ty, Val::Int(n.abs()))),
-            Val::UInt(n) => Ok((*ty, Val::UInt(*n))),
-            Val::Float(f) => Ok((*ty, Val::Float(f.abs()))),
+            Val::Int(n) => Ok((ty.clone(), Val::Int(n.abs()))),
+            Val::UInt(n) => Ok((ty.clone(), Val::UInt(*n))),
+            Val::Float(f) => Ok((ty.clone(), Val::Float(f.abs()))),
             _ => Err(ChError::type_mismatch("abs")),
         },
         ("round", [(_, v)]) => Ok((
@@ -1180,15 +1186,18 @@ fn eval_call(
             Ok((Type::Float64, Val::Float(vals.into_iter().fold(f64::MAX, f64::min))))
         }
         ("if", [(_, cond), (t1, v1), (_, v2)]) => {
-            Ok((*t1, if cond.is_truthy() { v1.clone() } else { v2.clone() }))
+            Ok((t1.clone(), if cond.is_truthy() { v1.clone() } else { v2.clone() }))
         }
-        // No NULLs modeled yet (Nullable isn't a supported column type), so
-        // the "or-null" behaviour these normally guard against never
-        // triggers: the first argument always wins.
-        ("ifnull", [(t, v), _]) => Ok((*t, v.clone())),
-        ("coalesce", args) if !args.is_empty() => Ok((args[0].0, args[0].1.clone())),
-        ("isnull", _) => Ok((Type::Bool, Val::Bool(false))),
-        ("isnotnull", _) => Ok((Type::Bool, Val::Bool(true))),
+        ("ifnull", [(t, v), (_, fallback)]) => {
+            Ok((t.clone(), if *v == Val::Null { fallback.clone() } else { v.clone() }))
+        }
+        ("coalesce", args) if !args.is_empty() => args
+            .iter()
+            .find(|(_, v)| *v != Val::Null)
+            .map(|(t, v)| Ok((t.clone(), v.clone())))
+            .unwrap_or_else(|| Ok((args[0].0.clone(), Val::Null))),
+        ("isnull", [(_, v)]) => Ok((Type::Bool, Val::Bool(*v == Val::Null))),
+        ("isnotnull", [(_, v)]) => Ok((Type::Bool, Val::Bool(*v != Val::Null))),
         _ => Err(ChError::unknown_function(name)),
     }
 }
@@ -1197,8 +1206,9 @@ fn to_int(v: &Val, t: Type) -> Result<(Type, Val), ChError> {
     let n = v
         .as_i128()
         .or_else(|| v.as_f64().map(|f| f as i128))
-        .ok_or_else(|| ChError::type_mismatch(t.name()))?;
-    let coerced = types::coerce(&if n >= 0 { Val::UInt(n as u64) } else { Val::Int(n as i64) }, t)?;
+        .ok_or_else(|| ChError::type_mismatch(&t.name()))?;
+    let coerced =
+        types::coerce(&if n >= 0 { Val::UInt(n as u64) } else { Val::Int(n as i64) }, &t)?;
     Ok((t, coerced))
 }
 
@@ -1342,6 +1352,57 @@ mod tests {
     fn insert_into_missing_table_errors() {
         let err = engine().execute("INSERT INTO nope VALUES (1)", b"").unwrap_err();
         assert_eq!(err.code, 60);
+    }
+
+    #[test]
+    fn nullable_column_round_trip_and_null_functions() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32, name Nullable(String)) ENGINE = Memory");
+        run(&e, "INSERT INTO t (id, name) VALUES (1, 'a'), (2, NULL)");
+
+        let r = run(&e, "SELECT id, name FROM t ORDER BY id");
+        assert_eq!(
+            r.columns,
+            [
+                ("id".to_string(), Type::UInt32),
+                ("name".to_string(), Type::Nullable(Box::new(Type::String)))
+            ]
+        );
+        assert_eq!(r.rows, [[Val::UInt(1), Val::Str("a".to_string())], [Val::UInt(2), Val::Null],]);
+
+        let r = run(&e, "SELECT id, isNull(name), isNotNull(name) FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            [
+                [Val::UInt(1), Val::Bool(false), Val::Bool(true)],
+                [Val::UInt(2), Val::Bool(true), Val::Bool(false)],
+            ]
+        );
+
+        let r = run(&e, "SELECT id, ifNull(name, 'default') FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            [
+                [Val::UInt(1), Val::Str("a".to_string())],
+                [Val::UInt(2), Val::Str("default".to_string())]
+            ]
+        );
+
+        let r = run(&e, "SELECT id, coalesce(name, 'default') FROM t ORDER BY id");
+        assert_eq!(
+            r.rows,
+            [
+                [Val::UInt(1), Val::Str("a".to_string())],
+                [Val::UInt(2), Val::Str("default".to_string())]
+            ]
+        );
+    }
+
+    #[test]
+    fn non_nullable_column_rejects_null_insert() {
+        let e = engine();
+        run(&e, "CREATE TABLE t (id UInt32) ENGINE = Memory");
+        assert!(e.execute("INSERT INTO t (id) VALUES (NULL)", b"").is_err());
     }
 
     #[test]

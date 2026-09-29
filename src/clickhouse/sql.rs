@@ -51,6 +51,7 @@ pub enum Expr {
     Float(f64),
     Str(String),
     Bool(bool),
+    Null,
     Call(String, Vec<Expr>),
     Ident(String),
     Star,
@@ -67,6 +68,7 @@ impl Expr {
             Expr::Float(f) => f.to_string(),
             Expr::Str(s) => format!("'{s}'"),
             Expr::Bool(b) => b.to_string(),
+            Expr::Null => "NULL".to_string(),
             Expr::Call(name, args) => {
                 let args: Vec<String> = args.iter().map(Expr::default_name).collect();
                 format!("{name}({})", args.join(", "))
@@ -578,6 +580,7 @@ impl Parser<'_> {
             }
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("true") => Ok(Expr::Bool(true)),
             Some(Token::Ident(name)) if name.eq_ignore_ascii_case("false") => Ok(Expr::Bool(false)),
+            Some(Token::Ident(name)) if name.eq_ignore_ascii_case("null") => Ok(Expr::Null),
             Some(Token::Ident(name)) => {
                 if self.eat(&Token::LParen) {
                     let args = self.parse_arg_list()?;
@@ -675,12 +678,20 @@ impl Parser<'_> {
     }
 
     /// A column type name: an identifier, optionally with parenthesized
-    /// arguments (`Decimal(10, 2)`, `Nullable(String)`) which are parsed
-    /// (so the syntax is accepted) but discarded — those types aren't
-    /// supported yet, so resolving the bare name later reports
-    /// `NOT_IMPLEMENTED` rather than silently ignoring the wrapper.
+    /// arguments (`Decimal(10, 2)`, `Nullable(String)`). `Nullable(...)`'s
+    /// argument is itself a type name, so it's parsed recursively and the
+    /// full `Nullable(Inner)` string is kept (matching what `Type::parse`
+    /// expects) — everything else's arguments are parsed (so the syntax is
+    /// accepted) but discarded, since those types aren't supported yet and
+    /// resolving the bare name later reports `NOT_IMPLEMENTED` rather than
+    /// silently ignoring the wrapper.
     fn parse_type_name(&mut self) -> Result<String, SqlError> {
         let name = self.parse_ident()?;
+        if name.eq_ignore_ascii_case("Nullable") && self.eat(&Token::LParen) {
+            let inner = self.parse_type_name()?;
+            self.expect(&Token::RParen)?;
+            return Ok(format!("Nullable({inner})"));
+        }
         if self.eat(&Token::LParen) {
             let _ = self.parse_arg_list()?;
         }
@@ -1124,9 +1135,22 @@ mod tests {
 
     #[test]
     fn create_table_column_type_with_args_is_captured_but_discarded() {
+        // Decimal isn't a supported type yet — its args are parsed (so the
+        // syntax is accepted) but discarded, leaving just the bare name for
+        // `Type::parse` to reject as NOT_IMPLEMENTED.
+        let stmt = parse("CREATE TABLE t (id UInt32, n Decimal(10, 2)) ENGINE = Memory").unwrap();
+        let Statement::CreateTable(c) = stmt else { panic!("expected CREATE TABLE") };
+        assert_eq!(c.columns[1], ("n".to_string(), "Decimal".to_string()));
+    }
+
+    #[test]
+    fn create_table_nullable_column_type_is_preserved() {
+        // Unlike other parenthesized types, Nullable(Inner) is supported —
+        // its inner type name is kept so `Type::parse` can build a real
+        // `Type::Nullable`.
         let stmt = parse("CREATE TABLE t (id UInt32, n Nullable(String)) ENGINE = Memory").unwrap();
         let Statement::CreateTable(c) = stmt else { panic!("expected CREATE TABLE") };
-        assert_eq!(c.columns[1], ("n".to_string(), "Nullable".to_string()));
+        assert_eq!(c.columns[1], ("n".to_string(), "Nullable(String)".to_string()));
     }
 
     #[test]
