@@ -14,10 +14,9 @@ fn get_reference_server() -> Option<SocketAddr> {
         return addr.parse().ok();
     }
     // Try connecting to a locally running memcached on default port.
-    if let Ok(stream) = TcpStream::connect_timeout(
-        &"127.0.0.1:11211".parse().unwrap(),
-        Duration::from_millis(50),
-    ) {
+    if let Ok(stream) =
+        TcpStream::connect_timeout(&"127.0.0.1:11211".parse().unwrap(), Duration::from_millis(50))
+    {
         let _ = stream;
         return Some("127.0.0.1:11211".parse().unwrap());
     }
@@ -36,9 +35,12 @@ fn run_script(addr: SocketAddr, script: &[&str]) -> Vec<String> {
         let line = script[i];
 
         // If this is a storage command (set, add, replace, append, prepend, cas) we must write the chunk as well before reading response
-        let is_storage = line.starts_with("set ") || line.starts_with("add ") ||
-                         line.starts_with("replace ") || line.starts_with("append ") ||
-                         line.starts_with("prepend ") || line.starts_with("cas ");
+        let is_storage = line.starts_with("set ")
+            || line.starts_with("add ")
+            || line.starts_with("replace ")
+            || line.starts_with("append ")
+            || line.starts_with("prepend ")
+            || line.starts_with("cas ");
 
         if is_storage {
             i += 1;
@@ -57,19 +59,20 @@ fn run_script(addr: SocketAddr, script: &[&str]) -> Vec<String> {
                 Ok(n) => {
                     response.push_str(std::str::from_utf8(&buf[..n]).unwrap());
                     // Heuristic for complete responses for standard tests
-                    if response.ends_with("END\r\n") ||
-                       response.ends_with("STORED\r\n") ||
-                       response.ends_with("NOT_STORED\r\n") ||
-                       response.ends_with("EXISTS\r\n") ||
-                       response.ends_with("NOT_FOUND\r\n") ||
-                       response.ends_with("DELETED\r\n") ||
-                       response.ends_with("OK\r\n") ||
-                       response.ends_with("TOUCHED\r\n") ||
-                       response.ends_with("CLIENT_ERROR\r\n") ||
-                       response.ends_with("ERROR\r\n") ||
-                       (line.starts_with("incr ") && response.ends_with("\r\n")) ||
-                       (line.starts_with("decr ") && response.ends_with("\r\n")) ||
-                       (line.starts_with("version") && response.ends_with("\r\n")) {
+                    if response.ends_with("END\r\n")
+                        || response.ends_with("STORED\r\n")
+                        || response.ends_with("NOT_STORED\r\n")
+                        || response.ends_with("EXISTS\r\n")
+                        || response.ends_with("NOT_FOUND\r\n")
+                        || response.ends_with("DELETED\r\n")
+                        || response.ends_with("OK\r\n")
+                        || response.ends_with("TOUCHED\r\n")
+                        || response.ends_with("CLIENT_ERROR\r\n")
+                        || response.ends_with("ERROR\r\n")
+                        || (line.starts_with("incr ") && response.ends_with("\r\n"))
+                        || (line.starts_with("decr ") && response.ends_with("\r\n"))
+                        || (line.starts_with("version") && response.ends_with("\r\n"))
+                    {
                         break;
                     }
                     if line.starts_with("stats") && response.ends_with("END\r\n") {

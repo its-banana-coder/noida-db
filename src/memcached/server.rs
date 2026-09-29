@@ -20,13 +20,12 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let shared = Arc::new(Shared { engine: Mutex::new(engine) });
 
     let sweeper = Arc::clone(&shared);
-    thread::Builder::new()
-        .name("memcached-expire".into())
-        .stack_size(STACK_SIZE)
-        .spawn(move || loop {
+    thread::Builder::new().name("memcached-expire".into()).stack_size(STACK_SIZE).spawn(
+        move || loop {
             thread::sleep(Duration::from_secs(1));
             sweeper.engine.lock().unwrap().purge_expired();
-        })?;
+        },
+    )?;
 
     let accepter = Arc::clone(&shared);
     thread::Builder::new()
@@ -40,25 +39,27 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     for stream in listener.incoming().flatten() {
         let shared = Arc::clone(&shared);
-        let _ = thread::Builder::new()
-            .name("memcached-conn".into())
-            .stack_size(STACK_SIZE)
-            .spawn(move || {
+        let _ = thread::Builder::new().name("memcached-conn".into()).stack_size(STACK_SIZE).spawn(
+            move || {
                 let _ = handle(stream, shared);
-            });
+            },
+        );
     }
 }
 
-fn read_exact_chunk(reader: &mut BufReader<TcpStream>, bytes: usize) -> io::Result<Option<Vec<u8>>> {
+fn read_exact_chunk(
+    reader: &mut BufReader<TcpStream>,
+    bytes: usize,
+) -> io::Result<Option<Vec<u8>>> {
     let mut buf = vec![0; bytes];
-    if let Err(_) = reader.read_exact(&mut buf) {
+    if reader.read_exact(&mut buf).is_err() {
         return Ok(None);
     }
     let mut crlf = [0; 2];
-    if let Err(_) = reader.read_exact(&mut crlf) {
+    if reader.read_exact(&mut crlf).is_err() {
         return Ok(None);
     }
-    if crlf != [b'\r', b'\n'] {
+    if crlf != *b"\r\n" {
         // Read until \n to recover
         let mut trash = Vec::new();
         let _ = reader.read_until(b'\n', &mut trash);
@@ -105,11 +106,25 @@ fn handle(stream: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
                         if !reply.is_empty() {
                             write_out(&mut writer, false, &reply)?;
                         }
-                    },
+                        // Real memcached closes the connection after `quit`
+                        // rather than waiting for more input.
+                        if cmd == "quit" {
+                            return Ok(());
+                        }
+                    }
                     Err(e) => {
                         // Error string returned. Write it if not a hard IO error.
                         if e.kind() == io::ErrorKind::InvalidData {
-                            write_out(&mut writer, false, format!("CLIENT_ERROR {}\r\n", e.into_inner().unwrap()).as_bytes())?;
+                            // noreply suppresses error replies too, same as
+                            // successful ones, for the commands that accept it.
+                            if !noreply {
+                                write_out(
+                                    &mut writer,
+                                    false,
+                                    format!("CLIENT_ERROR {}\r\n", e.into_inner().unwrap())
+                                        .as_bytes(),
+                                )?;
+                            }
                         } else {
                             return Err(e);
                         }
@@ -126,7 +141,7 @@ fn dispatch_command(
     args: &[&str],
     noreply: bool,
     reader: &mut BufReader<TcpStream>,
-    shared: &Arc<Shared>
+    shared: &Arc<Shared>,
 ) -> io::Result<Vec<u8>> {
     match cmd {
         "set" | "add" | "replace" | "append" | "prepend" => {
@@ -137,9 +152,15 @@ fn dispatch_command(
             if key.len() > 250 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
             }
-            let flags: u32 = args[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
-            let exptime: u32 = args[2].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
-            let bytes: usize = args[3].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
+            let flags: u32 = args[1].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
+            let exptime: i64 = args[2].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
+            let bytes: usize = args[3].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
 
             if bytes > 1024 * 1024 {
                 // Read and discard to recover the stream, but we don't allocate a big buffer.
@@ -147,7 +168,7 @@ fn dispatch_command(
                 let mut buf = [0; 4096];
                 while left > 0 {
                     let to_read = left.min(buf.len());
-                    if let Err(_) = reader.read_exact(&mut buf[..to_read]) {
+                    if reader.read_exact(&mut buf[..to_read]).is_err() {
                         break;
                     }
                     left -= to_read;
@@ -178,7 +199,7 @@ fn dispatch_command(
                 Ok(msg) => Ok(msg),
                 Err(_) => Ok(b"NOT_STORED\r\n".to_vec()),
             }
-        },
+        }
         "cas" => {
             if args.len() < 5 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
@@ -187,17 +208,25 @@ fn dispatch_command(
             if key.len() > 250 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
             }
-            let flags: u32 = args[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
-            let exptime: u32 = args[2].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
-            let bytes: usize = args[3].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
-            let cas_unique: u64 = args[4].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
+            let flags: u32 = args[1].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
+            let exptime: i64 = args[2].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
+            let bytes: usize = args[3].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
+            let cas_unique: u64 = args[4].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
 
             if bytes > 1024 * 1024 {
                 let mut left = bytes + 2;
                 let mut buf = [0; 4096];
                 while left > 0 {
                     let to_read = left.min(buf.len());
-                    if let Err(_) = reader.read_exact(&mut buf[..to_read]) {
+                    if reader.read_exact(&mut buf[..to_read]).is_err() {
                         break;
                     }
                     left -= to_read;
@@ -222,18 +251,23 @@ fn dispatch_command(
                 Err(true) => Ok(b"EXISTS\r\n".to_vec()), // cas conflict
                 Err(false) => Ok(b"NOT_FOUND\r\n".to_vec()),
             }
-        },
+        }
         "get" | "gets" | "gat" | "gats" => {
             let wants_cas = cmd == "gets" || cmd == "gats";
             let wants_touch = cmd == "gat" || cmd == "gats";
 
             let mut keys_start = 0;
-            let mut exptime = 0;
+            let mut exptime: i64 = 0;
             if wants_touch {
                 if args.is_empty() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad command line format",
+                    ));
                 }
-                exptime = args[0].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
+                exptime = args[0].parse().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+                })?;
                 keys_start = 1;
             }
 
@@ -242,7 +276,10 @@ fn dispatch_command(
             for &key_str in &args[keys_start..] {
                 let key = key_str.as_bytes();
                 if key.len() > 250 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad command line format",
+                    ));
                 }
 
                 if wants_touch {
@@ -251,9 +288,21 @@ fn dispatch_command(
 
                 if let Some(item) = e.get(key) {
                     if wants_cas {
-                        reply.extend_from_slice(format!("VALUE {} {} {} {}\r\n", key_str, item.flags, item.data.len(), item.cas).as_bytes());
+                        reply.extend_from_slice(
+                            format!(
+                                "VALUE {} {} {} {}\r\n",
+                                key_str,
+                                item.flags,
+                                item.data.len(),
+                                item.cas
+                            )
+                            .as_bytes(),
+                        );
                     } else {
-                        reply.extend_from_slice(format!("VALUE {} {} {}\r\n", key_str, item.flags, item.data.len()).as_bytes());
+                        reply.extend_from_slice(
+                            format!("VALUE {} {} {}\r\n", key_str, item.flags, item.data.len())
+                                .as_bytes(),
+                        );
                     }
                     reply.extend_from_slice(&item.data);
                     reply.extend_from_slice(b"\r\n");
@@ -261,20 +310,24 @@ fn dispatch_command(
             }
             reply.extend_from_slice(b"END\r\n");
             Ok(reply)
-        },
+        }
         "delete" => {
             if args.is_empty() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format.  Usage: delete <key> [noreply]"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad command line format.  Usage: delete <key> [noreply]",
+                ));
             }
             let key = args[0].as_bytes();
             if key.len() > 250 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
             }
             // handle legacy delete <key> 0
-            if args.len() >= 2 && args[1] != "noreply" {
-                if args[1] != "0" {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format.  Usage: delete <key> [noreply]"));
-                }
+            if args.len() >= 2 && args[1] != "noreply" && args[1] != "0" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad command line format.  Usage: delete <key> [noreply]",
+                ));
             }
 
             let mut e = shared.engine.lock().unwrap();
@@ -286,7 +339,7 @@ fn dispatch_command(
                 Ok(_) => Ok(b"DELETED\r\n".to_vec()),
                 Err(_) => Ok(b"NOT_FOUND\r\n".to_vec()),
             }
-        },
+        }
         "incr" | "decr" => {
             if args.len() < 2 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
@@ -307,10 +360,12 @@ fn dispatch_command(
             }
             match res {
                 Ok(new_val) => Ok(format!("{}\r\n", new_val).into_bytes()),
-                Err(Ok(_)) => Ok(b"CLIENT_ERROR cannot increment or decrement non-numeric value\r\n".to_vec()),
+                Err(Ok(_)) => {
+                    Ok(b"CLIENT_ERROR cannot increment or decrement non-numeric value\r\n".to_vec())
+                }
                 Err(Err(_)) => Ok(b"NOT_FOUND\r\n".to_vec()),
             }
-        },
+        }
         "touch" => {
             if args.len() < 2 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
@@ -319,7 +374,9 @@ fn dispatch_command(
             if key.len() > 250 {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
             }
-            let exptime: u32 = args[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad command line format"))?;
+            let exptime: i64 = args[1].parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "bad command line format")
+            })?;
 
             let mut e = shared.engine.lock().unwrap();
             let res = e.touch(key, exptime);
@@ -330,14 +387,17 @@ fn dispatch_command(
                 Ok(_) => Ok(b"TOUCHED\r\n".to_vec()),
                 Err(_) => Ok(b"NOT_FOUND\r\n".to_vec()),
             }
-        },
+        }
         "flush_all" => {
-            let mut delay = 0;
-            if args.len() >= 1 && args[0] != "noreply" {
+            let mut delay: i64 = 0;
+            if !args.is_empty() && args[0] != "noreply" {
                 if let Ok(d) = args[0].parse() {
                     delay = d;
                 } else {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "bad command line format"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad command line format",
+                    ));
                 }
             }
 
@@ -347,20 +407,16 @@ fn dispatch_command(
                 return Ok(vec![]);
             }
             Ok(b"OK\r\n".to_vec())
-        },
-        "version" => {
-            Ok(b"VERSION 1.6.29\r\n".to_vec())
-        },
+        }
+        "version" => Ok(b"VERSION 1.6.29\r\n".to_vec()),
         "verbosity" => {
             if noreply {
                 Ok(vec![])
             } else {
                 Ok(b"OK\r\n".to_vec())
             }
-        },
-        "quit" => {
-            Ok(vec![])
-        },
+        }
+        "quit" => Ok(vec![]),
         "stats" => {
             // Very minimal stats response
             let reply = b"STAT pid 1\r\n\
@@ -384,14 +440,10 @@ STAT threads 4\r\n\
 STAT evictions 0\r\n\
 END\r\n";
             Ok(reply.to_vec())
-        },
+        }
         "cache_memlimit" => Ok(b"OK\r\n".to_vec()),
         "shutdown" => Ok(b"ERROR: shutdown not enabled\r\n".to_vec()),
-        "misbehave" | "lru_crawler" | "slabs" | "watch" => {
-            Ok(b"ERROR\r\n".to_vec())
-        },
-        _ => {
-            Ok(b"ERROR\r\n".to_vec())
-        }
+        "misbehave" | "lru_crawler" | "slabs" | "watch" => Ok(b"ERROR\r\n".to_vec()),
+        _ => Ok(b"ERROR\r\n".to_vec()),
     }
 }

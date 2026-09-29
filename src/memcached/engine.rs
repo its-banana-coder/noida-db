@@ -1,3 +1,8 @@
+// The engine's mutation methods use `Result<_, ()>` as a simple presence/
+// absence signal; the server layer maps it directly to protocol replies
+// (STORED/NOT_STORED/NOT_FOUND) and never needs a richer error type.
+#![allow(clippy::result_unit_err)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,18 +30,20 @@ pub struct Engine {
     pub clock: Clock,
 }
 
-impl Engine {
-    pub fn new(clock: Clock) -> Self {
-        Self { items: HashMap::new(), next_cas: 1, clock }
-    }
-
-    pub fn default() -> Self {
+impl Default for Engine {
+    fn default() -> Self {
         Self::new(Arc::new(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0)
         }))
+    }
+}
+
+impl Engine {
+    pub fn new(clock: Clock) -> Self {
+        Self { items: HashMap::new(), next_cas: 1, clock }
     }
 
     pub fn now_sec(&self) -> u64 {
@@ -49,9 +56,14 @@ impl Engine {
     }
 
     /// Helper to calculate absolute expiry time based on memcached rules.
-    pub fn compute_exptime(&self, exptime: u32) -> u64 {
+    /// A negative `exptime` means "expire immediately" (memcached treats it
+    /// as already expired, e.g. clients that pass a negative TTL to delete
+    /// on next access).
+    pub fn compute_exptime(&self, exptime: i64) -> u64 {
         if exptime == 0 {
             0
+        } else if exptime < 0 {
+            self.now_sec().max(1)
         } else if exptime <= 60 * 60 * 24 * 30 {
             // Relative time if <= 30 days
             self.now_sec() + exptime as u64
@@ -61,28 +73,31 @@ impl Engine {
         }
     }
 
-    pub fn set(&mut self, key: Vec<u8>, flags: u32, exptime: u32, data: Vec<u8>) -> Result<(), ()> {
+    pub fn set(&mut self, key: Vec<u8>, flags: u32, exptime: i64, data: Vec<u8>) -> Result<(), ()> {
         let abs_exptime = self.compute_exptime(exptime);
         let cas = self.next_cas;
         self.next_cas += 1;
-        self.items.insert(
-            key,
-            Item { data, flags, cas, exptime: abs_exptime },
-        );
+        self.items.insert(key, Item { data, flags, cas, exptime: abs_exptime });
         Ok(())
     }
 
-    pub fn add(&mut self, key: Vec<u8>, flags: u32, exptime: u32, data: Vec<u8>) -> Result<(), ()> {
+    pub fn add(&mut self, key: Vec<u8>, flags: u32, exptime: i64, data: Vec<u8>) -> Result<(), ()> {
         let now = self.now_sec();
-        if let Some(item) = self.items.get(&key) {
-            if !item.is_expired(now) {
-                return Err(());
-            }
+        if let Some(item) = self.items.get(&key)
+            && !item.is_expired(now)
+        {
+            return Err(());
         }
         self.set(key, flags, exptime, data)
     }
 
-    pub fn replace(&mut self, key: Vec<u8>, flags: u32, exptime: u32, data: Vec<u8>) -> Result<(), ()> {
+    pub fn replace(
+        &mut self,
+        key: Vec<u8>,
+        flags: u32,
+        exptime: i64,
+        data: Vec<u8>,
+    ) -> Result<(), ()> {
         let now = self.now_sec();
         let exists_and_valid = self.items.get(&key).is_some_and(|item| !item.is_expired(now));
         if !exists_and_valid {
@@ -137,7 +152,14 @@ impl Engine {
         }
     }
 
-    pub fn cas(&mut self, key: Vec<u8>, flags: u32, exptime: u32, data: Vec<u8>, cas_unique: u64) -> Result<(), bool> {
+    pub fn cas(
+        &mut self,
+        key: Vec<u8>,
+        flags: u32,
+        exptime: i64,
+        data: Vec<u8>,
+        cas_unique: u64,
+    ) -> Result<(), bool> {
         let now = self.now_sec();
         if let Some(item) = self.items.get(&key) {
             if item.is_expired(now) {
@@ -195,7 +217,7 @@ impl Engine {
         }
     }
 
-    pub fn touch(&mut self, key: &[u8], exptime: u32) -> Result<(), ()> {
+    pub fn touch(&mut self, key: &[u8], exptime: i64) -> Result<(), ()> {
         let now = self.now_sec();
         let new_exptime = self.compute_exptime(exptime);
         if let Some(item) = self.items.get_mut(key) {
@@ -209,12 +231,12 @@ impl Engine {
         }
     }
 
-    pub fn flush_all(&mut self, delay: u32) {
-        if delay == 0 {
+    pub fn flush_all(&mut self, delay: i64) {
+        if delay <= 0 {
             self.items.clear();
         } else {
             let expiration_time = self.now_sec() + delay as u64;
-            for (_, item) in self.items.iter_mut() {
+            for item in self.items.values_mut() {
                 if item.exptime == 0 || item.exptime > expiration_time {
                     item.exptime = expiration_time;
                 }
@@ -267,13 +289,22 @@ mod tests {
         // Ensure it's treated as absolute (memcached treats > 30 days as absolute)
         // 30 days is 2592000. So we need abs_time > 2592000.
         // current_sec is 1_000_000_000, so it works.
-        engine.set(b"key".to_vec(), 0, abs_time as u32, b"val".to_vec()).unwrap();
+        engine.set(b"key".to_vec(), 0, abs_time as i64, b"val".to_vec()).unwrap();
 
         assert!(engine.get(b"key").is_some());
 
         // Advance 6s
         time.fetch_add(6_000, Ordering::SeqCst);
 
+        assert!(engine.get(b"key").is_none());
+    }
+
+    #[test]
+    fn test_expiry_negative_is_immediate() {
+        let (mut engine, _) = make_test_engine();
+        // A negative exptime means "expire immediately" per the memcached
+        // protocol, not a parse error.
+        engine.set(b"key".to_vec(), 0, -1, b"val".to_vec()).unwrap();
         assert!(engine.get(b"key").is_none());
     }
 
