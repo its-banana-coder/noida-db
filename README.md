@@ -4,9 +4,7 @@ One tiny binary for local development that speaks the wire protocols of
 Postgres, MySQL, Redis, Kafka and Elasticsearch — so your existing
 drivers, ORMs and CLIs point at it unchanged, without running five-plus
 heavy servers (or a Docker Compose stack that idles at 2.5–4GB) just to
-develop locally. ClickHouse, MongoDB, RabbitMQ and Memcached are also
-included and fully functional, tested at a lighter depth than the five
-above — see [Status](#status).
+develop locally.
 
 ```
 cargo install --path .
@@ -46,7 +44,6 @@ database — not a synthetic client, a real app doing real work.
 | [Gitea](https://about.gitea.com/) (Postgres + Redis) | Full production schema (~115 tables) via the xorm ORM; creating a repository, `git clone`/`git push` over HTTP, issues and comments, and a full pull-request workflow (branch push → PR → merge) via the REST API | ✅ All of the above works end to end |
 | [Miniflux](https://miniflux.app/) (Postgres) | Full schema migration (134 migrations, including a `DECLARE`/`FETCH`/`CLOSE` cursor); adding a real RSS feed, fetching and parsing its entries, marking one read, and full-text search over entry titles/content (a `setweight`+`||`-combined index, queried with `websearch_to_tsquery`) | ✅ All of the above works end to end |
 | [Faust](https://faust.readthedocs.io/) (Kafka) | Python streaming app pipeline (built on `aiokafka`); dynamically creating topics, concurrent consumer group joins, partition assignments via `SyncGroup`, maintaining continuous `Heartbeat` sessions through consumer rebalances, and actively streaming and decoding incoming records. | ✅ All of the above works end to end |
-| Django (Memcached) | Django's built-in `PyMemcacheCache` cache backend (via `pymemcache`); `set`/`get`/`delete`/`incr`/`decr`/`add`/`set_many`/`get_many`/`touch`/`clear` through the framework's normal cache API, not raw protocol commands | ✅ All of the above works end to end |
 
 **RAM usage while running these workflows:** as low as 2MB idle after
 boot, peaking at 15MB during the heaviest activity (Gitea's schema-check
@@ -57,9 +54,8 @@ More applications are being added over time.
 
 ## Status
 
-**Core** — the five services this project is built around first, each
-tested against real client libraries, differential tests against a real
-server, and (for several) real unmodified applications:
+Each tested against real client libraries, differential tests against a
+real server, and (for several) real unmodified applications:
 
 | Service | State |
 |---|---|
@@ -68,17 +64,6 @@ server, and (for several) real unmodified applications:
 | **Redis** | most of the protocol implemented (217 of 242 Redis 7.2 commands) and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq); real keyspace notifications (`notify-keyspace-events`) across generic/stream/HyperLogLog/hash/list/set/zset/string events — see [`src/redis/README.md`](src/redis/README.md) |
 | **Kafka** | native binary protocol, topics, consumer groups, cluster configs, and real transactional isolation (`read_committed` fetches, producer fencing on stale epochs) |
 | **Elasticsearch** | HTTP layer, index/document CRUD, bulk, `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp search with real BM25 scoring, and bucket/metric aggregations — see `docs/LIMITATIONS.md` for what's not built yet (`query_string`, `search_after`, nested queries, highlighting) |
-
-**Also included** — functional and tested, but at a lighter depth than
-the five above (fewer real-client libraries exercised, no real-app
-validation yet):
-
-| Service | State |
-|---|---|
-| **RabbitMQ** | AMQP 0-9-1 core over the native protocol — exchange/queue declare, binding, publish/consume/get, QoS, publisher confirms, dead-lettering, message TTLs, and `basic.nack`/`basic.reject` with real requeue — tested against the real `lapin` client; fanout/topic exchange routing and transactions are still stubbed/missing |
-| **ClickHouse** | HTTP interface: `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` with real `FINAL`/`OPTIMIZE` merge semantics, materialized views, `Nullable(...)` columns, TSV/CSV/JSON/RowBinary/Pretty formats; tested against the official Rust client — see `docs/specs/clickhouse.md` |
-| **MongoDB** | OP_MSG wire protocol, CRUD, unique-index enforcement, the aggregation pipeline (`$match`/`$group`/`$sort`/`$project`/`$unwind` and friends) — tested against the official Rust driver and a real `mongod` differential test |
-| **Memcached** | text protocol (set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit), verified against Django's built-in `PyMemcacheCache` backend and `pymemcache` |
 
 Each service is its own Cargo feature (on by default once merged) and can
 be switched on or off at build time and at runtime (`--only`); a disabled
