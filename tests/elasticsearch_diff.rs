@@ -33,7 +33,8 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Reply {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     let status = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-    let mut length = 0usize;
+    let mut length: Option<usize> = None;
+    let mut chunked = false;
     let mut product = None;
     loop {
         line.clear();
@@ -43,15 +44,52 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Reply {
         }
         if let Some((name, value)) = line.split_once(':') {
             if name.eq_ignore_ascii_case("content-length") {
-                length = value.trim().parse().unwrap();
+                length = Some(value.trim().parse().unwrap());
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
             }
             if name.eq_ignore_ascii_case("x-elastic-product") {
                 product = Some(value.trim().to_owned());
             }
         }
     }
-    let mut bytes = vec![0; length];
-    reader.read_exact(&mut bytes).unwrap();
+    // Real Elasticsearch's HTTP layer sends chunked responses for at
+    // least some endpoints (observed on _search) — this client has to
+    // decode that framing itself rather than assume Content-Length is
+    // always present, or it silently reads zero bytes and treats a real,
+    // successful response as an empty body.
+    let bytes = if chunked {
+        let mut out = Vec::new();
+        loop {
+            let mut size_line = String::new();
+            reader.read_line(&mut size_line).unwrap();
+            let size = usize::from_str_radix(size_line.trim(), 16).unwrap();
+            if size == 0 {
+                // Trailing headers (if any), then the final CRLF.
+                loop {
+                    let mut trailer = String::new();
+                    reader.read_line(&mut trailer).unwrap();
+                    if trailer == "\r\n" {
+                        break;
+                    }
+                }
+                break;
+            }
+            let mut chunk = vec![0; size];
+            reader.read_exact(&mut chunk).unwrap();
+            out.extend_from_slice(&chunk);
+            let mut crlf = [0; 2];
+            reader.read_exact(&mut crlf).unwrap();
+        }
+        out
+    } else {
+        let mut buf = vec![0; length.unwrap_or(0)];
+        reader.read_exact(&mut buf).unwrap();
+        buf
+    };
     let body = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
     Reply { status, product, body }
 }
