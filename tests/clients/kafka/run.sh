@@ -144,6 +144,20 @@ else
   skip "transactional-producer" "no java"
 fi
 
+# 6. Python: faust_app (real application test)
+if command -v python3 >/dev/null; then
+  if [ ! -d "$work/faust_env" ]; then
+    python3 -m venv "$work/faust_env" >/dev/null 2>&1 && "$work/faust_env/bin/pip" install -q faust-streaming >/dev/null 2>&1
+  fi
+  if [ -x "$work/faust_env/bin/python" ]; then
+    run "faust-app" bash -c "cd '$here/faust_app' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT PATH=\"$PWD/$work/faust_env/bin:\$PATH\" ./run.sh >/dev/null 2>&1"
+  else
+    skip "faust-app" "could not install"
+  fi
+else
+  skip "faust-app" "no python3"
+fi
+
 echo
 printf '%s\n' "${summary[@]}"
 exit $status

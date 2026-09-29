@@ -859,13 +859,13 @@ impl EngineState {
             return res;
         }
 
-        if req.generation_id != group.generation_id {
-            res.error_code = 22; // ILLEGAL_GENERATION
+        if group.state == GroupLifecycleState::PreparingRebalance {
+            res.error_code = 27; // REBALANCE_IN_PROGRESS
             return res;
         }
 
-        if group.state == GroupLifecycleState::PreparingRebalance {
-            res.error_code = 27; // REBALANCE_IN_PROGRESS
+        if req.generation_id != group.generation_id {
+            res.error_code = 22; // ILLEGAL_GENERATION
             return res;
         }
 
@@ -877,6 +877,9 @@ impl EngineState {
                     assignment.assignment.to_vec(),
                 );
             }
+            group.state = GroupLifecycleState::Stable;
+            group.awaiting_members.clear();
+        } else if group.leader_id.as_ref() == Some(&m_id) && req.assignments.is_empty() {
             group.state = GroupLifecycleState::Stable;
             group.awaiting_members.clear();
         }
@@ -916,13 +919,13 @@ impl EngineState {
             return res;
         }
 
-        if req.generation_id != group.generation_id {
-            res.error_code = 22; // ILLEGAL_GENERATION
+        if group.state == GroupLifecycleState::PreparingRebalance {
+            res.error_code = 27; // REBALANCE_IN_PROGRESS
             return res;
         }
 
-        if group.state == GroupLifecycleState::PreparingRebalance {
-            res.error_code = 27; // REBALANCE_IN_PROGRESS
+        if req.generation_id != group.generation_id {
+            res.error_code = 22; // ILLEGAL_GENERATION
             return res;
         }
 
@@ -1882,7 +1885,76 @@ impl Engine {
         req: &kafka_protocol::messages::JoinGroupRequest,
         version: i16,
     ) -> kafka_protocol::messages::JoinGroupResponse {
-        self.state.lock().unwrap().handle_join_group(req, version)
+        let mut resp = self.state.lock().unwrap().handle_join_group(req, version);
+
+        if resp.error_code != 0 || req.member_id.is_empty() {
+            return resp;
+        }
+
+        let group_id = req.group_id.as_str().to_string();
+        loop {
+            let state = self.state.lock().unwrap();
+            let group = match state.groups.get(&group_id) {
+                Some(g) => g,
+                None => {
+                    resp.error_code = 25; // UNKNOWN_MEMBER_ID
+                    return resp;
+                }
+            };
+
+            if group.state == GroupLifecycleState::CompletingRebalance
+                || group.state == GroupLifecycleState::Stable
+                || group.state == GroupLifecycleState::Dead
+            {
+                let mut final_resp = kafka_protocol::messages::JoinGroupResponse::default();
+                final_resp.generation_id = group.generation_id;
+                final_resp.protocol_type = Some(kafka_protocol::protocol::StrBytes::from_string(
+                    group.protocol_type.clone(),
+                ));
+                final_resp.protocol_name = Some(kafka_protocol::protocol::StrBytes::from_string(
+                    group.protocol_name.clone().unwrap_or_default(),
+                ));
+                final_resp.leader = kafka_protocol::protocol::StrBytes::from_string(
+                    group.leader_id.clone().unwrap_or_default(),
+                );
+                final_resp.member_id = req.member_id.clone();
+                if final_resp.leader == req.member_id {
+                    let mut mems = Vec::new();
+                    for (m_id, protos) in &group.awaiting_members {
+                        let mut mem = kafka_protocol::messages::join_group_response::JoinGroupResponseMember::default();
+                        mem.member_id =
+                            kafka_protocol::protocol::StrBytes::from_string(m_id.clone());
+                        mem.group_instance_id = None;
+                        mem.metadata = protos
+                            .iter()
+                            .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
+                            .map(|(_, m)| bytes::Bytes::copy_from_slice(m))
+                            .unwrap_or_default();
+                        mems.push(mem);
+                    }
+                    final_resp.members = mems;
+                }
+                return final_resp;
+            }
+
+            let now = state.now_ms();
+            let max_timeout =
+                group.members.values().map(|m| m.rebalance_timeout_ms).max().unwrap_or(0);
+            if group.rebalance_start_ms > 0 && now - group.rebalance_start_ms >= max_timeout as i64
+            {
+                drop(state);
+                let mut st = self.state.lock().unwrap();
+                if let Some(g) = st.groups.get_mut(&group_id)
+                    && g.state == GroupLifecycleState::PreparingRebalance
+                {
+                    g.state = GroupLifecycleState::CompletingRebalance;
+                }
+                continue;
+            }
+
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     pub fn handle_sync_group(
@@ -1890,7 +1962,34 @@ impl Engine {
         req: &kafka_protocol::messages::SyncGroupRequest,
         version: i16,
     ) -> kafka_protocol::messages::SyncGroupResponse {
-        self.state.lock().unwrap().handle_sync_group(req, version)
+        let mut resp = self.state.lock().unwrap().handle_sync_group(req, version);
+
+        let group_id = req.group_id.as_str().to_string();
+        loop {
+            let state = self.state.lock().unwrap();
+            let group = match state.groups.get(&group_id) {
+                Some(g) => g,
+                None => {
+                    resp.error_code = 25; // UNKNOWN_MEMBER_ID
+                    return resp;
+                }
+            };
+
+            if group.state == GroupLifecycleState::PreparingRebalance {
+                return resp; // Return the 27 REBALANCE_IN_PROGRESS
+            }
+
+            if group.state == GroupLifecycleState::Stable
+                || group.state == GroupLifecycleState::Dead
+                || group.state == GroupLifecycleState::CompletingRebalance
+            {
+                drop(state);
+                return self.state.lock().unwrap().handle_sync_group(req, version);
+            }
+
+            drop(state);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     pub fn handle_heartbeat(
