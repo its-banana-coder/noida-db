@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | handshake, literal-expression `SELECT` (arithmetic/comparisons/session vars), no real tables yet (see below) | partially — literal queries only |
+| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
@@ -389,27 +389,39 @@ Verified against the official MongoDB Rust driver and a differential test agains
 ## MySQL
 
 Handshake (`mysql_native_password`, any password accepted — no real
-credential check yet), `COM_INIT_DB`, and `COM_QUERY` for literal-only
-`SELECT` expressions: numeric/string/NULL literals, `+ - * /` (integer
-division formats as a 4-decimal-place string, matching MySQL's
-`div_precision_increment` default rather than a bare float), comparisons
-(`= <> < <= > >=`, three-valued NULL logic), `AND`/`OR`, `SHOW DATABASES`,
+credential check yet), `COM_INIT_DB`, and `COM_QUERY` for both
+literal-only `SELECT` expressions (numeric/string/NULL literals,
+`+ - * /`, integer division formats as a 4-decimal-place string matching
+MySQL's `div_precision_increment` default rather than a bare float,
+comparisons `= <> < <= > >=` with three-valued NULL logic, `AND`/`OR`)
+and real tables: `CREATE TABLE` (`INT`/`BIGINT`/`VARCHAR`/`TEXT`/
+`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
+`NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`), `INSERT INTO ...
+VALUES (...), ...`, `SELECT` with `WHERE` and basic `INNER`/`LEFT`/cross
+`JOIN`, `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`,
+`SHOW DATABASES`/`SHOW TABLES`/`SHOW COLUMNS FROM`/`SHOW CREATE TABLE`,
 `USE`, and `@@`-prefixed session variables the connection setup of real
 client libraries (e.g. mysql_async) needs (`version`, `version_comment`,
 `max_allowed_packet`, `wait_timeout`, `socket`, `lower_case_table_names`).
-Verified against `mysql_async` and a differential test against a real
-MySQL 8.0 server (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`).
+A real unsupported statement now gets a real MySQL `ERR` packet
+(previously a silent `OK`, indistinguishable from "0 rows, no error").
+Basic prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`) work for
+parameterless statements; parameter binding from the client isn't wired
+up yet (`EXECUTE` always runs the plan as originally prepared, ignoring
+any bound values). Verified against `mysql_async` and a differential
+test against a real MySQL 8.0 server (`tests/mysql_diff.rs`,
+`NOIDA_MYSQL_REF=host:port`).
 
 **Not yet**
-- Tables: `CREATE TABLE`, `INSERT`/`SELECT`/`UPDATE`/`DELETE` against real
-  data (`Plan::Scan`/`Plan::Join`/`Plan::Filter` are defined but nothing
-  populates or reads a real table yet — every query today only projects
-  literal expressions).
-- Prepared statements, transactions, `SHOW TABLES` (always empty),
-  authentication (every password is currently accepted).
-- Query errors are not reported as MySQL `ERR` packets yet — an
-  unsupported query currently gets a silent `OK` response instead of a
-  real error, which a client can't distinguish from "0 rows, no error."
+- Prepared-statement parameter binding (`?` placeholders are parsed but
+  not substituted at `EXECUTE` time — every execution reuses the literal
+  values, if any, from the original `PREPARE` text).
+- `GROUP BY` and aggregate functions (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`).
+- Transactions, authentication (every password is currently accepted).
+- `OK` packets never report a real `affected_rows` count for
+  `INSERT`/`UPDATE`/`DELETE` — always 0, even when rows were actually
+  affected. A client can't rely on "did my UPDATE match anything?"
+  through the wire protocol yet.
 
 ## Memcached
 

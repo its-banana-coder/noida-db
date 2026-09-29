@@ -37,10 +37,24 @@ async fn assert_same_result(noida_pool: &Pool, ref_pool: &Pool, query: &str) {
     let mut noida_conn = noida_pool.get_conn().await.unwrap();
     let mut ref_conn = ref_pool.get_conn().await.unwrap();
 
-    let noida_rows: Vec<Option<String>> = noida_conn.query(query).await.unwrap();
-    let ref_rows: Vec<Option<String>> = ref_conn.query(query).await.unwrap();
+    let noida_rows: Result<Vec<Option<String>>, _> = noida_conn.query(query).await;
+    let ref_rows: Result<Vec<Option<String>>, _> = ref_conn.query(query).await;
 
-    assert_eq!(noida_rows, ref_rows, "mismatch for query: {query}");
+    match (noida_rows, ref_rows) {
+        (Ok(n), Ok(r)) => assert_eq!(n, r, "mismatch for query: {query}"),
+        (Err(n), Err(r)) => {
+            // Compare error codes if possible
+            if let (mysql_async::Error::Server(ne), mysql_async::Error::Server(re)) = (&n, &r) {
+                assert_eq!(ne.code, re.code, "error code mismatch for query: {query}");
+            }
+        }
+        (n, r) => panic!("mismatch for query: {query}. noida: {n:?}, ref: {r:?}"),
+    }
+}
+
+async fn execute_query(pool: &Pool, query: &str) {
+    let mut conn = pool.get_conn().await.unwrap();
+    let _: Vec<mysql_async::Row> = conn.query(query).await.unwrap_or_default();
 }
 
 #[tokio::test]
@@ -55,6 +69,16 @@ async fn test_mysql_diff() {
     let noida_addr = start_noida_mysql();
     let noida_pool = Pool::new(format!("mysql://root@{noida_addr}/test").as_str());
 
+    // Setup for diff tests
+    execute_query(&noida_pool, "CREATE TABLE diff_test (id INT PRIMARY KEY, name VARCHAR(50))")
+        .await;
+    execute_query(
+        &ref_pool,
+        "CREATE TABLE IF NOT EXISTS diff_test (id INT PRIMARY KEY, name VARCHAR(50))",
+    )
+    .await;
+    execute_query(&ref_pool, "TRUNCATE TABLE diff_test").await;
+
     let mut compared = 0;
     for query in [
         "SELECT 1",
@@ -67,6 +91,12 @@ async fn test_mysql_diff() {
         "SELECT NULL",
         "SELECT 1 = 1",
         "SELECT 1 = 2",
+        "INSERT INTO diff_test VALUES (1, 'Alice'), (2, 'Bob')",
+        "SELECT id, name FROM diff_test",
+        "UPDATE diff_test SET name = 'Charlie' WHERE id = 1",
+        "SELECT id, name FROM diff_test",
+        "DELETE FROM diff_test WHERE id = 2",
+        "SELECT id, name FROM diff_test",
     ] {
         assert_same_result(&noida_pool, &ref_pool, query).await;
         compared += 1;
