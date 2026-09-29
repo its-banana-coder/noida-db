@@ -15,10 +15,12 @@ but not identical to the real server.
 |---|---|---|
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
-| Kafka | native binary protocol, topics, consumer groups, transactions, configs | yes |
-| MySQL | early scaffolding, not merged | no |
-| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below); not merged | yes, for these — the official Rust client works end to end |
-| Memcached, MongoDB, RabbitMQ, Elasticsearch | specs only (`docs/specs/`) | no |
+| Kafka | native binary protocol, topics, consumer groups, configs, transaction APIs wired but not yet fenced/isolated (see below) | yes |
+| MySQL | handshake, literal-expression `SELECT` (arithmetic/comparisons/session vars), no real tables yet (see below) | partially — literal queries only |
+| ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
+| Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
+| MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
+| RabbitMQ, Elasticsearch | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
 
@@ -205,13 +207,16 @@ constraints.
 
 ## Kafka
 
-Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported: topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`), and transactions (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`).
+Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported and verified against real clients (kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka): topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`, every compression codec), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`, multi-consumer rebalance), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`).
+
+The transaction APIs (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`) are wired on the wire and always answer success, but are **not functionally real yet**: a transactional producer isn't fenced by a newer one using the same `transactional.id`, and a `read_committed` consumer sees aborted records as if they were committed (there's no per-partition staging, last-stable-offset, or control-record filtering). Confirmed against a real transactional Java `kafka-clients` producer and Spring Kafka's `KafkaTemplate`/`TransactionTemplate`. See the Roadmap in `docs/specs/kafka.md` for what real support needs.
 
 **By design**
 - Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
 
 **Not yet**
 - Disk segment persistence (records live in-memory).
+- Real transactional isolation and producer fencing (see above).
 
 ## ClickHouse
 
@@ -371,9 +376,40 @@ of `docs/specs/clickhouse.md`:
   being accepted and ignored, user/role/quota management, query profiling
   and `system.query_log`/`trace_log` contents.
 
+## MongoDB
+
+The OP_MSG wire protocol and handshake (`hello`/`ismaster`, `buildInfo`, `ping`), CRUD (`insert`, `find`, `update`, `delete`), and `createIndexes` with unique-index enforcement (`E11000` duplicate key errors on insert and on index creation over existing duplicate data). Verified against the official MongoDB Rust driver and a differential test against a real `mongod`.
+
+**Not yet**
+- Replica sets, sharding, transactions, change streams, GridFS.
+- The aggregation pipeline.
+- Non-unique/TTL indexes, compound query operators beyond exact-match equality.
+- Authentication (SCRAM).
+
 ## MySQL
 
-Early scaffolding only: the real `mysql` CLI cannot run queries yet.
+Handshake (`mysql_native_password`, any password accepted — no real
+credential check yet), `COM_INIT_DB`, and `COM_QUERY` for literal-only
+`SELECT` expressions: numeric/string/NULL literals, `+ - * /` (integer
+division formats as a 4-decimal-place string, matching MySQL's
+`div_precision_increment` default rather than a bare float), comparisons
+(`= <> < <= > >=`, three-valued NULL logic), `AND`/`OR`, `SHOW DATABASES`,
+`USE`, and `@@`-prefixed session variables the connection setup of real
+client libraries (e.g. mysql_async) needs (`version`, `version_comment`,
+`max_allowed_packet`, `wait_timeout`, `socket`, `lower_case_table_names`).
+Verified against `mysql_async` and a differential test against a real
+MySQL 8.0 server (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`).
+
+**Not yet**
+- Tables: `CREATE TABLE`, `INSERT`/`SELECT`/`UPDATE`/`DELETE` against real
+  data (`Plan::Scan`/`Plan::Join`/`Plan::Filter` are defined but nothing
+  populates or reads a real table yet — every query today only projects
+  literal expressions).
+- Prepared statements, transactions, `SHOW TABLES` (always empty),
+  authentication (every password is currently accepted).
+- Query errors are not reported as MySQL `ERR` packets yet — an
+  unsupported query currently gets a silent `OK` response instead of a
+  real error, which a client can't distinguish from "0 rows, no error."
 
 ## Elasticsearch
 

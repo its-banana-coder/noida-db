@@ -13,6 +13,9 @@ pub mod redis;
 #[cfg(feature = "sql")]
 pub mod sql;
 
+#[cfg(feature = "mysql")]
+pub mod mysql;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
@@ -21,6 +24,8 @@ pub mod kafka;
 
 #[cfg(feature = "memcached")]
 pub mod memcached;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;

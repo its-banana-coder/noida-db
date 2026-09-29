@@ -270,3 +270,38 @@ fn test_rebalance_trigger_returns_rebalance_in_progress() {
     // Generation was incremented when rebalance was triggered
     assert!(hb_resp.error_code == 22 || hb_resp.error_code == 27);
 }
+
+#[test]
+fn test_concurrent_join_blocks_until_rebalance_completes() {
+    let t = T::new();
+
+    let mut c1_join = JoinGroupRequest::default();
+    c1_join.group_id = GroupId(StrBytes::from_static_str("wait-grp"));
+    c1_join.protocol_type = StrBytes::from_static_str("consumer");
+    c1_join.rebalance_timeout_ms = 500;
+    let c1_step1 = t.engine.handle_join_group(&c1_join, 5);
+    c1_join.member_id = c1_step1.member_id.clone();
+
+    let mut c2_join = JoinGroupRequest::default();
+    c2_join.group_id = GroupId(StrBytes::from_static_str("wait-grp"));
+    c2_join.protocol_type = StrBytes::from_static_str("consumer");
+    c2_join.rebalance_timeout_ms = 500;
+    let c2_step1 = t.engine.handle_join_group(&c2_join, 5);
+    c2_join.member_id = c2_step1.member_id.clone();
+
+    let eng1 = t.engine.clone();
+    let eng2 = t.engine.clone();
+
+    let t1 = std::thread::spawn(move || eng1.handle_join_group(&c1_join, 5));
+
+    // C2 joins slightly after C1
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let t2 = std::thread::spawn(move || eng2.handle_join_group(&c2_join, 5));
+
+    let resp1 = t1.join().unwrap();
+    let resp2 = t2.join().unwrap();
+
+    assert_eq!(resp1.generation_id, 1);
+    assert_eq!(resp2.generation_id, 1);
+}

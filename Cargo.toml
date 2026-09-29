@@ -26,9 +26,11 @@ redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
 sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
+mysql = ["sql", "dep:sqlparser", "dep:bytes"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
 elasticsearch = ["dep:serde_json"]
+mongodb = []
 # HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
 # same as the other services' wire protocols.
 clickhouse = []
@@ -49,6 +51,7 @@ mlua = { version = "0.12", default-features = false, features = ["lua51", "vendo
 serde_json = { version = "1", optional = true }
 # Kafka: wire protocol message encoding/decoding.
 kafka-protocol = { version = "0.18.0", optional = true }
+bson = { version = "3.1.0", features = ["chrono-0_4", "uuid-1"] }
 
 # The whole point of noida is a small footprint: tune release builds for size.
 [profile.release]
@@ -69,8 +72,10 @@ ureq = { version = "3", default-features = false }
 # ClickHouse: the official Rust client, now that RowBinaryWithNamesAndTypes
 # (which it requires) is implemented. Async (hyper/tokio), dev-only.
 clickhouse = "0.15"
+mysql_async = "0.37.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mongodb = "3.9.1"
 
 # Service test suites only build when their service is compiled in.
 [[test]]
@@ -102,6 +107,10 @@ name = "elasticsearch_diff"
 required-features = ["elasticsearch"]
 
 [[test]]
+name = "memcached_diff"
+required-features = ["memcached"]
+
+[[test]]
 name = "kafka_client"
 required-features = ["kafka"]
 
@@ -120,3 +129,19 @@ required-features = ["clickhouse"]
 [[test]]
 name = "clickhouse_official_client"
 required-features = ["clickhouse"]
+
+[[test]]
+name = "mysql_client"
+required-features = ["mysql"]
+
+[[test]]
+name = "mysql_diff"
+required-features = ["mysql"]
+
+[[test]]
+name = "mongodb_client"
+required-features = ["mongodb"]
+
+[[test]]
+name = "mongodb_diff"
+required-features = ["mongodb"]

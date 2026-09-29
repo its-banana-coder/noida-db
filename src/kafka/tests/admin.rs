@@ -110,6 +110,18 @@ fn test_configs_management() {
         .find(|c| c.name.as_str() == "cleanup.policy")
         .expect("cleanup.policy config exists");
     assert_eq!(cleanup.value.as_ref().map(|s| s.as_str()), Some("delete"));
+    // Every config needs a real ConfigSource id (not the crate's default of
+    // -1): the real admin client (kafka-topics.sh --describe included)
+    // throws IllegalArgumentException on an id outside the enum.
+    assert_eq!(cleanup.config_source, 5, "an unset config reports DEFAULT_CONFIG");
+    for c in &desc_resp.results[0].configs {
+        assert!(
+            c.config_source >= 0,
+            "{} has an invalid config_source {}",
+            c.name,
+            c.config_source
+        );
+    }
 
     // DescribeConfigs for unknown topic -> UNKNOWN_TOPIC_OR_PARTITION (3)
     let mut desc_req_bad = DescribeConfigsRequest::default();
@@ -135,11 +147,16 @@ fn test_configs_management() {
     let alter_resp = t.engine.handle_alter_configs(&alter_req, 2);
     assert_eq!(alter_resp.responses[0].error_code, 0);
 
-    // Verify DescribeConfigs reflects the altered value "compact"
+    // Verify DescribeConfigs reflects the altered value "compact", now
+    // reported as DYNAMIC_TOPIC_CONFIG (1) since it's no longer the default.
     let desc_resp2 = t.engine.handle_describe_configs(&desc_req, 4);
     let cleanup2 =
         desc_resp2.results[0].configs.iter().find(|c| c.name.as_str() == "cleanup.policy").unwrap();
     assert_eq!(cleanup2.value.as_ref().map(|s| s.as_str()), Some("compact"));
+    assert_eq!(
+        cleanup2.config_source, 1,
+        "an explicitly altered config reports DYNAMIC_TOPIC_CONFIG"
+    );
 
     // IncrementalAlterConfigs: SET retention.ms
     let mut incr_req = IncrementalAlterConfigsRequest::default();

@@ -119,6 +119,45 @@ else
   skip "kafka-clients" "no java"
 fi
 
+# 5. Java (Gradle): Spring Kafka, a transactional producer, and every
+# compression codec. Separate from the plain kafka-clients test above
+# because Spring Kafka's dependency tree is painful to hand-fetch as raw
+# jars; this uses a self-fetched Gradle wrapper instead (nothing global).
+if command -v java >/dev/null; then
+  export GRADLE_USER_HOME="$PWD/$work/gradle-home"
+  if (cd "$here/java-gradle" && ./gradlew --console=plain -q compileJava >/dev/null 2>&1); then
+    run "spring-kafka" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=SpringKafkaTest"
+    run "compression-codecs" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=CompressionTest"
+    # Known gap, tracked in docs/specs/kafka.md's roadmap: transactions are
+    # protocol-shaped but not functionally real yet (no producer fencing, no
+    # aborted-record filtering for read_committed). This is expected to fail
+    # until that's implemented; left red on purpose rather than hidden.
+    run "transactional-producer (known gap, see kafka.md)" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=TransactionalProducerTest"
+  else
+    skip "spring-kafka" "could not build"
+    skip "compression-codecs" "could not build"
+    skip "transactional-producer" "could not build"
+  fi
+else
+  skip "spring-kafka" "no java"
+  skip "compression-codecs" "no java"
+  skip "transactional-producer" "no java"
+fi
+
+# 6. Python: faust_app (real application test)
+if command -v python3 >/dev/null; then
+  if [ ! -d "$work/faust_env" ]; then
+    python3 -m venv "$work/faust_env" >/dev/null 2>&1 && "$work/faust_env/bin/pip" install -q faust-streaming >/dev/null 2>&1
+  fi
+  if [ -x "$work/faust_env/bin/python" ]; then
+    run "faust-app" bash -c "cd '$here/faust_app' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT PATH=\"$PWD/$work/faust_env/bin:\$PATH\" ./run.sh >/dev/null 2>&1"
+  else
+    skip "faust-app" "could not install"
+  fi
+else
+  skip "faust-app" "no python3"
+fi
+
 echo
 printf '%s\n' "${summary[@]}"
 exit $status
