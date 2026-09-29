@@ -132,3 +132,23 @@ fn test_idempotent_producer_sequence_and_deduplication() {
     let p_res5 = &resp5.responses[0].partition_responses[0];
     assert_eq!(p_res5.error_code, 45); // OUT_OF_ORDER_SEQUENCE_NUMBER
 }
+
+#[test]
+fn test_init_producer_id_transactional() {
+    let t = T::new();
+
+    // Test with transactional_id
+    let mut req_txn1 = InitProducerIdRequest::default();
+    req_txn1.transactional_id = Some(kafka_protocol::messages::TransactionalId(
+        kafka_protocol::protocol::StrBytes::from_static_str("tx1"),
+    ));
+    let resp_txn1 = t.engine.handle_init_producer_id(&req_txn1, 4);
+    assert_eq!(resp_txn1.error_code, 0);
+    assert_eq!(resp_txn1.producer_epoch, 0);
+    let txn_pid = resp_txn1.producer_id.0;
+
+    let resp_txn2 = t.engine.handle_init_producer_id(&req_txn1, 4);
+    assert_eq!(resp_txn2.error_code, 0);
+    assert_eq!(resp_txn2.producer_id.0, txn_pid);
+    assert_eq!(resp_txn2.producer_epoch, 1);
+}

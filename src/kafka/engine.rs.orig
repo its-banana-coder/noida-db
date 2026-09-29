@@ -449,8 +449,10 @@ impl EngineState {
         let mut res = InitProducerIdResponse::default();
         res.error_code = 0;
 
-        if let Some(ref tid) = req.transactional_id
-            && !tid.as_str().is_empty() {
+        if req.transactional_id.is_some()
+            && !req.transactional_id.as_ref().unwrap().as_str().is_empty()
+        {
+            let tid = req.transactional_id.as_ref().unwrap();
             let tid_str = tid.as_str().to_string();
             let (pid, epoch) = if let Some(&(p, e)) = self.txn_producers.get(&tid_str) {
                 (p, e.wrapping_add(1))

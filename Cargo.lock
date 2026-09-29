@@ -966,6 +966,7 @@ dependencies = [
  "pgwire",
  "postgres",
  "redis",
+ "regex",
  "regex-lite",
  "rust-stemmers",
  "serde",
