@@ -26,6 +26,7 @@ redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
 sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
+mysql = ["sql", "dep:sqlparser", "dep:bytes"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
 mongodb = []
@@ -70,6 +71,7 @@ ureq = { version = "3", default-features = false }
 # ClickHouse: the official Rust client, now that RowBinaryWithNamesAndTypes
 # (which it requires) is implemented. Async (hyper/tokio), dev-only.
 clickhouse = "0.15"
+mysql_async = "0.37.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 mongodb = "3.9.1"
@@ -122,6 +124,14 @@ required-features = ["clickhouse"]
 [[test]]
 name = "clickhouse_official_client"
 required-features = ["clickhouse"]
+
+[[test]]
+name = "mysql_client"
+required-features = ["mysql"]
+
+[[test]]
+name = "mysql_diff"
+required-features = ["mysql"]
 
 
 [[test]]
