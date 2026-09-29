@@ -2,6 +2,29 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
+
+/// Starts `name` on `addr` with on-disk persistence rooted at `data_dir`:
+/// loads a snapshot from there on startup if one exists, and arranges to
+/// save one back (periodically and/or on clean shutdown — see each
+/// service's own `spawn_persistent` for specifics). A service that
+/// hasn't wired persistence up yet falls back to `start`'s plain
+/// ephemeral behavior, so this is always safe to call from `main`
+/// regardless of how many services have been migrated.
+// Deliberately a `match` with just one arm for now: each service's own
+// persistence PR adds a real arm here (`"name" =>
+// crate::<service>::spawn_persistent(addr, data_dir)`) as it lands, so
+// keeping the `match` shape (instead of collapsing to the fallback body)
+// is what makes each of those PRs a small, easy diff.
+#[allow(clippy::match_single_binding)]
+pub fn start_persistent(name: &str, addr: &str, data_dir: &Path) -> Option<io::Result<SocketAddr>> {
+    match name {
+        _ => {
+            let _ = data_dir;
+            start(name, addr)
+        }
+    }
+}
 
 /// Starts `name` on `addr`. `None` if the service isn't built into this
 /// binary (its Cargo feature is off, or it isn't implemented yet).

@@ -36,7 +36,7 @@ fn start(cfg: &Config) -> std::io::Result<()> {
     println!("noida-db {} | data dir: {}", env!("CARGO_PKG_VERSION"), cfg.data_dir.display());
     for svc in &cfg.services {
         let addr = format!("{}:{}", cfg.host, svc.port);
-        match noida::services::start(svc.name, &addr) {
+        match noida::services::start_persistent(svc.name, &addr, &cfg.data_dir) {
             Some(Ok(bound)) => println!("  {:<14} {bound}", svc.name),
             Some(Err(e)) => return Err(io_context(e, svc.name, &addr)),
             None => println!("  {:<14} {addr}  (not in this build)", svc.name),
