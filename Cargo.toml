@@ -21,11 +21,12 @@ path = "src/main.rs"
 
 # One feature per service, so people can build only what they use.
 [features]
-default = ["redis", "postgres"]
+default = ["redis", "postgres", "mysql"]
 redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
 sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
+mysql = ["sql", "dep:sqlparser", "dep:bytes"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
 # HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
@@ -70,6 +71,7 @@ ureq = { version = "3", default-features = false }
 clickhouse = "0.15"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+mysql_async = "0.37.1"
 
 # Service test suites only build when their service is compiled in.
 [[test]]
@@ -116,3 +118,11 @@ required-features = ["clickhouse"]
 name = "clickhouse_official_client"
 required-features = ["clickhouse"]
 
+
+[[test]]
+name = "mysql_client"
+required-features = ["mysql"]
+
+[[test]]
+name = "mysql_diff"
+required-features = ["mysql"]

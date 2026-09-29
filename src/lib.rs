@@ -13,6 +13,9 @@ pub mod redis;
 #[cfg(feature = "sql")]
 pub mod sql;
 
+#[cfg(feature = "mysql")]
+pub mod mysql;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
