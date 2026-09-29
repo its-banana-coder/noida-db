@@ -81,16 +81,27 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
         amq_protocol::types::ShortString,
         amq_protocol::types::ShortString,
     )> = None;
+    let mut pending_expiration: Option<std::time::Instant> = None;
     let mut pending_body = Vec::new();
     let mut expected_body_size = 0;
 
-    let mut consumers: Vec<(amq_protocol::types::ShortString, u16)> = Vec::new();
+    let mut consumers: Vec<(
+        amq_protocol::types::ShortString,
+        u16,
+        amq_protocol::types::ShortString,
+    )> = Vec::new();
 
     // Channels that called confirm.select — every publish on one of these
     // gets a basic.ack back once stored (this is a single in-memory node,
     // so "stored" is immediate and never fails/nacks).
     let mut confirm_channels: HashSet<u16> = HashSet::new();
     let mut delivery_tags: HashMap<u16, u64> = HashMap::new();
+
+    // For nack/reject, we need to track unacked messages
+    // (channel_id, delivery_tag) -> (queue, Message)
+    let mut unacked_messages: HashMap<(u16, u64), (amq_protocol::types::ShortString, Message)> =
+        HashMap::new();
+    let mut next_delivery_tag: HashMap<u16, u64> = HashMap::new();
 
     stream.set_nonblocking(true).unwrap();
     let mut incomplete_buffer = Vec::new();
@@ -139,7 +150,11 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
                                     } else {
                                         args.consumer_tag.clone()
                                     };
-                                    consumers.push((args.queue.clone(), channel_id));
+                                    consumers.push((
+                                        args.queue.clone(),
+                                        channel_id,
+                                        consumer_tag.clone(),
+                                    ));
                                     let _ = send_method(
                                         &mut stream,
                                         channel_id,
@@ -151,13 +166,21 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
                                     &method
                                 {
                                     if let Some(msg) = engine.basic_get(&args.queue) {
+                                        let tag = next_delivery_tag.entry(channel_id).or_insert(1);
+                                        let current_tag = *tag;
+                                        *tag += 1;
+                                        unacked_messages.insert(
+                                            (channel_id, current_tag),
+                                            (args.queue.clone(), msg.clone()),
+                                        );
+
                                         let _ = send_method(
                                             &mut stream,
                                             channel_id,
                                             AMQPClass::Basic(basic::AMQPMethod::GetOk(
                                                 basic::GetOk {
-                                                    delivery_tag: 1,
-                                                    redelivered: false,
+                                                    delivery_tag: current_tag,
+                                                    redelivered: msg.redelivered,
                                                     exchange: "".into(),
                                                     routing_key: args.queue.clone(),
                                                     message_count: 0,
@@ -188,6 +211,59 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
                                             )),
                                         );
                                     }
+                                } else if let AMQPClass::Basic(basic::AMQPMethod::Ack(args)) =
+                                    &method
+                                {
+                                    if args.multiple {
+                                        unacked_messages.retain(|&(c, tag), _| {
+                                            c != channel_id || tag > args.delivery_tag
+                                        });
+                                    } else {
+                                        unacked_messages.remove(&(channel_id, args.delivery_tag));
+                                    }
+                                } else if let AMQPClass::Basic(basic::AMQPMethod::Nack(args)) =
+                                    &method
+                                {
+                                    let mut to_nack = Vec::new();
+                                    if args.multiple {
+                                        let tags: Vec<_> = unacked_messages
+                                            .keys()
+                                            .filter(|&&(c, tag)| {
+                                                c == channel_id && tag <= args.delivery_tag
+                                            })
+                                            .copied()
+                                            .collect();
+                                        for k in tags {
+                                            if let Some(v) = unacked_messages.remove(&k) {
+                                                to_nack.push(v);
+                                            }
+                                        }
+                                    } else {
+                                        if let Some(v) = unacked_messages
+                                            .remove(&(channel_id, args.delivery_tag))
+                                        {
+                                            to_nack.push(v);
+                                        }
+                                    }
+                                    for (q, msg) in to_nack {
+                                        if args.requeue {
+                                            engine.requeue(&q, msg);
+                                        } else {
+                                            engine.dead_letter(&q, msg);
+                                        }
+                                    }
+                                } else if let AMQPClass::Basic(basic::AMQPMethod::Reject(args)) =
+                                    &method
+                                {
+                                    if let Some((q, msg)) =
+                                        unacked_messages.remove(&(channel_id, args.delivery_tag))
+                                    {
+                                        if args.requeue {
+                                            engine.requeue(&q, msg);
+                                        } else {
+                                            engine.dead_letter(&q, msg);
+                                        }
+                                    }
                                 } else if let AMQPClass::Basic(basic::AMQPMethod::Qos(_args)) =
                                     &method
                                 {
@@ -207,16 +283,30 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
                                 if pending_publish.is_some() {
                                     expected_body_size = header.body_size;
                                     pending_body.clear();
+
+                                    pending_expiration = None;
+                                    if let Some(exp_str) = header.properties.expiration()
+                                        && let Ok(millis) = exp_str.as_str().parse::<u64>()
+                                    {
+                                        pending_expiration = Some(
+                                            std::time::Instant::now()
+                                                + std::time::Duration::from_millis(millis),
+                                        );
+                                    }
+
                                     if expected_body_size == 0
                                         && let Some((pub_channel, exchange, rk)) =
                                             pending_publish.take()
                                     {
                                         engine.publish(
                                             exchange,
-                                            rk,
+                                            rk.clone(),
                                             Message {
                                                 content_type: None,
+                                                routing_key: rk,
                                                 data: pending_body.clone(),
+                                                expiration: pending_expiration.take(),
+                                                redelivered: false,
                                             },
                                         );
                                         ack_if_confirming(
@@ -236,8 +326,14 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
                                 {
                                     engine.publish(
                                         exchange,
-                                        rk,
-                                        Message { content_type: None, data: pending_body.clone() },
+                                        rk.clone(),
+                                        Message {
+                                            content_type: None,
+                                            routing_key: rk,
+                                            data: pending_body.clone(),
+                                            expiration: pending_expiration.take(),
+                                            redelivered: false,
+                                        },
                                     );
                                     ack_if_confirming(
                                         &mut stream,
@@ -260,12 +356,18 @@ pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                for (queue, channel_id) in &consumers {
+                for (queue, channel_id, consumer_tag) in &consumers {
                     if let Some(msg) = engine.basic_get(queue) {
+                        let tag = next_delivery_tag.entry(*channel_id).or_insert(1);
+                        let current_tag = *tag;
+                        *tag += 1;
+                        unacked_messages
+                            .insert((*channel_id, current_tag), (queue.clone(), msg.clone()));
+
                         let deliver = basic::Deliver {
-                            consumer_tag: "test_consumer".into(),
-                            delivery_tag: 1,
-                            redelivered: false,
+                            consumer_tag: consumer_tag.clone(),
+                            delivery_tag: current_tag,
+                            redelivered: msg.redelivered,
                             exchange: "".into(),
                             routing_key: queue.clone(),
                         };
@@ -346,7 +448,7 @@ fn handle_method(stream: &mut TcpStream, channel_id: u16, method: AMQPClass, eng
             );
         }
         AMQPClass::Queue(queue::AMQPMethod::Declare(args)) => {
-            let queue = engine.declare_queue(args.queue);
+            let queue = engine.declare_queue(args.queue, args.arguments);
             let _ = send_method(
                 stream,
                 channel_id,
@@ -365,9 +467,6 @@ fn handle_method(stream: &mut TcpStream, channel_id: u16, method: AMQPClass, eng
                 AMQPClass::Queue(queue::AMQPMethod::BindOk(queue::BindOk {})),
             );
         }
-        AMQPClass::Basic(basic::AMQPMethod::Ack(_)) => {}
-        AMQPClass::Basic(basic::AMQPMethod::Nack(_)) => {}
-        AMQPClass::Basic(basic::AMQPMethod::Reject(_)) => {}
         _ => {}
     }
 }

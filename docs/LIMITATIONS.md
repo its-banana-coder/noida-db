@@ -21,7 +21,7 @@ but not identical to the real server.
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
 | Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
-| RabbitMQ | AMQP 0-9-1 core (exchanges/queues/bindings, publish/consume/get, QoS, publisher confirms), a stub management HTTP API (see below) | yes, for `lapin` |
+| RabbitMQ | AMQP 0-9-1 core (exchanges/queues/bindings, publish/consume/get, QoS, publisher confirms, dead-lettering, TTLs, nack/reject with requeue), a stub management HTTP API (see below) | yes, for `lapin` |
 
 ## By design, for every service
 
@@ -420,22 +420,36 @@ The modern binary/meta protocol is not implemented. Given that most major client
 ## RabbitMQ
 
 AMQP 0-9-1 core over the native binary protocol: exchange/queue declare,
-binding, `basic.publish`/`basic.get`/`basic.consume`, QoS (prefetch), and
+binding, `basic.publish`/`basic.get`/`basic.consume`, QoS (prefetch),
 publisher confirms (`confirm.select` + a real `basic.ack` after every
-publish on a confirming channel). Verified against the real `lapin` client
+publish on a confirming channel), dead-lettering (`x-dead-letter-exchange`/
+`x-dead-letter-routing-key` queue arguments, triggered by both TTL
+expiry and a `basic.nack`/`basic.reject` with `requeue=false`), message
+TTLs (per-queue `x-message-ttl` and the per-message `expiration`
+property — the queue's TTL and the message's own take whichever expires
+first), and `basic.nack`/`basic.reject` with real requeue behavior (a
+requeued message goes back to the head of the queue with `redelivered`
+set on the next delivery). Verified against the real `lapin` client
 (`tests/rabbitmq_client.rs`): connect/declare, publish/consume, get, QoS,
-publisher confirms, and the management HTTP API's basic shape. The
-management HTTP API (port 15672) is a fixed-response stub — enough for
-tooling that just probes `/api/whoami`/`/api/overview`/`/api/nodes` for
-liveness, not a real reflection of declared exchanges/queues/connections.
+publisher confirms, nack+requeue-then-redeliver, reject-to-dead-letter,
+and the management HTTP API's basic shape. `tests/rabbitmq_diff.rs` is a
+real differential test against a reference server (`NOIDA_RABBITMQ_REF`,
+or `127.0.0.1:5672` if reachable; skips cleanly otherwise) — currently
+covers basic declare/publish/get. The management HTTP API (port 15672)
+is a fixed-response stub — enough for tooling that just probes
+`/api/whoami`/`/api/overview`/`/api/nodes` for liveness, not a real
+reflection of declared exchanges/queues/connections.
 
 **Not yet**
-- `tests/rabbitmq_diff.rs` is a placeholder (no comparison against a real
-  RabbitMQ server yet) — no engine-level unit tests either, only the
-  real-client tests above.
-- Dead-lettering, TTLs, transactions (`tx.select`/`tx.commit`), `basic.nack`/
-  `basic.reject`-triggered requeue, and most exchange types beyond what's
-  needed for basic routing.
+- Fanout and topic exchange routing: the default `""` exchange and
+  `"amq.direct"` are both hardcoded to `kind: "direct"` — declaring a
+  `fanout` or `topic` exchange is accepted, but routing still behaves
+  like `direct` (exact routing-key match), not fan-out-to-all or
+  wildcard (`*`/`#`) matching.
+- Transactions (`tx.select`/`tx.commit`/`tx.rollback`).
+- `tests/rabbitmq_diff.rs` only covers basic declare/publish/get so far —
+  dead-lettering, TTLs, and nack/reject aren't yet compared against a
+  real server, only exercised via the `lapin` client tests above.
 - The management HTTP API doesn't reflect real server state (see above).
 
 ## Elasticsearch
