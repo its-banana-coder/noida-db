@@ -235,3 +235,72 @@ fn test_list_offsets() {
     let lo_resp_unknown = t.engine.handle_list_offsets(&lo_unknown, 6);
     assert_eq!(lo_resp_unknown.topics[0].partitions[0].error_code, 3);
 }
+
+fn produce_multi_record_batch(t: &T, topic: &'static str, num_records: i32, producer_id: i64) {
+    // A synthetic v2 record batch: magic byte (offset 16) = 2,
+    // last_offset_delta (offset 23..27, BE i32) = num_records - 1,
+    // producer_id (offset 43..51, BE i64).
+    let mut batch = vec![0u8; 70];
+    batch[16] = 2;
+    batch[23..27].copy_from_slice(&(num_records - 1).to_be_bytes());
+    batch[43..51].copy_from_slice(&producer_id.to_be_bytes());
+
+    let mut prod_req = ProduceRequest::default();
+    let mut topic_data = TopicProduceData::default();
+    topic_data.name = TopicName::from(StrBytes::from_static_str(topic));
+    let mut part_data = PartitionProduceData::default();
+    part_data.index = 0;
+    part_data.records = Some(bytes::Bytes::from(batch));
+    topic_data.partition_data.push(part_data);
+    prod_req.topic_data.push(topic_data);
+
+    let prod_resp = t.engine.handle_produce(&prod_req, 8);
+    let p_res = &prod_resp.responses[0].partition_responses[0];
+    assert_eq!(p_res.error_code, 0);
+}
+
+fn fetch_record_bytes(t: &T, topic: &'static str, offset: i64) -> usize {
+    let mut fetch_req = FetchRequest::default();
+    let mut fetch_topic = FetchTopic::default();
+    fetch_topic.topic = TopicName::from(StrBytes::from_static_str(topic));
+    let mut fetch_part = FetchPartition::default();
+    fetch_part.partition = 0;
+    fetch_part.fetch_offset = offset;
+    fetch_topic.partitions.push(fetch_part);
+    fetch_req.topics.push(fetch_topic);
+
+    let fetch_resp = t.engine.handle_fetch(&fetch_req, 11);
+    let f_part = &fetch_resp.responses[0].partitions[0];
+    f_part.records.as_ref().map(|b| b.len()).unwrap_or(0)
+}
+
+/// Regression test: `record_batches` used to be indexed by *push count*
+/// (one entry per Produce call), while a fetch treated `fetch_offset` as a
+/// direct index into it. That only lined up when every batch held exactly
+/// one record. A real producer that batches more than one record per
+/// partition per Produce call (the common case — kafkajs, librdkafka and
+/// the Java client all do this under normal linger.ms batching) broke any
+/// fetch at an offset that wasn't the very first offset of some batch: the
+/// consumer would get an empty response and could never resume mid-batch.
+#[test]
+fn multi_record_batch_fetch_resumes_at_any_offset_inside_it() {
+    let t = T::new();
+    let mut req = CreateTopicsRequest::default();
+    let mut topic = CreatableTopic::default();
+    topic.name = TopicName::from(StrBytes::from_static_str("multi"));
+    topic.num_partitions = 1;
+    topic.replication_factor = 1;
+    req.topics.push(topic);
+    t.engine.handle_create_topics(&req, 5);
+
+    // First batch: 3 records at offsets 0, 1, 2.
+    produce_multi_record_batch(&t, "multi", 3, -1);
+    // Second batch: 2 records at offsets 3, 4.
+    produce_multi_record_batch(&t, "multi", 2, -1);
+
+    assert!(fetch_record_bytes(&t, "multi", 0) > 0, "offset 0: start of first batch");
+    assert!(fetch_record_bytes(&t, "multi", 1) > 0, "offset 1: mid first batch");
+    assert!(fetch_record_bytes(&t, "multi", 2) > 0, "offset 2: end of first batch");
+    assert!(fetch_record_bytes(&t, "multi", 3) > 0, "offset 3: start of second batch");
+    assert!(fetch_record_bytes(&t, "multi", 4) > 0, "offset 4: mid second batch");
+}

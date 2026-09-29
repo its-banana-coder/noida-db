@@ -27,7 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct PartitionState {
     pub id: i32,
     pub leader: i32,
-    pub record_batches: Vec<Vec<u8>>,
+    // (base_offset, batch_bytes) — batches don't hold one record each, so
+    // fetching by offset has to find the batch that *contains* the
+    // requested offset, not treat this vec as if it were indexed by offset.
+    pub record_batches: Vec<(i64, Vec<u8>)>,
     pub high_watermark: i64,
     // (producer_id, epoch) -> (last_sequence, base_offset)
     pub producer_seqs: HashMap<(i64, i16), (i32, i64)>,
@@ -533,7 +536,7 @@ impl EngineState {
                             if is_batch_v2 && batch_bytes.len() >= 8 {
                                 batch_bytes[0..8].copy_from_slice(&base_offset.to_be_bytes());
                             }
-                            part_state.record_batches.push(batch_bytes);
+                            part_state.record_batches.push((base_offset, batch_bytes));
                             part_state.high_watermark += delta;
 
                             part_res.error_code = 0;
@@ -581,11 +584,19 @@ impl EngineState {
                         if fetch_offset < 0 || fetch_offset > part_state.high_watermark {
                             part_res.error_code = 1; // OFFSET_OUT_OF_RANGE
                         } else if fetch_offset < part_state.high_watermark {
-                            let idx = fetch_offset as usize;
-                            if idx < part_state.record_batches.len() {
-                                part_res.records = Some(bytes::Bytes::from(
-                                    part_state.record_batches[idx].clone(),
-                                ));
+                            // Batches aren't one record each, so find the
+                            // batch whose base_offset covers fetch_offset
+                            // (the last one starting at or before it) and
+                            // return it whole, same as real Kafka — the
+                            // client skips already-consumed records inside
+                            // it by their own relative offset.
+                            if let Some((_, batch)) = part_state
+                                .record_batches
+                                .iter()
+                                .rev()
+                                .find(|(base, _)| *base <= fetch_offset)
+                            {
+                                part_res.records = Some(bytes::Bytes::from(batch.clone()));
                             }
                         }
                     } else {
@@ -1297,29 +1308,38 @@ impl EngineState {
             result.resource_type = resource.resource_type;
             result.resource_name = resource.resource_name.clone();
 
+            // `ConfigSource` (org.apache.kafka.clients.admin.ConfigEntry):
+            // real clients (kafka-topics.sh's admin client included) reject
+            // an id outside the enum, and the crate's own default (-1) is
+            // exactly that — every config entry needs a real source.
+            const DYNAMIC_TOPIC_CONFIG: i8 = 1;
+            const STATIC_BROKER_CONFIG: i8 = 4;
+            const DEFAULT_CONFIG: i8 = 5;
+
             if resource.resource_type == 2 {
                 // Topic
                 let topic_name = resource.resource_name.as_str();
                 if let Some(topic_state) = self.topics.get(topic_name) {
                     result.error_code = 0;
 
-                    let mut configs_map: HashMap<String, String> = [
-                        ("cleanup.policy".to_string(), "delete".to_string()),
-                        ("retention.ms".to_string(), "604800000".to_string()),
-                        ("segment.bytes".to_string(), "1073741824".to_string()),
+                    let mut configs_map: HashMap<String, (String, i8)> = [
+                        ("cleanup.policy".to_string(), ("delete".to_string(), DEFAULT_CONFIG)),
+                        ("retention.ms".to_string(), ("604800000".to_string(), DEFAULT_CONFIG)),
+                        ("segment.bytes".to_string(), ("1073741824".to_string(), DEFAULT_CONFIG)),
                     ]
                     .into_iter()
                     .collect();
 
                     for (k, v) in &topic_state.configs {
-                        configs_map.insert(k.clone(), v.clone());
+                        configs_map.insert(k.clone(), (v.clone(), DYNAMIC_TOPIC_CONFIG));
                     }
 
-                    for (k, v) in configs_map {
+                    for (k, (v, source)) in configs_map {
                         let mut conf = DescribeConfigsResourceResult::default();
                         conf.name = StrBytes::from_string(k);
                         conf.value = Some(StrBytes::from_string(v));
                         conf.read_only = false;
+                        conf.config_source = source;
                         result.configs.push(conf);
                     }
                 } else {
@@ -1337,9 +1357,12 @@ impl EngineState {
                 for &(k, v) in configs {
                     let mut conf = DescribeConfigsResourceResult::default();
                     conf.name = StrBytes::from_string(k.to_string());
-                    let val = self.broker_configs.get(k).map(|s| s.as_str()).unwrap_or(v);
+                    let overridden = self.broker_configs.get(k);
+                    let val = overridden.map(|s| s.as_str()).unwrap_or(v);
                     conf.value = Some(StrBytes::from_string(val.to_string()));
                     conf.read_only = false;
+                    conf.config_source =
+                        if overridden.is_some() { STATIC_BROKER_CONFIG } else { DEFAULT_CONFIG };
                     result.configs.push(conf);
                 }
             }
