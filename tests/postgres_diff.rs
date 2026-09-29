@@ -624,6 +624,26 @@ const SCRIPTS: &[&[&str]] = &[
         "INSERT INTO fr VALUES (1), (2)",
         "SELECT id, s FROM fr, current_schema() s ORDER BY id",
     ],
+    &[
+        "CREATE TABLE def_fmt_test (
+            b1 boolean DEFAULT true,
+            b2 boolean DEFAULT 'true',
+            b3 boolean DEFAULT FALSE,
+            n1 int DEFAULT 42,
+            n2 int DEFAULT '42',
+            n3 numeric DEFAULT 0,
+            n4 numeric DEFAULT '0',
+            v varchar DEFAULT 'foo'
+        )",
+        "SELECT column_name, column_default FROM information_schema.columns WHERE table_name = 'def_fmt_test' ORDER BY column_name",
+        "SELECT a.attname, pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'def_fmt_test' ORDER BY a.attname",
+    ],
+    &[
+        "CREATE DATABASE test_create_db",
+        "SELECT datname FROM pg_database WHERE datname = 'test_create_db'",
+        "DROP DATABASE test_create_db",
+        "SELECT datname FROM pg_database WHERE datname = 'test_create_db'",
+    ],
 ];
 
 fn main_test_body() {}

@@ -220,7 +220,7 @@ fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
     if f.nx && f.xx {
         return Err(Value::err("ERR XX and NX options at the same time are not compatible"));
     }
-    if (f.gt && f.nx) || (f.lt && f.nx) || (f.gt && f.lt) {
+    if (f.lt || f.gt) && f.nx || (f.gt && f.lt) {
         return Err(Value::err(
             "ERR GT, LT, and/or NX options at the same time are not compatible",
         ));

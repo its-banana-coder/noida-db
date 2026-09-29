@@ -15,7 +15,7 @@ but not identical to the real server.
 |---|---|---|
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
-| Kafka | native binary protocol, topics, consumer groups, configs, transaction APIs wired but not yet fenced/isolated (see below) | yes |
+| Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
 | MySQL | handshake, literal-expression `SELECT` (arithmetic/comparisons/session vars), no real tables yet (see below) | partially — literal queries only |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
@@ -169,17 +169,6 @@ constraints.
 
 **Not yet**
 
-- `CREATE DATABASE`/`DROP DATABASE`: there's one database per data dir
-  (named whatever the client connects to first), so a client that expects
-  to provision its own database as part of setup (Gitea's own `gitea
-  migrate`, for one) needs to be pointed at an existing database name
-  instead (e.g. the default `postgres`).
-- Some `information_schema.columns`/`pg_attrdef` default-value text
-  doesn't always match a real server's exact formatting (e.g. boolean
-  literal case, or a numeric column default reported as empty instead of
-  its value) — cosmetic in most cases, but an ORM that compares its own
-  expected schema against the live one column-by-column (xorm, which
-  Gitea uses, does) may log a spurious mismatch warning for it.
 - PL/pgSQL, stored procedures, `CREATE PROCEDURE`/`CALL` and triggers,
   and extensions. Deliberately deferred: unlike everything else on this
   list, PL/pgSQL is a real procedural language embedded in SQL (its own
@@ -210,14 +199,16 @@ constraints.
 
 Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported and verified against real clients (kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka): topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`, every compression codec), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`, multi-consumer rebalance), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`).
 
-The transaction APIs (`AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`) are wired on the wire and always answer success, but are **not functionally real yet**: a transactional producer isn't fenced by a newer one using the same `transactional.id`, and a `read_committed` consumer sees aborted records as if they were committed (there's no per-partition staging, last-stable-offset, or control-record filtering). Confirmed against a real transactional Java `kafka-clients` producer and Spring Kafka's `KafkaTemplate`/`TransactionTemplate`. See the Roadmap in `docs/specs/kafka.md` for what real support needs.
+The transaction APIs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`) are functionally real: a `read_committed` fetch never returns a still-open or aborted transaction's records (tracked per-partition via a last-stable-offset and an aborted-transactions list, reported in `FetchResponse` for API version 4+), a `read_uncommitted` fetch (the default) is unaffected, and a stale producer epoch — a zombie instance superseded by a newer `InitProducerId` for the same `transactional.id` — is fenced (`INVALID_PRODUCER_EPOCH`) on `Produce`, `AddPartitionsToTxn` and `EndTxn`. `EndTxn` appends a control batch to every partition the transaction touched, same as real Kafka. Verified by an engine-level test that produces, aborts and commits real transactional record batches and checks both isolation levels see exactly what they should.
+
+**Differs**
+- Real Kafka's client discards an aborted batch's bytes itself using the `aborted_transactions` list (the bytes are still on the wire either way); this server simplifies to never serving an aborted batch to a `read_committed` fetch in the first place. Same observable behavior for any real consumer, simpler to implement.
 
 **By design**
 - Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
 
 **Not yet**
 - Disk segment persistence (records live in-memory).
-- Real transactional isolation and producer fencing (see above).
 
 ## ClickHouse
 
