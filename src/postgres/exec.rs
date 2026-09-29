@@ -44,6 +44,7 @@ pub struct Ctx<'a> {
     pub notifies: Vec<(String, String)>,
     /// Rows affected by the last DML node.
     pub affected: usize,
+    pub databases: Vec<(u32, String)>,
 }
 
 impl Ctx<'_> {

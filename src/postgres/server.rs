@@ -191,7 +191,14 @@ fn serve(stream: TcpStream, engine: Engine, cfg: Arc<Config>) -> io::Result<()> 
     }
     conn.send(PgWireBackendMessage::Authentication(Authentication::Ok))?;
 
-    let mut session = engine.connect(&user, &database);
+    let mut session = match engine.connect(&user, &database) {
+        Ok(s) => s,
+        Err(e) => {
+            conn.send(PgWireBackendMessage::ErrorResponse(ErrorResponse::new(e.fields())))?;
+            conn.flush()?;
+            return Ok(());
+        }
+    };
     // Startup parameters the client asked for.
     for (k, v) in &startup.parameters {
         if matches!(k.as_str(), "user" | "database" | "client_encoding" | "options" | "replication")

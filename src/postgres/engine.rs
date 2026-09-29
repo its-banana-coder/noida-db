@@ -115,13 +115,20 @@ pub struct Session {
     pub in_implicit_tx: bool,
 }
 
-struct Global {
+struct GlobalDb {
+    oid: u32,
+    name: String,
     db: DbState,
     seqs: BTreeMap<u32, SeqValue>,
+}
+
+struct Global {
+    databases: BTreeMap<String, GlobalDb>,
     /// Session id currently holding the write lock.
     writer: Option<u32>,
     sessions: BTreeMap<u32, SessionHandle>,
     next_id: u32,
+    next_db_oid: u32,
 }
 
 #[derive(Clone)]
@@ -131,6 +138,7 @@ struct SessionHandle {
     cancel: Arc<AtomicBool>,
     channels: Vec<String>,
     notifications: Arc<Mutex<Vec<(i32, String, String)>>>,
+    database: String,
 }
 
 #[derive(Clone)]
@@ -147,20 +155,36 @@ impl Default for Engine {
 
 impl Engine {
     pub fn new() -> Engine {
-        Engine {
-            global: Arc::new(Mutex::new(Global {
+        let mut databases = BTreeMap::new();
+        databases.insert(
+            "postgres".to_string(),
+            GlobalDb {
+                oid: super::catalog::DATABASE_OID,
+                name: "postgres".to_string(),
                 db: DbState::default(),
                 seqs: BTreeMap::new(),
+            },
+        );
+        Engine {
+            global: Arc::new(Mutex::new(Global {
+                databases,
                 writer: None,
                 sessions: BTreeMap::new(),
                 next_id: 1,
+                next_db_oid: super::catalog::DATABASE_OID + 1,
             })),
             next_pid: Arc::new(AtomicI32::new(10_000)),
         }
     }
 
-    pub fn connect(&self, user: &str, database: &str) -> Session {
+    pub fn connect(&self, user: &str, database: &str) -> PgResult<Session> {
         let mut g = self.global.lock().unwrap();
+        if !g.databases.contains_key(database) {
+            return Err(PgError::new(
+                code::INVALID_CATALOG_NAME,
+                format!("database \"{database}\" does not exist"),
+            ));
+        }
         let id = g.next_id;
         g.next_id += 1;
         let pid = self.next_pid.fetch_add(1, AtomicOrdering::SeqCst);
@@ -175,10 +199,11 @@ impl Engine {
                 cancel: cancel.clone(),
                 channels: vec![],
                 notifications: notifications.clone(),
+                database: database.to_string(),
             },
         );
         let now = super::datetime::now_micros();
-        Session {
+        Ok(Session {
             id,
             pid,
             secret,
@@ -202,7 +227,7 @@ impl Engine {
             cancel,
             notifications,
             in_implicit_tx: false,
-        }
+        })
     }
 
     pub fn disconnect(&self, s: &Session) {
@@ -245,7 +270,7 @@ impl Engine {
             });
         };
         let g = self.global.lock().unwrap();
-        let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.db);
+        let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
         let info = self.info(s);
         let mut b = Binder::new(db, &info, param_hints);
         let (cols, returns_rows, params) = match &stmt {
@@ -327,6 +352,59 @@ impl Engine {
     ) -> PgResult<StmtResult> {
         use a::Statement as S;
         match stmt {
+            S::CreateDatabase { db_name, if_not_exists, .. } => {
+                let name = super::binder::name_parts(db_name).pop().unwrap_or_default();
+                if s.status == TxStatus::InTransaction || s.txn.is_some() {
+                    return Err(PgError::new(
+                        code::ACTIVE_SQL_TRANSACTION,
+                        "CREATE DATABASE cannot run inside a transaction block",
+                    ));
+                }
+                let mut g = self.global.lock().unwrap();
+                if g.databases.contains_key(&name) {
+                    if !if_not_exists {
+                        return Err(PgError::new(
+                            code::DUPLICATE_DATABASE,
+                            format!("database \"{name}\" already exists"),
+                        ));
+                    }
+                } else {
+                    let oid = g.next_db_oid;
+                    g.next_db_oid += 1;
+                    g.databases.insert(name.clone(), GlobalDb {
+                        oid,
+                        name,
+                        db: DbState::default(),
+                        seqs: BTreeMap::new(),
+                    });
+                }
+                Ok(StmtResult::tag("CREATE DATABASE"))
+            }
+            S::Drop { object_type: a::ObjectType::Database, if_exists, names, .. } => {
+                if s.status == TxStatus::InTransaction || s.txn.is_some() {
+                    return Err(PgError::new(
+                        code::ACTIVE_SQL_TRANSACTION,
+                        "DROP DATABASE cannot run inside a transaction block",
+                    ));
+                }
+                let mut g = self.global.lock().unwrap();
+                for name in names {
+                    let n = super::binder::name_parts(name).pop().unwrap_or_default();
+                    if g.sessions.values().any(|h| h.database == n) {
+                        return Err(PgError::new(
+                            code::OBJECT_IN_USE,
+                            "cannot drop the currently open database".to_string(),
+                        ));
+                    }
+                    if g.databases.remove(&n).is_none() && !if_exists {
+                        return Err(PgError::new(
+                            code::INVALID_CATALOG_NAME,
+                            format!("database \"{n}\" does not exist"),
+                        ));
+                    }
+                }
+                Ok(StmtResult::tag("DROP DATABASE"))
+            }
             S::StartTransaction { .. } => {
                 if s.txn.is_some() && s.status != TxStatus::Idle {
                     let mut r = StmtResult::tag("BEGIN");
@@ -486,7 +564,7 @@ impl Engine {
                 let mut hints = vec![];
                 {
                     let g = self.global.lock().unwrap();
-                    let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.db);
+                    let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
                     let info = self.info(s);
                     let b = Binder::new(db, &info, &[]);
                     for dt in data_types {
@@ -509,7 +587,7 @@ impl Engine {
                 let mut vals = vec![];
                 {
                     let g = self.global.lock().unwrap();
-                    let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.db);
+                    let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
                     let info = self.info(s);
                     let mut b = Binder::new(db, &info, &prep.param_types);
                     for (i, p) in parameters.iter().enumerate() {
@@ -656,17 +734,20 @@ impl Engine {
         param_types: &[Type],
     ) -> PgResult<StmtResult> {
         let mut g = self.global.lock().unwrap();
+        let databases_info: Vec<(u32, String)> = g.databases.values().map(|d| (d.oid, d.name.clone())).collect();
         let global = &mut *g;
+        let global_db = global.databases.get_mut(&s.rt.database).unwrap();
         let txn = s.txn.as_mut().expect("transaction");
         let mut ctx = Ctx {
             db: &mut txn.state,
-            seqs: &mut global.seqs,
+            seqs: &mut global_db.seqs,
             rt: &mut s.rt,
             params,
             outer: vec![],
             ctes: vec![],
             notifies: vec![],
             affected: 0,
+            databases: databases_info,
         };
         let info = SessionInfo {
             user: ctx.rt.user.clone(),
@@ -841,7 +922,8 @@ impl Engine {
     fn begin(&self, s: &mut Session) {
         let g = self.global.lock().unwrap();
         s.rt.now = super::datetime::now_micros();
-        s.txn = Some(Txn { state: g.db.clone(), savepoints: vec![], wrote: false });
+        let db_state = g.databases.get(&s.rt.database).unwrap().db.clone();
+        s.txn = Some(Txn { state: db_state, savepoints: vec![], wrote: false });
     }
 
     /// Takes the single write lock, waiting for another transaction to finish.
@@ -857,7 +939,7 @@ impl Engine {
                         if let Some(tx) = s.txn.as_mut() {
                             if !tx.wrote {
                                 // Read committed: start writing from the latest state.
-                                tx.state = g.db.clone();
+                                tx.state = g.databases.get(&s.rt.database).unwrap().db.clone();
                             }
                             tx.wrote = true;
                         }
@@ -878,8 +960,10 @@ impl Engine {
     fn commit(&self, s: &mut Session) -> PgResult<()> {
         let Some(tx) = s.txn.take() else { return Ok(()) };
         let mut g = self.global.lock().unwrap();
-        if tx.wrote {
-            g.db = tx.state;
+        if tx.wrote
+            && let Some(global_db) = g.databases.get_mut(&s.rt.database)
+        {
+            global_db.db = tx.state;
         }
         if g.writer == Some(s.id) {
             g.writer = None;
@@ -924,7 +1008,7 @@ impl Engine {
             Some(tx) => f(&tx.state),
             None => {
                 let g = self.global.lock().unwrap();
-                f(&g.db)
+                f(&g.databases.get(&s.rt.database).unwrap().db)
             }
         }
     }

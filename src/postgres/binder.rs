@@ -2663,7 +2663,7 @@ impl<'a> Binder<'a> {
             if op == "^" {
                 return if lt.base == Numeric
                     || rt.base == Numeric
-                    || (lt.is_integer() && rt.is_integer() && false)
+
                 {
                     Some((Type::NUMERIC, Type::NUMERIC, Type::NUMERIC))
                 } else {

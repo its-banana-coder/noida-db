@@ -81,7 +81,7 @@ pub fn cast_context(from: Type, to: Type) -> Option<CastCtx> {
     }
     if from.array != to.array {
         // Arrays convert to strings via I/O; nothing else.
-        return if !from.array && false {
+        return if false {
             None
         } else if to.is_string() && from.array {
             Some(CastCtx::Assignment)
