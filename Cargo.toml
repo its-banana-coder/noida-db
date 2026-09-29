@@ -8,6 +8,9 @@ license = "MIT"
 # Its own workspace root, so cargo never reads the manifest of an enclosing
 # checkout (as when this repo is a worktree nested inside another).
 [workspace]
+# A client-test crate under tests/clients has its own dependencies (tokio,
+# sqlx...) that don't belong in noida-db's own build.
+exclude = ["tests/clients/postgres/rust"]
 
 [lib]
 name = "noida"
@@ -22,9 +25,12 @@ default = ["redis", "postgres"]
 redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
 sql = []
-postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
+postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 memcached = []
+# HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
+# same as the other services' wire protocols.
+clickhouse = []
 
 [dependencies]
 # Postgres: wire-protocol message codecs only (no tokio server API).
@@ -34,6 +40,8 @@ bytes = { version = "1", optional = true }
 regex-lite = { version = "0.1", optional = true }
 # Postgres: SQL parsing.
 sqlparser = { version = "0.63", default-features = false, features = ["std"], optional = true }
+# Postgres: Snowball stemming for to_tsvector/to_tsquery's 'english' config.
+rust-stemmers = { version = "1.2", optional = true }
 # Redis: EVAL and friends run in Lua 5.1, the version Redis embeds. The
 # vendored interpreter is compiled in (~250KB), which is the whole feature.
 mlua = { version = "0.12", default-features = false, features = ["lua51", "vendored"], optional = true }
@@ -54,6 +62,14 @@ postgres = { version = "0.19", features = ["with-serde_json-1", "with-uuid-1", "
 serde_json = "1"
 uuid = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+# ClickHouse: a real HTTP client library against the HTTP interface, the
+# same way clickhouse-connect/@clickhouse/client work.
+ureq = { version = "3", default-features = false }
+# ClickHouse: the official Rust client, now that RowBinaryWithNamesAndTypes
+# (which it requires) is implemented. Async (hyper/tokio), dev-only.
+clickhouse = "0.15"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 # Service test suites only build when their service is compiled in.
 [[test]]
@@ -87,4 +103,16 @@ required-features = ["kafka"]
 [[test]]
 name = "kafka_diff"
 required-features = ["kafka"]
+
+[[test]]
+name = "clickhouse_client"
+required-features = ["clickhouse"]
+
+[[test]]
+name = "clickhouse_diff"
+required-features = ["clickhouse"]
+
+[[test]]
+name = "clickhouse_official_client"
+required-features = ["clickhouse"]
 

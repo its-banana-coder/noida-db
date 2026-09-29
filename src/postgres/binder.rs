@@ -30,8 +30,13 @@ struct SCol {
     idx: usize,
     table_oid: u32,
     attnum: i16,
-    /// USING/NATURAL hides the underlying columns behind a merged one.
+    /// USING/NATURAL hides the underlying columns behind a merged one, or
+    /// (with `system`) this is a system column hidden from `SELECT *`.
     hidden: bool,
+    /// A system column (`ctid`/`xmin`/...): still resolves by bare name
+    /// (unlike other `hidden` columns, e.g. a pre-merge USING/NATURAL join
+    /// column or `excluded.*` in `ON CONFLICT`, which must be qualified).
+    system: bool,
     /// Field names of a record-typed column.
     rec: Option<Vec<(String, Type)>>,
 }
@@ -540,11 +545,11 @@ impl<'a> Binder<'a> {
         &mut self,
         sel: &a::Select,
         q: &a::Query,
-        from: From,
+        mut from: From,
     ) -> PgResult<(Query, Vec<OutCol>)> {
         let input_width = self.scopes.last().unwrap().width();
         // WHERE
-        let filter = match &sel.selection {
+        let mut filter = match &sel.selection {
             Some(e) => {
                 self.frames.push(AggFrame { forbid: Some("WHERE"), ..Default::default() });
                 let te = self.bind_expr(e);
@@ -553,6 +558,19 @@ impl<'a> Binder<'a> {
             }
             None => None,
         };
+        // A comma-separated `FROM a, b, c` binds to a chain of `Cross`
+        // joins with no `on`, which without this would run as a fully
+        // unfiltered nested-loop join at every step (many ORMs' catalog
+        // queries still use this older join style, and it blows up
+        // memory/time on wide implicit joins once WHERE is the only
+        // filter). Push down whichever WHERE conjuncts become fully
+        // evaluable once a join's columns are all in scope.
+        if let Some(f) = filter.take() {
+            let mut remaining = vec![];
+            flatten_and(f, &mut remaining);
+            push_cross_predicates(&mut from, &mut remaining);
+            filter = if remaining.is_empty() { None } else { Some(and_all(remaining)) };
+        }
         // Everything below may contain aggregates and window functions.
         self.frames.push(AggFrame::default());
         let r = self.bind_select_rest(sel, q, from, filter, input_width);
@@ -643,25 +661,27 @@ impl<'a> Binder<'a> {
                     order_specs.push((proj[idx - 1].clone(), desc, nulls_first, Some(idx - 1)));
                     continue;
                 }
+                // A simple name that matches an output column is always
+                // taken as that output column, even when it also matches
+                // (unambiguously or not) an input column: real Postgres
+                // resolves ORDER BY names against the select list first.
                 if let a::Expr::Identifier(id) = &o.expr {
                     let n = ident(id);
-                    if self.lookup_column(&n, None).is_none() {
-                        let hits: Vec<usize> = out_cols
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, c)| c.name == n)
-                            .map(|(i, _)| i)
-                            .collect();
-                        if hits.len() > 1 {
-                            return Err(PgError::new(
-                                code::AMBIGUOUS_COLUMN,
-                                format!("ORDER BY \"{n}\" is ambiguous"),
-                            ));
-                        }
-                        if let Some(&p) = hits.first() {
-                            order_specs.push((proj[p].clone(), desc, nulls_first, Some(p)));
-                            continue;
-                        }
+                    let hits: Vec<usize> = out_cols
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| c.name == n)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if hits.len() > 1 {
+                        return Err(PgError::new(
+                            code::AMBIGUOUS_COLUMN,
+                            format!("ORDER BY \"{n}\" is ambiguous"),
+                        ));
+                    }
+                    if let Some(&p) = hits.first() {
+                        order_specs.push((proj[p].clone(), desc, nulls_first, Some(p)));
+                        continue;
                     }
                 }
                 let te = self.bind_expr(&o.expr)?;
@@ -928,7 +948,11 @@ impl<'a> Binder<'a> {
                     if !scope.rels.contains(&rel) {
                         return Err(missing_from(&rel));
                     }
-                    for c in scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel.as_str())) {
+                    for c in scope
+                        .cols
+                        .iter()
+                        .filter(|c| c.rel.as_deref() == Some(rel.as_str()) && !c.hidden)
+                    {
                         cols.push(OutCol {
                             name: c.name.clone(),
                             ty: c.ty,
@@ -1219,8 +1243,12 @@ impl<'a> Binder<'a> {
                         table_oid: c.table_oid,
                         attnum: c.attnum,
                         hidden: false,
+                        system: false,
                         rec: None,
                     });
+                }
+                if let From::Table { oid, .. } = &from {
+                    push_system_cols(&mut scope, &rel, *oid, base + cols.len());
                 }
                 scope.rels.push(rel);
                 Ok((from, scope))
@@ -1253,6 +1281,7 @@ impl<'a> Binder<'a> {
                         table_oid: 0,
                         attnum: 0,
                         hidden: false,
+                        system: false,
                         rec: c.rec.clone(),
                     });
                 }
@@ -1381,6 +1410,7 @@ impl<'a> Binder<'a> {
                 table_oid: 0,
                 attnum: 0,
                 hidden: false,
+                system: false,
                 rec: None,
             });
         }
@@ -1464,7 +1494,7 @@ impl<'a> Binder<'a> {
             return Ok((From::Sub(Box::new(query)), cols, name));
         }
         let cols = table_out_cols(t);
-        Ok((From::Table { oid, ncols: t.columns.len() }, cols, name))
+        Ok((From::Table { oid, ncols: t.live_columns().count() + SYSTEM_COLS.len() }, cols, name))
     }
 
     /// The oid of the sequence `schema.name` (or found on the search path).
@@ -1529,7 +1559,7 @@ impl<'a> Binder<'a> {
                 .iter()
                 .filter(|c| {
                     c.name == name
-                        && (rel.is_none() && !c.hidden
+                        && (rel.is_none() && (!c.hidden || c.system)
                             || rel.is_some_and(|r| c.rel.as_deref() == Some(r)))
                 })
                 .collect();
@@ -1556,7 +1586,7 @@ impl<'a> Binder<'a> {
             if scope.merged.iter().any(|m| m.name == name) {
                 return false;
             }
-            let n = scope.cols.iter().filter(|c| c.name == name && !c.hidden).count();
+            let n = scope.cols.iter().filter(|c| c.name == name && (!c.hidden || c.system)).count();
             if n > 0 {
                 return n > 1;
             }
@@ -2021,7 +2051,7 @@ impl<'a> Binder<'a> {
     fn whole_row(&mut self, rel: &str) -> PgResult<TE> {
         let scope = self.scopes.last().cloned().unwrap_or_default();
         let cols: Vec<&SCol> =
-            scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel)).collect();
+            scope.cols.iter().filter(|c| c.rel.as_deref() == Some(rel) && !c.hidden).collect();
         if cols.is_empty() {
             return Err(missing_from(rel));
         }
@@ -2383,6 +2413,7 @@ impl<'a> Binder<'a> {
             B::HashLongArrow => "#>>",
             B::AtArrow => "@>",
             B::ArrowAt => "<@",
+            B::AtAt => "@@",
             B::Question => "?",
             B::QuestionPipe => "?|",
             B::QuestionAnd => "?&",
@@ -2439,7 +2470,9 @@ impl<'a> Binder<'a> {
                 }
             }
             "||" => {
-                if lt.array || rt.array {
+                if lt.base == Base::Tsvector && rt.base == Base::Tsvector {
+                    (Type::TSVECTOR, Type::TSVECTOR, Type::TSVECTOR)
+                } else if lt.array || rt.array {
                     let elem = if lt.array { lt.elem() } else { lt };
                     let relem = if rt.array { rt.elem() } else { rt };
                     let e = self
@@ -2499,7 +2532,17 @@ impl<'a> Binder<'a> {
                 (container, Type::array_of(Base::Text), ret)
             }
             "@>" | "<@" => {
-                if lt.array || rt.array {
+                if lt.is_range() || rt.is_range() {
+                    let range = if lt.is_range() { lt } else { rt };
+                    if lt.base == rt.base {
+                        (range, range, Type::BOOL)
+                    } else {
+                        // range @> element / element <@ range: the other
+                        // side is a value of the range's own element type.
+                        let elem = super::ranges::elem_type(range.base);
+                        if lt.is_range() { (lt, elem, Type::BOOL) } else { (elem, rt, Type::BOOL) }
+                    }
+                } else if lt.array || rt.array {
                     let elem = if lt.array { lt } else { rt };
                     (elem, elem, Type::BOOL)
                 } else {
@@ -2507,12 +2550,27 @@ impl<'a> Binder<'a> {
                 }
             }
             "&&" => {
-                let elem = if lt.array { lt } else { rt };
-                (elem, elem, Type::BOOL)
+                if lt.is_range() || rt.is_range() {
+                    let range = if lt.is_range() { lt } else { rt };
+                    (range, range, Type::BOOL)
+                } else {
+                    let elem = if lt.array { lt } else { rt };
+                    (elem, elem, Type::BOOL)
+                }
             }
             "?" => (Type::JSONB, Type::TEXT, Type::BOOL),
             "?|" | "?&" => (Type::JSONB, Type::array_of(Base::Text), Type::BOOL),
             "#-" => (Type::JSONB, Type::array_of(Base::Text), Type::JSONB),
+            // Either order (`tsvector @@ tsquery` or `tsquery @@ tsvector`);
+            // whichever side already resolved to tsquery decides which is
+            // which, defaulting to (tsvector, tsquery) when neither has.
+            "@@" => {
+                if lt.base == Base::Tsquery || rt.base == Base::Tsvector {
+                    (Type::TSQUERY, Type::TSVECTOR, Type::BOOL)
+                } else {
+                    (Type::TSVECTOR, Type::TSQUERY, Type::BOOL)
+                }
+            }
             _ => return Err(unsupported(&format!("operator {op}"))),
         };
         // jsonb - text / jsonb - int
@@ -2831,7 +2889,7 @@ impl<'a> Binder<'a> {
                     .map(|s| {
                         s.cols
                             .iter()
-                            .filter(|c| c.rel.as_deref() == Some(rel.as_str()))
+                            .filter(|c| c.rel.as_deref() == Some(rel.as_str()) && !c.hidden)
                             .map(|c| c.name.clone())
                             .collect()
                     })
@@ -3257,6 +3315,8 @@ impl<'a> Binder<'a> {
             D::JSON => (Type::JSON, -1),
             D::JSONB => (Type::JSONB, -1),
             D::Uuid => (Type::UUID, -1),
+            D::TsVector => (Type::TSVECTOR, -1),
+            D::TsQuery => (Type::TSQUERY, -1),
             D::Regclass => (Type::of(Base::Regclass), -1),
             D::Array(def) => {
                 let inner = match def {
@@ -3334,6 +3394,12 @@ impl<'a> Binder<'a> {
             "regrole" => Some(Base::Regrole),
             "tsvector" => Some(Base::Tsvector),
             "tsquery" => Some(Base::Tsquery),
+            "int4range" => Some(Base::Int4Range),
+            "int8range" => Some(Base::Int8Range),
+            "numrange" => Some(Base::NumRange),
+            "daterange" => Some(Base::DateRange),
+            "tsrange" => Some(Base::TsRange),
+            "tstzrange" => Some(Base::TstzRange),
             "pg_lsn" => Some(Base::PgLsn),
             "jsonb" => Some(Base::Jsonb),
             "json" => Some(Base::Json),
@@ -3482,8 +3548,13 @@ impl<'a> Binder<'a> {
                     let i = *i;
                     if self.params[i].is_unknown() {
                         self.params[i] = target;
-                        return Ok(Expr::Param(i));
                     }
+                    // Re-run through the ordinary (now not-unknown) path
+                    // below rather than returning bare `Expr::Param(i)`:
+                    // even when the locked type already equals `target`,
+                    // this still needs to apply `typmod` (e.g. a
+                    // `numeric(8,2)` column's scale), which only the
+                    // `Expr::Cast` wrapping below does.
                     let from = self.params[i];
                     return self.coerce(TE::new(Expr::Param(i), from), target, typmod, ctx, what);
                 }
@@ -3762,6 +3833,35 @@ impl<'a> Binder<'a> {
                 .collect();
             return Ok((Query::Values { rows, order: vec![], limit: None, offset: None }, ocols));
         }
+        // `INSERT INTO t (...) SELECT $1, $2, ... WHERE ...` (as opposed to
+        // `VALUES`): a still-unspecified parameter directly in target-list
+        // position resolves against that column's own type, the same way
+        // one in a `VALUES` row already does (see `coerce_assign` above) —
+        // real Postgres does this too. Since a bare `SELECT $1` alone has
+        // no such context, resolving it defaults to `text` (postponing
+        // the unknown to the whole query, see `resolve_unknown_output`),
+        // which then permanently locks the parameter's type before this
+        // function ever sees it — so this has to pre-seed the still-open
+        // parameters before `bind_query` runs, not fix them up after.
+        if q.with.is_none()
+            && let a::SetExpr::Select(sel) = q.body.as_ref()
+            && sel.projection.len() == targets.len()
+        {
+            for (item, (ty, _)) in sel.projection.iter().zip(targets) {
+                if let a::SelectItem::UnnamedExpr(a::Expr::Value(vws)) = item
+                    && let a::Value::Placeholder(p) = &vws.value
+                    && let Some(idx) = p.strip_prefix('$').and_then(|n| n.parse::<usize>().ok())
+                    && idx >= 1
+                {
+                    if self.params.len() < idx {
+                        self.params.resize(idx, Type::UNKNOWN);
+                    }
+                    if self.params[idx - 1].is_unknown() {
+                        self.params[idx - 1] = *ty;
+                    }
+                }
+            }
+        }
         let (plan, cols_out) = self.bind_query(q)?;
         // Cast the query's columns to the target types.
         let targets_t: Vec<Type> = targets.iter().map(|t| t.0).collect();
@@ -3920,6 +4020,7 @@ impl<'a> Binder<'a> {
                         table_oid: oid,
                         attnum: i as i16 + 1,
                         hidden: false,
+                        system: false,
                         rec: None,
                     });
                 }
@@ -3934,6 +4035,7 @@ impl<'a> Binder<'a> {
                         table_oid: 0,
                         attnum: i as i16 + 1,
                         hidden: true,
+                        system: false,
                         rec: None,
                     });
                 }
@@ -4004,6 +4106,7 @@ impl<'a> Binder<'a> {
                 table_oid: oid,
                 attnum: i as i16 + 1,
                 hidden: false,
+                system: false,
                 rec: None,
             });
         }
@@ -4302,6 +4405,39 @@ pub fn table_out_cols(t: &Table) -> Vec<OutCol> {
         .collect()
 }
 
+/// `ctid`, `xmin`, `cmin`, `xmax`, `cmax`, `tableoid`: Postgres's per-row
+/// system columns, in the same order as their real (negative) attnums.
+/// noida-db has no MVCC, so only `ctid` (scan position) and `tableoid`
+/// reflect real per-row state; the transaction/command ids are fixed
+/// placeholders (see docs/LIMITATIONS.md) so a client that blindly selects
+/// them (some ORMs' optimistic-locking or catalog-introspection code does)
+/// gets a plausible value instead of a hard "column does not exist" error.
+pub(super) const SYSTEM_COLS: &[(&str, Type, i16)] = &[
+    ("ctid", Type::TID, -1),
+    ("xmin", Type::XID, -2),
+    ("cmin", Type::CID, -3),
+    ("xmax", Type::XID, -4),
+    ("cmax", Type::CID, -5),
+    ("tableoid", Type::OID, -6),
+];
+
+fn push_system_cols(scope: &mut Scope, rel: &str, oid: u32, base: usize) {
+    for (i, (name, ty, attnum)) in SYSTEM_COLS.iter().enumerate() {
+        scope.cols.push(SCol {
+            rel: Some(rel.to_string()),
+            name: (*name).to_string(),
+            ty: *ty,
+            typmod: -1,
+            idx: base + i,
+            table_oid: oid,
+            attnum: *attnum,
+            hidden: true,
+            system: true,
+            rec: None,
+        });
+    }
+}
+
 fn table_scope(t: &Table, oid: u32, rel: &str, base: usize) -> Scope {
     let mut scope = Scope::default();
     for (i, c) in t.live_columns() {
@@ -4314,9 +4450,11 @@ fn table_scope(t: &Table, oid: u32, rel: &str, base: usize) -> Scope {
             table_oid: oid,
             attnum: i as i16 + 1,
             hidden: false,
+            system: false,
             rec: None,
         });
     }
+    push_system_cols(&mut scope, rel, oid, base + t.columns.len());
     scope.rels.push(rel.to_string());
     scope
 }
@@ -4362,6 +4500,79 @@ fn apply_alias_columns(
 
 fn rename_cols(cols: &mut [OutCol], names: &[a::TableAliasColumnDef], rel: &str) -> PgResult<()> {
     apply_alias_columns(cols, names, rel)
+}
+
+/// Flattens top-level (and nested) `AND`s into a flat conjunct list, the
+/// inverse of [`and_all`].
+fn flatten_and(e: Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::And(items) => items.into_iter().for_each(|i| flatten_and(i, out)),
+        other => out.push(other),
+    }
+}
+
+/// The highest column index a bound expression references in the current
+/// row, ignoring outer-query references (which are always "in scope").
+/// `None` means the expression references no row column at all.
+fn max_col(e: &Expr) -> Option<usize> {
+    let mut m = match e {
+        Expr::Col(i) => Some(*i),
+        _ => None,
+    };
+    let mut e = e.clone();
+    e.children_mut(&mut |c| {
+        if let Some(cm) = max_col(c) {
+            m = Some(m.map_or(cm, |x| x.max(cm)));
+        }
+    });
+    m
+}
+
+/// A comma-separated `FROM a, b, c` binds to a left-deep chain of `Cross`
+/// joins with no `on`, and an explicit `a JOIN b ON ... JOIN c ON ...`
+/// binds to the same left-deep shape with `Inner` joins that already have
+/// one. Either way, without this a WHERE-clause condition on an early
+/// table only applies after every later join has already run against the
+/// *whole* earlier result — many ORMs' catalog-introspection queries send
+/// exactly this shape (a long explicit-join chain filtered down to one
+/// specific row only in WHERE), and it blows up memory/time once the
+/// tables involved aren't tiny. Real Postgres has no such distinction
+/// (comma joins, `JOIN...ON` and WHERE conditions on an inner join are
+/// all equivalent), so it's correct to push a WHERE conjunct down onto
+/// (or, for an `Inner`/`Cross` join that already has one, AND it onto)
+/// whichever join makes all of its columns available first. `Left`/
+/// `Right`/`Full` joins are never touched (doing so would change which
+/// rows get null-padded), but a chain's own accumulation is always
+/// through `left` — see `bind_table_with_joins_at` — so descending only
+/// through `left` still reaches every `Inner`/`Cross` node nested inside
+/// an outer join's left-hand side. Only ever descends through `left` on
+/// the other axis too: a `right` item can itself be an arbitrary join
+/// subtree at some other column offset (a later comma-joined item), which
+/// this deliberately leaves untouched.
+fn push_cross_predicates(from: &mut From, remaining: &mut Vec<Expr>) {
+    let From::Join { left, kind, on, left_cols, right_cols, .. } = from else { return };
+    push_cross_predicates(left, remaining);
+    if !matches!(kind, JoinKind::Cross | JoinKind::Inner) || remaining.is_empty() {
+        return;
+    }
+    let width = *left_cols + *right_cols;
+    let mut mine = vec![];
+    let mut i = 0;
+    while i < remaining.len() {
+        if max_col(&remaining[i]).is_none_or(|m| m < width) {
+            mine.push(remaining.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+    if mine.is_empty() {
+        return;
+    }
+    let extra = and_all(mine);
+    *on = Some(match on.take() {
+        Some(existing) => Expr::And(vec![existing, extra]),
+        None => extra,
+    });
 }
 
 fn and_all(mut conds: Vec<Expr>) -> Expr {

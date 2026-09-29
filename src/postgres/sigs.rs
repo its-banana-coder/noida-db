@@ -61,6 +61,21 @@ left(text,int4)text right(text,int4)text repeat(text,int4)text reverse(text)text
 !concat(...any)text !concat_ws(text,...any)text split_part(text,text,int4)text
 md5(text)text md5(bytea)text sha256(bytea)bytea ascii(text)int4 chr(int4)text
 !format(text)text !format(text,...any)text quote_ident(text)text quote_literal(anyelement)text !quote_nullable(anyelement)text
+to_tsvector(text)tsvector to_tsvector(text,text)tsvector
+to_tsquery(text)tsquery to_tsquery(text,text)tsquery
+plainto_tsquery(text)tsquery plainto_tsquery(text,text)tsquery
+phraseto_tsquery(text)tsquery phraseto_tsquery(text,text)tsquery
+websearch_to_tsquery(text)tsquery websearch_to_tsquery(text,text)tsquery
+ts_rank(tsvector,tsquery)float4 setweight(tsvector,char)tsvector
+int4range(int4,int4)int4range int4range(int4,int4,text)int4range
+int8range(int8,int8)int8range int8range(int8,int8,text)int8range
+numrange(numeric,numeric)numrange numrange(numeric,numeric,text)numrange
+daterange(date,date)daterange daterange(date,date,text)daterange
+tsrange(timestamp,timestamp)tsrange tsrange(timestamp,timestamp,text)tsrange
+tstzrange(timestamptz,timestamptz)tstzrange tstzrange(timestamptz,timestamptz,text)tstzrange
+lower(int4range)int4 lower(int8range)int8 lower(numrange)numeric lower(daterange)date lower(tsrange)timestamp lower(tstzrange)timestamptz
+upper(int4range)int4 upper(int8range)int8 upper(numrange)numeric upper(daterange)date upper(tsrange)timestamp upper(tstzrange)timestamptz
+isempty(int4range)bool isempty(int8range)bool isempty(numrange)bool isempty(daterange)bool isempty(tsrange)bool isempty(tstzrange)bool
 regexp_replace(text,text,text)text regexp_replace(text,text,text,text)text
 regexp_match(text,text)_text regexp_match(text,text,text)_text
 regexp_like(text,text)bool regexp_like(text,text,text)bool regexp_count(text,text)int4

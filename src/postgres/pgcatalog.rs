@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 
 use super::catalog::{
-    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, Row, SeqValue,
+    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, RelKind, Row, SeqValue,
 };
 use super::error::PgResult;
 use super::exec::Ctx;
@@ -506,6 +506,36 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         NULL,
                     ]);
                 }
+                for (name, ty, attnum) in super::binder::SYSTEM_COLS {
+                    out.push(vec![
+                        n(tb.oid as i64),
+                        t(*name),
+                        n(ty.oid() as i64),
+                        n(-1),
+                        n(ty.typlen() as i64),
+                        n(*attnum as i64),
+                        n(0),
+                        n(-1),
+                        n(-1),
+                        b(ty.base.info().map(|i| i.byval).unwrap_or(false)),
+                        ch(ty.base.info().map(|i| i.align as char).unwrap_or('i')),
+                        ch('p'),
+                        ch('\0'),
+                        b(false),
+                        b(false),
+                        b(false),
+                        t(""),
+                        t(""),
+                        b(false),
+                        b(true),
+                        n(0),
+                        n(0),
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                    ]);
+                }
             }
         }
         "pg_type" => {
@@ -898,7 +928,19 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 ]);
             }
         }
-        "pg_matviews" => {}
+        "pg_matviews" => {
+            for tb in db.tables.values().filter(|t| t.kind == RelKind::MaterializedView) {
+                out.push(vec![
+                    t(db.schema_name(tb.schema)),
+                    t(&tb.name),
+                    t(&user),
+                    NULL,
+                    b(!tb.indexes.is_empty()),
+                    b(tb.matview_populated),
+                    tb.view_sql.clone().map_or(NULL, t),
+                ]);
+            }
+        }
         "pg_indexes" => {
             for tb in db.tables.values() {
                 for idx in &tb.indexes {

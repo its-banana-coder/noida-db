@@ -1298,13 +1298,30 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 )
             })?;
             let _ = ncols;
-            // The binder numbers a table's columns without the dropped ones.
-            if t.columns.iter().any(|c| c.dropped) {
-                let live: Vec<usize> = t.live_columns().map(|(i, _)| i).collect();
-                t.rows.iter().map(|r| live.iter().map(|&i| r[i].clone()).collect()).collect()
-            } else {
-                t.rows.clone()
+            if !t.matview_populated {
+                return Err(PgError::new(
+                    code::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    format!("materialized view \"{}\" has not been populated", t.name),
+                )
+                .hint("Use the REFRESH MATERIALIZED VIEW command."));
             }
+            // The binder numbers a table's columns without the dropped ones,
+            // then appends `ctid`/`xmin`/`cmin`/`xmax`/`cmax`/`tableoid`.
+            let has_dropped = t.columns.iter().any(|c| c.dropped);
+            let live: Vec<usize> = t.live_columns().map(|(i, _)| i).collect();
+            t.rows
+                .iter()
+                .enumerate()
+                .map(|(pos, r)| {
+                    let mut row: Row = if has_dropped {
+                        live.iter().map(|&i| r[i].clone()).collect()
+                    } else {
+                        r.clone()
+                    };
+                    row.extend(t.system_col_values(pos));
+                    row
+                })
+                .collect()
         }
         From::Virtual { name, .. } => pgcatalog::rows(name, ctx)?,
         From::Cte(slot) => ctx.ctes.get(*slot).cloned().flatten().unwrap_or_default(),

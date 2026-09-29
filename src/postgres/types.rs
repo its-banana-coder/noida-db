@@ -72,6 +72,12 @@ pub enum Base {
     Regconfig,
     Tsvector,
     Tsquery,
+    Int4Range,
+    Int8Range,
+    NumRange,
+    DateRange,
+    TsRange,
+    TstzRange,
     /// A user-defined enum, by its pg_type OID.
     Enum(u32),
 }
@@ -198,6 +204,12 @@ pub static TYPES: &[TypeInfo] = &[
     ti!(Regconfig, 3734, 3735, "regconfig", 4, true, b'N', false, "regconfig", b'b', b'i'),
     ti!(Tsvector, 3614, 3643, "tsvector", -1, false, b'U', false, "tsvector", b'b', b'i'),
     ti!(Tsquery, 3615, 3645, "tsquery", -1, false, b'U', false, "tsquery", b'b', b'i'),
+    ti!(Int4Range, 3904, 3905, "int4range", -1, false, b'R', false, "int4range", b'r', b'd'),
+    ti!(NumRange, 3906, 3907, "numrange", -1, false, b'R', false, "numrange", b'r', b'd'),
+    ti!(TsRange, 3908, 3909, "tsrange", -1, false, b'R', false, "tsrange", b'r', b'd'),
+    ti!(TstzRange, 3910, 3911, "tstzrange", -1, false, b'R', false, "tstzrange", b'r', b'd'),
+    ti!(DateRange, 3912, 3913, "daterange", -1, false, b'R', false, "daterange", b'r', b'd'),
+    ti!(Int8Range, 3926, 3927, "int8range", -1, false, b'R', false, "int8range", b'r', b'd'),
 ];
 
 /// A column/expression type. Postgres arrays of any dimension share a type.
@@ -232,6 +244,9 @@ impl Type {
     pub const NAME: Type = Type::of(Base::Name);
     pub const UNKNOWN: Type = Type::of(Base::Unknown);
     pub const OID: Type = Type::of(Base::Oid);
+    pub const TID: Type = Type::of(Base::Tid);
+    pub const XID: Type = Type::of(Base::Xid);
+    pub const CID: Type = Type::of(Base::Cid);
     pub const DATE: Type = Type::of(Base::Date);
     pub const TIMESTAMP: Type = Type::of(Base::Timestamp);
     pub const TIMESTAMPTZ: Type = Type::of(Base::Timestamptz);
@@ -240,6 +255,14 @@ impl Type {
     pub const JSONB: Type = Type::of(Base::Jsonb);
     pub const BYTEA: Type = Type::of(Base::Bytea);
     pub const UUID: Type = Type::of(Base::Uuid);
+    pub const TSVECTOR: Type = Type::of(Base::Tsvector);
+    pub const TSQUERY: Type = Type::of(Base::Tsquery);
+    pub const INT4RANGE: Type = Type::of(Base::Int4Range);
+    pub const INT8RANGE: Type = Type::of(Base::Int8Range);
+    pub const NUMRANGE: Type = Type::of(Base::NumRange);
+    pub const DATERANGE: Type = Type::of(Base::DateRange);
+    pub const TSRANGE: Type = Type::of(Base::TsRange);
+    pub const TSTZRANGE: Type = Type::of(Base::TstzRange);
     pub const VOID: Type = Type::of(Base::Void);
     pub const RECORD: Type = Type::of(Base::Record);
     pub const CHAR: Type = Type::of(Base::Char);
@@ -305,6 +328,19 @@ impl Type {
 
     pub fn is_string(self) -> bool {
         !self.array && matches!(self.base, Base::Text | Base::Varchar | Base::Bpchar | Base::Name)
+    }
+
+    pub fn is_range(self) -> bool {
+        !self.array
+            && matches!(
+                self.base,
+                Base::Int4Range
+                    | Base::Int8Range
+                    | Base::NumRange
+                    | Base::DateRange
+                    | Base::TsRange
+                    | Base::TstzRange
+            )
     }
 
     pub fn is_unknown(self) -> bool {
@@ -1111,6 +1147,21 @@ pub fn from_text(s: &str, ty: Type, ctx: &Ctx) -> PgResult<Value> {
             ));
         }
         Base::Void => Value::Null,
+        Base::Tsvector => Value::Text(super::fts::format_vector(&super::fts::parse_vector(s)?)),
+        Base::Tsquery => Value::Text(match super::fts::parse_query_text(s)? {
+            Some(q) => super::fts::format_query(&q),
+            None => String::new(),
+        }),
+        Base::Int4Range
+        | Base::Int8Range
+        | Base::NumRange
+        | Base::DateRange
+        | Base::TsRange
+        | Base::TstzRange => {
+            let r = super::ranges::parse(s, ty.base, ctx)?;
+            let fmt = FmtCtx { zone: ctx.zone.clone(), ..Default::default() };
+            Value::Text(super::ranges::format(&r, ty.base, &fmt))
+        }
         _ => Value::Text(s.to_string()),
     })
 }
@@ -1569,6 +1620,11 @@ pub fn to_binary(v: &Value, ty: Type, f: &FmtCtx) -> Vec<u8> {
             out.push(1);
             out.extend_from_slice(s.as_bytes());
         }
+        (Base::Tid, Value::Text(s)) => {
+            let (blk, off) = tid_from_text(s).unwrap_or((0, 0));
+            out.extend_from_slice(&blk.to_be_bytes());
+            out.extend_from_slice(&off.to_be_bytes());
+        }
         (_, Value::Text(s)) => out.extend_from_slice(s.as_bytes()),
         (_, Value::Bytes(b)) => out.extend_from_slice(b),
         (_, Value::Date(d)) => out.extend_from_slice(&d.to_be_bytes()),
@@ -1703,8 +1759,21 @@ pub fn from_binary(b: &[u8], ty: Type) -> PgResult<Value> {
             Value::Text(s)
         }
         Base::Char => Value::Text(b.first().map(|&c| (c as char).to_string()).unwrap_or_default()),
+        Base::Tid => {
+            let x = arr(6)?;
+            let blk = u32::from_be_bytes(x[..4].try_into().unwrap());
+            let off = u16::from_be_bytes(x[4..6].try_into().unwrap());
+            Value::Text(format!("({blk},{off})"))
+        }
         _ => Value::Text(text()?),
     })
+}
+
+/// Parses a `tid`'s canonical `(block,offset)` text form.
+fn tid_from_text(s: &str) -> Option<(u32, u16)> {
+    let s = s.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let (a, b) = s.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 #[cfg(test)]

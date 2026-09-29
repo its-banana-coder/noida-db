@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the committed Postgres client apps (psycopg, SQLAlchemy, Django,
-# asyncpg, Alembic, node-postgres, Knex, TypeORM, pgx, GORM, JDBC) against a
-# server.
+# asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx,
+# Npgsql, JDBC) against a server.
 #
 #   tests/clients/postgres/run.sh            # starts noida-db on a free port
 #   PGPORT=5432 tests/clients/postgres/run.sh  # an already-running server
@@ -84,11 +84,11 @@ else
   echo "-- psycopg SKIPPED (not installed)"
 fi
 
-# --- Node: node-postgres, Knex and TypeORM ---------------------------------
+# --- Node: node-postgres, Knex, TypeORM and Sequelize -----------------------
 if command -v node >/dev/null && command -v npm >/dev/null; then
   if [ ! -d "$cache/node_modules/pg" ]; then
-    echo "== installing node-postgres, Knex and TypeORM"
-    (cd "$cache" && npm install --silent --no-package-lock pg knex typeorm reflect-metadata >/dev/null 2>&1)
+    echo "== installing node-postgres, Knex, TypeORM and Sequelize"
+    (cd "$cache" && npm install --silent --no-package-lock pg knex typeorm reflect-metadata sequelize >/dev/null 2>&1)
   fi
   if [ -d "$cache/node_modules/pg" ]; then
     run_client "node-postgres" env NODE_PATH="$cache/node_modules" node "$here/node/pg_test.js"
@@ -105,8 +105,13 @@ if command -v node >/dev/null && command -v npm >/dev/null; then
   else
     echo "-- typeorm SKIPPED (npm install failed)"
   fi
+  if [ -d "$cache/node_modules/sequelize" ]; then
+    run_client "sequelize" env NODE_PATH="$cache/node_modules" node "$here/node/sequelize_test.js"
+  else
+    echo "-- sequelize SKIPPED (npm install failed)"
+  fi
 else
-  echo "-- node-postgres, knex, typeorm SKIPPED (no node)"
+  echo "-- node-postgres, knex, typeorm, sequelize SKIPPED (no node)"
 fi
 
 # --- Go: pgx and GORM -------------------------------------------------------
@@ -115,6 +120,20 @@ if command -v go >/dev/null; then
   run_client "gorm" env -C "$here/go" go run ./gorm
 else
   echo "-- pgx, gorm SKIPPED (no go)"
+fi
+
+# --- Rust: sqlx -------------------------------------------------------------
+if command -v cargo >/dev/null; then
+  run_client "sqlx" env -C "$here/rust" cargo run -q
+else
+  echo "-- sqlx SKIPPED (no cargo)"
+fi
+
+# --- .NET: Npgsql -----------------------------------------------------------
+if command -v dotnet >/dev/null; then
+  run_client "npgsql" env -C "$here/dotnet/npgsql" dotnet run
+else
+  echo "-- npgsql SKIPPED (no dotnet)"
 fi
 
 # --- Java: the PostgreSQL JDBC driver --------------------------------------

@@ -1,5 +1,8 @@
 /target
 tests/clients/target
+tests/clients/postgres/rust/target/
+tests/clients/postgres/dotnet/npgsql/bin/
+tests/clients/postgres/dotnet/npgsql/obj/
 /.noida-db
 /.claude
 
@@ -16,3 +19,5 @@ tests/clients/kafka/java-gradle/build/
 node_modules/
 __pycache__/
 *.pyc
+venv
+venv/

@@ -62,6 +62,7 @@ settings.configure(
         "django.contrib.sessions",
         "django.contrib.admin",
         "django.contrib.messages",
+        "django.contrib.postgres",
         "shop",
     ],
     MIDDLEWARE=[],
@@ -94,6 +95,7 @@ def main():
     from django.db import connection, transaction, IntegrityError
     from django.db.models import Avg, Count, DecimalField, F, Max, Q, Sum, Value
     from django.db.models.functions import Lower, Coalesce
+    from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
 
     call_command("makemigrations", "shop", verbosity=0)
     call_command("migrate", verbosity=0)
@@ -126,6 +128,14 @@ def main():
     check(b.added.tzinfo is not None, "aware datetime")
 
     check(list(Book.objects.filter(price__lt=10).order_by("title").values_list("title", flat=True)) == ["Alpha", "Gamma"], "filter")
+    matched = Book.objects.annotate(search=SearchVector("title")).filter(search=SearchQuery("alpha"))
+    check(list(matched.values_list("title", flat=True)) == ["Alpha"], f"full-text search {list(matched)}")
+    ranked = dict(
+        Book.objects.annotate(
+            rank=SearchRank(SearchVector("title"), SearchQuery("alpha | beta", search_type="raw"))
+        ).values_list("title", "rank")
+    )
+    check(ranked["Alpha"] > 0 and ranked["Beta"] > 0 and ranked["Gamma"] == 0, f"search rank {ranked}")
     check(Book.objects.filter(Q(title__startswith="A") | Q(in_print=False)).count() == 2, "Q")
     check(Book.objects.filter(tags__contains=["x"]).count() == 1, "json contains")
     check(Book.objects.filter(title__iexact="beta").exists(), "iexact")

@@ -15,10 +15,13 @@ pub mod dml;
 pub mod engine;
 pub mod error;
 pub mod exec;
+pub mod fts;
 pub mod funcs;
 pub mod keywords;
 pub mod pgcatalog;
 pub mod plan;
+pub mod ranges;
+pub mod refresh;
 pub mod seqddl;
 pub mod server;
 pub mod session;
@@ -37,8 +40,10 @@ use sqlparser::parser::Parser;
 
 /// Parses a SQL string into statements.
 pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
-    let rewritten = seqddl::rewrite(sql)?;
-    let sql = rewritten.as_deref().unwrap_or(sql);
+    let after_seq = seqddl::rewrite(sql)?;
+    let sql1 = after_seq.as_deref().unwrap_or(sql);
+    let after_refresh = refresh::rewrite(sql1)?;
+    let sql = after_refresh.as_deref().unwrap_or(sql1);
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(syntax_error)
 }
 

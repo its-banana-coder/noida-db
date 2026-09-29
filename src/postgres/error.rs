@@ -131,6 +131,7 @@ pub mod code {
     pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
     pub const INVALID_JSON_TEXT: &str = "22P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
+    pub const DATA_EXCEPTION: &str = "22000";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
     pub const UNIQUE_VIOLATION: &str = "23505";
