@@ -23,6 +23,8 @@ pub fn start(name: &str, addr: &str) -> Option<io::Result<SocketAddr>> {
         "elasticsearch" => Some(crate::elasticsearch::spawn(addr)),
         #[cfg(feature = "clickhouse")]
         "clickhouse" => Some(crate::clickhouse::spawn(addr)),
+        #[cfg(feature = "rabbitmq")]
+        "rabbitmq" => Some(crate::rabbitmq::spawn(addr)),
         _ => {
             let _ = addr;
             None

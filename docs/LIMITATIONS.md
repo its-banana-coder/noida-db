@@ -21,7 +21,7 @@ but not identical to the real server.
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
 | Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
-| RabbitMQ | specs only (`docs/specs/`) | no |
+| RabbitMQ | AMQP 0-9-1 core (exchanges/queues/bindings, publish/consume/get, QoS, publisher confirms), a stub management HTTP API (see below) | yes, for `lapin` |
 
 ## By design, for every service
 
@@ -407,6 +407,27 @@ MySQL 8.0 server (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`).
 - Query errors are not reported as MySQL `ERR` packets yet — an
   unsupported query currently gets a silent `OK` response instead of a
   real error, which a client can't distinguish from "0 rows, no error."
+
+## RabbitMQ
+
+AMQP 0-9-1 core over the native binary protocol: exchange/queue declare,
+binding, `basic.publish`/`basic.get`/`basic.consume`, QoS (prefetch), and
+publisher confirms (`confirm.select` + a real `basic.ack` after every
+publish on a confirming channel). Verified against the real `lapin` client
+(`tests/rabbitmq_client.rs`): connect/declare, publish/consume, get, QoS,
+publisher confirms, and the management HTTP API's basic shape. The
+management HTTP API (port 15672) is a fixed-response stub — enough for
+tooling that just probes `/api/whoami`/`/api/overview`/`/api/nodes` for
+liveness, not a real reflection of declared exchanges/queues/connections.
+
+**Not yet**
+- `tests/rabbitmq_diff.rs` is a placeholder (no comparison against a real
+  RabbitMQ server yet) — no engine-level unit tests either, only the
+  real-client tests above.
+- Dead-lettering, TTLs, transactions (`tx.select`/`tx.commit`), `basic.nack`/
+  `basic.reject`-triggered requeue, and most exchange types beyond what's
+  needed for basic routing.
+- The management HTTP API doesn't reflect real server state (see above).
 
 ## Elasticsearch
 

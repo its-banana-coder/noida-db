@@ -28,6 +28,7 @@ sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
 mysql = ["sql", "dep:sqlparser", "dep:bytes"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
+rabbitmq = ["dep:amq-protocol", "dep:bytes", "dep:cookie-factory", "dep:fastrand"]
 memcached = []
 elasticsearch = ["dep:serde_json"]
 mongodb = []
@@ -74,6 +75,7 @@ ureq = { version = "3", default-features = false }
 clickhouse = "0.15"
 mysql_async = "0.37.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 mongodb = "3.9.1"
 
@@ -121,6 +123,35 @@ required-features = ["kafka"]
 [[test]]
 name = "clickhouse_client"
 required-features = ["clickhouse"]
+
+[dependencies.amq-protocol]
+version = "10.6.3"
+optional = true
+
+[dependencies.cookie-factory]
+version = "0.3.3"
+optional = true
+
+[dependencies.fastrand]
+version = "2.5.0"
+optional = true
+
+[dev-dependencies.lapin]
+version = "4.12.0"
+default-features = false
+features = ["rustls", "tokio", "default-runtime"]
+
+[dev-dependencies.tokio-stream]
+version = "0.1"
+features = ["time"]
+
+[[test]]
+name = "rabbitmq_client"
+required-features = ["rabbitmq"]
+
+[[test]]
+name = "rabbitmq_diff"
+required-features = ["rabbitmq"]
 
 [[test]]
 name = "clickhouse_diff"
