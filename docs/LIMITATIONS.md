@@ -20,8 +20,8 @@ but not identical to the real server.
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
+| Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
 | RabbitMQ | AMQP 0-9-1 core (exchanges/queues/bindings, publish/consume/get, QoS, publisher confirms), a stub management HTTP API (see below) | yes, for `lapin` |
-| Elasticsearch | specs only (`docs/specs/`) | no |
 
 ## By design, for every service
 
@@ -423,6 +423,47 @@ liveness, not a real reflection of declared exchanges/queues/connections.
   `basic.reject`-triggered requeue, and most exchange types beyond what's
   needed for basic routing.
 - The management HTTP API doesn't reflect real server state (see above).
+
+## Elasticsearch
+
+Milestone 1 (index/document CRUD) and the first half of milestone 2
+(analysis + `_search`) are implemented. The HTTP server returns the
+required `X-Elastic-Product` header and supports index create/get/delete,
+mapping and settings endpoints, document get/index/create/update/delete,
+`_mget`, bulk indexing/deletion, aliases, and index templates. Storage is in
+memory and is lost when the process exits. Bulk chunked transfer encoding
+is accepted.
+
+`_search` and `_count` work for `match_all`/`match_none`, `match`, `term`,
+`terms`, `range`, `exists`, `prefix`, `ids`, `bool` (must/should/filter/
+must_not, minimum_should_match) and `constant_score`, across a single index,
+a comma-separated list, a `name*` prefix, or `_all`/`*`. `match` scores with
+BM25 (k1=1.2, b=0.75), including Lucene's lossy per-document field-length
+norm encoding, so ranking and `_score` should match real Elasticsearch for
+the same data (see `tests/elasticsearch_diff.rs`); everything else (`term`,
+`range`, etc.) uses a constant score, matching how Elasticsearch's
+structured queries are evaluated. `from`/`size`, `sort` (field or `_score`,
+asc/desc), `_source` filtering (bool/string/array/includes-excludes), and
+`min_score` are supported. The `standard`, `simple`, `whitespace`,
+`keyword` and `stop` analyzers are implemented and reachable via
+`_analyze`; `standard` approximates Lucene's `StandardTokenizer` for common
+ASCII/word cases rather than full UAX#29 segmentation. Near-real-time
+semantics are enforced: a write is visible to real-time GET immediately but
+not to search until `_refresh` (or `refresh=true`/`wait_for` on the write).
+
+Aggregations are implemented: `terms`, `range`, `histogram`, `filter`,
+`filters`, `missing` (bucket aggregations, with recursive sub-aggregations
+via a nested `aggs`), and `avg`/`sum`/`min`/`max`/`stats`/`value_count`/
+`cardinality`/`top_hits` (metric aggregations) — see
+`src/elasticsearch/search.rs`.
+
+Not yet built: `match_phrase`/`multi_match`/`wildcard`/`regexp`/
+`query_string`, nested field mappings and nested queries, highlighting,
+`search_after`, scroll/PIT, date-math ranges (`now-1d/d`), optimistic
+concurrency parameters (`version`, `if_seq_no`), gzip, `_cat`/`_cluster`
+endpoints, and exact Elasticsearch error/response parity for every path.
+This is not ready to replace Elasticsearch for application workflows that
+search with more than the query types above (aggregating is well covered).
 
 ## Numbers we do not claim yet
 
