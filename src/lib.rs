@@ -21,6 +21,8 @@ pub mod kafka;
 
 #[cfg(feature = "memcached")]
 pub mod memcached;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
