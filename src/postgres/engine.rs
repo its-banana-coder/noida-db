@@ -270,7 +270,11 @@ impl Engine {
             });
         };
         let g = self.global.lock().unwrap();
-        let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
+        let db = s
+            .txn
+            .as_ref()
+            .map(|t| &t.state)
+            .unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
         let info = self.info(s);
         let mut b = Binder::new(db, &info, param_hints);
         let (cols, returns_rows, params) = match &stmt {
@@ -371,12 +375,10 @@ impl Engine {
                 } else {
                     let oid = g.next_db_oid;
                     g.next_db_oid += 1;
-                    g.databases.insert(name.clone(), GlobalDb {
-                        oid,
-                        name,
-                        db: DbState::default(),
-                        seqs: BTreeMap::new(),
-                    });
+                    g.databases.insert(
+                        name.clone(),
+                        GlobalDb { oid, name, db: DbState::default(), seqs: BTreeMap::new() },
+                    );
                 }
                 Ok(StmtResult::tag("CREATE DATABASE"))
             }
@@ -564,7 +566,11 @@ impl Engine {
                 let mut hints = vec![];
                 {
                     let g = self.global.lock().unwrap();
-                    let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
+                    let db = s
+                        .txn
+                        .as_ref()
+                        .map(|t| &t.state)
+                        .unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
                     let info = self.info(s);
                     let b = Binder::new(db, &info, &[]);
                     for dt in data_types {
@@ -587,7 +593,11 @@ impl Engine {
                 let mut vals = vec![];
                 {
                     let g = self.global.lock().unwrap();
-                    let db = s.txn.as_ref().map(|t| &t.state).unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
+                    let db = s
+                        .txn
+                        .as_ref()
+                        .map(|t| &t.state)
+                        .unwrap_or(&g.databases.get(&s.rt.database).unwrap().db);
                     let info = self.info(s);
                     let mut b = Binder::new(db, &info, &prep.param_types);
                     for (i, p) in parameters.iter().enumerate() {
@@ -734,7 +744,8 @@ impl Engine {
         param_types: &[Type],
     ) -> PgResult<StmtResult> {
         let mut g = self.global.lock().unwrap();
-        let databases_info: Vec<(u32, String)> = g.databases.values().map(|d| (d.oid, d.name.clone())).collect();
+        let databases_info: Vec<(u32, String)> =
+            g.databases.values().map(|d| (d.oid, d.name.clone())).collect();
         let global = &mut *g;
         let global_db = global.databases.get_mut(&s.rt.database).unwrap();
         let txn = s.txn.as_mut().expect("transaction");
