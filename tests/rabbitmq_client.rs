@@ -197,4 +197,144 @@ mod test {
         assert_eq!(body["management_version"], "3.13.7");
         assert_eq!(body["rabbitmq_version"], "3.13.7");
     }
+
+    #[tokio::test]
+    async fn rabbitmq_nack_requeue() {
+        let addr = start("rabbitmq", "127.0.0.1:0").unwrap().unwrap();
+        let uri = format!("amqp://127.0.0.1:{}/%2f", addr.port());
+        let conn = Connection::connect(&uri, ConnectionProperties::default()).await.unwrap();
+        let channel = conn.create_channel().await.unwrap();
+
+        channel
+            .queue_declare(
+                "nack_requeue_q".into(),
+                lapin::options::QueueDeclareOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap();
+
+        channel
+            .basic_publish(
+                "".into(),
+                "nack_requeue_q".into(),
+                lapin::options::BasicPublishOptions::default(),
+                b"msg1",
+                lapin::BasicProperties::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut consumer = channel
+            .basic_consume(
+                "nack_requeue_q".into(),
+                "tag1".into(),
+                lapin::options::BasicConsumeOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap();
+
+        if let Some(delivery) = consumer.next().await {
+            let delivery = delivery.unwrap();
+            assert_eq!(delivery.data, b"msg1");
+            assert!(!delivery.redelivered);
+            delivery
+                .nack(lapin::options::BasicNackOptions { multiple: false, requeue: true })
+                .await
+                .unwrap();
+        }
+
+        // Consume again, it should be there and redelivered=true
+        if let Some(delivery) = consumer.next().await {
+            let delivery = delivery.unwrap();
+            assert_eq!(delivery.data, b"msg1");
+            assert!(delivery.redelivered);
+            delivery.ack(lapin::options::BasicAckOptions::default()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rabbitmq_reject_dead_letter() {
+        let addr = start("rabbitmq", "127.0.0.1:0").unwrap().unwrap();
+        let uri = format!("amqp://127.0.0.1:{}/%2f", addr.port());
+        let conn = Connection::connect(&uri, ConnectionProperties::default()).await.unwrap();
+        let channel = conn.create_channel().await.unwrap();
+
+        let mut args = lapin::types::FieldTable::default();
+        args.insert("x-dead-letter-exchange".into(), lapin::types::AMQPValue::LongString("dlx2".into()));
+        args.insert(
+            "x-dead-letter-routing-key".into(),
+            lapin::types::AMQPValue::LongString("dlrk2".into()),
+        );
+
+        channel
+            .exchange_declare(
+                "dlx2".into(),
+                lapin::ExchangeKind::Direct,
+                lapin::options::ExchangeDeclareOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap();
+        channel
+            .queue_declare(
+                "dlq2".into(),
+                lapin::options::QueueDeclareOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap();
+        channel
+            .queue_bind(
+                "dlq2".into(),
+                "dlx2".into(),
+                "dlrk2".into(),
+                lapin::options::QueueBindOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap();
+
+        channel
+            .queue_declare("reject_dl_q".into(), lapin::options::QueueDeclareOptions::default(), args)
+            .await
+            .unwrap();
+
+        channel
+            .basic_publish(
+                "".into(),
+                "reject_dl_q".into(),
+                lapin::options::BasicPublishOptions::default(),
+                b"msg2",
+                lapin::BasicProperties::default(),
+            )
+            .await
+            .unwrap();
+
+        let mut consumer = channel
+            .basic_consume(
+                "reject_dl_q".into(),
+                "tag2".into(),
+                lapin::options::BasicConsumeOptions::default(),
+                lapin::types::FieldTable::default(),
+            )
+            .await
+            .unwrap();
+
+        if let Some(delivery) = consumer.next().await {
+            let delivery = delivery.unwrap();
+            delivery.reject(lapin::options::BasicRejectOptions { requeue: false }).await.unwrap();
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Check it's in DLQ
+        let get_res = channel
+            .basic_get("dlq2".into(), lapin::options::BasicGetOptions::default())
+            .await
+            .unwrap();
+        assert!(get_res.is_some());
+        assert_eq!(get_res.unwrap().delivery.data, b"msg2");
+    }
 }
