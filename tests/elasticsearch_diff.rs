@@ -61,7 +61,14 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Reply {
     // decode that framing itself rather than assume Content-Length is
     // always present, or it silently reads zero bytes and treats a real,
     // successful response as an empty body.
-    let bytes = if chunked {
+    //
+    // A HEAD response never has a body, full stop, regardless of what its
+    // Content-Length/Transfer-Encoding headers claim (they describe what a
+    // GET to the same resource would return) — trying to decode one as
+    // chunked reads an empty chunk-size line and panics.
+    let bytes = if method == "HEAD" {
+        Vec::new()
+    } else if chunked {
         let mut out = Vec::new();
         loop {
             let mut size_line = String::new();
