@@ -219,6 +219,9 @@ fn sadd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     let s = ctx.get_set(&a[1])?.expect("exists");
     let added = a[2..].iter().filter(|m| s.add(m, lim)).count();
+    if added > 0 {
+        ctx.notify_keyspace_event('s', "sadd", &a[1]);
+    }
     Ok(Value::Integer(added as i64))
 }
 
@@ -233,10 +236,15 @@ fn srem(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             }
         }
     }
+    if removed > 0 {
+        ctx.notify_keyspace_event('s', "srem", &a[1]);
+    }
     ctx.drop_if_empty(&a[1]);
     Ok(Value::Integer(removed))
 }
 
+/// A port of `smoveCommand`: the source fires "srem" (Redis never fires a
+/// "smove" event), the destination fires "sadd" if the member was new there.
 fn smove(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let lim = ctx.limits("set");
     let (src, dst, m) = (&a[1], &a[2], &a[3]);
@@ -251,11 +259,14 @@ fn smove(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if !ctx.get_set(src)?.expect("exists").remove(m) {
         return Ok(Value::Integer(0));
     }
+    ctx.notify_keyspace_event('s', "srem", src);
     ctx.drop_if_empty(src);
     if ctx.get_set(dst)?.is_none() {
         ctx.db().insert(dst.clone(), Entry::new(Data::Set(Set::create(m, 1, lim))));
     }
-    ctx.get_set(dst)?.expect("exists").add(m, lim);
+    if ctx.get_set(dst)?.expect("exists").add(m, lim) {
+        ctx.notify_keyspace_event('s', "sadd", dst);
+    }
     Ok(Value::Integer(1))
 }
 
@@ -300,6 +311,7 @@ fn spop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             return Ok(Value::Null);
         }
         let m = pop_random(ctx, &a[1]);
+        ctx.notify_keyspace_event('s', "spop", &a[1]);
         ctx.drop_if_empty(&a[1]);
         return Ok(Value::Bulk(m));
     }
@@ -315,6 +327,8 @@ fn spop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         let s = ctx.set_copy(&a[1])?;
         let now = ctx.now;
         ctx.db().remove(&a[1], now);
+        ctx.notify_keyspace_event('s', "spop", &a[1]);
+        ctx.notify_keyspace_event('g', "del", &a[1]);
         return Ok(bulk_set(union_diff(&[s], false, false, lim).members()));
     }
     let remaining = size - count;
@@ -355,6 +369,8 @@ fn spop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         *ctx.get_set(&a[1])?.expect("exists") = new;
         old.members()
     };
+    ctx.notify_keyspace_event('s', "spop", &a[1]);
+    ctx.drop_if_empty(&a[1]);
     Ok(bulk_set(popped))
 }
 
@@ -454,13 +470,16 @@ fn sintercard(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 /// Stores `set` at `dst` (or deletes `dst` if empty) and replies its size.
-fn store_result(ctx: &mut Ctx, dst: &[u8], set: Set) -> Reply {
+fn store_result(ctx: &mut Ctx, dst: &[u8], set: Set, event: &str) -> Reply {
     let len = set.len();
     if len == 0 {
         let now = ctx.now;
-        ctx.db().remove(dst, now);
+        if ctx.db().remove(dst, now).is_some() {
+            ctx.notify_keyspace_event('g', "del", dst);
+        }
     } else {
         ctx.store_set(dst, set);
+        ctx.notify_keyspace_event('s', event, dst);
     }
     Ok(Value::Integer(len as i64))
 }
@@ -469,7 +488,7 @@ fn sinterstore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let lim = ctx.limits("set");
     let sets = load_sets(ctx, &a[2..])?;
     let Some(mut sets) = sets.into_iter().collect::<Option<Vec<Set>>>() else {
-        return store_result(ctx, &a[1], Set::Int(vec![]));
+        return store_result(ctx, &a[1], Set::Int(vec![]), "sinterstore");
     };
     sets.sort_by_key(|s| s.len());
     let members = intersect(&sets, 0);
@@ -483,7 +502,7 @@ fn sinterstore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if !dst.is_empty() && members.iter().all(|m| parse_int(m).is_some()) {
         dst.maybe_convert_to_intset(lim);
     }
-    store_result(ctx, &a[1], dst)
+    store_result(ctx, &a[1], dst, "sinterstore")
 }
 
 /// `sunionDiffGenericCommand`: builds the result the way Redis does,
@@ -541,7 +560,7 @@ fn sunion(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 
 fn sunionstore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let result = union_diff_keys(ctx, &a[2..], false)?;
-    store_result(ctx, &a[1], result)
+    store_result(ctx, &a[1], result, "sunionstore")
 }
 
 fn sdiff(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -550,7 +569,7 @@ fn sdiff(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 
 fn sdiffstore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let result = union_diff_keys(ctx, &a[2..], true)?;
-    store_result(ctx, &a[1], result)
+    store_result(ctx, &a[1], result, "sdiffstore")
 }
 
 /// SSCAN: compact sets come back whole; a hashtable is walked by cursor.

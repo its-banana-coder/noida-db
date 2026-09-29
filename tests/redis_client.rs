@@ -522,3 +522,71 @@ fn keyspace_notifications() -> RedisResult<()> {
 
     Ok(())
 }
+
+/// Ordinary hash/list/set/zset/string mutations, and the generic RENAME/MOVE
+/// two-event cases, each publish the exact `__keyevent@<db>__:<event>`
+/// channel and key payload real Redis would (verified against Redis 7.2's
+/// `notifyKeyspaceEvent` call sites in t_string.c/t_hash.c/t_list.c/
+/// t_set.c/t_zset.c/db.c), not just "some message came through".
+#[test]
+fn keyspace_notifications_match_real_redis_events() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    let publisher_client = redis::Client::open(format!("redis://{addr}/"))?;
+    let mut publisher = publisher_client.get_connection()?;
+
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("notify-keyspace-events")
+        .arg("KEA")
+        .query::<()>(&mut publisher)?;
+
+    let client = redis::Client::open(format!("redis://{addr}/"))?;
+    let mut con = client.get_connection()?;
+    let mut pubsub = con.as_pubsub();
+    pubsub.psubscribe("__keyevent@0__:*")?;
+    pubsub.psubscribe("__keyevent@1__:*")?;
+    pubsub.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+
+    let next = |pubsub: &mut redis::PubSub| -> RedisResult<(String, String)> {
+        let msg = pubsub.get_message()?;
+        Ok((msg.get_channel_name().to_string(), msg.get_payload::<String>()?))
+    };
+
+    // String: SET fires "set".
+    let _: () = publisher.set("str", "v")?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:set".into(), "str".into()));
+
+    // Hash: HSET fires "hset".
+    let _: () = publisher.hset("h", "f", "v")?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:hset".into(), "h".into()));
+
+    // List: LPUSH fires "lpush".
+    let _: i64 = publisher.lpush("l", "v")?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:lpush".into(), "l".into()));
+
+    // Set: SADD fires "sadd".
+    let _: i64 = publisher.sadd("s", "m")?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:sadd".into(), "s".into()));
+
+    // Sorted set: ZADD fires "zadd".
+    let _: i64 = publisher.zadd("z", "m", 1.0)?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:zadd".into(), "z".into()));
+
+    // RENAME fires "rename_from" on the source key and "rename_to" on the
+    // destination key, both events for the one command.
+    let _: () = publisher.set("src", "v")?;
+    let _ = next(&mut pubsub)?; // the SET above
+    let _: () = redis::cmd("RENAME").arg("src").arg("dst").query(&mut publisher)?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:rename_from".into(), "src".into()));
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:rename_to".into(), "dst".into()));
+
+    // MOVE fires "move_from" on the source database and "move_to" on the
+    // destination database, for the same key.
+    let _: () = publisher.set("mv", "v")?;
+    let _ = next(&mut pubsub)?; // the SET above
+    let _: i64 = redis::cmd("MOVE").arg("mv").arg(1).query(&mut publisher)?;
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@0__:move_from".into(), "mv".into()));
+    assert_eq!(next(&mut pubsub)?, ("__keyevent@1__:move_to".into(), "mv".into()));
+
+    Ok(())
+}

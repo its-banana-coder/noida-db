@@ -63,7 +63,10 @@ fn push_generic(ctx: &mut Ctx, a: &[Vec<u8>], end: End, only_existing: bool) -> 
     for v in &a[2..] {
         push(l, v.clone(), end);
     }
-    Ok(Value::Integer(l.len() as i64))
+    let len = l.len() as i64;
+    let event = if end == End::Head { "lpush" } else { "rpush" };
+    ctx.notify_keyspace_event('l', event, &a[1]);
+    Ok(Value::Integer(len))
 }
 
 fn lpush(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -93,7 +96,9 @@ fn linsert(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let Some(l) = ctx.get_list(&a[1])? else { return Ok(Value::Integer(0)) };
     let Some(i) = l.iter().position(|v| *v == a[3]) else { return Ok(Value::Integer(-1)) };
     l.insert(if after { i + 1 } else { i }, a[4].clone());
-    Ok(Value::Integer(l.len() as i64))
+    let len = l.len() as i64;
+    ctx.notify_keyspace_event('l', "linsert", &a[1]);
+    Ok(Value::Integer(len))
 }
 
 fn llen(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -117,6 +122,7 @@ fn lset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let index = long_arg(&a[2])?;
     let i = resolve_index(l.len(), index).ok_or_else(|| Value::err("ERR index out of range"))?;
     l[i] = a[3].clone();
+    ctx.notify_keyspace_event('l', "lset", &a[1]);
     Ok(Value::ok())
 }
 
@@ -126,6 +132,10 @@ fn pop_many(ctx: &mut Ctx, key: &[u8], end: End, count: usize) -> Result<Vec<Val
     let l = ctx.get_list(key)?.expect("caller checked the key exists");
     let n = count.min(l.len());
     let out = (0..n).filter_map(|_| pop(l, end)).map(Value::Bulk).collect();
+    if n > 0 {
+        let event = if end == End::Head { "lpop" } else { "rpop" };
+        ctx.notify_keyspace_event('l', event, key);
+    }
     ctx.drop_if_empty(key);
     Ok(out)
 }
@@ -193,6 +203,7 @@ fn ltrim(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
         None => l.clear(),
     }
+    ctx.notify_keyspace_event('l', "ltrim", &a[1]);
     ctx.drop_if_empty(&a[1]);
     Ok(Value::ok())
 }
@@ -278,6 +289,9 @@ fn lrem(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 i += 1;
             }
         }
+    }
+    if removed > 0 {
+        ctx.notify_keyspace_event('l', "lrem", &a[1]);
     }
     ctx.drop_if_empty(&a[1]);
     Ok(Value::Integer(removed as i64))
