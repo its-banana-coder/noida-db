@@ -262,7 +262,10 @@ mod test {
         let channel = conn.create_channel().await.unwrap();
 
         let mut args = lapin::types::FieldTable::default();
-        args.insert("x-dead-letter-exchange".into(), lapin::types::AMQPValue::LongString("dlx2".into()));
+        args.insert(
+            "x-dead-letter-exchange".into(),
+            lapin::types::AMQPValue::LongString("dlx2".into()),
+        );
         args.insert(
             "x-dead-letter-routing-key".into(),
             lapin::types::AMQPValue::LongString("dlrk2".into()),
@@ -297,7 +300,11 @@ mod test {
             .unwrap();
 
         channel
-            .queue_declare("reject_dl_q".into(), lapin::options::QueueDeclareOptions::default(), args)
+            .queue_declare(
+                "reject_dl_q".into(),
+                lapin::options::QueueDeclareOptions::default(),
+                args,
+            )
             .await
             .unwrap();
 
