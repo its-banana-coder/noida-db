@@ -80,6 +80,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_aggregate() {
+        let addr = spawn("127.0.0.1:0").unwrap();
+
+        let mut client_options =
+            ClientOptions::parse(format!("mongodb://{}/?directConnection=true", addr))
+                .await
+                .unwrap();
+        client_options.server_selection_timeout = Some(Duration::from_secs(2));
+
+        let client = Client::with_options(client_options).unwrap();
+        let db = client.database("test");
+
+        db.run_command(doc! {
+            "insert": "agg",
+            "documents": [
+                doc! {"_id": 1, "item": "abc", "price": 10, "quantity": 2, "date": "2014-03-01T08:00:00Z"},
+                doc! {"_id": 2, "item": "jkl", "price": 20, "quantity": 1, "date": "2014-03-01T09:00:00Z"},
+                doc! {"_id": 3, "item": "xyz", "price": 5, "quantity": 10, "date": "2014-03-15T09:00:00Z"},
+                doc! {"_id": 4, "item": "xyz", "price": 5, "quantity": 20, "date": "2014-04-04T11:21:39.736Z"},
+                doc! {"_id": 5, "item": "abc", "price": 10, "quantity": 10, "date": "2014-04-04T21:23:13.331Z"},
+            ]
+        }).await.unwrap();
+
+        let agg_res2 = db.run_command(doc! {
+            "aggregate": "agg",
+            "pipeline": [
+                doc! { "$match": { "item": "abc" } },
+                doc! { "$group": { "_id": "$item", "totalQuantity": { "$sum": "$quantity" }, "avgPrice": { "$avg": "$price" } } }
+            ],
+            "cursor": {}
+        }).await.unwrap();
+
+        let cursor = agg_res2.get_document("cursor").unwrap();
+        let first_batch = cursor.get_array("firstBatch").unwrap();
+        assert_eq!(first_batch.len(), 1);
+        let doc = first_batch[0].as_document().unwrap();
+        assert_eq!(doc.get_str("_id").unwrap(), "abc");
+        assert_eq!(doc.get_f64("totalQuantity").unwrap(), 12.0);
+        assert_eq!(doc.get_f64("avgPrice").unwrap(), 10.0);
+    }
+
+    #[tokio::test]
     async fn test_unique_indexes() {
         let addr = spawn("127.0.0.1:0").unwrap();
 

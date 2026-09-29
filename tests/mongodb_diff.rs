@@ -56,6 +56,7 @@ mod diff {
             doc! { "find": "test_diff_coll", "filter": doc! {"a": 1} },
             doc! { "update": "test_diff_coll", "updates": [doc! {"q": {"a": 1}, "u": {"$set": {"a": 2}}}] },
             doc! { "find": "test_diff_coll", "filter": doc! {"a": 2} },
+            doc! { "aggregate": "test_diff_coll", "pipeline": [ doc! { "$match": { "a": 2 } }, doc! { "$group": { "_id": "a", "count": { "$sum": 1 } } } ], "cursor": {} },
             doc! { "delete": "test_diff_coll", "deletes": [doc! {"q": {"a": 2}, "limit": 1}] },
         ];
 
