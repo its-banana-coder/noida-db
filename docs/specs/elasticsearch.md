@@ -11,45 +11,44 @@
   `ES_JAVA_OPTS=-Xms512m -Xmx512m`. Env var:
   `NOIDA_ELASTICSEARCH_REF=http://host:port`.
 
-## Roadmap (checked 2026-09-27)
+## Roadmap (checked 2026-09-28)
 
-Current state, read from the code: `src/elasticsearch/engine.rs` (~560
-lines) has index CRUD, document CRUD (`_doc`/`_create`/`_source`), `_bulk`,
-and dynamic mapping — a real start on milestone 1. `_search` is not wired
-into `dispatch()` at all yet, so nothing past "index and fetch a document by
-id" works. There are **zero tests** (`grep -c '#\[test\]'` is 0 across all
-three files), and the module's ~700 lines are still uncommitted on disk.
-This is the opposite problem from Kafka: instead of tests trailing features,
-here there's no test harness at all yet to trail. Fix that before writing
-more of the engine, not after:
+Milestone 1 is done and tested. Milestone 2 is partially done: `_search`/
+`_count` are wired into `dispatch()` with `match_all`/`match_none`, `match`
+(BM25-scored), `term`, `terms`, `range`, `exists`, `prefix`, `ids`, `bool`
+and `constant_score`, plus `from`/`size`, `sort`, `_source` filtering and
+`min_score` (`src/elasticsearch/search.rs`). Analysis
+(`src/elasticsearch/analysis.rs`: `standard`/`simple`/`whitespace`/
+`keyword`/`stop`, reachable via `_analyze`) and BM25 scoring
+(`src/elasticsearch/scoring.rs`, ported from Lucene's `SmallFloat` and
+`BM25Similarity` — see `THIRD_PARTY.md`) are their own modules with unit
+tests, plus engine-level tests covering near-real-time refresh semantics
+and a differential test comparing `_score` and ranking against a real node
+(`tests/elasticsearch_diff.rs`, not yet run against a live server in this
+environment — no Docker locally; CI has the ES 8.15.3 service). Remaining
+for milestone 2/3, in priority order:
 
-1. **Commit a checkpoint now.** Uncommitted work of this size is one bad
-   `git checkout` away from being lost. It doesn't need to be finished —
-   `wip(elasticsearch): index and document CRUD, bulk, dynamic mapping` is a
-   fine commit message for a feature branch. Then keep committing in small
-   slices from here.
-2. **Before adding `_search`, set up the three-layer test structure this
-   project uses everywhere else** (see the Redis module for the pattern):
-   - `src/elasticsearch/tests/`: engine-level tests against `Engine::dispatch`
-     directly, no HTTP, checking exact JSON shapes and status codes against
-     what §2/§3 specify (the error JSON shape in §2 especially — get that
-     byte-for-byte right early, since every error path depends on it).
-   - `tests/elasticsearch_diff.rs`: wire up `NOIDA_ELASTICSEARCH_REF` now,
-     even with nothing to compare yet beyond `GET /` and index CRUD — CI
-     already runs the ES 8.15.3 service, so this starts paying off on the
-     first PR.
-   - Back-fill tests for the CRUD/bulk/mapping code that already exists
-     before extending it further.
-3. Then continue in spec order (§8's milestones are still the right shape):
-   finish milestone 1 (the Python/Node clients' `info()`/index/get, with a
-   test asserting it), then `_search` with `match_all`/`term`/`bool`/`range`
-   and BM25 scoring (§3's "Relevance" section — the Lucene norm-encoding
-   detail there is easy to get subtly wrong, so a differential test against
-   real ES's `_score` is what catches it, not eyeballing the formula).
-4. Wire the `elasticsearch` feature into CI (`.github/workflows/ci.yml`
-   needs the ES service and a test step, matching how Redis and Postgres are
-   wired) once milestone 1 has tests behind it — don't wait for the whole
-   spec to be done to get a CI signal.
+1. **Aggregations** (`terms`, `date_histogram`, `histogram`, `range`,
+   `date_range`, `filter(s)`, `missing`, `avg`/`sum`/`min`/`max`/`stats`,
+   `value_count`, `cardinality`, `top_hits`, nested sub-aggregations,
+   `size: 0` searches) — none implemented yet. This is the largest
+   remaining chunk of §3 and the next thing to build.
+2. **`match_phrase`, `multi_match`, `wildcard`, `regexp`, `query_string`/
+   `simple_query_string`** — not implemented; only `match`, `term`/`terms`,
+   `range`, `exists`, `prefix`, `ids`, `bool` and `constant_score` exist.
+3. **`search_after` and `highlight`** — `from`/`size` and `sort` (field or
+   `_score`) work; these two P0 items don't yet.
+4. **Nested field mappings**: `dynamic_mapping` only records top-level
+   field types; dotted paths into objects (`"meta.source"`) are resolved at
+   query time by runtime value type, not by a recorded sub-mapping. Fine
+   for now, but means `term` on a dotted field can't distinguish `keyword`
+   from `text` the way a real explicit nested mapping would.
+5. Scroll/PIT, `_cat`/`_cluster`, index-pattern wildcards beyond a single
+   trailing `*`, date-math ranges (`now-1d/d`), and optimistic concurrency
+   query params (`version`, `if_seq_no`) are still open (§8 milestones 3–4).
+CI already runs the ES 8.15.3 service and the diff/client test steps
+(`.github/workflows/ci.yml`); `elasticsearch` isn't in `default` features
+yet (§8 milestone 4 gates that).
 
 ## 1. Purpose
 

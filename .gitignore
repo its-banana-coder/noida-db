@@ -15,5 +15,3 @@ tests/clients/kafka/node/
 node_modules/
 __pycache__/
 *.pyc
-venv
-venv/

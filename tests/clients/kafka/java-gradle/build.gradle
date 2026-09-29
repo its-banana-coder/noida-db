@@ -1,0 +1,23 @@
+// Spring Kafka, transactional producers and compression codecs against
+// noida-db. Run through tests/clients/kafka/run.sh, which starts the
+// server, sets NOIDA_KAFKA_PORT and picks a Gradle cache under target/
+// (nothing global). Separate from ../java/ (plain kafka-clients, no
+// dependency manager needed there) because Spring Kafka's dependency tree
+// is painful to hand-fetch as raw jars.
+plugins {
+    id "application"
+}
+repositories { mavenCentral() }
+dependencies {
+    implementation "org.apache.kafka:kafka-clients:3.8.0"
+    implementation "org.springframework.kafka:spring-kafka:3.2.4"
+    implementation "org.springframework:spring-context:6.1.13"
+    implementation "org.springframework.retry:spring-retry:2.0.9"
+    runtimeOnly "org.slf4j:slf4j-simple:2.0.16"
+    runtimeOnly "com.github.luben:zstd-jni:1.5.6-3"
+    runtimeOnly "org.lz4:lz4-java:1.8.0"
+    runtimeOnly "org.xerial.snappy:snappy-java:1.1.10.5"
+}
+application {
+    mainClass = System.getProperty("mainClass", "SpringKafkaTest")
+}

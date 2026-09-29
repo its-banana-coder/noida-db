@@ -20,10 +20,20 @@ jobs:
           POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      elasticsearch:
+        image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+        ports: ["9200:9200"]
+        env:
+          discovery.type: single-node
+          xpack.security.enabled: "false"
+          ES_JAVA_OPTS: -Xms512m -Xmx512m
+        options: >-
+          --health-cmd "curl -fs http://localhost:9200" --health-interval 10s --health-timeout 5s --health-retries 30
     env:
       NOIDA_REDIS_REF: 127.0.0.1:6379
       NOIDA_POSTGRES_REF: 127.0.0.1:5432
       NOIDA_POSTGRES_REF_PASSWORD: postgres
+      NOIDA_ELASTICSEARCH_REF: http://127.0.0.1:9200
       PGTZ: UTC
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +46,8 @@ jobs:
       # Show how many replies were compared against the real servers.
       - run: cargo test --test redis_diff -- --nocapture
       - run: cargo test --features postgres --test postgres_diff -- --nocapture
+      - run: cargo test --features elasticsearch --test elasticsearch_diff -- --nocapture
+      - run: tests/clients/elasticsearch/run.sh
       # Real drivers and ORMs: psycopg, SQLAlchemy, node-postgres, JDBC.
       - run: tests/clients/postgres/run.sh
       # Modularity: the binary must build with any service set, even none.
