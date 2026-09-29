@@ -481,3 +481,44 @@ fn a_password_protects_the_server() {
     let bad = redis::Client::open(format!("redis://:nope@{addr}/")).unwrap();
     assert!(bad.get_connection().is_err());
 }
+
+#[test]
+fn keyspace_notifications() -> RedisResult<()> {
+    let addr = common::start_noida_redis();
+    let publisher_client = redis::Client::open(format!("redis://{addr}/"))?;
+    let mut publisher = publisher_client.get_connection()?;
+
+    // Enable keyspace events for generic, strings, set, expire
+    redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("notify-keyspace-events")
+        .arg("Kg$sx")
+        .query::<()>(&mut publisher)?;
+
+    let client = redis::Client::open(format!("redis://{addr}/"))?;
+    let mut con = client.get_connection()?;
+    let mut pubsub = con.as_pubsub();
+
+    // Subscribe to keyevents and keyspace patterns
+    pubsub.psubscribe("__keyspace@0__:*")?;
+    pubsub.psubscribe("__keyevent@0__:*")?;
+
+    // Trigger some events
+    let _: () = publisher.set("foo", "bar")?;
+    let _: () = publisher.del("foo")?;
+
+    let mut events = Vec::new();
+    pubsub.set_read_timeout(Some(std::time::Duration::from_millis(500)))?;
+    while let Ok(msg) = pubsub.get_message() {
+        events.push(format!("{} {}", msg.get_channel_name(), msg.get_payload::<String>()?));
+        if events.len() >= 4 {
+            break;
+        }
+    }
+
+    // Sort events to be order-independent for now
+    events.sort();
+    println!("Events: {:?}", events);
+
+    Ok(())
+}

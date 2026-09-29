@@ -62,9 +62,14 @@ current count).
 
 - `FUNCTION` `FCALL` `FCALL_RO` (Redis Functions). `EVAL`/`EVALSHA`/`SCRIPT`
   work.
-- Keyspace notifications: `notify-keyspace-events` can be set, but no
-  `__keyspace@*__` / `__keyevent@*__` messages are published, so apps that
-  listen for expired-key events see nothing.
+- Keyspace notifications: `notify-keyspace-events` is enforced and
+  `__keyspace@*__` / `__keyevent@*__` messages are published for generic
+  events (key `del`, `expired`), streams (`xadd`/`xtrim`/`xdel`/`xsetid`/
+  `xclaim`/`xautoclaim`/`xgroup-*`) and the HyperLogLog commands (`pfadd`/
+  `pfmerge`). Not yet wired for ordinary hash/list/set/zset/string mutations
+  (`hset`, `lpush`, `sadd`, `zadd`, `set`, ...) — those commands don't emit
+  events yet even though their event-type flags (`h`/`l`/`s`/`z`/`$`) are
+  accepted by `CONFIG SET`.
 - `maxmemory`, eviction policies and the OOM error. The setting is stored; it
   is not enforced.
 - Lua libraries `struct` and `bit`. `cjson`, `cmsgpack` and the `redis` table

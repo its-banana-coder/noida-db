@@ -191,7 +191,7 @@ impl Engine {
     }
 
     /// PUBLISH / SPUBLISH: delivers and counts receivers.
-    fn publish(&mut self, channel: &[u8], msg: &[u8], shard: bool) -> i64 {
+    pub(crate) fn publish(&mut self, channel: &[u8], msg: &[u8], shard: bool) -> i64 {
         let mut n = 0;
         let kind = if shard { Kind::Shard } else { Kind::Channel };
         let word = if shard { "smessage" } else { "message" };
