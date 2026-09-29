@@ -375,12 +375,15 @@ of `docs/specs/clickhouse.md`:
 
 ## MongoDB
 
-The OP_MSG wire protocol and handshake (`hello`/`ismaster`, `buildInfo`, `ping`), CRUD (`insert`, `find`, `update`, `delete`), and `createIndexes` with unique-index enforcement (`E11000` duplicate key errors on insert and on index creation over existing duplicate data). Verified against the official MongoDB Rust driver and a differential test against a real `mongod`.
+The OP_MSG wire protocol and handshake (`hello`/`ismaster`, `buildInfo`, `ping`), CRUD (`insert`, `find`, `update`, `delete`), `createIndexes` with unique-index enforcement (`E11000` duplicate key errors on insert and on index creation over existing duplicate data), and the aggregation pipeline (`$match`, `$project`, `$sort`, `$limit`, `$skip`, `$unwind`, `$group` with `$sum`, `$avg`, `$min`, `$max`, `$count` accumulators).
+
+Compound query operators are supported for exact-match equality and basic comparisons (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$and`, `$or`, `$not`), as well as document field path resolution (dot notation).
+
+Verified against the official MongoDB Rust driver and a differential test against a real `mongod`.
 
 **Not yet**
 - Replica sets, sharding, transactions, change streams, GridFS.
-- The aggregation pipeline.
-- Non-unique/TTL indexes, compound query operators beyond exact-match equality.
+- Non-unique/TTL indexes.
 - Authentication (SCRAM).
 
 ## MySQL

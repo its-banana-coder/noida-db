@@ -184,6 +184,34 @@ fn handle_client(mut stream: TcpStream, engine: Arc<Mutex<Engine>>) -> io::Resul
                             n += eng.delete(db, coll, q, limit);
                         }
                         doc! { "n": n, "ok": 1.0 }
+                    } else if cmd_doc.contains_key("aggregate") {
+                        let coll = cmd_doc.get_str("aggregate").unwrap();
+                        let db = cmd_doc.get_str("$db").unwrap_or("test");
+                        let pipeline = cmd_doc.get_array("pipeline").unwrap_or(&Vec::new()).clone();
+                        let eng = engine.lock().unwrap();
+                        match eng.aggregate(db, coll, &pipeline) {
+                            Ok(docs) => {
+                                let first_batch = bson::Bson::Array(
+                                    docs.into_iter().map(bson::Bson::Document).collect(),
+                                );
+                                doc! {
+                                    "cursor": {
+                                        "id": 0i64,
+                                        "ns": format!("{}.{}", db, coll),
+                                        "firstBatch": first_batch
+                                    },
+                                    "ok": 1.0
+                                }
+                            }
+                            Err(e) => {
+                                doc! {
+                                    "ok": 0.0,
+                                    "errmsg": e,
+                                    "code": 14,
+                                    "codeName": "TypeMismatch"
+                                }
+                            }
+                        }
                     } else {
                         let cmd_name =
                             cmd_doc.keys().next().cloned().unwrap_or_else(|| "".to_string());

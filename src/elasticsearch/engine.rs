@@ -688,7 +688,7 @@ fn merge(a: &mut Value, b: Value) {
     }
 }
 fn dynamic_mapping(m: &mut Value, src: &Value) {
-    if !m.get("properties").is_some() {
+    if m.get("properties").is_none() {
         m["properties"] = json!({});
     }
     let props = m["properties"].as_object_mut().unwrap();
