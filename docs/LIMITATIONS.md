@@ -168,17 +168,6 @@ constraints.
 
 **Not yet**
 
-- `CREATE DATABASE`/`DROP DATABASE`: there's one database per data dir
-  (named whatever the client connects to first), so a client that expects
-  to provision its own database as part of setup (Gitea's own `gitea
-  migrate`, for one) needs to be pointed at an existing database name
-  instead (e.g. the default `postgres`).
-- Some `information_schema.columns`/`pg_attrdef` default-value text
-  doesn't always match a real server's exact formatting (e.g. boolean
-  literal case, or a numeric column default reported as empty instead of
-  its value) — cosmetic in most cases, but an ORM that compares its own
-  expected schema against the live one column-by-column (xorm, which
-  Gitea uses, does) may log a spurious mismatch warning for it.
 - PL/pgSQL, stored procedures, `CREATE PROCEDURE`/`CALL` and triggers,
   and extensions. Deliberately deferred: unlike everything else on this
   list, PL/pgSQL is a real procedural language embedded in SQL (its own

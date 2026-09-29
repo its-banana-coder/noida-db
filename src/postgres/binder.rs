@@ -2661,10 +2661,7 @@ impl<'a> Binder<'a> {
             let ty = if ty.base == Float4 && lt != rt { Type::FLOAT8 } else { ty };
             // ^ is float8-only unless both are numeric-ish.
             if op == "^" {
-                return if lt.base == Numeric
-                    || rt.base == Numeric
-                    || (lt.is_integer() && rt.is_integer() && false)
-                {
+                return if lt.base == Numeric || rt.base == Numeric {
                     Some((Type::NUMERIC, Type::NUMERIC, Type::NUMERIC))
                 } else {
                     Some((Type::FLOAT8, Type::FLOAT8, Type::FLOAT8))

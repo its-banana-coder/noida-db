@@ -1572,6 +1572,32 @@ fn apply_seq_options(seq: &mut Sequence, d: &SeqDdl, create: bool) -> PgResult<(
 /// A column default as Postgres stores it: a string literal keeps the cast
 /// to the column type (`'x'::character varying`), anything else prints as is.
 fn default_sql(db: &DbState, e: &a::Expr, ty: Type) -> String {
+    if let a::Expr::Value(v) = e {
+        match &v.value {
+            a::Value::Boolean(b) => {
+                return if *b { "true".to_string() } else { "false".to_string() };
+            }
+            a::Value::SingleQuotedString(s) if ty.base == Base::Bool => {
+                let is_true = s.eq_ignore_ascii_case("true")
+                    || s == "1"
+                    || s.eq_ignore_ascii_case("t")
+                    || s.eq_ignore_ascii_case("y")
+                    || s.eq_ignore_ascii_case("yes");
+                return if is_true { "true".to_string() } else { "false".to_string() };
+            }
+            a::Value::SingleQuotedString(s)
+                if matches!(
+                    ty.base,
+                    Base::Int2 | Base::Int4 | Base::Int8 | Base::Float4 | Base::Float8
+                ) =>
+            {
+                return s.clone();
+            }
+            a::Value::Number(n, _) => return n.clone(),
+            _ => {}
+        }
+    }
+
     let literal = matches!(
         e,
         a::Expr::Value(v) if matches!(v.value, a::Value::SingleQuotedString(_))

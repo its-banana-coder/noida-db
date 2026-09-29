@@ -391,6 +391,12 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     let db: &DbState = ctx.db;
     let user = ctx.rt.user.clone();
     let database = ctx.rt.database.clone();
+    let current_db_oid = ctx
+        .databases
+        .iter()
+        .find(|(_, n)| n == &database)
+        .map(|(o, _)| *o)
+        .unwrap_or(super::catalog::DATABASE_OID);
     let mut out = vec![];
     match name.to_ascii_lowercase().as_str() {
         "pg_namespace" => {
@@ -725,25 +731,27 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
         }
         "pg_database" => {
-            out.push(vec![
-                n(super::catalog::DATABASE_OID as i64),
-                t(&database),
-                n(10),
-                n(6),
-                ch('c'),
-                b(false),
-                b(true),
-                n(-1),
-                n(1),
-                n(1),
-                n(1663),
-                t("C"),
-                t("C"),
-                NULL,
-                NULL,
-                NULL,
-                NULL,
-            ]);
+            for (oid, name) in &ctx.databases {
+                out.push(vec![
+                    n(*oid as i64),
+                    t(name),
+                    n(10),
+                    n(6),
+                    ch('c'),
+                    b(false),
+                    b(true),
+                    n(-1),
+                    n(1),
+                    n(1),
+                    n(1663),
+                    t("C"),
+                    t("C"),
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                ]);
+            }
         }
         "pg_proc" => {
             for s in super::sigs::all_sigs() {
@@ -821,7 +829,7 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         }
         "pg_shdescription" => {
             if let Some(c) = &db.db_comment {
-                out.push(vec![n(super::catalog::DATABASE_OID as i64), n(1262), t(c)]);
+                out.push(vec![n(current_db_oid as i64), n(1262), t(c)]);
             }
         }
         "pg_am" => {
@@ -1053,7 +1061,7 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         }
         "pg_stat_activity" => {
             out.push(vec![
-                n(super::catalog::DATABASE_OID as i64),
+                n(current_db_oid as i64),
                 t(&database),
                 n(ctx.rt.pid as i64),
                 NULL,
