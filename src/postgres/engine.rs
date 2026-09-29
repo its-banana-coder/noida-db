@@ -13,7 +13,7 @@ use super::error::{PgError, PgResult, code};
 use super::exec::{self, Ctx, Runtime};
 use super::plan::{OutCol, Planned, Query};
 use super::session::Settings;
-use super::types::{self, RegNames, Type, Value};
+use super::types::{RegNames, Type, Value};
 
 /// A statement's result.
 pub struct StmtResult {
@@ -85,6 +85,16 @@ pub struct Portal {
     pub suspended: bool,
 }
 
+/// A `DECLARE ... CURSOR FOR` cursor: the query runs eagerly right away
+/// (this engine has no lazy/streaming execution), and `FETCH` just slices
+/// the already-materialized rows — the same shape `Portal` already uses
+/// for extended-protocol row-limited fetches.
+pub struct Cursor {
+    pub cols: Vec<OutCol>,
+    pub rows: Vec<Row>,
+    pub pos: usize,
+}
+
 pub struct Session {
     pub id: u32,
     pub pid: i32,
@@ -94,6 +104,11 @@ pub struct Session {
     txn: Option<Txn>,
     pub prepared: BTreeMap<String, Prepared>,
     pub portals: BTreeMap<String, Portal>,
+    /// `DECLARE`d cursors. Not `WITH HOLD`-aware: cleared on commit and
+    /// rollback like an ordinary (non-holdable) cursor, since that's the
+    /// common case and a `WITH HOLD` cursor surviving its transaction is
+    /// a rare, P1-scale pattern.
+    pub cursors: BTreeMap<String, Cursor>,
     pub cancel: Arc<AtomicBool>,
     pub notifications: Arc<Mutex<Vec<(i32, String, String)>>>,
     /// Statements run so far in an implicit multi-statement simple query.
@@ -183,6 +198,7 @@ impl Engine {
             txn: None,
             prepared: BTreeMap::new(),
             portals: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             cancel,
             notifications,
             in_implicit_tx: false,
@@ -259,12 +275,23 @@ impl Engine {
         }
     }
 
-    /// Runs one statement, managing the transaction around it.
+    /// Runs one statement, managing the transaction around it. `param_types`
+    /// are the types `params` were already decoded with (from `Prepared`,
+    /// see `prepare`) — re-binding the statement here (see `run_one`) must
+    /// reuse them rather than re-deriving types from the decoded values:
+    /// a client-declared parameter type is authoritative and doesn't
+    /// change just because this statement uses it in a different context
+    /// (e.g. an `int2`-declared parameter assigned into a `numeric`
+    /// column stays `int2`, cast to `numeric` at the point of use, the
+    /// same way `prepare` itself resolved it), and some values (e.g. a
+    /// `json` parameter, stored as `Value::Text`) can't be told apart
+    /// from a same-shaped value of a different type at all once decoded.
     pub fn execute(
         &self,
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         if s.status == TxStatus::Failed && !is_transaction_control(stmt) {
             return Err(PgError::new(
@@ -276,7 +303,7 @@ impl Engine {
         if s.txn.is_none() {
             s.rt.now = s.rt.stmt_now;
         }
-        let result = self.run_statement(s, stmt, params);
+        let result = self.run_statement(s, stmt, params, param_types);
         match &result {
             Err(e) if e.severity != "NOTICE" => {
                 if s.status == TxStatus::InTransaction {
@@ -296,6 +323,7 @@ impl Engine {
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         use a::Statement as S;
         match stmt {
@@ -496,7 +524,68 @@ impl Engine {
                     }
                 }
                 let Some(inner) = prep.stmt.clone() else { return Ok(StmtResult::tag("EXECUTE")) };
-                self.run_statement(s, &inner, &vals)
+                self.run_statement(s, &inner, &vals, &prep.param_types)
+            }
+            S::Declare { stmts } => {
+                for d in stmts {
+                    let Some(for_query) = &d.for_query else {
+                        return Err(unsupported("DECLARE without CURSOR FOR"));
+                    };
+                    if d.names.len() != 1 {
+                        return Err(unsupported("DECLARE of multiple cursor names"));
+                    }
+                    let name = d.names[0].value.to_lowercase();
+                    // The engine has no lazy/streaming execution, so the
+                    // cursor's query just runs eagerly right now, in
+                    // whatever transaction is already open (an ordinary
+                    // data statement); `FETCH` below only slices the
+                    // already-materialized rows.
+                    let q_stmt = a::Statement::Query(for_query.clone());
+                    let result = self.run_data_statement(s, &q_stmt, &[], &[])?;
+                    s.cursors.insert(name, Cursor { cols: result.cols, rows: result.rows, pos: 0 });
+                }
+                Ok(StmtResult::tag("DECLARE CURSOR"))
+            }
+            S::Fetch { name, direction, into, .. } => {
+                if into.is_some() {
+                    return Err(unsupported("FETCH ... INTO"));
+                }
+                let key = name.value.to_lowercase();
+                let cur = s.cursors.get_mut(&key).ok_or_else(|| {
+                    PgError::new(
+                        code::INVALID_CURSOR_NAME,
+                        format!("cursor \"{key}\" does not exist"),
+                    )
+                })?;
+                let n = match direction {
+                    a::FetchDirection::Next => 1,
+                    a::FetchDirection::Count { limit } => fetch_count(limit)?,
+                    a::FetchDirection::Forward { limit: Some(l) } => fetch_count(l)?,
+                    a::FetchDirection::Forward { limit: None } => 1,
+                    a::FetchDirection::All | a::FetchDirection::ForwardAll => usize::MAX,
+                    _ => return Err(unsupported("FETCH direction (only forward movement is)")),
+                };
+                let end = cur.pos.saturating_add(n).min(cur.rows.len());
+                let rows = cur.rows[cur.pos..end].to_vec();
+                cur.pos = end;
+                let cols = cur.cols.clone();
+                Ok(StmtResult {
+                    cols,
+                    rows,
+                    tag: "FETCH".into(),
+                    notices: vec![],
+                    params_changed: vec![],
+                    returns_rows: true,
+                })
+            }
+            S::Close { cursor } => {
+                match cursor {
+                    a::CloseCursor::All => s.cursors.clear(),
+                    a::CloseCursor::Specific { name } => {
+                        s.cursors.remove(&name.value.to_lowercase());
+                    }
+                }
+                Ok(StmtResult::tag("CLOSE CURSOR"))
             }
             S::Deallocate { name, .. } => {
                 if name.value.eq_ignore_ascii_case("all") {
@@ -530,7 +619,7 @@ impl Engine {
             S::CreateRole { .. } => Ok(StmtResult::tag("CREATE ROLE")),
             S::CreateExtension { .. } => Ok(StmtResult::tag("CREATE EXTENSION")),
             S::DropExtension { .. } => Ok(StmtResult::tag("DROP EXTENSION")),
-            other => self.run_data_statement(s, other, params),
+            other => self.run_data_statement(s, other, params, param_types),
         }
     }
 
@@ -540,6 +629,7 @@ impl Engine {
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         let writes = statement_writes(stmt);
         let implicit = s.txn.is_none();
@@ -549,7 +639,7 @@ impl Engine {
         if writes {
             self.acquire_writer(s)?;
         }
-        let out = self.run_in_txn(s, stmt, params);
+        let out = self.run_in_txn(s, stmt, params, param_types);
         match (&out, implicit) {
             (Ok(_), true) => self.commit(s)?,
             (Err(_), true) => self.rollback(s),
@@ -563,6 +653,7 @@ impl Engine {
         s: &mut Session,
         stmt: &a::Statement,
         params: &[Value],
+        param_types: &[Type],
     ) -> PgResult<StmtResult> {
         let mut g = self.global.lock().unwrap();
         let global = &mut *g;
@@ -584,7 +675,7 @@ impl Engine {
             fmt: ctx.rt.settings.fmt(),
             now: ctx.rt.now,
         };
-        let result = run_one(&mut ctx, stmt, &info);
+        let result = run_one(&mut ctx, stmt, &info, param_types);
         let notifies = std::mem::take(&mut ctx.notifies);
         drop(g);
         for (chan, payload) in notifies {
@@ -793,6 +884,7 @@ impl Engine {
         if g.writer == Some(s.id) {
             g.writer = None;
         }
+        s.cursors.clear();
         Ok(())
     }
 
@@ -802,6 +894,7 @@ impl Engine {
         if g.writer == Some(s.id) {
             g.writer = None;
         }
+        s.cursors.clear();
     }
 
     fn rollback_to(&self, s: &mut Session, name: &str) -> PgResult<StmtResult> {
@@ -867,6 +960,14 @@ fn call_arg_text(f: &a::Function) -> String {
 
 fn warning(msg: &str) -> PgError {
     PgError { severity: "WARNING", ..PgError::new(code::WARNING, msg) }
+}
+
+/// The row count in `FETCH n FROM cursor` / `FETCH FORWARD n FROM cursor`.
+fn fetch_count(limit: &a::ValueWithSpan) -> PgResult<usize> {
+    let a::Value::Number(n, _) = &limit.value else {
+        return Err(unsupported("non-numeric FETCH count"));
+    };
+    n.parse().map_err(|_| PgError::new(code::SYNTAX_ERROR, format!("invalid FETCH count: {n}")))
 }
 
 fn is_transaction_control(stmt: &a::Statement) -> bool {
@@ -964,12 +1065,28 @@ fn set_value_text(values: &[a::Expr]) -> PgResult<String> {
 }
 
 /// Runs a query, DML or DDL statement inside an open transaction.
-fn run_one(ctx: &mut Ctx, stmt: &a::Statement, info: &SessionInfo) -> PgResult<StmtResult> {
+fn run_one(
+    ctx: &mut Ctx,
+    stmt: &a::Statement,
+    info: &SessionInfo,
+    param_types: &[Type],
+) -> PgResult<StmtResult> {
     use a::Statement as S;
     match stmt {
         S::Query(_) | S::Insert(_) | S::Update(_) | S::Delete(_) => {
             let db = ctx.db.clone();
-            let mut b = Binder::new(&db, info, &param_types(ctx));
+            // Re-binding here needs hints for `ctx.params`; reuse the ones
+            // `Prepared::param_types` already resolved (see `execute`'s
+            // doc comment) rather than re-guessing from the decoded
+            // values, falling back to `Unknown` (safe: this binder's own
+            // "resolve `Unknown` from context" handling is exactly what
+            // `prepare` itself used) only if the caller genuinely has none.
+            let hints: Vec<Type> = if param_types.len() == ctx.params.len() {
+                param_types.to_vec()
+            } else {
+                vec![Type::UNKNOWN; ctx.params.len()]
+            };
+            let mut b = Binder::new(&db, info, &hints);
             let planned = b.bind_statement(stmt)?;
             run_planned(ctx, planned, stmt)
         }
@@ -1052,10 +1169,6 @@ fn ddl<'a, 'b>(ctx: &'a mut Ctx<'b>, info: &SessionInfo) -> Ddl<'a, 'b> {
             now: info.now,
         },
     }
-}
-
-fn param_types(ctx: &Ctx) -> Vec<Type> {
-    ctx.params.iter().map(types::value_type_guess).collect()
 }
 
 fn run_planned(ctx: &mut Ctx, planned: Planned, stmt: &a::Statement) -> PgResult<StmtResult> {

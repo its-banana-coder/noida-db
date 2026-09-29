@@ -263,6 +263,10 @@ pub fn binop(
                 v.extend_from_slice(y);
                 return Ok(Bytes(v));
             }
+            if ret.base == Base::Tsvector {
+                let (Text(x), Text(y)) = (a, b) else { return Ok(Null) };
+                return Ok(Text(fts::concat_vectors(x, y)?));
+            }
             let sa = to_str(a, tys[0], env);
             let sb = to_str(b, tys[1], env);
             Text(sa + &sb)
@@ -1717,11 +1721,22 @@ pub fn call(
                     .map_or_else(String::new, |q| fts::format_query(&q)),
             )));
         }
+        "websearch_to_tsquery" => {
+            let (config, txt) = fts_args(a);
+            return Ok(Some(Text(
+                fts::websearch_to_tsquery(&txt, &config)
+                    .map_or_else(String::new, |q| fts::format_query(&q)),
+            )));
+        }
         "ts_rank" => {
             let vec = fts::parse_vector(text(&a[0]))?;
             let q = fts::parse_query_text(text(&a[1]))?
                 .unwrap_or(fts::Query::Lexeme(String::new(), false));
             return Ok(Some(Float(fts::rank(&vec, &q) as f64)));
+        }
+        "setweight" => {
+            let weight = text(&a[1]).chars().next().unwrap_or('\0');
+            return Ok(Some(Text(fts::set_weight(text(&a[0]), weight)?)));
         }
         "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
             let base = range_name_base(name);

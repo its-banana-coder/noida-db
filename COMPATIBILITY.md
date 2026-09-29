@@ -84,26 +84,47 @@ Every service is its own module:
     constraints, `LISTEN`/`NOTIFY`, `COPY ... FROM/TO STDIN/STDOUT` (text
     and CSV; verified against `pg_dump`/`psql` restore and the copy APIs of
     psycopg, node-postgres and the Rust `postgres` crate), full-text search
-    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`, `@@`,
-    `ts_rank`; verified against Django's `django.contrib.postgres.search`),
-    `REFRESH MATERIALIZED VIEW`.
+    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`/
+    `websearch_to_tsquery`, `@@`, `ts_rank`, `setweight`,
+    `tsvector || tsvector`; verified against Django's
+    `django.contrib.postgres.search` and Miniflux's own search index),
+    `REFRESH MATERIALIZED VIEW`, `DECLARE`/`FETCH`/`CLOSE` cursors
+    (forward-only: `NEXT`, a row count, `ALL`/`FORWARD ALL`; verified
+    against Miniflux's own schema-migration cursor usage).
   - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz,
     numeric and the range types (`int4range`/`int8range`/`numrange`/
     `daterange`/`tsrange`/`tstzrange`: canonical text, `@>`/`<@`/`&&`,
     `lower`/`upper`/`isempty`).
+  - System columns: `ctid`, `xmin`, `cmin`, `xmax`, `cmax`, `tableoid` are
+    selectable (bare or qualified), usable in `WHERE`/`UPDATE`/`DELETE`,
+    excluded from `SELECT *`, listed in `pg_attribute`, and ambiguous when
+    referenced unqualified across more than one joined table, same as an
+    ordinary column.
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
     Flyway, Liquibase, Prisma, Django and Rails to look up the schema,
-    including old-style comma-separated joins across them (what Sequelize's
-    own index introspection sends).
+    including old-style comma-separated joins and long explicit
+    `JOIN ... ON` chains filtered to one row only in `WHERE` across them
+    (Sequelize's own index introspection and Gitea/xorm's own per-table
+    column-metadata query, respectively — both real, unmodified real-app
+    schemas verified end to end against `tests/clients/postgres/run.sh`
+    and, for Gitea specifically, by migrating and starting its actual
+    ~115-table production schema).
   - Clients verified: psycopg, SQLAlchemy, Django, asyncpg, Alembic,
-    node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, the JDBC
-    driver.
+    node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, the
+    JDBC driver.
 - **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
   extensions, logical replication, `COPY` to/from a server-side file or
-  program, `FORMAT BINARY`, full-text search GIN/GiST
-  indexes and `ts_headline`. Concurrency is one writer at a time.
+  program, `FORMAT BINARY`, full-text search GIN/GiST indexes and
+  `ts_headline`, backward-moving cursors (`PRIOR`/`BACKWARD`/`ABSOLUTE`/
+  `RELATIVE`) and `WITH HOLD` (a cursor is closed at the end of its
+  transaction like an ordinary one). Concurrency is one writer at a time.
 - **Known gap:** enum values order and compare by label text, not by the
   order they were declared in (`<`, `ORDER BY`, `min`/`max`).
+- **Known gap:** there's no MVCC, so `xmin`/`cmin`/`xmax`/`cmax` are fixed
+  placeholder values, not real transaction/command ids — a pattern that
+  relies on them actually changing (e.g. optimistic-locking via a stale
+  `xmin` check) won't behave like real Postgres. `ctid` (scan position)
+  and `tableoid` are real.
 - **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
   migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
   `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported

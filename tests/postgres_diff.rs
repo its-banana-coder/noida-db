@@ -438,6 +438,12 @@ const SCRIPTS: &[&[&str]] = &[
         "SELECT to_tsquery('fox & quick'), to_tsquery('fox | !slow'), to_tsquery('(fox | dog) & quick')",
         "SELECT to_tsquery('quick <-> brown'), to_tsquery('quick <2> fox'), to_tsquery('jump:*')",
         "SELECT plainto_tsquery('the quick foxes'), phraseto_tsquery('quick brown fox')",
+        "SELECT websearch_to_tsquery('rust programming')",
+        "SELECT websearch_to_tsquery('\"exact phrase\" here')",
+        "SELECT websearch_to_tsquery('cats or dogs')",
+        "SELECT websearch_to_tsquery('cats -dogs')",
+        "SELECT websearch_to_tsquery('-\"exact phrase\"')",
+        "SELECT websearch_to_tsquery('   ')",
         "SELECT '''fox'':2,4 ''quick'':1'::tsvector",
         "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & quick')",
         "SELECT to_tsvector('the quick brown fox') @@ to_tsquery('fox & slow')",
@@ -448,6 +454,28 @@ const SCRIPTS: &[&[&str]] = &[
         "INSERT INTO docs VALUES (1, 'The quick brown fox jumps over the lazy dog'), (2, 'A completely unrelated sentence about cats')",
         "SELECT id FROM docs WHERE to_tsvector(body) @@ to_tsquery('fox & dog') ORDER BY id",
         "SELECT id FROM docs WHERE to_tsvector(body) @@ plainto_tsquery('lazy dog') ORDER BY id",
+        "SELECT setweight(to_tsvector('a cat sat'), 'A')",
+        "SELECT setweight(to_tsvector('cat sat'), 'A') || setweight(to_tsvector('a dog ran'), 'B')",
+        "SELECT setweight(to_tsvector(''), 'A') || to_tsvector('fox')",
+        "SELECT setweight(to_tsvector('cat'), 'X')",
+    ],
+    // DECLARE/FETCH/CLOSE cursors: the query runs at DECLARE time, FETCH
+    // returns NEXT/N/ALL rows from where the cursor left off, and CLOSE
+    // (or COMMIT) ends it. Found via Miniflux's own schema migration,
+    // which uses exactly this shape (`... FOR UPDATE`, `FETCH NEXT`, a
+    // deferred `CLOSE`) to walk a table in a loop.
+    &[
+        "CREATE TABLE cur_items (id int)",
+        "INSERT INTO cur_items VALUES (1), (2), (3), (4), (5)",
+        "BEGIN",
+        "DECLARE cur_c CURSOR FOR SELECT id FROM cur_items WHERE id > 0 FOR UPDATE",
+        "FETCH NEXT FROM cur_c",
+        "FETCH NEXT FROM cur_c",
+        "FETCH 2 FROM cur_c",
+        "FETCH NEXT FROM cur_c",
+        "FETCH NEXT FROM cur_c",
+        "CLOSE cur_c",
+        "COMMIT",
     ],
     // REFRESH MATERIALIZED VIEW: stays stale until refreshed, WITH NO DATA
     // unpopulates it, an unpopulated matview errors on read.
@@ -519,6 +547,71 @@ const SCRIPTS: &[&[&str]] = &[
          WHERE cjb.a_id = cja.id AND cjc.b_id = cjb.id ORDER BY cja.id, cjb.id, cjc.id",
         "SELECT t.relname, i.relname FROM pg_class t, pg_class i, pg_index ix \
          WHERE t.oid = ix.indrelid AND i.oid = ix.indexrelid AND t.relname = 'cja'",
+    ],
+    // `ctid`/`xmin`/`xmax`/`cmin`/`cmax`/`tableoid`: per-row system columns.
+    // Comparable across servers: ctid position for freshly inserted rows,
+    // ctid as a WHERE/UPDATE/DELETE key, tableoid's identity (not its raw
+    // OID, which differs per server), pg_attribute listing them, `SELECT *`
+    // still excluding them, and the "ambiguous" error for a bare reference
+    // across two tables. xmin/xmax/cmin/cmax have no MVCC behind them here
+    // (documented gap), so their exact values aren't compared.
+    &[
+        "CREATE TABLE syscols (id int, name text)",
+        "INSERT INTO syscols VALUES (1, 'a'), (2, 'b')",
+        "SELECT ctid FROM syscols ORDER BY id",
+        "!SELECT xmin, xmax, cmin, cmax FROM syscols",
+        "SELECT tableoid = 'syscols'::regclass FROM syscols LIMIT 1",
+        "SELECT id FROM syscols WHERE ctid = '(0,2)'",
+        "UPDATE syscols SET name = 'z' WHERE ctid = '(0,1)'",
+        "SELECT id, name FROM syscols ORDER BY id",
+        "DELETE FROM syscols WHERE ctid = '(0,2)'",
+        "SELECT id FROM syscols",
+        "SELECT attname, attnum FROM pg_attribute WHERE attrelid = 'syscols'::regclass ORDER BY attnum",
+        "SELECT * FROM syscols",
+        "CREATE TABLE syscols2 (id int)",
+        "SELECT ctid FROM syscols, syscols2",
+        "SELECT syscols.* FROM syscols",
+        // Values only: the composite's reported type name (real Postgres
+        // names it after the table; noida-db reports generic "record", a
+        // pre-existing, unrelated gap) isn't part of what this checks.
+        "!SELECT syscols FROM syscols",
+    ],
+    // ORDER BY resolves a bare name against the SELECT list's output
+    // columns first, even when the name also matches (unambiguously or,
+    // as here, ambiguously) an input column: two joined tables both named
+    // `oid`-like columns, selected unaliased so the output column takes
+    // that name, must not make `ORDER BY` on that name "ambiguous" (found
+    // via Npgsql's own connection-startup catalog query, which relies on
+    // exactly this precedence and otherwise fails to connect at all).
+    &[
+        "CREATE TABLE obA (oid int, v text)",
+        "CREATE TABLE obB (oid int, w text)",
+        "INSERT INTO obA VALUES (2, 'a'), (1, 'b')",
+        "INSERT INTO obB VALUES (10, 'x')",
+        "SELECT obA.oid, v FROM obA, obB ORDER BY oid",
+    ],
+    // An explicit `JOIN ... ON` chain filtered down to one row only in
+    // WHERE (not any join's own ON): without pushing WHERE conjuncts down
+    // into the earliest safe (Inner/Cross) join, the whole chain runs
+    // fully unfiltered before WHERE ever applies. This is exactly the
+    // shape of Gitea's own startup schema-introspection query (a long
+    // pg_attribute/pg_class/pg_type/pg_attrdef/... LEFT JOIN chain,
+    // filtered to one table by name only in WHERE) — real ClickHouse-scale
+    // catalogs made it take 11+ seconds per table there, which is what
+    // caught this.
+    &[
+        "CREATE TABLE jwA (id int, aname text)",
+        "CREATE TABLE jwB (id int, a_id int, bname text)",
+        "CREATE TABLE jwC (id int, b_id int, cname text)",
+        "INSERT INTO jwA VALUES (1, 'x'), (2, 'y')",
+        "INSERT INTO jwB VALUES (1, 1, 'p'), (2, 2, 'q'), (3, 2, 'r')",
+        "INSERT INTO jwC VALUES (1, 1, 'm'), (2, 2, 'n')",
+        "SELECT jwA.id, jwB.id, jwC.id \
+         FROM jwA JOIN jwB ON jwB.a_id = jwA.id LEFT JOIN jwC ON jwC.b_id = jwB.id \
+         WHERE jwA.aname = 'y' ORDER BY jwA.id, jwB.id, jwC.id",
+        "SELECT t.relname, i.relname FROM pg_class t \
+         JOIN pg_index ix ON t.oid = ix.indrelid JOIN pg_class i ON i.oid = ix.indexrelid \
+         WHERE t.relname = 'jwa'",
     ],
     // A scalar function in FROM returns one row (TypeORM, and other ORMs,
     // probe the connection with SELECT * FROM current_schema()/version()).

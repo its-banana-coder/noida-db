@@ -497,7 +497,7 @@ fn simple_query(
         let outcome = if let a::Statement::Copy { .. } = stmt {
             handle_copy(conn, engine, session, stmt)?
         } else {
-            engine.execute(session, stmt, &[])
+            engine.execute(session, stmt, &[], &[])
         };
         match outcome {
             Ok(result) => {
@@ -619,7 +619,8 @@ fn copy_in(
             return;
         }
         let sql = format!("INSERT INTO {table}{col_list} VALUES {}", batch.join(", "));
-        match engine.parse_sql(&sql).and_then(|stmts| engine.execute(session, &stmts[0], &[])) {
+        match engine.parse_sql(&sql).and_then(|stmts| engine.execute(session, &stmts[0], &[], &[]))
+        {
             Ok(_) => total += batch.len() as i64,
             Err(e) => *failed = Some(e),
         }
@@ -734,7 +735,7 @@ fn copy_out(
         Ok(s) => s,
         Err(e) => return Ok(Err(e)),
     };
-    let result = match engine.execute(session, &stmts[0], &[]) {
+    let result = match engine.execute(session, &stmts[0], &[], &[]) {
         Ok(r) => r,
         Err(e) => return Ok(Err(e)),
     };
@@ -965,7 +966,7 @@ fn do_execute(
         let result: StmtResult = if let a::Statement::Copy { .. } = &stmt {
             handle_copy(conn, engine, session, &stmt).map_err(io_to_pg)??
         } else {
-            engine.execute(session, &stmt, &params)?
+            engine.execute(session, &stmt, &params, &prep.param_types)?
         };
         notices(conn, &result.notices).map_err(io_to_pg)?;
         params_changed(conn, &result.params_changed).map_err(io_to_pg)?;

@@ -355,6 +355,82 @@ fn prepared_statements_are_reusable() {
     }
 }
 
+/// The engine re-binds every statement at execute time (see
+/// `engine::run_one`), and that re-bind must reuse the parameter types
+/// `Prepared::param_types` already resolved rather than re-deriving types
+/// from the decoded runtime values. Found via a real Gitea (xorm) INSERT:
+/// an unspecified-type parameter (the driver leaves it for the server to
+/// resolve, exactly what `c.execute` below does for `$2`) bound to a
+/// `json` column decodes as a `Value::Text` (json's own runtime
+/// representation), which a value-shape guess reports as plain `text` —
+/// and `text -> json` isn't even a valid assignment cast, so the very
+/// column the value was headed for rejected it on re-bind.
+#[test]
+fn unspecified_param_type_resolves_consistently_on_rebind() {
+    let mut c = client();
+    c.batch_execute("CREATE TABLE t (id int, meta json)").unwrap();
+    let empty_array = serde_json::json!([]);
+    c.execute("INSERT INTO t (id, meta) VALUES ($1, $2)", &[&1i32, &empty_array]).unwrap();
+    let row = c.query_one("SELECT meta FROM t WHERE id = $1", &[&1i32]).unwrap();
+    assert_eq!(row.get::<_, serde_json::Value>(0), serde_json::json!([]));
+    // Re-executing the same prepared shape (a second `execute` of the same
+    // SQL text reuses the unnamed statement) must resolve identically, not
+    // just on the first bind.
+    let empty_obj = serde_json::json!({});
+    c.execute("INSERT INTO t (id, meta) VALUES ($1, $2)", &[&2i32, &empty_obj]).unwrap();
+    let row = c.query_one("SELECT meta FROM t WHERE id = $1", &[&2i32]).unwrap();
+    assert_eq!(row.get::<_, serde_json::Value>(0), serde_json::json!({}));
+}
+
+/// A second bug surfaced fixing the first: even a parameter whose type
+/// the *client* declares explicitly (not left unspecified) must still get
+/// its target column's own `typmod` (e.g. a `numeric(p,s)` column's
+/// scale) applied on every re-bind, not just resolved once and forgotten.
+#[test]
+fn concretely_typed_param_gets_column_typmod_on_every_rebind() {
+    let mut c = client();
+    c.batch_execute("CREATE TABLE t (id int, price numeric(8,2))").unwrap();
+    // Declare $1 as int4 explicitly — a type other than the target
+    // column's own numeric(8,2) — so the server must coerce and scale it
+    // at the point of use each time, the same way `prepare` itself did.
+    let ins = c
+        .prepare_typed("INSERT INTO t (id, price) VALUES ($1, $2)", &[Type::INT4, Type::INT4])
+        .unwrap();
+    c.execute(&ins, &[&1i32, &5i32]).unwrap();
+    let row = c.query_one("SELECT price::text FROM t WHERE id = $1", &[&1i32]).unwrap();
+    assert_eq!(row.get::<_, String>(0), "5.00");
+    c.execute(&ins, &[&2i32, &11i32]).unwrap();
+    let row = c.query_one("SELECT price::text FROM t WHERE id = $1", &[&2i32]).unwrap();
+    assert_eq!(row.get::<_, String>(0), "11.00");
+    let upd = c
+        .prepare_typed("UPDATE t SET price = $1 WHERE id = $2", &[Type::INT4, Type::INT4])
+        .unwrap();
+    c.execute(&upd, &[&7i32, &1i32]).unwrap();
+    let row = c.query_one("SELECT price::text FROM t WHERE id = $1", &[&1i32]).unwrap();
+    assert_eq!(row.get::<_, String>(0), "7.00");
+}
+
+/// `INSERT INTO t (...) SELECT $1, $2, ...` (as opposed to `VALUES`): an
+/// unspecified-type parameter directly in the target list must resolve
+/// against that column's own type, the same way one in a `VALUES` row
+/// already does. Found via Miniflux's own entry-insert query, which uses
+/// exactly this shape (`INSERT ... SELECT $1, ... WHERE NOT EXISTS (...)`,
+/// an atomicity idiom) with a `time.Time` parameter headed for a
+/// `timestamptz` column.
+#[test]
+fn unspecified_param_in_insert_select_resolves_against_target_column() {
+    let mut c = client();
+    c.batch_execute("CREATE TABLE t (id serial primary key, ts timestamptz, body text)").unwrap();
+    let now = std::time::SystemTime::now();
+    c.execute(
+        "INSERT INTO t (ts, body) SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM t WHERE body = $2)",
+        &[&now, &"hello"],
+    )
+    .unwrap();
+    let row = c.query_one("SELECT body FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(row.get::<_, String>(0), "hello");
+}
+
 #[test]
 fn two_connections_share_data() {
     let addr = start();

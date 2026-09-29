@@ -24,3 +24,6 @@ pub mod memcached;
 
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
+
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
