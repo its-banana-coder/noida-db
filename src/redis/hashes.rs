@@ -34,11 +34,15 @@ fn set_fields(ctx: &mut Ctx, a: &[Vec<u8>], name: &str) -> Result<i64, Value> {
 }
 
 fn hset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    set_fields(ctx, a, "hset").map(Value::Integer)
+    let n = set_fields(ctx, a, "hset")?;
+    ctx.notify_keyspace_event('h', "hset", &a[1]);
+    Ok(Value::Integer(n))
 }
 
 fn hmset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    set_fields(ctx, a, "hmset").map(|_| Value::ok())
+    set_fields(ctx, a, "hmset")?;
+    ctx.notify_keyspace_event('h', "hset", &a[1]);
+    Ok(Value::ok())
 }
 
 fn hsetnx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
@@ -48,6 +52,7 @@ fn hsetnx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         return Ok(Value::Integer(0));
     }
     h.insert(&a[2], &a[3], lim);
+    ctx.notify_keyspace_event('h', "hset", &a[1]);
     Ok(Value::Integer(1))
 }
 
@@ -68,6 +73,9 @@ fn hmget(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 fn hdel(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let Some(h) = ctx.get_hash(&a[1])? else { return Ok(Value::Integer(0)) };
     let n = a[2..].iter().filter(|f| h.map.remove(f)).count();
+    if n > 0 {
+        ctx.notify_keyspace_event('h', "hdel", &a[1]);
+    }
     ctx.drop_if_empty(&a[1]);
     Ok(Value::Integer(n as i64))
 }
@@ -122,6 +130,7 @@ fn hincrby(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         .checked_add(by)
         .ok_or_else(|| Value::err("ERR increment or decrement would overflow"))?;
     h.insert(&a[2], next.to_string().as_bytes(), lim);
+    ctx.notify_keyspace_event('h', "hincrby", &a[1]);
     Ok(Value::Integer(next))
 }
 
@@ -138,6 +147,7 @@ fn hincrbyfloat(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     let next = num::add_human(&current, &a[3]).map_err(Value::err)?;
     h.insert(&a[2], next.as_bytes(), lim);
+    ctx.notify_keyspace_event('h', "hincrbyfloat", &a[1]);
     Ok(Value::bulk(next))
 }
 

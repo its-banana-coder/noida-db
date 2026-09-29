@@ -154,12 +154,15 @@ impl Ctx<'_> {
         }
     }
 
-    fn store_zset(&mut self, key: &[u8], z: Zset) -> Reply {
+    fn store_zset(&mut self, key: &[u8], z: Zset, event: &str) -> Reply {
         let now = self.now;
         let len = z.len();
-        self.db().remove(key, now);
+        let existed = self.db().remove(key, now).is_some();
         if len > 0 {
             self.db().insert(key.to_vec(), Entry::new(Data::Zset(z)));
+            self.notify_keyspace_event('z', event, key);
+        } else if existed {
+            self.notify_keyspace_event('g', "del", key);
         }
         Ok(Value::Integer(len as i64))
     }
@@ -279,6 +282,11 @@ fn zadd_generic(ctx: &mut Ctx, a: &[Vec<u8>], mut f: AddFlags) -> Reply {
             last = score;
         }
     }
+    if added > 0 || updated > 0 {
+        // Real Redis fires "zincr" (not "zincrby") for ZINCRBY and for
+        // ZADD ... INCR, and "zadd" otherwise.
+        ctx.notify_keyspace_event('z', if f.incr { "zincr" } else { "zadd" }, &a[1]);
+    }
     if f.incr {
         return Ok(if processed > 0 { Value::Double(last) } else { Value::Null });
     }
@@ -304,6 +312,9 @@ fn zrem(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         if z.is_empty() {
             break;
         }
+    }
+    if n > 0 {
+        ctx.notify_keyspace_event('z', "zrem", &a[1]);
     }
     ctx.drop_if_empty(&a[1]);
     Ok(Value::Integer(n))
@@ -584,7 +595,7 @@ fn zrange_generic(
             for (s, m) in &selected {
                 z.insert(m, *s, lim);
             }
-            ctx.store_zset(dst, z)
+            ctx.store_zset(dst, z, "zrangestore")
         }
         None => Ok(with_scores(&selected, withscores, resp3)),
     }
@@ -1048,7 +1059,7 @@ fn zsetop(
     match dst {
         Some(dst) => {
             result.shrink_if_small(lim);
-            ctx.store_zset(dst, result)
+            ctx.store_zset(dst, result, name)
         }
         None => {
             let resp3 = ctx.resp() >= 3;

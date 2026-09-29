@@ -125,6 +125,7 @@ fn set(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         None => None,
     };
     ctx.db().insert(a[1].clone(), Entry { data: Data::Str(a[2].clone()), expires_at });
+    ctx.notify_keyspace_event('$', "set", &a[1]);
     Ok(old.map_or(Value::ok(), |o| o.map_or(Value::Null, Value::Bulk)))
 }
 
@@ -137,6 +138,7 @@ fn setnx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         return Ok(Value::Integer(0));
     }
     set_str(ctx, &a[1], a[2].clone(), None);
+    ctx.notify_keyspace_event('$', "set", &a[1]);
     Ok(Value::Integer(1))
 }
 
@@ -148,6 +150,7 @@ fn setex_generic(ctx: &mut Ctx, a: &[Vec<u8>], millis: bool, cmd: &str) -> Reply
     let ms = if millis { n } else { n * 1000 };
     let at = ms.checked_add(ctx.now as i64).ok_or_else(|| invalid_expire(cmd))?;
     set_str(ctx, &a[1], a[3].clone(), Some(at as u64));
+    ctx.notify_keyspace_event('$', "set", &a[1]);
     Ok(Value::ok())
 }
 
@@ -162,6 +165,7 @@ fn psetex(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 fn getset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let old = opt_bulk(ctx.get_str(&a[1])?);
     set_str(ctx, &a[1], a[2].clone(), None);
+    ctx.notify_keyspace_event('$', "set", &a[1]);
     Ok(old)
 }
 
@@ -170,6 +174,7 @@ fn getdel(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if old != Value::Null {
         let now = ctx.now;
         ctx.db().remove(&a[1], now);
+        ctx.notify_keyspace_event('g', "del", &a[1]);
     }
     Ok(old)
 }
@@ -234,10 +239,13 @@ fn append(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 return Err(too_big());
             }
             s.extend_from_slice(&a[2]);
-            Ok(Value::Integer(s.len() as i64))
+            let len = s.len() as i64;
+            ctx.notify_keyspace_event('$', "append", &a[1]);
+            Ok(Value::Integer(len))
         }
         None => {
             set_str(ctx, &a[1], a[2].clone(), None);
+            ctx.notify_keyspace_event('$', "append", &a[1]);
             Ok(Value::Integer(a[2].len() as i64))
         }
     }
@@ -265,6 +273,10 @@ fn incr_by(ctx: &mut Ctx, key: &[u8], by: i64) -> Reply {
         Some(s) => *s = text,
         None => set_str(ctx, key, text, None),
     }
+    // Real Redis picks the event name by the sign of the increment, not by
+    // which command was called: DECRBY with a negative amount still fires
+    // "incrby", and INCRBY with a negative amount fires "decrby".
+    ctx.notify_keyspace_event('$', if by < 0 { "decrby" } else { "incrby" }, key);
     Ok(Value::Integer(next))
 }
 
@@ -294,6 +306,7 @@ fn incrbyfloat(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         Some(s) => *s = next.clone().into_bytes(),
         None => set_str(ctx, &a[1], next.clone().into_bytes(), None),
     }
+    ctx.notify_keyspace_event('$', "incrbyfloat", &a[1]);
     Ok(Value::bulk(next))
 }
 
@@ -343,6 +356,9 @@ fn setrange(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             s.resize(offset + value.len(), 0);
         }
         s[offset..offset + value.len()].copy_from_slice(value);
+        let len = s.len() as i64;
+        ctx.notify_keyspace_event('$', "setrange", &a[1]);
+        return Ok(Value::Integer(len));
     }
     Ok(Value::Integer(s.len() as i64))
 }

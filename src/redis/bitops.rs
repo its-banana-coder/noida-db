@@ -67,6 +67,7 @@ fn setbit(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let old = (s[byte] >> bit) & 1;
     s[byte] &= !(1 << bit);
     s[byte] |= (on as u8 & 1) << bit;
+    ctx.notify_keyspace_event('$', "setbit", &a[1]);
     Ok(Value::Integer(old as i64))
 }
 

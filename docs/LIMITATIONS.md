@@ -64,12 +64,23 @@ current count).
   work.
 - Keyspace notifications: `notify-keyspace-events` is enforced and
   `__keyspace@*__` / `__keyevent@*__` messages are published for generic
-  events (key `del`, `expired`), streams (`xadd`/`xtrim`/`xdel`/`xsetid`/
-  `xclaim`/`xautoclaim`/`xgroup-*`) and the HyperLogLog commands (`pfadd`/
-  `pfmerge`). Not yet wired for ordinary hash/list/set/zset/string mutations
-  (`hset`, `lpush`, `sadd`, `zadd`, `set`, ...) — those commands don't emit
-  events yet even though their event-type flags (`h`/`l`/`s`/`z`/`$`) are
-  accepted by `CONFIG SET`.
+  events (key `del`, `expired`, `expire`, `persist`, `rename_from`/
+  `rename_to`, `move_from`/`move_to`, `copy_to`), streams (`xadd`/`xtrim`/
+  `xdel`/`xsetid`/`xclaim`/`xautoclaim`/`xgroup-*`), the HyperLogLog commands
+  (`pfadd`/`pfmerge`), and ordinary string/hash/list/set/zset mutations
+  (`set`/`setnx`/`setex`/`psetex`/`getset`/`getdel`/`append`/`setrange`/
+  `setbit`/`incr`/`decr`/`incrby`/`decrby`/`incrbyfloat`, `hset`/`hmset`/
+  `hsetnx`/`hdel`/`hincrby`/`hincrbyfloat`, `lpush`/`rpush`/`lpushx`/
+  `rpushx`/`lpop`/`rpop`/`lset`/`lrem`/`linsert`/`ltrim`, `sadd`/`srem`/
+  `spop`/`smove` (as `srem`+`sadd`, matching real Redis)/`sinterstore`/
+  `sunionstore`/`sdiffstore`, `zadd`/`zincrby` (as `zincr`, matching real
+  Redis)/`zrem`/`zinterstore`/`zunionstore`/`zdiffstore`/`zrangestore`, and
+  the generic `expire`/`pexpire`/`expireat`/`pexpireat`/`persist`/`rename`/
+  `renamenx`/`move`/`copy` commands. Not yet wired: `GETEX`/`MSET`/`MSETNX`/
+  `ZREMRANGEBYRANK`/`ZREMRANGEBYSCORE`/`ZREMRANGEBYLEX`/`ZPOPMIN`/`ZPOPMAX`/
+  `LMOVE`/`RPOPLPUSH`/`LMPOP`/`ZMPOP` and the blocking variants of the
+  list/zset pop and move commands - those still don't emit events even
+  though their event-type flags are accepted by `CONFIG SET`.
 - `maxmemory`, eviction policies and the OOM error. The setting is stored; it
   is not enforced.
 - Lua libraries `struct` and `bit`. `cjson`, `cmsgpack` and the `redis` table

@@ -132,8 +132,12 @@ fn expire_generic(ctx: &mut Ctx, a: &[Vec<u8>], base: i64, unit: Unit, cmd: &str
     }
     if when <= now {
         ctx.db().remove(&a[1], now as u64);
-    } else if let Some(e) = ctx.lookup(&a[1]) {
-        e.expires_at = Some(when as u64);
+        ctx.notify_keyspace_event('g', "del", &a[1]);
+    } else {
+        if let Some(e) = ctx.lookup(&a[1]) {
+            e.expires_at = Some(when as u64);
+        }
+        ctx.notify_keyspace_event('g', "expire", &a[1]);
     }
     Ok(Value::Integer(1))
 }
@@ -169,6 +173,9 @@ fn pexpiretime(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 
 fn persist(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let had = ctx.lookup(&a[1]).and_then(|e| e.expires_at.take()).is_some();
+    if had {
+        ctx.notify_keyspace_event('g', "persist", &a[1]);
+    }
     Ok(Value::Integer(had as i64))
 }
 
@@ -280,6 +287,8 @@ fn rename_generic(ctx: &mut Ctx, a: &[Vec<u8>], nx: bool) -> Reply {
     }
     let entry = ctx.db().remove(src, now).expect("checked above");
     ctx.db().insert(dst.clone(), entry);
+    ctx.notify_keyspace_event('g', "rename_from", src);
+    ctx.notify_keyspace_event('g', "rename_to", dst);
     Ok(if nx { Value::Integer(1) } else { Value::ok() })
 }
 
@@ -322,6 +331,7 @@ fn copy(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         target.remove(dst, now);
     }
     target.insert(dst.clone(), entry);
+    ctx.engine.notify_keyspace_event_engine(dst_db, 'g', "copy_to", dst);
     Ok(Value::Integer(1))
 }
 
@@ -334,8 +344,11 @@ fn move_cmd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if ctx.lookup(&a[1]).is_none() || ctx.engine.dbs[dst_db].contains(&a[1], now) {
         return Ok(Value::Integer(0));
     }
+    let src_db = ctx.db_index();
     let entry = ctx.db().remove(&a[1], now).expect("checked above");
     ctx.engine.dbs[dst_db].insert(a[1].clone(), entry);
+    ctx.engine.notify_keyspace_event_engine(src_db, 'g', "move_from", &a[1]);
+    ctx.engine.notify_keyspace_event_engine(dst_db, 'g', "move_to", &a[1]);
     Ok(Value::Integer(1))
 }
 
