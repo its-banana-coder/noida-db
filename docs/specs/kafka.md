@@ -8,59 +8,79 @@
   `apache/kafka:3.8.0` as a single-node KRaft broker. Env var:
   `NOIDA_KAFKA_REF=host:port`.
 
-## Roadmap (checked 2026-09-27)
+## Roadmap (checked 2026-09-27, updated same day after a real-client pass)
 
-Where things actually stand, read from the branch itself, not from commit
-messages: `src/kafka/engine.rs` (~1050 lines) already has handlers for
-nearly every P0 key and most of P1 — topics, produce/fetch, consumer groups,
-group admin, configs, and the four transaction APIs. That's real progress.
-But it's outrunning its own tests badly: `tests/kafka_client.rs` has exactly
-**one** test, covering milestone 1–2 only (ApiVersions, CreateTopics,
-Metadata); `tests/kafka_diff.rs` is a stub that does nothing (no local
-broker, no CI run yet). None of §3's P1 work — groups, configs,
-transactions — has a single test proving it does what the spec says. This
-project's rule is tests first; this branch has been writing engine code
-without them, which means nobody, including whoever wrote it, actually
-knows if `handle_join_group` or `handle_add_partitions_to_txn` behave like
-a real broker.
+Since this was first written, the branch merged `main`, backfilled 30
+engine-level tests (`src/kafka/tests/`, one file per area: topics,
+produce/fetch, coordinator, offsets, admin, idempotence, transactions) and
+`tests/kafka_client.rs` grew to 4 network tests including a real 2-consumer
+rebalance. All P0 and every P1 API key from §3 is wired on the wire
+(confirmed by grepping `ApiKey::` matches in `connection.rs` against this
+file's list — nothing missing). `tests/kafka_diff.rs` is still a stub (no
+CI run against a real broker yet); that remains the next structural gap.
 
-The branch was also 8 commits behind `main` (still on the pre-rename
-`noida` package name, missing every Redis and Postgres commit) and had never
-been run through CI's `-D warnings` clippy pass, which failed on two lints
-in existing code. Do these two first, in order, before writing another
-handler:
+Real clients were then run directly against noida-db (no broker/Docker
+needed for this part — see `tests/clients/kafka/run.sh`, which now covers
+kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka
+and every compression codec). This found two real bugs, one already fixed:
 
-1. **`git fetch && git merge origin/main`**, resolve the `Cargo.toml`/
-   `Cargo.lock` conflict by keeping both sides (the `[lib]`/`[[bin]]` split
-   and `sql`/`postgres` features from `main`, `kafka`'s own feature and
-   dependency), then `cargo generate-lockfile`. Confirm with
-   `cargo build --features kafka`, `cargo fmt --check`,
-   `cargo clippy --all-targets --all-features -- -D warnings`, and the
-   existing test.
-2. **Stop adding API keys. Write the tests for what's already there,
-   engine-level first** (`src/kafka/tests/`, following the Redis module's
-   pattern: one file per area, real error codes, no networking). At minimum,
-   one test per handler already in `engine.rs`, covering: correct happy
-   path, the real Kafka error code on each failure branch (see the list in
-   §2), and the group coordinator's state machine transitions (Empty →
-   PreparingRebalance → CompletingRebalance → Stable → Dead) with actual
-   timers, not just the join/sync happy path.
-3. Only then extend `tests/kafka_client.rs` past milestone 2: idempotent
-   producer, a 2-consumer group rebalance (scenario (b) in §5), AdminClient
-   describe/delete. This is what proves the code in `engine.rs` is not just
-   plausible-looking Rust.
-4. Set up `tests/kafka_diff.rs` for real, even without a local broker:
-   build the request/response pairs now (the CI service is already
-   `apache/kafka:3.8.0`; env var `NOIDA_KAFKA_REF` already wired into the
-   spec), so the first CI run on this branch tells you where the engine
-   actually diverges from a real broker. Expect it to find things —
-   that's the point of writing it before more feature work, not after.
-5. Once 1–4 are green in CI, pick up real clients per §5 (Java
-   `kafka-clients` first, since that's this project's primary audience),
-   then continue down the P1/P2 list in §3.
+- **Fixed:** `handle_produce`'s non-idempotent path always advanced the log
+  by exactly one record per Produce call, ignoring the record batch's
+  `lastOffsetDelta` header field (`= record count - 1`). Any producer that
+  batches more than one record onto a partition — normal behavior, not an
+  idempotent-producer edge case — silently lost every record after the
+  first. This cascaded into consumers replaying old messages after a
+  restart, because the committed offset ended up pointing past what was
+  actually stored, so the next Fetch got `OFFSET_OUT_OF_RANGE` and the
+  client reset to earliest. Caught by kafkajs's produce/consume/rebalance
+  scenario, not by any engine test (all 30 use single-record batches).
+- **Not fixed, real, and reproducible two independent ways** (raw
+  transactional `kafka-clients` producer, and Spring Kafka's
+  `KafkaTemplate`/`TransactionTemplate`): **transactions are protocol-shaped
+  but not functionally real.**
+  - `handle_init_producer_id` ignores `transactional_id` entirely and hands
+    out a fresh producer id on every call, so two producers configured with
+    the *same* `transactional.id` never share an identity — there is
+    nothing to fence. A real broker returns the same producer id with a
+    bumped epoch and rejects the stale one (`PRODUCER_FENCED`, 90).
+  - `handle_end_txn` and `handle_add_partitions_to_txn` always report
+    success and never actually gate visibility: there's no per-partition
+    staging of in-flight transactional records, no last stable offset
+    (LSO), and no control-record markers written on commit/abort. The
+    result: a `read_committed` consumer sees an aborted record exactly like
+    a committed one, because nothing distinguishes them once written.
+  - `tests/clients/kafka/java-gradle/` (`TransactionalProducerTest.java`,
+    `SpringKafkaTest.java`) reproduce both, and are wired into `run.sh` on
+    purpose — left red (`transactional-producer (known gap, see kafka.md)`)
+    rather than hidden, so this doesn't quietly regress further or get
+    "fixed" by weakening the test.
 
-Whoever picks this branch up next: do not add features under time pressure
-just because `engine.rs` compiles. A handler with no test is not done here.
+Real transactional semantics (per-partition staging keyed by
+(producer_id, epoch), LSO tracking, control batches, isolation-level
+filtering in `handle_fetch`) is a chunk of work comparable to a new
+milestone, not a quick patch — budget accordingly rather than
+patching around it. Producer fencing (store `transactional_id -> (producer_id,
+epoch)`, bump epoch on re-`InitProducerId`, reject a stale epoch in
+`Produce`/`EndTxn`/`AddPartitionsToTxn` with 90) is the smaller, more
+self-contained half and a reasonable place to start.
+
+Next, in order:
+
+1. Fix producer fencing (self-contained; see above).
+2. Implement real transaction visibility: staged records per open
+   transaction, LSO per partition, commit/abort control records, and
+   `read_committed` filtering in `handle_fetch`. Get
+   `TransactionalProducerTest` and `SpringKafkaTest` green, then remove the
+   "known gap" label from `run.sh`.
+3. Stand up `tests/kafka_diff.rs` for real against the CI `apache/kafka:3.8.0`
+   service — still the biggest structural gap: nothing here has ever been
+   compared against a genuine broker automatically.
+4. Continue down the P2 list in §3 (KIP-848, log compaction, quotas) once
+   1–3 are done.
+
+Whoever picks this branch up next: a handler with no test is not done here,
+and a real-client test that fails on a genuine gap should stay red and
+labeled, not be papered over.
 
 ## 1. Purpose
 

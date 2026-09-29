@@ -10,8 +10,12 @@ tests/clients/postgres/dotnet/npgsql/obj/
 tests/clients/redis/java/.gradle/
 tests/clients/redis/java/build/
 tests/clients/kafka/data/
+tests/clients/kafka/data-more/
 tests/clients/kafka/server.log
+tests/clients/kafka/server-more.log
 tests/clients/kafka/node/
+tests/clients/kafka/java-gradle/.gradle/
+tests/clients/kafka/java-gradle/build/
 node_modules/
 __pycache__/
 *.pyc

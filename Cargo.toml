@@ -97,6 +97,10 @@ name = "postgres_diff"
 required-features = ["postgres"]
 
 [[test]]
+name = "memcached_diff"
+required-features = ["memcached"]
+
+[[test]]
 name = "kafka_client"
 required-features = ["kafka"]
 
