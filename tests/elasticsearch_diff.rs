@@ -56,6 +56,16 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> Reply {
     Reply { status, product, body }
 }
 
+/// Panics with the full status/body if `r` isn't a 2xx — every call site
+/// that writes to the *real* server used to ignore its return value
+/// entirely, so a silent failure there (index creation racing a still-
+/// in-flight delete, a transient error) would only surface much later as
+/// a confusing mismatch on some unrelated field, instead of here where
+/// the actual problem is.
+fn expect_ok(what: &str, r: &Reply) {
+    assert!((200..300).contains(&r.status), "{what} failed: {} {}", r.status, r.body);
+}
+
 fn normalize_root(mut body: Value) -> Value {
     body.as_object_mut().unwrap().remove("name");
     body.as_object_mut().unwrap().remove("cluster_uuid");
@@ -139,8 +149,8 @@ fn p0_search_bm25_scoring_matches_real_elasticsearch() {
     let _ = request(real_addr, "DELETE", index, b"");
     let _ = request(ours_addr, "DELETE", index, b"");
     let create = br#"{"settings":{"index":{"number_of_shards":"1","number_of_replicas":"0"}}}"#;
-    request(real_addr, "PUT", index, create);
-    request(ours_addr, "PUT", index, create);
+    expect_ok("real: PUT index", &request(real_addr, "PUT", index, create));
+    expect_ok("ours: PUT index", &request(ours_addr, "PUT", index, create));
 
     let docs: [&[u8]; 4] = [
         br#"{"title":"the quick brown fox","pages":100}"#,
@@ -150,17 +160,23 @@ fn p0_search_bm25_scoring_matches_real_elasticsearch() {
     ];
     for (i, d) in docs.iter().enumerate() {
         let path = format!("{index}/_doc/{}", i + 1);
-        request(real_addr, "PUT", &path, d);
-        request(ours_addr, "PUT", &path, d);
+        expect_ok("real: PUT doc", &request(real_addr, "PUT", &path, d));
+        expect_ok("ours: PUT doc", &request(ours_addr, "PUT", &path, d));
     }
-    request(real_addr, "POST", &format!("{index}/_refresh"), b"");
-    request(ours_addr, "POST", &format!("{index}/_refresh"), b"");
+    expect_ok("real: refresh", &request(real_addr, "POST", &format!("{index}/_refresh"), b""));
+    expect_ok("ours: refresh", &request(ours_addr, "POST", &format!("{index}/_refresh"), b""));
 
     let query = br#"{"query":{"match":{"title":"quick fox"}}}"#;
     let real = request(real_addr, "POST", &format!("{index}/_search"), query);
     let ours = request(ours_addr, "POST", &format!("{index}/_search"), query);
+    expect_ok("real: search", &real);
+    expect_ok("ours: search", &ours);
     assert_eq!(ours.status, real.status);
-    assert_eq!(ours.body["hits"]["total"]["value"], real.body["hits"]["total"]["value"]);
+    assert_eq!(
+        ours.body["hits"]["total"]["value"], real.body["hits"]["total"]["value"],
+        "real search response was: {}",
+        real.body
+    );
 
     let real_hits = real.body["hits"]["hits"].as_array().expect("real hits");
     let ours_hits = ours.body["hits"]["hits"].as_array().expect("our hits");
