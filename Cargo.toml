@@ -30,7 +30,7 @@ mysql = ["sql", "dep:sqlparser", "dep:bytes"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 rabbitmq = ["dep:amq-protocol", "dep:bytes", "dep:cookie-factory", "dep:fastrand"]
 memcached = []
-elasticsearch = ["dep:serde_json"]
+elasticsearch = ["dep:serde_json", "dep:regex-lite"]
 mongodb = []
 # HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
 # same as the other services' wire protocols.
@@ -40,7 +40,8 @@ clickhouse = []
 # Postgres: wire-protocol message codecs only (no tokio server API).
 pgwire = { version = "0.41", default-features = false, optional = true }
 bytes = { version = "1", optional = true }
-# Postgres: regular expressions (already a pgwire dependency).
+# Postgres regex ops and Elasticsearch's `regexp` query (already a pgwire
+# dependency).
 regex-lite = { version = "0.1", optional = true }
 # Postgres: SQL parsing.
 sqlparser = { version = "0.63", default-features = false, features = ["std"], optional = true }

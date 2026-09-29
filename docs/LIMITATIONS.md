@@ -485,22 +485,47 @@ mapping and settings endpoints, document get/index/create/update/delete,
 memory and is lost when the process exits. Bulk chunked transfer encoding
 is accepted.
 
-`_search` and `_count` work for `match_all`/`match_none`, `match`, `term`,
-`terms`, `range`, `exists`, `prefix`, `ids`, `bool` (must/should/filter/
-must_not, minimum_should_match) and `constant_score`, across a single index,
-a comma-separated list, a `name*` prefix, or `_all`/`*`. `match` scores with
-BM25 (k1=1.2, b=0.75), including Lucene's lossy per-document field-length
-norm encoding, so ranking and `_score` should match real Elasticsearch for
-the same data (see `tests/elasticsearch_diff.rs`); everything else (`term`,
-`range`, etc.) uses a constant score, matching how Elasticsearch's
-structured queries are evaluated. `from`/`size`, `sort` (field or `_score`,
-asc/desc), `_source` filtering (bool/string/array/includes-excludes), and
-`min_score` are supported. The `standard`, `simple`, `whitespace`,
-`keyword` and `stop` analyzers are implemented and reachable via
-`_analyze`; `standard` approximates Lucene's `StandardTokenizer` for common
-ASCII/word cases rather than full UAX#29 segmentation. Near-real-time
-semantics are enforced: a write is visible to real-time GET immediately but
-not to search until `_refresh` (or `refresh=true`/`wait_for` on the write).
+`_search` and `_count` work for `match_all`/`match_none`, `match`,
+`match_phrase`, `multi_match`, `term`, `terms`, `range`, `exists`, `prefix`,
+`wildcard`, `regexp`, `ids`, `bool` (must/should/filter/must_not,
+minimum_should_match) and `constant_score`, across a single index, a
+comma-separated list, a `name*` prefix, or `_all`/`*`. `match` and
+`match_phrase` score with BM25 (k1=1.2, b=0.75), including Lucene's lossy
+per-document field-length norm encoding, so ranking and `_score` should
+match real Elasticsearch for the same data (see `tests/elasticsearch_diff.rs`
+— note its coverage predates `match_phrase`/`multi_match`/`wildcard`/
+`regexp`, which are only verified by the engine-level tests in
+`src/elasticsearch/tests/mod.rs`, self-consistently, not against a real
+node; no Elasticsearch/Docker is reachable in this sandbox); everything else
+(`term`, `range`, `wildcard`, `regexp`, etc.) uses a constant score, matching
+how Elasticsearch's structured queries are evaluated. `from`/`size`, `sort`
+(field or `_score`, asc/desc), `_source` filtering
+(bool/string/array/includes-excludes), and `min_score` are supported. The
+`standard`, `simple`, `whitespace`, `keyword` and `stop` analyzers are
+implemented and reachable via `_analyze`; `standard` approximates Lucene's
+`StandardTokenizer` for common ASCII/word cases rather than full UAX#29
+segmentation. Near-real-time semantics are enforced: a write is visible to
+real-time GET immediately but not to search until `_refresh` (or
+`refresh=true`/`wait_for` on the write).
+
+`match_phrase` requires the query's analyzed terms to appear in a document
+at consecutive positions, in order — matching Lucene's default `slop=0`.
+Term position here is just index order in a field's analyzed token list
+(nothing in the tokenizer pipeline drops or reorders tokens, so position
+tracking didn't need a separate data structure to be correct); an explicit
+non-zero `slop` option is accepted but currently has no effect (treated as
+0). `multi_match` implements the `best_fields` type (Elasticsearch's
+default): the query is matched against every listed field independently and
+a document's score is its single highest-scoring field (`field^boost`
+per-field boosting and `operator: "and"` are both honored) — `most_fields`,
+`cross_fields`, `phrase` and `phrase_prefix` multi_match types are not
+implemented. `wildcard` (`*`/`?` glob) and `regexp` are constant-score
+(unboosted 1.0 by default, same as `term`/`prefix`) and match against a
+field's index terms — the raw value for `keyword` fields, analyzed tokens
+for `text` fields; `regexp` anchors the whole term the way Elasticsearch
+does (the pattern must match start to end, not just find a substring) and
+uses `regex-lite`'s syntax, which is close to but not a byte-for-byte match
+of Lucene's own regexp dialect (e.g. no `~` complement operator).
 
 Aggregations are implemented: `terms`, `range`, `histogram`, `filter`,
 `filters`, `missing` (bucket aggregations, with recursive sub-aggregations
@@ -508,13 +533,13 @@ via a nested `aggs`), and `avg`/`sum`/`min`/`max`/`stats`/`value_count`/
 `cardinality`/`top_hits` (metric aggregations) — see
 `src/elasticsearch/search.rs`.
 
-Not yet built: `match_phrase`/`multi_match`/`wildcard`/`regexp`/
-`query_string`, nested field mappings and nested queries, highlighting,
-`search_after`, scroll/PIT, date-math ranges (`now-1d/d`), optimistic
-concurrency parameters (`version`, `if_seq_no`), gzip, `_cat`/`_cluster`
-endpoints, and exact Elasticsearch error/response parity for every path.
-This is not ready to replace Elasticsearch for application workflows that
-search with more than the query types above (aggregating is well covered).
+Not yet built: `query_string`, `simple_query_string`, `search_after`,
+scroll/PIT, nested field mappings and nested queries, highlighting,
+date-math ranges (`now-1d/d`), optimistic concurrency parameters (`version`,
+`if_seq_no`), gzip, `_cat`/`_cluster` endpoints, and exact Elasticsearch
+error/response parity for every path. This is not ready to replace
+Elasticsearch for application workflows that search with more than the
+query types above (aggregating is well covered).
 
 ## Numbers we do not claim yet
 

@@ -196,6 +196,174 @@ fn eval_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
     bm25_scores(mappings, docs, field, &query_terms, op.eq_ignore_ascii_case("and"))
 }
 
+/// Whether `query_terms` occurs in `doc_tokens` as a contiguous run at
+/// consecutive positions — Lucene's default `slop=0` phrase match. Document
+/// term vectors here are already position-ordered with no gaps (nothing
+/// filters tokens out of `tokens_for`), so the vector index *is* the term
+/// position, exactly like a real positional inverted index at slop 0.
+fn phrase_matches(doc_tokens: &[String], query_terms: &[String]) -> bool {
+    let n = query_terms.len();
+    if n == 0 || doc_tokens.len() < n {
+        return false;
+    }
+    (0..=doc_tokens.len() - n).any(|start| doc_tokens[start..start + n] == query_terms[..])
+}
+
+/// `match_phrase`: like `match`, but the query's analyzed terms must appear
+/// in the document at consecutive positions, in order (slop 0 — the only
+/// slop value implemented; a non-zero `slop` option is accepted but
+/// currently treated as 0).
+fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
+    let text = if let Some(o) = spec.as_object() {
+        o.get("query").and_then(Value::as_str).unwrap_or("").to_string()
+    } else {
+        spec.as_str().unwrap_or("").to_string()
+    };
+    let query_terms = analysis::standard(&text);
+    if query_terms.is_empty() {
+        return HashMap::new();
+    }
+    let per_doc = doc_tokens(mappings, docs, field);
+    let matched: HashSet<usize> = per_doc
+        .iter()
+        .enumerate()
+        .filter(|(_, toks)| phrase_matches(toks, &query_terms))
+        .map(|(idx, _)| idx)
+        .collect();
+    // Score the same as an AND `match` (every term must be present, which a
+    // phrase match already implies) restricted to documents where the
+    // phrase actually occurs at consecutive positions.
+    let mut scores = bm25_scores(mappings, docs, field, &query_terms, true);
+    scores.retain(|idx, _| matched.contains(idx));
+    scores
+}
+
+/// `field` or `field^boost` (multi_match's field-boost syntax).
+fn parse_field_boost(spec: &str) -> (&str, f32) {
+    match spec.rsplit_once('^') {
+        Some((field, boost)) => match boost.parse::<f32>() {
+            Ok(b) => (field, b),
+            Err(_) => (spec, 1.0),
+        },
+        None => (spec, 1.0),
+    }
+}
+
+/// `multi_match` (`best_fields` type, Elasticsearch's default): analyzes the
+/// query once and runs it as a `match` against every listed field, keeping
+/// each matched document's *highest*-scoring field as its overall score —
+/// matching `DisjunctionMaxQuery` with `tie_breaker=0.0` (also ES's
+/// default), i.e. take the max, ignore the rest.
+fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+    let Some(obj) = v.as_object() else { return HashMap::new() };
+    let text = obj.get("query").and_then(Value::as_str).unwrap_or("");
+    let query_terms = analysis::standard(text);
+    if query_terms.is_empty() {
+        return HashMap::new();
+    }
+    let fields: Vec<(String, f32)> = obj
+        .get("fields")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|s| {
+                    let (f, b) = parse_field_boost(s);
+                    (f.to_string(), b)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let op = obj.get("operator").and_then(Value::as_str).unwrap_or("or");
+    let require_all = op.eq_ignore_ascii_case("and");
+
+    let mut best: HashMap<usize, f32> = HashMap::new();
+    for (field, boost) in &fields {
+        for (idx, score) in bm25_scores(mappings, docs, field, &query_terms, require_all) {
+            let scaled = score * boost;
+            let entry = best.entry(idx).or_insert(scaled);
+            if scaled > *entry {
+                *entry = scaled;
+            }
+        }
+    }
+    best
+}
+
+/// Glob match (`*` = any run of characters, `?` = exactly one character),
+/// case-sensitive, the way Elasticsearch's `wildcard` query matches against
+/// index terms.
+fn glob_match(pattern: &[char], text: &[char]) -> bool {
+    // Standard two-pointer glob matcher with backtracking on `*`: `star`
+    // remembers the last `*` position in the pattern and how far into the
+    // text we'd consumed when we saw it, so a failed match past that point
+    // can retry by having `*` eat one more character.
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+/// `wildcard`: constant-score, non-analyzed glob match against a field's
+/// index terms (the raw value for `keyword` fields, analyzed tokens for
+/// `text` fields — same as `prefix`/`term`).
+fn eval_wildcard(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
+    let (value, boost) = value_and_boost(spec);
+    let pattern = value_to_term(&value);
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let mut out = HashMap::new();
+    for (idx, d) in docs.iter().enumerate() {
+        let matched = tokens_for(mappings, &d.source, field).iter().any(|t| {
+            let t_chars: Vec<char> = t.chars().collect();
+            glob_match(&pattern_chars, &t_chars)
+        });
+        if matched {
+            out.insert(idx, boost);
+        }
+    }
+    out
+}
+
+/// `regexp`: constant-score regular-expression match against a field's
+/// index terms. Elasticsearch anchors the whole term against the pattern
+/// (it must match start to end), which `regex_lite::Regex` doesn't do by
+/// default, so the pattern is wrapped in `^(?:...)$`.
+fn eval_regexp(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
+    let (value, boost) = value_and_boost(spec);
+    let pattern = value_to_term(&value);
+    let Ok(re) = regex_lite::Regex::new(&format!("^(?:{pattern})$")) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (idx, d) in docs.iter().enumerate() {
+        if tokens_for(mappings, &d.source, field).iter().any(|t| re.is_match(t)) {
+            out.insert(idx, boost);
+        }
+    }
+    out
+}
+
 fn number_cmp(a: &Value, b: &Value) -> Option<Ordering> {
     a.as_f64()?.partial_cmp(&b.as_f64()?)
 }
@@ -326,9 +494,10 @@ fn eval_bool(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
 
 /// Evaluates a Query DSL clause, returning matched document indices (into
 /// `docs`) mapped to their score contribution. Structured queries (`term`,
-/// `range`, `exists`, `prefix`, `ids`) score as a constant (their boost, 1.0
-/// by default) the way Elasticsearch's `ConstantScoreQuery` does; only
-/// `match_all` and `match` produce a graded, BM25-backed score.
+/// `range`, `exists`, `prefix`, `ids`, `wildcard`, `regexp`) score as a
+/// constant (their boost, 1.0 by default) the way Elasticsearch's
+/// `ConstantScoreQuery` does; `match_all`, `match`, `match_phrase` and
+/// `multi_match` produce a graded, BM25-backed score.
 pub fn eval(query: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some(obj) = query.as_object() else { return HashMap::new() };
     if obj.contains_key("match_all") {
@@ -345,6 +514,18 @@ pub fn eval(query: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<u
     }
     if let Some(v) = obj.get("match") {
         return eval_match(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("match_phrase") {
+        return eval_match_phrase(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("multi_match") {
+        return eval_multi_match(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("wildcard") {
+        return eval_wildcard(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("regexp") {
+        return eval_regexp(v, mappings, docs);
     }
     if let Some(v) = obj.get("range") {
         return eval_range(v, mappings, docs);
