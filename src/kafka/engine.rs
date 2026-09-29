@@ -19,6 +19,9 @@ use kafka_protocol::messages::{
     ProducerId, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,6 +37,18 @@ pub struct PartitionState {
     pub high_watermark: i64,
     // (producer_id, epoch) -> (last_sequence, base_offset)
     pub producer_seqs: HashMap<(i64, i16), (i32, i64)>,
+    // producer_id -> first_offset of its still-open transaction on this
+    // partition. Populated when a transactional batch is produced,
+    // cleared on EndTxn. Used to compute the last-stable-offset (LSO): a
+    // read_committed fetch never sees past the earliest still-open
+    // transaction.
+    pub active_txns: HashMap<i64, i64>,
+    // (producer_id, first_offset) for every aborted transaction whose
+    // first_offset is still >= the log's earliest retained offset —
+    // reported to read_committed fetchers via FetchResponse's
+    // aborted_transactions so they know to skip those records even
+    // though they're physically still in the log.
+    pub aborted_txns: Vec<(i64, i64)>,
 }
 
 impl PartitionState {
@@ -44,6 +59,8 @@ impl PartitionState {
             record_batches: Vec::new(),
             high_watermark: 0,
             producer_seqs: HashMap::new(),
+            active_txns: HashMap::new(),
+            aborted_txns: Vec::new(),
         }
     }
 }
@@ -137,6 +154,16 @@ pub struct EngineState {
     pub groups: HashMap<String, GroupState>,
     pub broker_configs: HashMap<String, String>,
     pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    // producer_id -> its current epoch. Set by InitProducerId, checked by
+    // every Produce/AddPartitionsToTxn/EndTxn carrying that producer_id: a
+    // lower epoch means a zombie/superseded producer instance and gets
+    // fenced (INVALID_PRODUCER_EPOCH) rather than accepted.
+    pub producer_epochs: HashMap<i64, i16>,
+    // transactional.id -> (producer_id, current epoch).
+    pub txn_producers: HashMap<String, (i64, i16)>,
+    // transactional.id -> (topic, partition) set added via
+    // AddPartitionsToTxn for the transaction currently in progress.
+    pub txn_partitions: HashMap<String, HashSet<(String, i32)>>,
 }
 
 impl std::fmt::Debug for EngineState {
@@ -154,6 +181,53 @@ impl std::fmt::Debug for EngineState {
     }
 }
 
+/// Builds a v2 record batch containing one control record — the commit or
+/// abort marker real Kafka appends to every partition a transaction
+/// touched, once it ends. Uses kafka_protocol's own encoder rather than
+/// hand-writing the batch header/CRC/varint-length record framing, since
+/// a real client's decoder validates all of that strictly.
+fn encode_control_batch(
+    producer_id: i64,
+    producer_epoch: i16,
+    base_offset: i64,
+    committed: bool,
+    now_ms: i64,
+) -> Vec<u8> {
+    // EndTxnMarker (KIP-98): a 2-byte version followed by the 4-byte
+    // coordinator epoch. The control record's key holds the marker type
+    // (0 = abort, 1 = commit) the same way; noida-db has no real
+    // transaction-coordinator epoch to report, so 0 stands in for it —
+    // nothing here reads it back.
+    let mut key = Vec::with_capacity(4);
+    key.extend_from_slice(&0i16.to_be_bytes());
+    key.extend_from_slice(&(if committed { 1i16 } else { 0i16 }).to_be_bytes());
+    let mut value = Vec::with_capacity(6);
+    value.extend_from_slice(&0i16.to_be_bytes());
+    value.extend_from_slice(&0i32.to_be_bytes());
+
+    let record = Record {
+        transactional: true,
+        control: true,
+        delete_horizon: false,
+        partition_leader_epoch: 0,
+        producer_id,
+        producer_epoch,
+        timestamp_type: TimestampType::Creation,
+        offset: base_offset,
+        sequence: -1,
+        timestamp: now_ms,
+        key: Some(bytes::Bytes::from(key)),
+        value: Some(bytes::Bytes::from(value)),
+        headers: Default::default(),
+    };
+
+    let mut buf = bytes::BytesMut::new();
+    let options = RecordEncodeOptions { version: 2, compression: Compression::None };
+    RecordBatchEncoder::encode(&mut buf, std::iter::once(&record), &options)
+        .expect("encoding a single uncompressed control record cannot fail");
+    buf.to_vec()
+}
+
 impl EngineState {
     pub fn new(host: String, port: i32) -> Self {
         let mut state = Self {
@@ -169,6 +243,9 @@ impl EngineState {
             groups: HashMap::new(),
             broker_configs: HashMap::new(),
             clock: None,
+            producer_epochs: HashMap::new(),
+            txn_producers: HashMap::new(),
+            txn_partitions: HashMap::new(),
         };
 
         // Pre-create internal topics as a real KRaft broker does
@@ -436,16 +513,48 @@ impl EngineState {
 
     pub fn handle_init_producer_id(
         &mut self,
-        _req: &InitProducerIdRequest,
+        req: &InitProducerIdRequest,
         _version: i16,
     ) -> InitProducerIdResponse {
-        let pid = self.next_producer_id;
-        self.next_producer_id += 1;
-
         let mut res = InitProducerIdResponse::default();
+
+        // A null *or* empty transactional.id both mean "no transactional
+        // id" on the wire (NULLABLE_STRING encodes absence as either) —
+        // treating "" as a real transactional.id would make every
+        // non-transactional producer share one fake transaction and
+        // fence each other's producer_id assignments.
+        let tx_id =
+            req.transactional_id.as_ref().map(|t| t.as_str().to_string()).filter(|s| !s.is_empty());
+        let (pid, epoch) = match &tx_id {
+            Some(tid) => {
+                // A new InitProducerId for a known transactional.id fences
+                // the previous producer instance (a "zombie" from a
+                // restarted/duplicate app) by bumping the epoch — any
+                // Produce/AddPartitionsToTxn/EndTxn still arriving with the
+                // old epoch gets rejected once producer_epochs is updated.
+                if let Some(&(pid, epoch)) = self.txn_producers.get(tid) {
+                    (pid, epoch.wrapping_add(1))
+                } else {
+                    let pid = self.next_producer_id;
+                    self.next_producer_id += 1;
+                    (pid, 0)
+                }
+            }
+            None => {
+                let pid = self.next_producer_id;
+                self.next_producer_id += 1;
+                (pid, 0)
+            }
+        };
+
+        if let Some(tid) = tx_id {
+            self.txn_producers.insert(tid, (pid, epoch));
+        }
+        self.producer_epochs.insert(pid, epoch);
+
         res.error_code = 0;
         res.producer_id = ProducerId(pid);
-        res.producer_epoch = 0;
+        res.producer_epoch = epoch;
         res
     }
 
@@ -477,6 +586,11 @@ impl EngineState {
                                 -1
                             };
                             if is_batch_v2 {
+                                let attributes =
+                                    i16::from_be_bytes(records[21..23].try_into().unwrap());
+                                // Attributes bit 4: isTransactional (see
+                                // Kafka's RecordBatch wire format).
+                                let is_transactional = attributes & 0x0010 != 0;
                                 let producer_id =
                                     i64::from_be_bytes(records[43..51].try_into().unwrap());
                                 let producer_epoch =
@@ -486,6 +600,21 @@ impl EngineState {
                                 let last_offset_delta = last_offset_delta_v2;
 
                                 if producer_id >= 0 {
+                                    // A stale/zombie producer instance:
+                                    // InitProducerId bumped the epoch for
+                                    // this producer_id (a newer instance
+                                    // took over), so this older-epoch
+                                    // Produce is rejected rather than
+                                    // silently accepted.
+                                    if let Some(&expected_epoch) =
+                                        self.producer_epochs.get(&producer_id)
+                                        && producer_epoch < expected_epoch
+                                    {
+                                        part_res.error_code = 47; // INVALID_PRODUCER_EPOCH
+                                        topic_res.partition_responses.push(part_res);
+                                        continue;
+                                    }
+
                                     if let Some(&(last_seq, prev_base_offset)) =
                                         part_state.producer_seqs.get(&(producer_id, producer_epoch))
                                     {
@@ -514,6 +643,19 @@ impl EngineState {
                                         (producer_id, producer_epoch),
                                         (last_seq, part_state.high_watermark),
                                     );
+
+                                    // First transactional batch from this
+                                    // producer on this partition: remember
+                                    // where its (still uncommitted) records
+                                    // start, so a read_committed fetch's
+                                    // last-stable-offset can't pass it
+                                    // until EndTxn clears this entry.
+                                    if is_transactional {
+                                        part_state
+                                            .active_txns
+                                            .entry(producer_id)
+                                            .or_insert(part_state.high_watermark);
+                                    }
                                 }
                             }
 
@@ -564,7 +706,13 @@ impl EngineState {
     }
 
     pub fn handle_fetch(&self, req: &FetchRequest, _version: i16) -> FetchResponse {
+        use kafka_protocol::messages::fetch_response::AbortedTransaction;
+
         let mut res = FetchResponse::default();
+        // isolation_level: 0 = read_uncommitted (default, sees everything
+        // immediately), 1 = read_committed (never sees past the earliest
+        // still-open transaction).
+        let read_committed = req.isolation_level == 1;
 
         for topic in &req.topics {
             let mut topic_res = FetchableTopicResponse::default();
@@ -580,23 +728,73 @@ impl EngineState {
                         part_res.error_code = 0;
                         part_res.high_watermark = part_state.high_watermark;
 
+                        // Last-stable-offset: the high watermark, capped to
+                        // just before the earliest still-open transaction
+                        // on this partition (if any). A read_uncommitted
+                        // fetch ignores this and reads straight to the
+                        // high watermark, same as before this existed.
+                        let lso = part_state
+                            .active_txns
+                            .values()
+                            .copied()
+                            .min()
+                            .map_or(part_state.high_watermark, |min_open| {
+                                min_open.min(part_state.high_watermark)
+                            });
+                        let visible_up_to =
+                            if read_committed { lso } else { part_state.high_watermark };
+                        part_res.last_stable_offset = lso;
+
                         let fetch_offset = partition.fetch_offset;
                         if fetch_offset < 0 || fetch_offset > part_state.high_watermark {
                             part_res.error_code = 1; // OFFSET_OUT_OF_RANGE
-                        } else if fetch_offset < part_state.high_watermark {
+                        } else if fetch_offset < visible_up_to {
                             // Batches aren't one record each, so find the
                             // batch whose base_offset covers fetch_offset
                             // (the last one starting at or before it) and
                             // return it whole, same as real Kafka — the
                             // client skips already-consumed records inside
                             // it by their own relative offset.
-                            if let Some((_, batch)) = part_state
+                            if let Some((base, batch)) = part_state
                                 .record_batches
                                 .iter()
                                 .rev()
                                 .find(|(base, _)| *base <= fetch_offset)
                             {
-                                part_res.records = Some(bytes::Bytes::from(batch.clone()));
+                                // Real Kafka includes an aborted batch's
+                                // bytes in the fetch response too, relying
+                                // on the client to discard it using
+                                // aborted_transactions below. This engine
+                                // doesn't replicate that client-side
+                                // bookkeeping, so it simplifies to: a
+                                // read_committed fetch never serves a batch
+                                // whose base_offset is a known aborted
+                                // transaction's start.
+                                let is_this_batch_aborted = read_committed
+                                    && part_state
+                                        .aborted_txns
+                                        .iter()
+                                        .any(|&(_, first_offset)| first_offset == *base);
+                                if !is_this_batch_aborted {
+                                    part_res.records = Some(bytes::Bytes::from(batch.clone()));
+                                }
+                            }
+                        }
+
+                        if read_committed {
+                            let aborted: Vec<AbortedTransaction> = part_state
+                                .aborted_txns
+                                .iter()
+                                .filter(|&&(_, first_offset)| first_offset < lso)
+                                .map(|&(producer_id, first_offset)| {
+                                    let mut at = AbortedTransaction::default();
+                                    at.producer_id = ProducerId(producer_id);
+                                    at.first_offset = first_offset;
+                                    at
+                                })
+                                .collect();
+                            if !aborted.is_empty() {
+                                part_res.aborted_transactions = Some(aborted);
                             }
                         }
                     } else {
@@ -1435,7 +1633,7 @@ impl EngineState {
     }
 
     pub fn handle_add_partitions_to_txn(
-        &self,
+        &mut self,
         req: &kafka_protocol::messages::AddPartitionsToTxnRequest,
         _version: i16,
     ) -> kafka_protocol::messages::AddPartitionsToTxnResponse {
@@ -1444,6 +1642,14 @@ impl EngineState {
         };
         let mut res = kafka_protocol::messages::AddPartitionsToTxnResponse::default();
 
+        let tx_id = req.v3_and_below_transactional_id.as_str().to_string();
+        let producer_id = req.v3_and_below_producer_id.0;
+        let producer_epoch = req.v3_and_below_producer_epoch;
+        let is_fenced = self
+            .producer_epochs
+            .get(&producer_id)
+            .is_some_and(|&expected| producer_epoch < expected);
+
         for topic in &req.v3_and_below_topics {
             let mut topic_res = AddPartitionsToTxnTopicResult::default();
             topic_res.name = topic.name.clone();
@@ -1451,7 +1657,15 @@ impl EngineState {
             for &p_id in &topic.partitions {
                 let mut part_res = AddPartitionsToTxnPartitionResult::default();
                 part_res.partition_index = p_id;
-                part_res.partition_error_code = 0;
+                if is_fenced {
+                    part_res.partition_error_code = 47; // INVALID_PRODUCER_EPOCH
+                } else {
+                    part_res.partition_error_code = 0;
+                    self.txn_partitions
+                        .entry(tx_id.clone())
+                        .or_default()
+                        .insert((topic.name.as_str().to_string(), p_id));
+                }
                 topic_res.results_by_partition.push(part_res);
             }
 
@@ -1472,11 +1686,52 @@ impl EngineState {
     }
 
     pub fn handle_end_txn(
-        &self,
-        _req: &kafka_protocol::messages::EndTxnRequest,
+        &mut self,
+        req: &kafka_protocol::messages::EndTxnRequest,
         _version: i16,
     ) -> kafka_protocol::messages::EndTxnResponse {
         let mut res = kafka_protocol::messages::EndTxnResponse::default();
+        let tx_id = req.transactional_id.as_str().to_string();
+        let producer_id = req.producer_id.0;
+        let producer_epoch = req.producer_epoch;
+
+        if self.producer_epochs.get(&producer_id).is_some_and(|&expected| producer_epoch < expected)
+        {
+            res.error_code = 47; // INVALID_PRODUCER_EPOCH
+            return res;
+        }
+
+        if let Some(partitions) = self.txn_partitions.remove(&tx_id) {
+            let now = self.now_ms();
+            for (topic_name, p_id) in partitions {
+                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
+                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
+
+                if let Some(first_offset) = part_state.active_txns.remove(&producer_id)
+                    && !req.committed
+                {
+                    part_state.aborted_txns.push((producer_id, first_offset));
+                }
+
+                // Real Kafka appends a control batch (commit/abort marker)
+                // to every partition the transaction touched, advancing
+                // the log (and the LSO, once this partition has no other
+                // open transaction) past it — a read_committed fetch needs
+                // this offset to exist so the next fetch can move past
+                // where the transaction used to be pending.
+                let base_offset = part_state.high_watermark;
+                let control_batch = encode_control_batch(
+                    producer_id,
+                    producer_epoch,
+                    base_offset,
+                    req.committed,
+                    now,
+                );
+                part_state.record_batches.push((base_offset, control_batch));
+                part_state.high_watermark += 1;
+            }
+        }
+
         res.error_code = 0;
         res
     }
