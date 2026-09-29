@@ -1,4 +1,4 @@
-# ClickHouse: noida spec
+# ClickHouse: noida-db spec
 
 - **Module:** `src/clickhouse/`, Cargo feature `clickhouse`, branch
   `svc/clickhouse`
@@ -15,7 +15,7 @@ Analytics code written against ClickHouse (clickhouse-connect/Python,
 @clickhouse/client/Node, clickhouse-java/JDBC, clickhouse-go (native),
 clickhouse-rs, Grafana-style dashboards, dbt-clickhouse) works unchanged,
 at local data sizes. ClickHouse's SQL dialect differs a lot from Postgres:
-it gets its own parser/analyzer on top of noida's shared storage and
+it gets its own parser/analyzer on top of noida-db's shared storage and
 expression machinery where that's reusable (coordinate with the SQL engine
 from `svc/postgres`), but columnar and aggregate-heavy semantics are
 ClickHouse-specific.
@@ -97,7 +97,7 @@ non-nullable columns.
   `EXCHANGE TABLES`, `DETACH/ATTACH` (P1).
 - **Merge semantics:** inserts create parts; ReplacingMergeTree,
   SummingMergeTree and Collapsing engines apply their logic when parts merge.
-  noida merges on `OPTIMIZE TABLE … [FINAL]` and in the background, and
+  noida-db merges on `OPTIMIZE TABLE … [FINAL]` and in the background, and
   `SELECT … FINAL` applies the merge logic at read time. Because a real
   server's background merge timing is nondeterministic, tests compare results
   after `OPTIMIZE … FINAL` or with `FINAL`, which are deterministic.
@@ -209,7 +209,7 @@ Commit test apps under `tests/clients/clickhouse/` with a runner script.
 ## 8. Differential tests
 
 `tests/clickhouse_diff.rs` runs SQL scripts over HTTP against real
-ClickHouse and noida in several output formats (TSVWithNamesAndTypes as the
+ClickHouse and noida-db in several output formats (TSVWithNamesAndTypes as the
 main one, plus JSON and RowBinaryWithNamesAndTypes) and compares bodies
 byte for byte, normalizing only query ids, timings in `statistics`, and
 `version()`/`uptime()` values. Queries without a deterministic order must
@@ -230,12 +230,140 @@ Play UI, MySQL/Postgres wire compatibility ports of ClickHouse itself.
 
 ## 10. Milestones
 
-1. HTTP interface, `SELECT 1`, `SELECT version()`, formats TSV/JSON/
-   JSONEachRow, `system.one`/`numbers`; errors in ClickHouse's format.
-2. CREATE/INSERT/SELECT on MergeTree/Memory with the P0 types; WHERE,
-   GROUP BY, ORDER BY, LIMIT, core functions; diff suite for these.
-3. RowBinary/Native formats; ReplacingMergeTree/SummingMergeTree + FINAL/
-   OPTIMIZE; materialized views (TO form); HTTP client matrix green;
-   `clickhouse` in default features.
-4. Native TCP protocol; clickhouse-go and clickhouse-driver pass.
-5. P1 items.
+Nothing exists yet: no `src/clickhouse/`, no Cargo feature, no branch. This
+is a from-scratch service, not incremental hardening, so phases below are
+sized to each leave a genuinely testable, demo-able state — not just "code
+compiles." Each phase ends with its own differential-test coverage; don't
+defer verification to a later phase.
+
+### Phase 0 — Scaffolding
+Branch `svc/clickhouse`, `src/clickhouse/{mod.rs,server.rs,engine.rs}`,
+Cargo feature `clickhouse = ["sql", ...]` (reuse whatever's genuinely
+shareable from `src/sql/`, the dialect-neutral engine Postgres already
+carved out — check before writing anything new). `spawn()` binds 8123,
+serves `GET /ping` → `Ok.\n`. CI: add the `clickhouse/clickhouse-server:24.8`
+service container, `NOIDA_CLICKHOUSE_REF`, and a `tests/clickhouse_diff.rs`
+skeleton that prints `SKIPPED` until Phase 1 has something to compare.
+Update this file's row in `docs/specs/README.md` to `building
+(svc/clickhouse)`.
+**Exit:** CI green on an empty-but-real pipeline; `curl :8123/ping` works.
+
+### Phase 1 — HTTP interface + trivial queries
+Request parsing (`query` param and/or body, auth headers, `database`
+selection, settings-as-URL-params plumbing — most settings can be
+accepted-and-ignored for now). `SELECT 1`, `SELECT version()`,
+`system.one`, `system.numbers` (bounded). Formats: `TabSeparated`
+(+`WithNames`/`Types`), `JSON`, `JSONEachRow` — enough to unblock every
+later client test. Response headers (`X-ClickHouse-Query-Id`, `-Format`,
+`-Timezone`, `-Server-Display-Name`) and ClickHouse-shaped errors with
+`X-ClickHouse-Exception-Code` for at least `UNKNOWN_TABLE`/
+`UNKNOWN_FUNCTION`/`SYNTAX_ERROR`. Differential tests for all of the above.
+**Exit:** clickhouse-connect/@clickhouse/client can connect and run
+`SELECT 1`.
+
+### Phase 2a — Types & schema
+P0 scalar types (§5): UInt8…256, Int8…256, Float32/64, Bool, Decimal,
+String, FixedString, UUID, Date/Date32/DateTime[tz]/DateTime64,
+Enum8/16, LowCardinality(T) as a no-op, Nullable(T), Array, Tuple, Map,
+IPv4/IPv6. `CREATE DATABASE`, `CREATE TABLE … ENGINE = MergeTree/Memory`
+with `ORDER BY`/`PRIMARY KEY`/`PARTITION BY`/`SETTINGS` accepted, column
+`DEFAULT`/`MATERIALIZED`/`ALIAS`/`CODEC`(accepted)/`COMMENT`,
+`IF NOT EXISTS`, `CREATE TEMPORARY TABLE`, `DROP`/`TRUNCATE`/`RENAME`.
+Storage: plain in-memory rows per table — defer the "parts" model to
+Phase 3, since Memory/MergeTree without a merge-dependent engine don't
+need it yet.
+**Exit:** every P0 type round-trips through INSERT/SELECT in TSV and
+JSON, diffed against real ClickHouse.
+
+### Phase 2b — DML/SELECT core
+`INSERT INTO … VALUES`, `INSERT … FORMAT <fmt>` + data, `INSERT …
+SELECT`. `SELECT`: `WHERE`, `GROUP BY` (defer `WITH ROLLUP/CUBE/TOTALS`/
+`GROUPING SETS` to Phase 5 if they threaten scope), `ORDER BY`,
+`LIMIT`/`OFFSET`, `DISTINCT`, joins (`INNER/LEFT/RIGHT/FULL/CROSS` with
+`USING`/`ON`; `ANY/ALL/SEMI/ANTI/ASOF` → Phase 5), `UNION ALL/DISTINCT`,
+`INTERSECT/EXCEPT`. ClickHouse's arithmetic promotion rules (`UInt8 +
+UInt8 → UInt16`, wrapping overflow, division always `Float64`,
+`intDiv`), NULL only through `Nullable`. The ~100 most-used P0 functions
+(dates, strings, arrays, conditionals, `CAST`/`::`/`toT()` family) — not
+all ~200; the long tail is Phase 5. `ALTER TABLE ADD/DROP/MODIFY/
+RENAME/COMMENT COLUMN`, lightweight `DELETE FROM … WHERE`, `ALTER …
+UPDATE/DELETE WHERE` (synchronous mutations). `SHOW DATABASES/TABLES/
+CREATE TABLE/COLUMNS`, `DESCRIBE`, `EXISTS`, `USE`, `SET`, and the
+system tables clients actually query (`system.databases/tables/columns/
+settings/functions/data_type_families`).
+**Exit:** the client-matrix scenario (§7) runs correctly *logically*,
+even before RowBinary/Native formats exist (verify via TSV/JSON first).
+
+### Phase 3 — Binary formats, merge-engine semantics, materialized views
+The phase most likely to blow its size estimate — split into 3a/3b if it
+does.
+- **3a, formats:** RowBinary (+`WithNames`/`Types`), Native format at
+  least for HTTP responses. Needed by JDBC v2 and clickhouse-connect's
+  binary path.
+- **3b, merge engines + views:** `ReplacingMergeTree([ver[,is_deleted]])`,
+  `SummingMergeTree`; `OPTIMIZE TABLE … FINAL` and `SELECT … FINAL` apply
+  engine logic deterministically (no real background-merge scheduler
+  needed — computing it on demand is sanctioned by §5's merge-semantics
+  note). `CREATE MATERIALIZED VIEW … TO … AS SELECT` (insert-triggered:
+  on INSERT into the source, run the view's SELECT over the new rows and
+  insert into the target) — genuinely new architecture; nothing else in
+  the codebase does trigger-like insert propagation yet, so give it a
+  deliberate design pass rather than an ad hoc bolt-on.
+Full HTTP client matrix (§7): clickhouse-connect, `@clickhouse/client`,
+clickhouse-java/JDBC v2, Rust `clickhouse` crate — 10k-row bulk insert,
+`toStartOfHour`+`uniqExact`+`quantile` aggregation, `FINAL` query,
+parameterized query, error-code check, `system.tables` listing. Add
+`clickhouse` to default features once this is green.
+**Exit:** full HTTP client matrix passes end to end.
+
+### Phase 4 — Native TCP protocol
+The single biggest phase, comparable in scope to the whole pgwire
+integration Postgres needed: Client/Server Hello (revision ~54467),
+Query/Data/Progress/ProfileInfo/Totals-Extremes/EndOfStream/Exception/
+Ping-Pong/Cancel/TableColumns, LZ4 block compression with CityHash128
+checksums. Required by `clickhouse-go` (default protocol) and
+`clickhouse-driver` (Python) — check both toolchains are actually
+available (or install them, e.g. via each language's official
+non-root/user-local installer) *before* committing to this phase's
+timing, not after hitting the wall mid-phase.
+**Exit:** native-protocol client matrix scenario passes for both
+drivers.
+
+Done ahead of this phase, over HTTP: `DESCRIBE TABLE`/`DESC TABLE` and
+`system.columns` (unblocking the official Rust client's default
+*validated* insert path — `.with_validation(false)` is no longer
+needed), `SHOW DATABASES/TABLES/CREATE TABLE`, `EXISTS TABLE`, `USE`,
+`SET`, `CSV` (+`WithNames`/`WithNamesAndTypes`) and `Pretty`/
+`PrettyCompact` output formats, and `HAVING`/`UNION ALL`/`UNION
+DISTINCT` on `SELECT`. See docs/LIMITATIONS.md's ClickHouse section for
+exact behavior and known deviations.
+
+### Phase 5 — P1 widening
+Remaining aggregate combinators (`-Array/-State/-Merge/-OrNull/
+-OrDefault/-Distinct`), `uniqCombined`, `topK`, `sumMap`; `ASOF/SEMI/
+ANTI/ANY/ALL` joins; `QUALIFY`; `ORDER BY … WITH FILL`; `LIMIT n BY`;
+the long tail of P0 functions not yet covered; Parquet/Arrow if a small
+dependency exists; HTTP `gzip`/`zstd` and CH's own `compress=1`;
+`ALTER … DROP/DETACH PARTITION`, `ALTER … MODIFY TTL/ORDER BY`;
+`system.time_zones`; `EXPLAIN SYNTAX/AST`.
+
+### Two risks to plan around, not discover mid-phase
+1. **`uniq`'s approximate cardinality algorithm.** ClickHouse's `uniq`
+   is a specific HyperLogLog-family variant — matching its *exact*
+   output for the same input data means porting the real algorithm, not
+   any HLL. `uniqExact` (a plain hash set) is the safe P0 fallback;
+   treat `uniq` itself as a research spike inside whichever phase needs
+   it, and document the deviation in `docs/LIMITATIONS.md` if the port
+   isn't worth it rather than silently approximating.
+2. **Materialized-view insert propagation (Phase 3b)** is architecturally
+   new for this codebase — design it deliberately before coding.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- `BACKUP`/`RESTORE`, Keeper/ZooKeeper, replicated engines beyond being
+  accepted as plain MergeTree, distributed tables and `ON CLUSTER`
+  (accepted and ignored), user/role/quota/settings-profile management.

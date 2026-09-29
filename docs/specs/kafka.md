@@ -1,4 +1,4 @@
-# Kafka: noida spec
+# Kafka: noida-db spec
 
 - **Module:** `src/kafka/` (stub exists), Cargo feature `kafka`, branch
   `svc/kafka`
@@ -8,10 +8,64 @@
   `apache/kafka:3.8.0` as a single-node KRaft broker. Env var:
   `NOIDA_KAFKA_REF=host:port`.
 
+## Roadmap (checked 2026-09-27)
+
+Where things actually stand, read from the branch itself, not from commit
+messages: `src/kafka/engine.rs` (~1050 lines) already has handlers for
+nearly every P0 key and most of P1 — topics, produce/fetch, consumer groups,
+group admin, configs, and the four transaction APIs. That's real progress.
+But it's outrunning its own tests badly: `tests/kafka_client.rs` has exactly
+**one** test, covering milestone 1–2 only (ApiVersions, CreateTopics,
+Metadata); `tests/kafka_diff.rs` is a stub that does nothing (no local
+broker, no CI run yet). None of §3's P1 work — groups, configs,
+transactions — has a single test proving it does what the spec says. This
+project's rule is tests first; this branch has been writing engine code
+without them, which means nobody, including whoever wrote it, actually
+knows if `handle_join_group` or `handle_add_partitions_to_txn` behave like
+a real broker.
+
+The branch was also 8 commits behind `main` (still on the pre-rename
+`noida` package name, missing every Redis and Postgres commit) and had never
+been run through CI's `-D warnings` clippy pass, which failed on two lints
+in existing code. Do these two first, in order, before writing another
+handler:
+
+1. **`git fetch && git merge origin/main`**, resolve the `Cargo.toml`/
+   `Cargo.lock` conflict by keeping both sides (the `[lib]`/`[[bin]]` split
+   and `sql`/`postgres` features from `main`, `kafka`'s own feature and
+   dependency), then `cargo generate-lockfile`. Confirm with
+   `cargo build --features kafka`, `cargo fmt --check`,
+   `cargo clippy --all-targets --all-features -- -D warnings`, and the
+   existing test.
+2. **Stop adding API keys. Write the tests for what's already there,
+   engine-level first** (`src/kafka/tests/`, following the Redis module's
+   pattern: one file per area, real error codes, no networking). At minimum,
+   one test per handler already in `engine.rs`, covering: correct happy
+   path, the real Kafka error code on each failure branch (see the list in
+   §2), and the group coordinator's state machine transitions (Empty →
+   PreparingRebalance → CompletingRebalance → Stable → Dead) with actual
+   timers, not just the join/sync happy path.
+3. Only then extend `tests/kafka_client.rs` past milestone 2: idempotent
+   producer, a 2-consumer group rebalance (scenario (b) in §5), AdminClient
+   describe/delete. This is what proves the code in `engine.rs` is not just
+   plausible-looking Rust.
+4. Set up `tests/kafka_diff.rs` for real, even without a local broker:
+   build the request/response pairs now (the CI service is already
+   `apache/kafka:3.8.0`; env var `NOIDA_KAFKA_REF` already wired into the
+   spec), so the first CI run on this branch tells you where the engine
+   actually diverges from a real broker. Expect it to find things —
+   that's the point of writing it before more feature work, not after.
+5. Once 1–4 are green in CI, pick up real clients per §5 (Java
+   `kafka-clients` first, since that's this project's primary audience),
+   then continue down the P1/P2 list in §3.
+
+Whoever picks this branch up next: do not add features under time pressure
+just because `engine.rs` compiles. A handler with no test is not done here.
+
 ## 1. Purpose
 
 Producers, consumers, stream processors and admin tools work unchanged
-against noida. The project's users are largely Java/Spring developers, so
+against noida-db. The project's users are largely Java/Spring developers, so
 the Java `kafka-clients` library is the primary target, followed by
 librdkafka-based clients (confluent-kafka-python, node-rdkafka, Go
 confluent-kafka-go), kafkajs, franz-go and sarama.
@@ -25,7 +79,7 @@ confluent-kafka-go), kafkajs, franz-go and sarama.
 - Use the `kafka-protocol` crate for message encoding/decoding and record
   batches. Justify any other dependency against binary size.
 - Version negotiation: **ApiVersions** advertises exactly the (min, max)
-  ranges noida implements for each key. A request at an unsupported version
+  ranges noida-db implements for each key. A request at an unsupported version
   gets `UNSUPPORTED_VERSION` (35), and ApiVersions itself falls back to v0
   in that case, like a real broker.
 - The broker advertises the host:port it's bound to (configurable later as
@@ -131,7 +185,7 @@ Commit test apps under `tests/clients/kafka/` with a runner script.
 ## 6. Differential tests
 
 `tests/kafka_diff.rs` sends the same request sequences to the real broker
-and noida and compares decoded responses field by field, normalizing only
+and noida-db and compares decoded responses field by field, normalizing only
 what legitimately differs (cluster id, node host/port, timestamps, member
 ids, throttle times). Cover: ApiVersions at each version, Metadata with and
 without auto-create, produce/fetch at several versions with each
@@ -154,3 +208,15 @@ KRaft controller quorum behaviour.
 3. Consumer groups; scenario (b) passes with 2 Java consumers.
 4. Diff suite for P0 green in CI; `kafka` in default features.
 5. P1: configs, transactions, Kafka Streams.
+
+## Scope filter (project rule)
+
+Only what a developer on a laptop uses. Everything below is out of scope even
+where an earlier section mentions it, and behaves as unknown (see "Scope
+filter" in `docs/specs/README.md`):
+
+- ACL APIs (DescribeAcls, CreateAcls, DeleteAcls), SCRAM, quotas APIs.
+- KRaft controller and quorum APIs, DescribeLogDirs, replica-management and
+  reassignment APIs, MirrorMaker.
+- APIs that clients call automatically (for example OffsetForLeaderEpoch)
+  still reply, with single-broker answers.

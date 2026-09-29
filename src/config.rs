@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 pub const USAGE: &str = "\
-usage: noida <command> [options]
+usage: noida-db <command> [options]
 
 commands:
   start      run the server
@@ -11,7 +11,7 @@ commands:
   help       print this message
 
 start options:
-  --data-dir <path>      where data lives (default: ./.noida)
+  --data-dir <path>      where data lives (default: ./.noida-db)
   --host <addr>          address to bind (default: 127.0.0.1)
   --only <a,b,...>       enable only these services
   --<service>-port <n>   override a port, e.g. --redis-port 6380
@@ -25,7 +25,7 @@ pub struct Service {
     pub port: u16,
 }
 
-/// Every service noida speaks, on the port its real counterpart uses,
+/// Every service noida-db speaks, on the port its real counterpart uses,
 /// so existing clients work with their defaults.
 pub const DEFAULT_SERVICES: [Service; 9] = [
     Service { name: "postgres", port: 5432 },
@@ -49,7 +49,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            data_dir: PathBuf::from(".noida"),
+            data_dir: PathBuf::from(".noida-db"),
             host: "127.0.0.1".into(),
             services: DEFAULT_SERVICES.to_vec(),
         }

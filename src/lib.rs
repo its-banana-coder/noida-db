@@ -1,4 +1,4 @@
-//! noida: one tiny local binary standing in for Postgres, MySQL, Redis,
+//! noida-db: one tiny local binary standing in for Postgres, MySQL, Redis,
 //! Kafka, Elasticsearch, ClickHouse, Memcached, MongoDB and RabbitMQ during
 //! development.
 //!
@@ -10,6 +10,9 @@ pub mod services;
 #[cfg(feature = "redis")]
 pub mod redis;
 
+#[cfg(feature = "sql")]
+pub mod sql;
+
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
@@ -18,3 +21,6 @@ pub mod kafka;
 
 #[cfg(feature = "memcached")]
 pub mod memcached;
+
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;

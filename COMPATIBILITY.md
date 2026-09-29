@@ -1,14 +1,17 @@
 # Compatibility & footprint targets
 
+What does *not* work is listed in [docs/LIMITATIONS.md](docs/LIMITATIONS.md).
+The footprint figures below are targets; only the binary size is measured today.
+
 ## The promise
 
-An app that uses these systems in the usual way can point at noida on a
+An app that uses these systems in the usual way can point at noida-db on a
 laptop and work without code changes, using the common drivers, ORMs,
 migration tools and CLIs.
 
 "100% compatible" means **100% of the compatibility test suite passes**. The
 suite is a set of real-client scenarios, each run against both the real server
-and noida, with the results compared. Anything outside the suite returns the
+and noida-db, with the results compared. Anything outside the suite returns the
 real system's own "not supported" error, never a silently wrong result.
 
 ## Footprint targets
@@ -27,9 +30,10 @@ Redis ~10MB. Docker Desktop's VM comes on top of that.
 How we stay inside the targets:
 - **Data lives on disk.** Only a bounded cache is held in RAM. Kafka logs are
   read straight from files.
-- **Redis data is in memory, as it is in real Redis.** It counts toward
-  `--max-memory`, and when the cap is hit noida follows Redis's `maxmemory`
-  rules (eviction policies, then the OOM error).
+- **Redis data is in memory, as it is in real Redis.** *Planned:* it counts
+  toward `--max-memory`, and when the cap is hit noida-db follows Redis's
+  `maxmemory` rules (eviction policies, then the OOM error). Not built yet:
+  today nothing is enforced and nothing is persisted.
 - **A thread per connection,** with small stacks. Only the stack memory a
   connection actually touches counts, so an idle one costs KBs, not MBs.
 - **Services start lazily.** A service that no one has connected to allocates
@@ -41,29 +45,35 @@ Every service is its own module:
 - **Build time:** each service is a Cargo feature (`redis`, `postgres`, ...),
   all on by default. `cargo build --no-default-features --features redis,postgres`
   leaves the other services out of the binary entirely.
-- **Run time:** `noida start --only redis,postgres` starts only those. A
+- **Run time:** `noida-db start --only redis,postgres` starts only those. A
   service that is off opens no port and allocates no memory.
 
 ## Rules for every system
 
-- **Every command and API works.** Where a feature makes no sense on one local
-  node (clustering, replication, sharding), noida replies exactly as a
-  standalone real server would. That counts as compatible.
-- **No performance analysis.** noida never implements EXPLAIN ANALYZE,
+- **Every command and API a developer uses locally works.** Production-only
+  operations are out of scope and answer as *unknown*, not as stubs: no
+  replication, clustering, sharding, sentinel/HA/failover, backup/restore/
+  migration (DUMP/RESTORE/MIGRATE, snapshots), or multi-user security
+  management. See "Scope filter" in `docs/specs/README.md`.
+- **No performance analysis.** noida-db never implements EXPLAIN ANALYZE,
   SLOWLOG, LATENCY, profilers or query statistics. Where clients or tools may
-  send these, noida accepts them and returns an empty or minimal reply so
+  send these, noida-db accepts them and returns an empty or minimal reply so
   nothing breaks.
-- **Not in scope:** real clustering, replication, high availability,
-  performance tuning, plugins and extensions.
+- **Not in scope:** clustering, replication, sharding, sentinel, high
+  availability, failover, backup/restore/migration, performance tuning,
+  plugins and extensions.
 
 ## Per system
 
 ### Redis (port 6379), target Redis 7.2
 - **In scope:** all 242 commands and their subcommands
   (`tests/data/redis-7.2-commands.txt`, tracked by a coverage test), RESP2
-  and RESP3, Lua scripting and functions. Cluster, replication and Sentinel
-  commands reply as a standalone Redis does.
-- **Out of scope:** modules (RedisJSON, RediSearch).
+  and RESP3, Lua scripting and functions.
+- **Out of scope:** modules (RedisJSON, RediSearch), and the production-only
+  commands `DUMP` `RESTORE` `RESTORE-ASKING` `MIGRATE` `PSYNC` `SYNC`
+  `REPLCONF` `REPLICAOF` `SLAVEOF` `ROLE` `WAIT` `WAITAOF` `FAILOVER`
+  `SENTINEL` `CLUSTER` `ASKING` `READONLY` `READWRITE` `DEBUG` `SHUTDOWN`
+  `PFDEBUG` `PFSELFTEST`; they answer as unknown commands.
 
 ### Postgres (port 5432)
 - **In scope:**
@@ -71,18 +81,65 @@ Every service is its own module:
     declining SSL cleanly.
   - SQL: DDL, DML, joins, subqueries, CTEs, window functions, aggregates,
     transactions, `ON CONFLICT`, `RETURNING`, sequences and identity columns,
-    constraints.
-  - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz
-    and numeric.
+    constraints, `LISTEN`/`NOTIFY`, `COPY ... FROM/TO STDIN/STDOUT` (text
+    and CSV; verified against `pg_dump`/`psql` restore and the copy APIs of
+    psycopg, node-postgres and the Rust `postgres` crate), full-text search
+    (`to_tsvector`/`to_tsquery`/`plainto_tsquery`/`phraseto_tsquery`/
+    `websearch_to_tsquery`, `@@`, `ts_rank`, `setweight`,
+    `tsvector || tsvector`; verified against Django's
+    `django.contrib.postgres.search` and Miniflux's own search index),
+    `REFRESH MATERIALIZED VIEW`, `DECLARE`/`FETCH`/`CLOSE` cursors
+    (forward-only: `NEXT`, a row count, `ALL`/`FORWARD ALL`; verified
+    against Miniflux's own schema-migration cursor usage).
+  - Types: the common ones, including json/jsonb, arrays, uuid, timestamptz,
+    numeric and the range types (`int4range`/`int8range`/`numrange`/
+    `daterange`/`tsrange`/`tstzrange`: canonical text, `@>`/`<@`/`&&`,
+    `lower`/`upper`/`isempty`).
+  - System columns: `ctid`, `xmin`, `cmin`, `xmax`, `cmax`, `tableoid` are
+    selectable (bare or qualified), usable in `WHERE`/`UPDATE`/`DELETE`,
+    excluded from `SELECT *`, listed in `pg_attribute`, and ambiguous when
+    referenced unqualified across more than one joined table, same as an
+    ordinary column.
   - Catalogs: enough of `pg_catalog` and `information_schema` for Hibernate,
-    Flyway, Liquibase, Prisma, Django and Rails to look up the schema.
-- **Out of scope (for now):** PL/pgSQL and stored procedures, extensions,
-  logical replication. Concurrency is one writer at a time.
+    Flyway, Liquibase, Prisma, Django and Rails to look up the schema,
+    including old-style comma-separated joins and long explicit
+    `JOIN ... ON` chains filtered to one row only in `WHERE` across them
+    (Sequelize's own index introspection and Gitea/xorm's own per-table
+    column-metadata query, respectively — both real, unmodified real-app
+    schemas verified end to end against `tests/clients/postgres/run.sh`
+    and, for Gitea specifically, by migrating and starting its actual
+    ~115-table production schema).
+  - Clients verified: psycopg, SQLAlchemy, Django, asyncpg, Alembic,
+    node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, the
+    JDBC driver.
+- **Out of scope (for now):** PL/pgSQL, stored procedures and triggers,
+  extensions, logical replication, `COPY` to/from a server-side file or
+  program, `FORMAT BINARY`, full-text search GIN/GiST indexes and
+  `ts_headline`, backward-moving cursors (`PRIOR`/`BACKWARD`/`ABSOLUTE`/
+  `RELATIVE`) and `WITH HOLD` (a cursor is closed at the end of its
+  transaction like an ordinary one). Concurrency is one writer at a time.
+- **Known gap:** enum values order and compare by label text, not by the
+  order they were declared in (`<`, `ORDER BY`, `min`/`max`).
+- **Known gap:** there's no MVCC, so `xmin`/`cmin`/`xmax`/`cmax` are fixed
+  placeholder values, not real transaction/command ids — a pattern that
+  relies on them actually changing (e.g. optimistic-locking via a stale
+  `xmin` check) won't behave like real Postgres. `ctid` (scan position)
+  and `tableoid` are real.
+- **Accepted but not enforced:** `GRANT`, `REVOKE`, `CREATE/ALTER ROLE` (schema
+  migrations contain them; there is one login). `VACUUM`, `ANALYZE` and plain
+  `EXPLAIN` return minimal valid replies; `EXPLAIN ANALYZE` is unsupported
+  (all performance-analysis tooling is by design, not a gap — see "Scope
+  filter" in `docs/specs/README.md`).
+  Replication (streaming, logical, master/slave, primary/replica — whatever
+  it's called), backup and physical/logical streaming are not implemented
+  and do not work: a connection with the `replication` startup parameter is
+  treated as an ordinary connection, so replication commands and
+  `pg_basebackup`/`pg_recvlogical` will not function.
 
 ### Kafka (port 9092, native binary protocol)
 - **In scope:**
   - Every API key a single-node KRaft broker advertises in ApiVersions:
-    produce, fetch, offsets, topic and config admin, ACLs.
+    produce, fetch, offsets, topic and config admin.
   - Full consumer groups: join, sync, heartbeat, offset commit and fetch.
   - Idempotent producers, transactions and exactly-once.
   - Spring Kafka and Kafka Streams.
@@ -132,7 +189,7 @@ Every service is its own module:
   - CRUD, the query and update operators, indexes (unique, TTL), the
     aggregation pipeline, change streams, transactions and GridFS.
   - The official drivers, Spring Data MongoDB and Mongoose working.
-- **Out of scope:** sharding, replica sets (noida replies as a single-node
+- **Out of scope:** sharding, replica sets (noida-db replies as a single-node
   replica set so transactions and change streams work), `$where` and
   server-side JavaScript.
 

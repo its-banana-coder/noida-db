@@ -1,3 +1,17 @@
 /target
-/.noida
+tests/clients/target
+tests/clients/postgres/rust/target/
+tests/clients/postgres/dotnet/npgsql/bin/
+tests/clients/postgres/dotnet/npgsql/obj/
+/.noida-db
 /.claude
+
+# Real-client test scratch (Gradle/Go build output living inside tests/)
+tests/clients/redis/java/.gradle/
+tests/clients/redis/java/build/
+tests/clients/kafka/data/
+tests/clients/kafka/server.log
+tests/clients/kafka/node/
+node_modules/
+__pycache__/
+*.pyc

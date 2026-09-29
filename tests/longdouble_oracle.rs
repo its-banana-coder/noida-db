@@ -1,4 +1,4 @@
-//! Checks noida's software `long double` against real x87 hardware: a
+//! Checks noida-db's software `long double` against real x87 hardware: a
 //! small C program does what Redis's INCRBYFLOAT does (string2ld, +,
 //! ld2string human) and every result must match byte for byte.
 //!
@@ -147,7 +147,7 @@ fn incrbyfloat_arithmetic_matches_x87() {
             _ => "INVALID".into(),
         };
         if &got != want {
-            failures.push(format!("{a} + {b}\n    x87:   {want}\n    noida: {got}"));
+            failures.push(format!("{a} + {b}\n    x87:   {want}\n    noida-db: {got}"));
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

@@ -1,0 +1,14 @@
+# Its own workspace: this crate has different dependencies than noida-db's
+# own build and must never be pulled into that workspace, however it's
+# nested on disk (e.g. inside a git worktree under the main checkout).
+[workspace]
+
+[package]
+name = "sqlx_client_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rust_decimal = "1.43.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "rust_decimal", "uuid", "macros"] }
+tokio = { version = "1.53.1", features = ["full"] }

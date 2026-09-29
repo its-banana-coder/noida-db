@@ -130,6 +130,11 @@ const ACL_ORDER: &[&str] = &[
     "scripting",
 ];
 
+/// Names of the ACL categories, in Redis's table order.
+pub fn acl_category_names() -> &'static [&'static str] {
+    ACL_ORDER
+}
+
 /// Key-spec flags: (generated name, reported name), in report order.
 const KEY_FLAG_ORDER: &[(&str, &str)] = &[
     ("ro", "RO"),
@@ -532,7 +537,7 @@ pub fn list_filter(cmd: &CommandMeta, kind: &str, arg: &[u8]) -> bool {
             ACL_ORDER.contains(&cat.as_str()) && cmd.acl_categories().contains(&cat.as_str())
         }
         "pattern" => glob::matches(arg, cmd.name.as_bytes(), true),
-        // noida loads no modules.
+        // noida-db loads no modules.
         _ => false,
     }
 }

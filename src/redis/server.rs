@@ -1,29 +1,64 @@
 //! TCP front end: one thread per connection, one engine behind a mutex.
-//! Simple on purpose; noida is for local development.
+//! Simple on purpose; noida-db is for local development.
 
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use super::engine::{ClientConn, Engine};
+use super::engine::{ClientConn, Engine, Session};
 use super::resp::{self, ReadError, Value};
 
 /// Connection threads touch little stack; keep reservations small.
 const STACK_SIZE: usize = 256 * 1024;
 
+/// How often a blocked connection re-checks its socket and timeout.
+const BLOCKED_POLL: Duration = Duration::from_millis(100);
+
+/// The engine, plus a condition variable that blocked connections wait on.
+/// It is notified whenever a command may have produced replies for them.
+struct Shared {
+    engine: Mutex<Engine>,
+    replies: Condvar,
+}
+
 /// Binds `addr` and serves Redis on background threads.
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
+    let password = std::env::var("NOIDA_REDIS_PASSWORD").ok().filter(|p| !p.is_empty());
+    spawn_with(addr, password.as_deref())
+}
+
+/// Like `spawn`, with `requirepass` set: new connections must AUTH first.
+/// (`noida-db start` passes `NOIDA_REDIS_PASSWORD` through `spawn`.)
+pub fn spawn_with(addr: &str, password: Option<&str>) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
-    let engine = Arc::new(Mutex::new(Engine::new()));
+    let mut engine = Engine::new();
+    if let Some(password) = password {
+        // Set it the way CONFIG SET would, from a throwaway connection.
+        let conn = ClientConn {
+            addr: "127.0.0.1:0".into(),
+            laddr: local.to_string(),
+            fd: -1,
+            kill: None,
+            push: None,
+        };
+        let mut session = engine.connect(conn);
+        let args: Vec<Vec<u8>> = ["CONFIG", "SET", "requirepass", password]
+            .iter()
+            .map(|a| a.as_bytes().to_vec())
+            .collect();
+        engine.execute(&mut session, &args);
+        engine.disconnect(&session);
+    }
+    let engine = Arc::new(Shared { engine: Mutex::new(engine), replies: Condvar::new() });
 
     let sweeper = Arc::clone(&engine);
     thread::Builder::new().name("redis-expire".into()).stack_size(STACK_SIZE).spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(1));
-            sweeper.lock().unwrap().purge_expired();
+            sweeper.engine.lock().unwrap().purge_expired();
         }
     })?;
 
@@ -34,7 +69,7 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     Ok(local)
 }
 
-fn accept_loop(listener: TcpListener, engine: Arc<Mutex<Engine>>) {
+fn accept_loop(listener: TcpListener, engine: Arc<Shared>) {
     for stream in listener.incoming().flatten() {
         let engine = Arc::clone(&engine);
         let _ = thread::Builder::new().name("redis-conn".into()).stack_size(STACK_SIZE).spawn(
@@ -56,9 +91,18 @@ fn fd_of(_: &TcpStream) -> i64 {
     0
 }
 
-fn handle(stream: TcpStream, engine: Arc<Mutex<Engine>>) -> io::Result<()> {
+fn handle(stream: TcpStream, engine: Arc<Shared>) -> io::Result<()> {
     stream.set_nodelay(true)?;
+    // All output goes through one writer thread, queued while the engine
+    // lock is held, so replies and pub/sub messages keep the engine's order.
+    let (out, queued) = mpsc::channel::<Vec<u8>>();
+    let write_half = stream.try_clone()?;
+    let writer = thread::Builder::new()
+        .name("redis-write".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || write_loop(write_half, queued))?;
     let killer = stream.try_clone()?;
+    let pusher = out.clone();
     let conn = ClientConn {
         addr: stream.peer_addr()?.to_string(),
         laddr: stream.local_addr()?.to_string(),
@@ -66,56 +110,140 @@ fn handle(stream: TcpStream, engine: Arc<Mutex<Engine>>) -> io::Result<()> {
         kill: Some(Box::new(move || {
             let _ = killer.shutdown(Shutdown::Both);
         })),
+        push: Some(Box::new(move |bytes| {
+            let _ = pusher.send(bytes);
+        })),
     };
-    let mut session = engine.lock().unwrap().connect(conn);
-    let result = serve(stream, &engine, &mut session);
-    engine.lock().unwrap().disconnect(&session);
+    let closer = stream.try_clone()?;
+    let mut session = engine.engine.lock().unwrap().connect(conn);
+    let result = serve(stream, &engine, &mut session, &out);
+    engine.engine.lock().unwrap().disconnect(&session);
+    // The writer drains what's queued, then the connection closes.
+    drop(out);
+    let _ = writer.join();
+    let _ = closer.shutdown(Shutdown::Both);
     result
+}
+
+fn write_loop(stream: TcpStream, queued: mpsc::Receiver<Vec<u8>>) {
+    let mut w = BufWriter::new(stream);
+    while let Ok(bytes) = queued.recv() {
+        if w.write_all(&bytes).is_err() {
+            return;
+        }
+        // Batch whatever else is ready (pipelines) into one flush.
+        while let Ok(more) = queued.try_recv() {
+            if w.write_all(&more).is_err() {
+                return;
+            }
+        }
+        if w.flush().is_err() {
+            return;
+        }
+    }
+}
+
+fn send(out: &mpsc::Sender<Vec<u8>>, v: &Value, proto: u8) {
+    let mut bytes = Vec::new();
+    resp::encode(v, proto, &mut bytes);
+    if !bytes.is_empty() {
+        let _ = out.send(bytes);
+    }
 }
 
 fn serve(
     stream: TcpStream,
-    engine: &Mutex<Engine>,
-    session: &mut super::Session,
+    shared: &Shared,
+    session: &mut Session,
+    out: &mpsc::Sender<Vec<u8>>,
 ) -> io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = BufWriter::new(stream);
-    let mut out = Vec::new();
+    let peer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
     loop {
         let args = match resp::read_command(&mut reader) {
             Ok(Some(args)) => args,
             Ok(None) => return Ok(()),
             Err(ReadError::Io(e)) => return Err(e),
             Err(ReadError::Protocol(e)) => {
-                out.clear();
                 let err = Value::err(format!("ERR Protocol error: {}", e.0));
-                resp::encode(&err, session.resp, &mut out);
-                writer.write_all(&out)?;
-                return writer.flush();
+                send(out, &err, session.resp);
+                return Ok(());
             }
         };
         if args.is_empty() {
             continue;
         }
-        let reply = loop {
-            let mut e = engine.lock().unwrap();
+        loop {
+            let mut e = shared.engine.lock().unwrap();
             if !e.is_paused_for(&args) {
-                break e.execute(session, &args);
+                let reply = e.execute(session, &args);
+                if e.has_replies() {
+                    shared.replies.notify_all();
+                }
+                if !session.blocked {
+                    send(out, &reply, session.resp);
+                }
+                break;
             }
             drop(e);
             // CLIENT PAUSE: hold the command until the pause ends.
-            writer.flush()?;
             thread::sleep(Duration::from_millis(10));
-        };
-        out.clear();
-        resp::encode(&reply, session.resp, &mut out);
-        writer.write_all(&out)?;
-        if session.closing {
-            return writer.flush();
         }
-        // Flush once the pipeline drains, not after every reply.
-        if reader.buffer().is_empty() {
-            writer.flush()?;
+        if session.blocked && !wait_unblocked(shared, session, &peer, out) {
+            return Ok(());
+        }
+        if session.closing {
+            return Ok(());
         }
     }
+}
+
+/// Waits for a blocked command's reply (served by another client's write,
+/// timed out, or unblocked by CLIENT UNBLOCK) and queues it. False if the
+/// client went away meanwhile (disconnected or killed).
+fn wait_unblocked(
+    shared: &Shared,
+    session: &mut Session,
+    peer: &TcpStream,
+    out: &mpsc::Sender<Vec<u8>>,
+) -> bool {
+    let mut e = shared.engine.lock().unwrap();
+    loop {
+        if let Some(reply) = e.take_reply(session) {
+            send(out, &reply, session.resp);
+            return true;
+        }
+        let Some(deadline) = e.block_deadline(session.id) else { return false };
+        if e.expire_blocked() {
+            shared.replies.notify_all();
+            continue;
+        }
+        let mut wait = BLOCKED_POLL;
+        if deadline != 0 {
+            let left = (deadline + 1).saturating_sub(e.now());
+            wait = wait.min(Duration::from_millis(left.max(1)));
+        }
+        e = shared.replies.wait_timeout(e, wait).unwrap().0;
+        if e.has_reply_for(session.id) {
+            continue;
+        }
+        // Like Redis, notice a client that disconnects while blocked, so it
+        // can't swallow data meant for the next waiter.
+        if closed(peer) {
+            return false;
+        }
+    }
+}
+
+/// Whether the peer has closed its end, without consuming any input. A
+/// short read timeout (not non-blocking mode, which would also affect the
+/// writer thread) keeps the peek from waiting.
+fn closed(s: &TcpStream) -> bool {
+    if s.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 1];
+    let eof = matches!(s.peek(&mut buf), Ok(0));
+    let _ = s.set_read_timeout(None);
+    eof
 }
