@@ -24,3 +24,6 @@ pub mod memcached;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
+
+#[cfg(feature = "rabbitmq")]
+pub mod rabbitmq;
