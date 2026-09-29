@@ -31,6 +31,7 @@ pub(crate) fn val_text(v: &Val) -> String {
         Val::Float(f) => f.to_string(),
         Val::Str(s) => s.clone(),
         Val::Bool(b) => b.to_string(),
+        Val::Null => "\\N".to_string(),
     }
 }
 
@@ -56,8 +57,10 @@ fn tab_separated(r: &QueryResult, with_names: bool, with_types: bool) -> Vec<u8>
         out.push('\n');
     }
     if with_types {
-        let types: Vec<&str> = r.columns.iter().map(|(_, t)| t.name()).collect();
-        out.push_str(&types.join("\t"));
+        let types: Vec<String> = r.columns.iter().map(|(_, t)| t.name()).collect();
+        let types_strs: Vec<&str> = types.iter().map(|s| s.as_str()).collect();
+        out.push_str(&types_strs.join("\t"));
+
         out.push('\n');
     }
     for row in &r.rows {
@@ -200,6 +203,15 @@ fn json_string(s: &str) -> String {
 /// 64-bit integers are quoted by default
 /// (`output_format_json_quote_64bit_integers=1`).
 fn json_value(v: &Val, t: Type) -> String {
+    if *v == Val::Null {
+        return "null".to_string();
+    }
+    // A non-null value in a Nullable column still needs its *inner* type's
+    // formatting rules (e.g. a Nullable(String) must still be quoted).
+    let t = match t {
+        Type::Nullable(inner) => *inner,
+        t => t,
+    };
     match (t, v) {
         (Type::String, Val::Str(s)) => json_string(s),
         (Type::UInt64, _) | (Type::Int64, _) => format!("\"{}\"", val_text(v)),
@@ -217,7 +229,7 @@ fn json_each_row(r: &QueryResult) -> Vec<u8> {
             }
             out.push_str(&json_string(name));
             out.push(':');
-            out.push_str(&json_value(val, *ty));
+            out.push_str(&json_value(val, ty.clone()));
         }
         out.push_str("}\n");
     }
@@ -234,7 +246,7 @@ fn json(r: &QueryResult) -> Vec<u8> {
         out.push_str(&format!(
             "\t\t{{\n\t\t\t\"name\": {},\n\t\t\t\"type\": {}\n\t\t}}",
             json_string(name),
-            json_string(ty.name())
+            json_string(&ty.name())
         ));
     }
     out.push_str("\n\t],\n\n\t\"data\":\n\t[\n");
@@ -247,7 +259,7 @@ fn json(r: &QueryResult) -> Vec<u8> {
             if i > 0 {
                 out.push_str(",\n");
             }
-            out.push_str(&format!("\t\t\t{}: {}", json_string(name), json_value(val, *ty)));
+            out.push_str(&format!("\t\t\t{}: {}", json_string(name), json_value(val, ty.clone())));
         }
         out.push_str("\n\t\t}");
     }
@@ -339,6 +351,28 @@ mod tests {
     #[test]
     fn unknown_format_returns_none() {
         assert_eq!(render(&one_row(), "Parquet").unwrap(), None);
+    }
+
+    fn nullable_row() -> QueryResult {
+        QueryResult {
+            columns: vec![("s".into(), Type::Nullable(Box::new(Type::String)))],
+            rows: vec![vec![Val::Null], vec![Val::Str("hi".into())]],
+        }
+    }
+
+    #[test]
+    fn tab_separated_renders_null_as_backslash_n() {
+        let body = render(&nullable_row(), "TabSeparated").unwrap().unwrap();
+        assert_eq!(String::from_utf8(body).unwrap(), "\\N\nhi\n");
+    }
+
+    #[test]
+    fn json_each_row_renders_null_as_json_null_not_backslash_n() {
+        let body = render(&nullable_row(), "JSONEachRow").unwrap().unwrap();
+        let text = String::from_utf8(body).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("{\"s\":null}"));
+        assert_eq!(lines.next(), Some("{\"s\":\"hi\"}"));
     }
 
     #[test]

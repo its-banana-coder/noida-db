@@ -73,6 +73,14 @@ fn as_f64(v: &Val) -> Result<f64, ChError> {
 
 fn encode_value(v: &Val, t: Type, out: &mut Vec<u8>) -> Result<(), ChError> {
     match t {
+        Type::Nullable(inner) => {
+            if v == &Val::Null {
+                out.push(1);
+            } else {
+                out.push(0);
+                encode_value(v, *inner, out)?;
+            }
+        }
         Type::UInt8 => out.push(as_u64(v)? as u8),
         Type::Int8 => out.push(as_i64(v)? as i8 as u8),
         Type::Bool => out.push(v.is_truthy() as u8),
@@ -94,6 +102,10 @@ fn encode_value(v: &Val, t: Type, out: &mut Vec<u8>) -> Result<(), ChError> {
 
 fn decode_value(data: &[u8], pos: &mut usize, t: Type) -> Result<Val, ChError> {
     Ok(match t {
+        Type::Nullable(inner) => {
+            let is_null = take(data, pos, 1)?[0] != 0;
+            if is_null { Val::Null } else { decode_value(data, pos, *inner)? }
+        }
         Type::UInt8 => Val::UInt(take(data, pos, 1)?[0] as u64),
         Type::Int8 => Val::Int(take(data, pos, 1)?[0] as i8 as i64),
         Type::Bool => Val::Bool(take(data, pos, 1)?[0] != 0),
@@ -127,12 +139,12 @@ pub fn encode(r: &QueryResult, with_names: bool, with_types: bool) -> Result<Vec
     }
     if with_types {
         for (_, t) in &r.columns {
-            encode_string(t.name(), &mut out);
+            encode_string(&t.name(), &mut out);
         }
     }
     for row in &r.rows {
         for (val, (_, ty)) in row.iter().zip(r.columns.iter()) {
-            encode_value(val, *ty, &mut out)?;
+            encode_value(val, ty.clone(), &mut out)?;
         }
     }
     Ok(out)
@@ -176,7 +188,7 @@ pub fn decode_rows(
     while pos < data.len() {
         let mut row = Vec::with_capacity(schema.len());
         for (_, t) in schema {
-            row.push(decode_value(data, &mut pos, *t)?);
+            row.push(decode_value(data, &mut pos, t.clone())?);
         }
         rows.push(row);
     }
@@ -238,5 +250,17 @@ mod tests {
         let mut encoded = encode(&result(), false, false).unwrap();
         encoded.truncate(2);
         assert!(decode_rows(&encoded, &schema(), false, false).is_err());
+    }
+
+    #[test]
+    fn nullable_roundtrip_mixes_null_and_real_values() {
+        let schema: Columns = vec![("s".into(), Type::Nullable(Box::new(Type::String)))];
+        let r = QueryResult {
+            columns: schema.clone(),
+            rows: vec![vec![Val::Null], vec![Val::Str("hi".into())]],
+        };
+        let encoded = encode(&r, false, false).unwrap();
+        let decoded = decode_rows(&encoded, &schema, false, false).unwrap();
+        assert_eq!(decoded, r.rows);
     }
 }

@@ -10,7 +10,7 @@
 
 use super::error::ChError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     UInt8,
     UInt16,
@@ -24,30 +24,37 @@ pub enum Type {
     Float64,
     String,
     Bool,
+    Nullable(Box<Type>),
 }
 
 impl Type {
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> String {
         match self {
-            Type::UInt8 => "UInt8",
-            Type::UInt16 => "UInt16",
-            Type::UInt32 => "UInt32",
-            Type::UInt64 => "UInt64",
-            Type::Int8 => "Int8",
-            Type::Int16 => "Int16",
-            Type::Int32 => "Int32",
-            Type::Int64 => "Int64",
-            Type::Float32 => "Float32",
-            Type::Float64 => "Float64",
-            Type::String => "String",
-            Type::Bool => "Bool",
+            Type::UInt8 => "UInt8".to_string(),
+            Type::UInt16 => "UInt16".to_string(),
+            Type::UInt32 => "UInt32".to_string(),
+            Type::UInt64 => "UInt64".to_string(),
+            Type::Int8 => "Int8".to_string(),
+            Type::Int16 => "Int16".to_string(),
+            Type::Int32 => "Int32".to_string(),
+            Type::Int64 => "Int64".to_string(),
+            Type::Float32 => "Float32".to_string(),
+            Type::Float64 => "Float64".to_string(),
+            Type::String => "String".to_string(),
+            Type::Bool => "Bool".to_string(),
+            Type::Nullable(t) => format!("Nullable({})", t.name()),
         }
     }
 
     /// Parses a ClickHouse type name. `None` for anything not supported yet
-    /// (`Nullable(...)`, `Array(...)`, `Decimal`, `Date`, `UUID`, ...) —
+    /// (`Array(...)`, `Decimal`, `Date`, `UUID`, ...) —
     /// callers turn that into `NOT_IMPLEMENTED`, never a silent guess.
     pub fn parse(name: &str) -> Option<Type> {
+        if let Some(inner) = name.strip_prefix("Nullable(")
+            && let Some(inner) = inner.strip_suffix(")")
+        {
+            return Type::parse(inner).map(|t| Type::Nullable(Box::new(t)));
+        }
         match name {
             "UInt8" => Some(Type::UInt8),
             "UInt16" => Some(Type::UInt16),
@@ -65,21 +72,36 @@ impl Type {
         }
     }
 
-    pub fn is_unsigned(self) -> bool {
-        matches!(self, Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64)
+    pub fn is_unsigned(&self) -> bool {
+        match self {
+            Type::Nullable(t) => t.is_unsigned(),
+            Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => true,
+            _ => false,
+        }
     }
 
-    pub fn is_float(self) -> bool {
-        matches!(self, Type::Float32 | Type::Float64)
+    pub fn is_float(&self) -> bool {
+        match self {
+            Type::Nullable(t) => t.is_float(),
+            Type::Float32 | Type::Float64 => true,
+            _ => false,
+        }
     }
 
-    pub fn is_integer(self) -> bool {
-        self.is_unsigned() || matches!(self, Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64)
+    pub fn is_integer(&self) -> bool {
+        if self.is_unsigned() {
+            return true;
+        }
+        match self {
+            Type::Nullable(t) => t.is_integer(),
+            Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 => true,
+            _ => false,
+        }
     }
 
     /// `(min, max)`, wide enough (`i128`) for both signed and unsigned
     /// ranges. Only meaningful for integer types.
-    fn int_range(self) -> (i128, i128) {
+    fn int_range(&self) -> (i128, i128) {
         match self {
             Type::UInt8 => (0, u8::MAX as i128),
             Type::UInt16 => (0, u16::MAX as i128),
@@ -89,6 +111,7 @@ impl Type {
             Type::Int16 => (i16::MIN as i128, i16::MAX as i128),
             Type::Int32 => (i32::MIN as i128, i32::MAX as i128),
             Type::Int64 => (i64::MIN as i128, i64::MAX as i128),
+            Type::Nullable(t) => t.int_range(),
             Type::Float32 | Type::Float64 | Type::String | Type::Bool => (i128::MIN, i128::MAX),
         }
     }
@@ -101,6 +124,7 @@ pub enum Val {
     Float(f64),
     Str(String),
     Bool(bool),
+    Null,
 }
 
 impl Val {
@@ -110,7 +134,7 @@ impl Val {
             Val::Int(n) => Some(*n as f64),
             Val::Float(n) => Some(*n),
             Val::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-            Val::Str(_) => None,
+            Val::Str(_) | Val::Null => None,
         }
     }
 
@@ -119,7 +143,7 @@ impl Val {
             Val::UInt(n) => Some(*n as i128),
             Val::Int(n) => Some(*n as i128),
             Val::Bool(b) => Some(*b as i128),
-            Val::Float(_) | Val::Str(_) => None,
+            Val::Float(_) | Val::Str(_) | Val::Null => None,
         }
     }
 
@@ -130,6 +154,7 @@ impl Val {
             Val::Int(n) => *n != 0,
             Val::Float(n) => *n != 0.0,
             Val::Str(s) => !s.is_empty(),
+            Val::Null => false,
         }
     }
 
@@ -142,13 +167,15 @@ impl Val {
             Val::Float(_) => Type::Float64,
             Val::Str(_) => Type::String,
             Val::Bool(_) => Type::Bool,
+            Val::Null => Type::Nullable(Box::new(Type::String)), // Type of NULL literal is Nullable(String)
         }
     }
 }
 
 /// The value ClickHouse gives a column an `INSERT` doesn't mention.
-pub fn zero_value(t: Type) -> Val {
+pub fn zero_value(t: &Type) -> Val {
     match t {
+        Type::Nullable(_) => Val::Null,
         Type::String => Val::Str(String::new()),
         Type::Bool => Val::Bool(false),
         t if t.is_float() => Val::Float(0.0),
@@ -159,20 +186,27 @@ pub fn zero_value(t: Type) -> Val {
 
 /// Coerces `v` into `t`, range-checking integers (approximating
 /// ClickHouse's `ARGUMENT_OUT_OF_BOUND`).
-pub fn coerce(v: &Val, t: Type) -> Result<Val, ChError> {
+pub fn coerce(v: &Val, t: &Type) -> Result<Val, ChError> {
+    if v == &Val::Null {
+        if let Type::Nullable(_) = t {
+            return Ok(Val::Null);
+        }
+        return Err(ChError::type_mismatch(&t.name()));
+    }
     match t {
+        Type::Nullable(inner) => coerce(v, inner),
         Type::String => match v {
             Val::Str(s) => Ok(Val::Str(s.clone())),
-            _ => Err(ChError::type_mismatch(t.name())),
+            _ => Err(ChError::type_mismatch(&t.name())),
         },
         Type::Bool => match v {
             Val::Bool(b) => Ok(Val::Bool(*b)),
             Val::UInt(n) => Ok(Val::Bool(*n != 0)),
             Val::Int(n) => Ok(Val::Bool(*n != 0)),
-            _ => Err(ChError::type_mismatch(t.name())),
+            _ => Err(ChError::type_mismatch(&t.name())),
         },
         t if t.is_float() => {
-            v.as_f64().map(Val::Float).ok_or_else(|| ChError::type_mismatch(t.name()))
+            v.as_f64().map(Val::Float).ok_or_else(|| ChError::type_mismatch(&t.name()))
         }
         t => {
             // Aggregates like sum()/avg() are computed in f64 (see the
@@ -182,10 +216,10 @@ pub fn coerce(v: &Val, t: Type) -> Result<Val, ChError> {
             let n = v
                 .as_i128()
                 .or_else(|| v.as_f64().map(|f| f.round() as i128))
-                .ok_or_else(|| ChError::type_mismatch(t.name()))?;
+                .ok_or_else(|| ChError::type_mismatch(&t.name()))?;
             let (min, max) = t.int_range();
             if n < min || n > max {
-                return Err(ChError::out_of_range(t.name()));
+                return Err(ChError::out_of_range(&t.name()));
             }
             Ok(if t.is_unsigned() { Val::UInt(n as u64) } else { Val::Int(n as i64) })
         }
@@ -205,28 +239,51 @@ mod tests {
 
     #[test]
     fn coerce_rejects_out_of_range_ints() {
-        assert!(coerce(&Val::Int(300), Type::UInt8).is_err());
-        assert!(coerce(&Val::Int(-1), Type::UInt8).is_err());
-        assert_eq!(coerce(&Val::Int(200), Type::UInt8).unwrap(), Val::UInt(200));
+        assert!(coerce(&Val::Int(300), &Type::UInt8).is_err());
+        assert!(coerce(&Val::Int(-1), &Type::UInt8).is_err());
+        assert_eq!(coerce(&Val::Int(200), &Type::UInt8).unwrap(), Val::UInt(200));
     }
 
     #[test]
     fn coerce_rejects_type_mismatches() {
-        assert!(coerce(&Val::Str("x".into()), Type::UInt8).is_err());
-        assert!(coerce(&Val::Int(1), Type::String).is_err());
+        assert!(coerce(&Val::Str("x".into()), &Type::UInt8).is_err());
+        assert!(coerce(&Val::Int(1), &Type::String).is_err());
     }
 
     #[test]
     fn coerce_int_to_float() {
-        assert_eq!(coerce(&Val::Int(3), Type::Float64).unwrap(), Val::Float(3.0));
+        assert_eq!(coerce(&Val::Int(3), &Type::Float64).unwrap(), Val::Float(3.0));
+    }
+
+    #[test]
+    fn nullable_parses_and_names() {
+        assert_eq!(Type::parse("Nullable(String)"), Some(Type::Nullable(Box::new(Type::String))));
+        assert_eq!(Type::parse("Nullable(UInt32)"), Some(Type::Nullable(Box::new(Type::UInt32))));
+        assert_eq!(Type::Nullable(Box::new(Type::String)).name(), "Nullable(String)");
+    }
+
+    #[test]
+    fn nullable_coerces_null_and_passes_through_to_inner() {
+        assert_eq!(coerce(&Val::Null, &Type::Nullable(Box::new(Type::UInt32))).unwrap(), Val::Null);
+        assert_eq!(
+            coerce(&Val::Int(5), &Type::Nullable(Box::new(Type::UInt32))).unwrap(),
+            Val::UInt(5)
+        );
+        // A non-Nullable column must still reject NULL.
+        assert!(coerce(&Val::Null, &Type::UInt32).is_err());
+    }
+
+    #[test]
+    fn nullable_zero_value_is_null() {
+        assert_eq!(zero_value(&Type::Nullable(Box::new(Type::String))), Val::Null);
     }
 
     #[test]
     fn coerce_float_to_int_rounds() {
         // sum()/avg() are computed in f64 (see the module doc); a whole
         // number arriving as a Float must still fit an integer column.
-        assert_eq!(coerce(&Val::Float(3.0), Type::UInt64).unwrap(), Val::UInt(3));
-        assert_eq!(coerce(&Val::Float(2.6), Type::Int32).unwrap(), Val::Int(3));
-        assert!(coerce(&Val::Float(1e30), Type::UInt64).is_err());
+        assert_eq!(coerce(&Val::Float(3.0), &Type::UInt64).unwrap(), Val::UInt(3));
+        assert_eq!(coerce(&Val::Float(2.6), &Type::Int32).unwrap(), Val::Int(3));
+        assert!(coerce(&Val::Float(1e30), &Type::UInt64).is_err());
     }
 }
