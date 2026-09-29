@@ -1,10 +1,12 @@
 # noida-db
 
 One tiny binary for local development that speaks the wire protocols of
-Postgres, MySQL, Redis, Kafka, Elasticsearch, ClickHouse, Memcached,
-MongoDB and RabbitMQ — so your existing drivers, ORMs and CLIs point at it
-unchanged, without running six-plus heavy servers (or a Docker Compose
-stack that idles at 2.5–4GB) just to develop locally.
+Postgres, MySQL, Redis, Kafka and Elasticsearch — so your existing
+drivers, ORMs and CLIs point at it unchanged, without running five-plus
+heavy servers (or a Docker Compose stack that idles at 2.5–4GB) just to
+develop locally. ClickHouse, MongoDB, RabbitMQ and Memcached are also
+included and fully functional, tested at a lighter depth than the five
+above — see [Status](#status).
 
 ```
 cargo install --path .
@@ -55,21 +57,37 @@ More applications are being added over time.
 
 ## Status
 
+**Core** — the five services this project is built around first, each
+tested against real client libraries, differential tests against a real
+server, and (for several) real unmodified applications:
+
 | Service | State |
 |---|---|
-| **Redis** | most of the protocol implemented (217 of 242 Redis 7.2 commands) and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq); real keyspace notifications (`notify-keyspace-events`) for key expiry/deletion, streams and HyperLogLog — see [`src/redis/README.md`](src/redis/README.md) |
 | **Postgres** | wire protocol, catalogs, DDL/DML, full-text search, range types, materialized views, tested against psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql and JDBC, plus real applications (see above) |
+| **MySQL** | handshake, literal-expression `SELECT`, and real tables: `CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `INNER`/`LEFT`/cross `JOIN`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets — tested against `mysql_async` and a differential test against a real MySQL 8.0 server; prepared-statement parameter binding, `GROUP BY`/aggregates and transactions are the remaining gaps — see `docs/LIMITATIONS.md` |
+| **Redis** | most of the protocol implemented (217 of 242 Redis 7.2 commands) and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq); real keyspace notifications (`notify-keyspace-events`) across generic/stream/HyperLogLog/hash/list/set/zset/string events — see [`src/redis/README.md`](src/redis/README.md) |
 | **Kafka** | native binary protocol, topics, consumer groups, cluster configs, and real transactional isolation (`read_committed` fetches, producer fencing on stale epochs) |
-| **ClickHouse** | HTTP interface: CREATE/INSERT/SELECT on Memory/MergeTree/ReplacingMergeTree/SummingMergeTree with real FINAL/OPTIMIZE merge semantics, materialized views, DESCRIBE/SHOW/EXISTS, TSV/CSV/JSON/RowBinary/Pretty formats; tested against the official Rust client — see `docs/specs/clickhouse.md` |
-| **Elasticsearch** | HTTP layer, index/document CRUD, bulk, `match`/`term`/`range`/`bool` search with real BM25 scoring, and bucket/metric aggregations — see `docs/LIMITATIONS.md` for query types not yet built (`match_phrase`, `multi_match`, wildcard/regexp) |
-| **RabbitMQ** | AMQP 0-9-1 core over the native protocol — exchange/queue declare, binding, publish/consume/get, QoS, and publisher confirms (`confirm.select` + real `basic.ack`) — tested against the real `lapin` client |
-| **MongoDB** | OP_MSG wire protocol, CRUD, unique-index enforcement — tested against the official Rust driver and a real `mongod` differential test |
+| **Elasticsearch** | HTTP layer, index/document CRUD, bulk, `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp search with real BM25 scoring, and bucket/metric aggregations — see `docs/LIMITATIONS.md` for what's not built yet (`query_string`, `search_after`, nested queries, highlighting) |
+
+**Also included** — functional and tested, but at a lighter depth than
+the five above (fewer real-client libraries exercised, no real-app
+validation yet):
+
+| Service | State |
+|---|---|
+| **RabbitMQ** | AMQP 0-9-1 core over the native protocol — exchange/queue declare, binding, publish/consume/get, QoS, publisher confirms, dead-lettering, message TTLs, and `basic.nack`/`basic.reject` with real requeue — tested against the real `lapin` client; fanout/topic exchange routing and transactions are still stubbed/missing |
+| **ClickHouse** | HTTP interface: `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` with real `FINAL`/`OPTIMIZE` merge semantics, materialized views, `Nullable(...)` columns, TSV/CSV/JSON/RowBinary/Pretty formats; tested against the official Rust client — see `docs/specs/clickhouse.md` |
+| **MongoDB** | OP_MSG wire protocol, CRUD, unique-index enforcement, the aggregation pipeline (`$match`/`$group`/`$sort`/`$project`/`$unwind` and friends) — tested against the official Rust driver and a real `mongod` differential test |
 | **Memcached** | text protocol (set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit), verified against Django's built-in `PyMemcacheCache` backend and `pymemcache` |
-| **MySQL** | handshake and literal-expression `SELECT` (arithmetic, comparisons, session vars); real tables (`CREATE TABLE`/CRUD/joins) are the most underinvested piece right now — see `docs/specs/mysql.md` |
 
 Each service is its own Cargo feature (on by default once merged) and can
 be switched on or off at build time and at runtime (`--only`); a disabled
 service allocates nothing.
+
+**Not built yet, for every service:** none of it persists across a
+restart today — everything lives in memory only. `--data-dir` is
+accepted but not yet wired to save or load anything; see
+`docs/LIMITATIONS.md` and `COMPATIBILITY.md` for the intended design.
 
 ## Documentation
 
