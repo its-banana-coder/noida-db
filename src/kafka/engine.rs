@@ -27,7 +27,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct PartitionState {
     pub id: i32,
     pub leader: i32,
-    pub record_batches: Vec<Vec<u8>>,
+    // (base_offset, batch_bytes) — batches don't hold one record each, so
+    // fetching by offset has to find the batch that *contains* the
+    // requested offset, not treat this vec as if it were indexed by offset.
+    pub record_batches: Vec<(i64, Vec<u8>)>,
     pub high_watermark: i64,
     // (producer_id, epoch) -> (last_sequence, base_offset)
     pub producer_seqs: HashMap<(i64, i16), (i32, i64)>,
@@ -533,7 +536,7 @@ impl EngineState {
                             if is_batch_v2 && batch_bytes.len() >= 8 {
                                 batch_bytes[0..8].copy_from_slice(&base_offset.to_be_bytes());
                             }
-                            part_state.record_batches.push(batch_bytes);
+                            part_state.record_batches.push((base_offset, batch_bytes));
                             part_state.high_watermark += delta;
 
                             part_res.error_code = 0;
@@ -581,11 +584,19 @@ impl EngineState {
                         if fetch_offset < 0 || fetch_offset > part_state.high_watermark {
                             part_res.error_code = 1; // OFFSET_OUT_OF_RANGE
                         } else if fetch_offset < part_state.high_watermark {
-                            let idx = fetch_offset as usize;
-                            if idx < part_state.record_batches.len() {
-                                part_res.records = Some(bytes::Bytes::from(
-                                    part_state.record_batches[idx].clone(),
-                                ));
+                            // Batches aren't one record each, so find the
+                            // batch whose base_offset covers fetch_offset
+                            // (the last one starting at or before it) and
+                            // return it whole, same as real Kafka — the
+                            // client skips already-consumed records inside
+                            // it by their own relative offset.
+                            if let Some((_, batch)) = part_state
+                                .record_batches
+                                .iter()
+                                .rev()
+                                .find(|(base, _)| *base <= fetch_offset)
+                            {
+                                part_res.records = Some(bytes::Bytes::from(batch.clone()));
                             }
                         }
                     } else {
