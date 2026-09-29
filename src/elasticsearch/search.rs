@@ -471,7 +471,376 @@ fn apply_source_filter(source: &Value, filter: Option<&Value>) -> Value {
     }
 }
 
-/// `POST/GET _search`: runs the query, ranks and paginates the results.
+// --- Aggregations -----------------------------------------------------
+//
+// Metric aggregations reduce a bucket (a set of document indices) to a
+// number; bucket aggregations partition a bucket into named sub-buckets,
+// each of which can itself carry sub-aggregations, recursively.
+
+/// The values a field contributes to an aggregation: raw (typed) scalars
+/// for `keyword`/numeric/boolean fields and the implicit `.keyword`
+/// sub-field, analyzed terms (as strings) for `text` fields — so a `terms`
+/// aggregation bucket key comes back as the right JSON type.
+fn agg_values(mappings: &Value, source: &Value, field: &str) -> Vec<Value> {
+    if let Some(base) = field.strip_suffix(".keyword") {
+        return raw_values(source, base).into_iter().filter(|v| v.is_string()).cloned().collect();
+    }
+    let ty = mapped_type(mappings, field);
+    let mut out = Vec::new();
+    for v in raw_values(source, field) {
+        match v {
+            Value::String(s) => {
+                if ty == Some("keyword") {
+                    out.push(Value::String(s.clone()));
+                } else {
+                    out.extend(analysis::standard(s).into_iter().map(Value::String));
+                }
+            }
+            Value::Number(_) | Value::Bool(_) => out.push(v.clone()),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn numeric_values(
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+    field: &str,
+) -> Vec<f64> {
+    bucket
+        .iter()
+        .flat_map(|&i| agg_values(mappings, &docs[i].source, field))
+        .filter_map(|v| v.as_f64())
+        .collect()
+}
+
+fn agg_field(spec: &Value) -> &str {
+    spec.get("field").and_then(Value::as_str).unwrap_or("")
+}
+
+fn sub_aggs_of(spec: &Value) -> Option<&Value> {
+    spec.get("aggs").or_else(|| spec.get("aggregations"))
+}
+
+fn with_sub_aggs(
+    mut bucket_obj: Map<String, Value>,
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    idxs: &[usize],
+) -> Value {
+    if let Some(sa) = sub_aggs_of(spec)
+        && let Value::Object(computed) = eval_aggs(sa, mappings, docs, idxs)
+    {
+        for (k, v) in computed {
+            bucket_obj.insert(k, v);
+        }
+    }
+    Value::Object(bucket_obj)
+}
+
+fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let inner = spec.get("terms").cloned().unwrap_or_default();
+    let field = agg_field(&inner);
+    let size = inner.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
+    let mut buckets: HashMap<String, (Value, Vec<usize>)> = HashMap::new();
+    for &idx in bucket {
+        let mut seen = HashSet::new();
+        for v in agg_values(mappings, &docs[idx].source, field) {
+            let key = value_to_term(&v);
+            if seen.insert(key.clone()) {
+                buckets.entry(key).or_insert_with(|| (v, Vec::new())).1.push(idx);
+            }
+        }
+    }
+    let mut entries: Vec<(Value, Vec<usize>)> = buckets.into_values().collect();
+    entries.sort_by(|a, b| {
+        b.1.len().cmp(&a.1.len()).then_with(|| value_to_term(&a.0).cmp(&value_to_term(&b.0)))
+    });
+    let sum_other: usize = entries.iter().skip(size).map(|(_, idxs)| idxs.len()).sum();
+    let out_buckets: Vec<Value> = entries
+        .into_iter()
+        .take(size)
+        .map(|(key, idxs)| {
+            let mut b = Map::new();
+            b.insert("key".to_string(), key);
+            b.insert("doc_count".to_string(), json!(idxs.len()));
+            with_sub_aggs(b, spec, mappings, docs, &idxs)
+        })
+        .collect();
+    json!({"doc_count_error_upper_bound": 0, "sum_other_doc_count": sum_other, "buckets": out_buckets})
+}
+
+fn range_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let inner = spec.get("range").cloned().unwrap_or_default();
+    let field = agg_field(&inner);
+    let ranges = inner.get("ranges").and_then(Value::as_array).cloned().unwrap_or_default();
+    let keyed = inner.get("keyed").and_then(Value::as_bool).unwrap_or(false);
+    let mut named = Vec::new();
+    for r in &ranges {
+        let from = r.get("from").and_then(Value::as_f64);
+        let to = r.get("to").and_then(Value::as_f64);
+        let idxs: Vec<usize> = bucket
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                agg_values(mappings, &docs[idx].source, field).iter().any(|v| {
+                    let Some(n) = v.as_f64() else { return false };
+                    from.is_none_or(|f| n >= f) && to.is_none_or(|t| n < t)
+                })
+            })
+            .collect();
+        let mut b = Map::new();
+        let key = r.get("key").and_then(Value::as_str).map(str::to_string);
+        if let Some(k) = &key {
+            b.insert("key".to_string(), json!(k));
+        }
+        if let Some(f) = from {
+            b.insert("from".to_string(), json!(f));
+        }
+        if let Some(t) = to {
+            b.insert("to".to_string(), json!(t));
+        }
+        b.insert("doc_count".to_string(), json!(idxs.len()));
+        named.push((key, with_sub_aggs(b, spec, mappings, docs, &idxs)));
+    }
+    if keyed {
+        let map: Map<String, Value> = named
+            .into_iter()
+            .enumerate()
+            .map(|(i, (k, v))| (k.unwrap_or_else(|| i.to_string()), v))
+            .collect();
+        json!({"buckets": map})
+    } else {
+        json!({"buckets": named.into_iter().map(|(_, v)| v).collect::<Vec<_>>()})
+    }
+}
+
+fn histogram_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let inner = spec.get("histogram").cloned().unwrap_or_default();
+    let field = agg_field(&inner);
+    let interval =
+        inner.get("interval").and_then(Value::as_f64).unwrap_or(1.0).max(f64::MIN_POSITIVE);
+    let min_doc_count = inner.get("min_doc_count").and_then(Value::as_u64).unwrap_or(1);
+    let mut buckets: HashMap<i64, Vec<usize>> = HashMap::new();
+    for &idx in bucket {
+        for v in agg_values(mappings, &docs[idx].source, field) {
+            if let Some(n) = v.as_f64() {
+                buckets.entry((n / interval).floor() as i64).or_default().push(idx);
+            }
+        }
+    }
+    let mut keys: Vec<i64> = buckets.keys().copied().collect();
+    keys.sort_unstable();
+    let out: Vec<Value> = keys
+        .into_iter()
+        .filter_map(|k| {
+            let idxs = buckets.remove(&k).unwrap_or_default();
+            if (idxs.len() as u64) < min_doc_count {
+                return None;
+            }
+            let mut b = Map::new();
+            b.insert("key".to_string(), json!(k as f64 * interval));
+            b.insert("doc_count".to_string(), json!(idxs.len()));
+            Some(with_sub_aggs(b, spec, mappings, docs, &idxs))
+        })
+        .collect();
+    json!({"buckets": out})
+}
+
+fn filter_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let filter_query = spec.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));
+    let matched = eval(&filter_query, mappings, docs);
+    let idxs: Vec<usize> = bucket.iter().copied().filter(|i| matched.contains_key(i)).collect();
+    let mut b = Map::new();
+    b.insert("doc_count".to_string(), json!(idxs.len()));
+    with_sub_aggs(b, spec, mappings, docs, &idxs)
+}
+
+fn named_filter_bucket(
+    filter_query: &Value,
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+) -> Value {
+    let matched = eval(filter_query, mappings, docs);
+    let idxs: Vec<usize> = bucket.iter().copied().filter(|i| matched.contains_key(i)).collect();
+    let mut b = Map::new();
+    b.insert("doc_count".to_string(), json!(idxs.len()));
+    with_sub_aggs(b, spec, mappings, docs, &idxs)
+}
+
+fn filters_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let filters =
+        spec.get("filters").and_then(|v| v.get("filters")).cloned().unwrap_or_else(|| json!({}));
+    match &filters {
+        Value::Object(map) => {
+            let out: Map<String, Value> = map
+                .iter()
+                .map(|(name, q)| {
+                    (name.clone(), named_filter_bucket(q, spec, mappings, docs, bucket))
+                })
+                .collect();
+            json!({"buckets": out})
+        }
+        Value::Array(arr) => {
+            let out: Vec<Value> =
+                arr.iter().map(|q| named_filter_bucket(q, spec, mappings, docs, bucket)).collect();
+            json!({"buckets": out})
+        }
+        _ => json!({"buckets": {}}),
+    }
+}
+
+fn missing_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let inner = spec.get("missing").cloned().unwrap_or_default();
+    let field = agg_field(&inner);
+    let idxs: Vec<usize> = bucket
+        .iter()
+        .copied()
+        .filter(|&i| raw_values(&docs[i].source, field).into_iter().all(|v| v.is_null()))
+        .collect();
+    let mut b = Map::new();
+    b.insert("doc_count".to_string(), json!(idxs.len()));
+    with_sub_aggs(b, spec, mappings, docs, &idxs)
+}
+
+fn metric_agg(
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+    f: impl Fn(&[f64]) -> Option<f64>,
+) -> Value {
+    let vals = numeric_values(mappings, docs, bucket, agg_field(spec));
+    json!({"value": f(&vals)})
+}
+
+fn stats_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let vals = numeric_values(mappings, docs, bucket, agg_field(spec));
+    let count = vals.len();
+    let sum: f64 = vals.iter().sum();
+    if count == 0 {
+        return json!({"count": 0, "min": null, "max": null, "avg": null, "sum": 0.0});
+    }
+    let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    json!({"count": count, "min": min, "max": max, "avg": sum / count as f64, "sum": sum})
+}
+
+fn value_count_agg(
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+) -> Value {
+    let field = agg_field(spec);
+    let count: usize =
+        bucket.iter().map(|&i| agg_values(mappings, &docs[i].source, field).len()).sum();
+    json!({"value": count})
+}
+
+fn cardinality_agg(
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+) -> Value {
+    let field = agg_field(spec);
+    let mut seen = HashSet::new();
+    for &i in bucket {
+        for v in agg_values(mappings, &docs[i].source, field) {
+            seen.insert(value_to_term(&v));
+        }
+    }
+    json!({"value": seen.len()})
+}
+
+fn top_hits_agg(spec: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let size = spec.get("size").and_then(Value::as_u64).unwrap_or(3) as usize;
+    let hits: Vec<Value> = bucket
+        .iter()
+        .take(size)
+        .map(|&i| {
+            let d = &docs[i];
+            json!({"_index": d.index, "_id": d.id, "_score": Value::Null, "_source": d.source})
+        })
+        .collect();
+    json!({"hits": {"total": {"value": bucket.len(), "relation": "eq"}, "max_score": Value::Null, "hits": hits}})
+}
+
+fn eval_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    // These take the full outer `spec` (not just the type-specific inner
+    // object) because a sibling `aggs`/`aggregations` key holding nested
+    // sub-aggregations lives on the outer object, not inside e.g. `terms`.
+    if spec.get("terms").is_some() {
+        return terms_agg(spec, mappings, docs, bucket);
+    }
+    if spec.get("range").is_some() {
+        return range_agg(spec, mappings, docs, bucket);
+    }
+    if spec.get("histogram").is_some() {
+        return histogram_agg(spec, mappings, docs, bucket);
+    }
+    if spec.get("filter").is_some() {
+        return filter_agg(spec, mappings, docs, bucket);
+    }
+    if spec.get("filters").is_some() {
+        return filters_agg(spec, mappings, docs, bucket);
+    }
+    if spec.get("missing").is_some() {
+        return missing_agg(spec, mappings, docs, bucket);
+    }
+    if let Some(v) = spec.get("avg") {
+        return metric_agg(v, mappings, docs, bucket, |vals| {
+            (!vals.is_empty()).then(|| vals.iter().sum::<f64>() / vals.len() as f64)
+        });
+    }
+    if let Some(v) = spec.get("sum") {
+        return metric_agg(v, mappings, docs, bucket, |vals| Some(vals.iter().sum()));
+    }
+    if let Some(v) = spec.get("min") {
+        return metric_agg(v, mappings, docs, bucket, |vals| {
+            vals.iter().copied().fold(None, |acc, x| Some(acc.map_or(x, |a: f64| a.min(x))))
+        });
+    }
+    if let Some(v) = spec.get("max") {
+        return metric_agg(v, mappings, docs, bucket, |vals| {
+            vals.iter().copied().fold(None, |acc, x| Some(acc.map_or(x, |a: f64| a.max(x))))
+        });
+    }
+    if let Some(v) = spec.get("stats") {
+        return stats_agg(v, mappings, docs, bucket);
+    }
+    if let Some(v) = spec.get("value_count") {
+        return value_count_agg(v, mappings, docs, bucket);
+    }
+    if let Some(v) = spec.get("cardinality") {
+        return cardinality_agg(v, mappings, docs, bucket);
+    }
+    if let Some(v) = spec.get("top_hits") {
+        return top_hits_agg(v, docs, bucket);
+    }
+    json!({})
+}
+
+/// Evaluates every named aggregation in an `aggs`/`aggregations` block over
+/// `bucket` (a set of document indices — the whole matched set for a
+/// top-level `_search`, or a sub-bucket's members for a nested `aggs`).
+pub fn eval_aggs(aggs: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+    let Some(obj) = aggs.as_object() else { return json!({}) };
+    let out: Map<String, Value> = obj
+        .iter()
+        .map(|(name, spec)| (name.clone(), eval_agg(spec, mappings, docs, bucket)))
+        .collect();
+    Value::Object(out)
+}
+
+/// `POST/GET _search`: runs the query, ranks and paginates the results,
+/// and computes any `aggs`/`aggregations` over the full matched set.
 pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Value {
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
     let mut scores = eval(&query, mappings, docs);
@@ -479,6 +848,7 @@ pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Value {
         let min_score = min_score as f32;
         scores.retain(|_, s| *s >= min_score);
     }
+    let matched: Vec<usize> = scores.keys().copied().collect();
     let total = scores.len();
     let from = body.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
     let size = body.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
@@ -507,7 +877,7 @@ pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Value {
         })
         .collect();
 
-    json!({
+    let mut resp = json!({
         "took": 0,
         "timed_out": false,
         "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
@@ -516,7 +886,11 @@ pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Value {
             "max_score": max_score,
             "hits": hits,
         }
-    })
+    });
+    if let Some(agg_spec) = body.get("aggs").or_else(|| body.get("aggregations")) {
+        resp["aggregations"] = eval_aggs(agg_spec, mappings, docs, &matched);
+    }
+    resp
 }
 
 /// `POST/GET _count`: the number of matching documents.
@@ -621,5 +995,108 @@ mod tests {
         let docs = vec![doc("i", "1", json!({"a":1,"b":2}))];
         let resp = search(&json!({}), &docs, &json!({"_source": ["a"]}));
         assert_eq!(resp["hits"]["hits"][0]["_source"], json!({"a":1}));
+    }
+
+    fn agg_docs() -> Vec<CommittedDoc> {
+        vec![
+            doc("i", "1", json!({"tag":"a","price":10})),
+            doc("i", "2", json!({"tag":"a","price":20})),
+            doc("i", "3", json!({"tag":"b","price":30})),
+            doc("i", "4", json!({"price":40})),
+        ]
+    }
+
+    #[test]
+    fn terms_aggregation_buckets_by_keyword_field_with_sub_metric() {
+        let mappings = json!({"properties": {"tag": {"type": "keyword"}}});
+        let docs = agg_docs();
+        let resp = search(
+            &mappings,
+            &docs,
+            &json!({"size":0,"aggs":{"by_tag":{"terms":{"field":"tag"},"aggs":{"avg_price":{"avg":{"field":"price"}}}}}}),
+        );
+        assert_eq!(resp["hits"]["hits"].as_array().unwrap().len(), 0);
+        let buckets = resp["aggregations"]["by_tag"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets[0]["key"], "a");
+        assert_eq!(buckets[0]["doc_count"], 2);
+        assert_eq!(buckets[0]["avg_price"]["value"], 15.0);
+        assert_eq!(buckets[1]["key"], "b");
+        assert_eq!(buckets[1]["doc_count"], 1);
+    }
+
+    #[test]
+    fn stats_and_cardinality_aggregations() {
+        let mappings = json!({"properties": {"tag": {"type": "keyword"}}});
+        let docs = agg_docs();
+        let resp = search(
+            &mappings,
+            &docs,
+            &json!({"aggs":{"price_stats":{"stats":{"field":"price"}},"distinct_tags":{"cardinality":{"field":"tag"}}}}),
+        );
+        assert_eq!(resp["aggregations"]["price_stats"]["count"], 4);
+        assert_eq!(resp["aggregations"]["price_stats"]["min"], 10.0);
+        assert_eq!(resp["aggregations"]["price_stats"]["max"], 40.0);
+        assert_eq!(resp["aggregations"]["price_stats"]["sum"], 100.0);
+        assert_eq!(resp["aggregations"]["distinct_tags"]["value"], 2);
+    }
+
+    #[test]
+    fn range_and_missing_aggregations() {
+        let docs = agg_docs();
+        let resp = search(
+            &json!({}),
+            &docs,
+            &json!({"aggs":{
+                "by_price":{"range":{"field":"price","ranges":[{"to":25},{"from":25}]}},
+                "no_tag":{"missing":{"field":"tag"}}
+            }}),
+        );
+        let buckets = resp["aggregations"]["by_price"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets[0]["doc_count"], 2);
+        assert_eq!(buckets[1]["doc_count"], 2);
+        assert_eq!(resp["aggregations"]["no_tag"]["doc_count"], 1);
+    }
+
+    #[test]
+    fn range_and_missing_aggregations_carry_sub_aggregations() {
+        // `aggs` is a sibling of `range`/`missing` in the request body, not
+        // nested inside them — regression test for a bug where sub-aggs
+        // were looked up on the wrong (inner) object and silently dropped.
+        let docs = agg_docs();
+        let resp = search(
+            &json!({}),
+            &docs,
+            &json!({"aggs":{
+                "by_price":{
+                    "range":{"field":"price","ranges":[{"to":25},{"from":25}]},
+                    "aggs":{"avg_price":{"avg":{"field":"price"}}}
+                },
+                "no_tag":{
+                    "missing":{"field":"tag"},
+                    "aggs":{"avg_price":{"avg":{"field":"price"}}}
+                }
+            }}),
+        );
+        let buckets = resp["aggregations"]["by_price"]["buckets"].as_array().unwrap();
+        assert_eq!(buckets[0]["avg_price"]["value"], 15.0);
+        assert_eq!(buckets[1]["avg_price"]["value"], 35.0);
+        assert_eq!(resp["aggregations"]["no_tag"]["avg_price"]["value"], 40.0);
+    }
+
+    #[test]
+    fn filter_and_filters_aggregations_restrict_the_bucket() {
+        let mappings = json!({"properties": {"tag": {"type": "keyword"}}});
+        let docs = agg_docs();
+        let resp = search(
+            &mappings,
+            &docs,
+            &json!({"aggs":{
+                "tag_a":{"filter":{"term":{"tag":"a"}}},
+                "by_tag":{"filters":{"filters":{"a":{"term":{"tag":"a"}},"b":{"term":{"tag":"b"}}}}}
+            }}),
+        );
+        assert_eq!(resp["aggregations"]["tag_a"]["doc_count"], 2);
+        assert_eq!(resp["aggregations"]["by_tag"]["buckets"]["a"]["doc_count"], 2);
+        assert_eq!(resp["aggregations"]["by_tag"]["buckets"]["b"]["doc_count"], 1);
     }
 }
