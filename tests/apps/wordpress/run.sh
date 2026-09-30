@@ -36,18 +36,18 @@
 # network access to wordpress.org/github.com is unavailable, the script
 # prints "SKIPPED" and exits 0 rather than failing.
 #
-# KNOWN CURRENT GAP (as of the MySQL work this test was added alongside — see
-# docs/LIMITATIONS.md's MySQL section): this test is expected to FAIL at the
-# `wp core install` step today, not skip. WordPress's real core schema
-# (wp-admin/includes/schema.php) uses column types noida-db's MySQL CREATE
-# TABLE doesn't parse yet (`BIGINT ... UNSIGNED`, `TINYINT`, `MEDIUMTEXT`,
-# `LONGTEXT`) and table-level composite/UNIQUE KEY definitions, which are
-# silently dropped rather than applied. That's left as-is deliberately: this
-# script exercises WordPress's actual, unmodified schema (not a trimmed-down
-# stand-in) specifically so a green run means real WordPress compatibility,
-# and a red run points at exactly which real-world MySQL feature is missing
-# next. `wp core install`'s own log (captured on failure below) will show the
-# first CREATE TABLE that errors.
+# This script exercises WordPress's actual, unmodified core schema (not a
+# trimmed-down stand-in) specifically so a green run means real WordPress
+# compatibility, and a red run points at exactly which real-world MySQL
+# feature is missing next — `wp core install`'s own log (captured on
+# failure below) will show the first CREATE TABLE that errors.
+#
+# The MySQL gaps this schema originally hit at `wp core install` (BIGINT
+# UNSIGNED/TINYINT/MEDIUMTEXT/LONGTEXT column types, table-level PRIMARY
+# KEY) have since been fixed — see docs/LIMITATIONS.md's MySQL section for
+# the current state and any gaps discovered by a later run of this script
+# that still remain (e.g. ALTER TABLE, used by dbDelta() on upgrades but
+# not a fresh-install blocker).
 set -uo pipefail
 
 run_start=$(date +%s)
