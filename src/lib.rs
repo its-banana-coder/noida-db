@@ -5,6 +5,7 @@
 //! Each service is a module behind its own Cargo feature.
 
 pub mod config;
+pub mod persistence;
 pub mod services;
 
 #[cfg(feature = "redis")]

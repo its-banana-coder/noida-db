@@ -5,10 +5,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 /// Starts `name` on `addr` with on-disk persistence rooted at `data_dir`:
-/// loads a snapshot from there on startup if one exists, and arranges to
-/// save one back (periodically and/or on clean shutdown — see each
-/// service's own `spawn_persistent` for specifics). A service that
-/// hasn't wired persistence up yet falls back to `start`'s plain
+/// loads a snapshot from there on startup if one exists, and registers a
+/// shutdown hook (via `crate::persistence::on_shutdown`) to save one back
+/// on a clean exit (SIGINT/SIGTERM — see `crate::persistence`). A service
+/// that hasn't wired persistence up yet falls back to `start`'s plain
 /// ephemeral behavior, so this is always safe to call from `main`
 /// regardless of how many services have been migrated.
 // Deliberately a `match` with just one arm for now: each service's own

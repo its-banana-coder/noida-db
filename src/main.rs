@@ -34,6 +34,11 @@ fn main() -> ExitCode {
 fn start(cfg: &Config) -> std::io::Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     println!("noida-db {} | data dir: {}", env!("CARGO_PKG_VERSION"), cfg.data_dir.display());
+    // Before starting any service, so a persistent service's own
+    // `spawn_persistent` can register its shutdown-save hook as soon as
+    // it starts rather than racing a signal that arrives before this is
+    // installed.
+    noida::persistence::install_shutdown_handler();
     for svc in &cfg.services {
         let addr = format!("{}:{}", cfg.host, svc.port);
         match noida::services::start_persistent(svc.name, &addr, &cfg.data_dir) {
