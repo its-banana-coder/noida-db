@@ -29,6 +29,13 @@ pub struct Engine {
     /// can report them in the wire column-definition packets instead of
     /// placeholders. See `plan::column_names`.
     pub last_column_names: Vec<String>,
+    /// The row count `SQL_CALC_FOUND_ROWS` computed (before `LIMIT`
+    /// truncation) for the most recent query that used it, so a later
+    /// `FOUND_ROWS()` call can read it. Unlike `last_insert_id`'s wire
+    /// field, this *does* persist across intervening statements, matching
+    /// real MySQL and how the `LAST_INSERT_ID()` SQL function (not yet
+    /// implemented) would too -- see `Executor::last_found_rows`.
+    pub last_found_rows: u64,
     /// A whole-`DbState` snapshot taken at `BEGIN`/`START TRANSACTION`,
     /// restored verbatim on `ROLLBACK` and discarded on `COMMIT`. This is
     /// deliberately the simplest thing that gives real commit/rollback
@@ -47,6 +54,7 @@ impl Default for Engine {
             last_affected_rows: 0,
             last_insert_id: 0,
             last_column_names: Vec::new(),
+            last_found_rows: 0,
             tx_snapshot: None,
         }
     }
@@ -106,9 +114,11 @@ impl Engine {
         };
 
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
+        executor.last_found_rows = self.last_found_rows;
         let res = executor.execute_plan(plan)?;
         self.last_affected_rows = executor.last_affected_rows;
         self.last_insert_id = executor.last_insert_id;
+        self.last_found_rows = executor.last_found_rows;
 
         // Update current DB if USE was called
         if let Some(db) = executor.current_db {

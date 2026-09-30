@@ -593,3 +593,69 @@ async fn test_mysql_create_table_default_clause() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// `TINYTEXT` (alongside the already-supported `TEXT`/`MEDIUMTEXT`/
+/// `LONGTEXT`) -- WordPress's own `wp_comments.comment_author` column
+/// uses it, and its `CREATE TABLE` silently failed without this (the
+/// comments table just never got created, without erroring the whole
+/// install).
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_tinytext_column_type() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop("CREATE TABLE tinytext_test (author TINYTEXT NOT NULL)").await.unwrap();
+    conn.query_drop("INSERT INTO tinytext_test (author) VALUES ('a commenter')").await.unwrap();
+    let v: String = conn.query_first("SELECT author FROM tinytext_test").await.unwrap().unwrap();
+    assert_eq!(v, "a commenter");
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
+
+/// `SQL_CALC_FOUND_ROWS` + a later `SELECT FOUND_ROWS()` -- exactly what
+/// WordPress's `WP_Query` uses for pagination (`set_found_posts()`).
+/// `FOUND_ROWS()` reports the row count from BEFORE `LIMIT` truncation,
+/// and persists across intervening statements (a plain `SELECT` in
+/// between doesn't reset it), matching real MySQL.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_found_rows() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop("CREATE TABLE found_rows_test (id INT)").await.unwrap();
+    conn.query_drop("INSERT INTO found_rows_test (id) VALUES (1), (2), (3), (4), (5)")
+        .await
+        .unwrap();
+
+    let ids: Vec<i32> = conn
+        .query("SELECT SQL_CALC_FOUND_ROWS id FROM found_rows_test ORDER BY id LIMIT 2")
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![1, 2]);
+
+    let found: i64 = conn.query_first("SELECT FOUND_ROWS()").await.unwrap().unwrap();
+    assert_eq!(found, 5);
+
+    // Persists across an intervening statement.
+    let _: Vec<i32> = conn.query("SELECT id FROM found_rows_test").await.unwrap();
+    let found: i64 = conn.query_first("SELECT FOUND_ROWS()").await.unwrap().unwrap();
+    assert_eq!(found, 5);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

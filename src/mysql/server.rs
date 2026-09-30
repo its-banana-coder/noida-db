@@ -259,6 +259,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             session.engine.current_db.clone(),
                         );
                         executor.params = params;
+                        executor.last_found_rows = session.engine.last_found_rows;
                         let names = {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)
@@ -268,6 +269,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                                 let affected = executor.last_affected_rows;
                                 session.engine.last_affected_rows = affected;
                                 session.engine.last_insert_id = executor.last_insert_id;
+                                session.engine.last_found_rows = executor.last_found_rows;
                                 // COM_STMT_EXECUTE's result set uses the
                                 // binary protocol row format, not the text
                                 // protocol format `send_resultset` (used for

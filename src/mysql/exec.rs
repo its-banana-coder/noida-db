@@ -23,11 +23,27 @@ pub struct Executor {
     /// last, so that's what this tracks. 0 if the last statement wasn't an
     /// INSERT that generated one.
     pub last_insert_id: u64,
+    /// The row count `SQL_CALC_FOUND_ROWS` computed (before `LIMIT`
+    /// truncation) for the most recent query that used it, for a later
+    /// `FOUND_ROWS()` call to read. Unlike `last_insert_id`/
+    /// `last_affected_rows`, callers seed this from the connection's
+    /// previous value before executing a statement (see `Engine::execute`
+    /// and the `COM_STMT_EXECUTE` handler), since -- matching real
+    /// MySQL -- it persists across intervening statements rather than
+    /// resetting to 0 each time.
+    pub last_found_rows: u64,
 }
 
 impl Executor {
     pub fn new(db: Arc<Mutex<DbState>>, current_db: Option<String>) -> Self {
-        Self { db, current_db, params: Vec::new(), last_affected_rows: 0, last_insert_id: 0 }
+        Self {
+            db,
+            current_db,
+            params: Vec::new(),
+            last_affected_rows: 0,
+            last_insert_id: 0,
+            last_found_rows: 0,
+        }
     }
 
     /// Finds the `Table` a plan's rows ultimately come from, for resolving
@@ -385,9 +401,13 @@ impl Executor {
                 }
                 Ok(out_rows)
             }
-            Plan::Sort { source, keys, limit, offset } => {
+            Plan::Sort { source, keys, limit, offset, calc_found_rows } => {
                 let table_context = self.resolve_table_context(&source)?;
                 let mut rows = self.execute_plan(*source)?;
+
+                if calc_found_rows {
+                    self.last_found_rows = rows.len() as u64;
+                }
 
                 if !keys.is_empty() {
                     // Evaluate every sort key once per row up front rather
@@ -484,6 +504,7 @@ impl Executor {
             Expr::Const(v) => Ok(v.clone()),
             Expr::Param(i) => Ok(self.params.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::Col(i) => Ok(row.get(*i).cloned().unwrap_or(Value::Null)),
+            Expr::FoundRows => Ok(Value::Int(self.last_found_rows as i64)),
             Expr::ColName(name) => {
                 if let Some(t) = table
                     && let Some(idx) = t.columns.iter().position(|c| c.name == *name)

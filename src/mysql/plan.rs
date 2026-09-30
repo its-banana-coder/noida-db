@@ -46,6 +46,13 @@ pub enum Expr {
     /// `Executor`'s own handling), not evaluated as a single value the
     /// way every other `Expr` variant is.
     Wildcard,
+    /// `FOUND_ROWS()` -- the count `SQL_CALC_FOUND_ROWS` computed for the
+    /// most recent query that used it, on this connection, persisting
+    /// across intervening statements the same way MySQL's own
+    /// `LAST_INSERT_ID()` does (a real SQL function, not the wire
+    /// protocol field). See `Plan::Sort`'s `calc_found_rows` and
+    /// `Executor::last_found_rows`.
+    FoundRows,
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Compare {
@@ -183,6 +190,11 @@ pub enum Plan {
         keys: Vec<(Expr, bool)>, // (expr, ascending)
         limit: Option<u64>,
         offset: Option<u64>,
+        /// Real MySQL's `SQL_CALC_FOUND_ROWS` select modifier: when set,
+        /// the row count *before* `limit`/`offset` truncation is recorded
+        /// (see `Executor`'s handling) for a later `FOUND_ROWS()` call to
+        /// read.
+        calc_found_rows: bool,
     },
 }
 
