@@ -23,10 +23,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  real-apps:
+  # Each app is its own job (not sequential steps in one job) so that one
+  # app's failure -- or flakiness, e.g. Gitea's own async merge-readiness
+  # checks -- can't prevent the others from running and reporting their
+  # own real signal.
+  gitea:
     runs-on: ubuntu-latest
-    # No service containers needed -- each script under tests/apps/ starts
-    # its own noida-db instance with the services it needs.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: tests/apps/gitea/run.sh
+  miniflux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: tests/apps/miniflux/run.sh
+  wordpress:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -34,9 +48,4 @@ jobs:
         with:
           php-version: "8.2"
           extensions: mysqli
-      # Real Gitea (git server) against noida-db's Postgres + Redis.
-      - run: tests/apps/gitea/run.sh
-      # Real Miniflux (RSS reader) against noida-db's Postgres.
-      - run: tests/apps/miniflux/run.sh
-      # Real WordPress (via WP-CLI) against noida-db's MySQL.
       - run: tests/apps/wordpress/run.sh
