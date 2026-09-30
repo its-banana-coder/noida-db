@@ -19,6 +19,8 @@ pub fn start_persistent(name: &str, addr: &str, data_dir: &Path) -> Option<io::R
         "postgres" => Some(crate::postgres::server::spawn_persistent(addr, data_dir)),
         #[cfg(feature = "elasticsearch")]
         "elasticsearch" => Some(crate::elasticsearch::spawn_persistent(addr, data_dir)),
+        #[cfg(feature = "redis")]
+        "redis" => Some(crate::redis::server::spawn_persistent(addr, data_dir)),
         _ => {
             let _ = data_dir;
             start(name, addr)

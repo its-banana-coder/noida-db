@@ -524,3 +524,72 @@ async fn test_mysql_real_column_names() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// `SELECT *` and `SELECT table.*` were entirely unhandled before (hit
+/// the generic "unsupported select item" error) -- arguably the single
+/// most common `SELECT` shape of all. Covers both forms, real column
+/// names for the expanded columns, and mixing a wildcard with an
+/// explicit column in the same projection.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_select_star() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop("CREATE TABLE star_test (id INT, name VARCHAR(255))").await.unwrap();
+    conn.query_drop("INSERT INTO star_test (id, name) VALUES (1, 'a')").await.unwrap();
+
+    // Bare `SELECT *`.
+    let row: mysql_async::Row = conn.query_first("SELECT * FROM star_test").await.unwrap().unwrap();
+    assert_eq!(row.get::<i32, _>("id"), Some(1));
+    assert_eq!(row.get::<String, _>("name"), Some("a".to_string()));
+
+    // Qualified `table.*` -- what WordPress's own queries use.
+    let row: mysql_async::Row =
+        conn.query_first("SELECT star_test.* FROM star_test").await.unwrap().unwrap();
+    assert_eq!(row.get::<i32, _>("id"), Some(1));
+    assert_eq!(row.get::<String, _>("name"), Some("a".to_string()));
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
+
+/// A column with an explicit `DEFAULT` (e.g. WordPress's own
+/// `comment_count bigint(20) NOT NULL default '0'`) used to be silently
+/// discarded entirely at `CREATE TABLE` time, so omitting that column
+/// from an `INSERT`'s column list incorrectly hit MySQL's "doesn't have
+/// a default value" error even though the schema had one.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_create_table_default_clause() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop(
+        "CREATE TABLE default_test (id INT, comment_count BIGINT NOT NULL DEFAULT '0')",
+    )
+    .await
+    .unwrap();
+
+    // Omits comment_count entirely -- must fall back to the real default,
+    // not error.
+    conn.query_drop("INSERT INTO default_test (id) VALUES (1)").await.unwrap();
+    let row: (i32, i64) =
+        conn.query_first("SELECT id, comment_count FROM default_test").await.unwrap().unwrap();
+    assert_eq!(row, (1, 0));
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

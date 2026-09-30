@@ -1,5 +1,6 @@
 //! The Redis keyspace, connected clients, and command dispatch.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 pub const NUM_DBS: usize = 16;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Data {
     Str(Vec<u8>),
     Hash(Hash),
@@ -49,7 +50,7 @@ pub struct Limits {
     pub intset: usize,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Hash {
     pub map: OrderedMap,
     /// Converted to Redis's hashtable encoding; like Redis, never goes back.
@@ -69,7 +70,7 @@ impl Hash {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub data: Data,
     /// Absolute expiry in unix milliseconds.
@@ -95,6 +96,26 @@ pub struct Db {
     /// Keys added since the engine last looked, in order: they may wake
     /// blocked clients (Redis's `signalKeyAsReady` from `dbAdd`).
     pub(crate) added: Vec<Vec<u8>>,
+}
+
+// `map`'s `Vec<u8>` keys aren't valid JSON object keys (serde_json errors
+// at runtime, "key must be a string"), so this serializes it as a plain
+// list of pairs instead. `added` is transient in-process signaling state
+// (which keys changed since the engine last looked, to wake blocked
+// clients) -- meaningless across a restart, so it's just left empty on
+// load rather than persisted.
+impl Serialize for Db {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let entries: Vec<(&Vec<u8>, &Entry)> = self.map.iter().collect();
+        entries.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Db {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let entries: Vec<(Vec<u8>, Entry)> = Vec::deserialize(d)?;
+        Ok(Db { map: entries.into_iter().collect(), added: Vec::new() })
+    }
 }
 
 impl Db {

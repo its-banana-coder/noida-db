@@ -100,7 +100,10 @@ impl Engine {
 
         let mut binder = Binder::new(self.current_db.clone());
         let plan = binder.bind_statement(stmt)?;
-        self.last_column_names = plan::column_names(&plan);
+        self.last_column_names = {
+            let state = self.db.lock().unwrap();
+            plan::column_names(&plan, &state)
+        };
 
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
         let res = executor.execute_plan(plan)?;

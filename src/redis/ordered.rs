@@ -1,12 +1,34 @@
 //! An insertion-ordered map. Redis keeps small hashes (and sets) in
 //! insertion order, and clients see that order in HGETALL and friends.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default)]
 pub struct OrderedMap {
     entries: Vec<(Vec<u8>, Vec<u8>)>,
     index: HashMap<Vec<u8>, usize>,
+}
+
+// `index` is fully derivable from `entries` (it's just an insertion-order
+// lookup cache), so persistence only needs to save/restore `entries` --
+// serializing `index` itself would also hit serde_json's "map key must be
+// a string" restriction, since it's keyed by `Vec<u8>`.
+impl Serialize for OrderedMap {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.entries.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedMap {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::deserialize(d)?;
+        let mut m = OrderedMap::default();
+        for (k, v) in entries {
+            m.insert(k, v);
+        }
+        Ok(m)
+    }
 }
 
 impl OrderedMap {
@@ -61,6 +83,25 @@ impl OrderedMap {
 pub struct OrderedSet {
     items: Vec<Vec<u8>>,
     index: HashMap<Vec<u8>, usize>,
+}
+
+// Same reasoning as `OrderedMap`'s impls above: `index` is derived from
+// `items`, so only `items` needs to round-trip.
+impl Serialize for OrderedSet {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedSet {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let items: Vec<Vec<u8>> = Vec::deserialize(d)?;
+        let mut s = OrderedSet::default();
+        for v in items {
+            s.insert(&v);
+        }
+        Ok(s)
+    }
 }
 
 impl OrderedSet {

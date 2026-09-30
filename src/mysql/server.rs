@@ -259,7 +259,10 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             session.engine.current_db.clone(),
                         );
                         executor.params = params;
-                        let names = plan::column_names(&stmt_plan);
+                        let names = {
+                            let state = session.engine.db.lock().unwrap();
+                            plan::column_names(&stmt_plan, &state)
+                        };
                         match executor.execute_plan(stmt_plan) {
                             Ok(rows) => {
                                 let affected = executor.last_affected_rows;
