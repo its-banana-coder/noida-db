@@ -411,3 +411,59 @@ async fn test_mysql_in_list() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// `ORDER BY`, `LIMIT`/`OFFSET` (both the standard and MySQL's own
+/// `LIMIT offset, limit` syntax), qualified column references
+/// (`table.col`, `AstExpr::CompoundIdentifier`), and `ORDER BY` on a
+/// column that isn't in the `SELECT` list at all -- all four were
+/// entirely unhandled before. This is exactly the shape of WordPress's
+/// own frontend post-listing query (`SELECT ... wp_posts.ID FROM wp_posts
+/// WHERE ... ORDER BY wp_posts.post_date DESC LIMIT 0, 1`), which is what
+/// surfaced the gap.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_order_by_limit() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop("CREATE TABLE ob_test (id INT, created INT)").await.unwrap();
+    conn.query_drop(
+        "INSERT INTO ob_test (id, created) VALUES (1, 30), (2, 10), (3, 20), (4, NULL)",
+    )
+    .await
+    .unwrap();
+
+    // Plain ORDER BY ASC (default), NULL sorts first.
+    let res: Vec<i32> = conn.query("SELECT id FROM ob_test ORDER BY created").await.unwrap();
+    assert_eq!(res, vec![4, 2, 3, 1]);
+
+    // DESC, qualified column reference, and a column not in the SELECT
+    // list -- exactly WordPress's own query shape.
+    let res: Vec<i32> =
+        conn.query("SELECT ob_test.id FROM ob_test ORDER BY ob_test.created DESC").await.unwrap();
+    assert_eq!(res, vec![1, 3, 2, 4]);
+
+    // Standard LIMIT/OFFSET.
+    let res: Vec<i32> =
+        conn.query("SELECT id FROM ob_test ORDER BY created DESC LIMIT 2 OFFSET 1").await.unwrap();
+    assert_eq!(res, vec![3, 2]);
+
+    // MySQL's own `LIMIT offset, limit` syntax (order reversed from the
+    // standard form above) -- what WordPress's own query actually uses.
+    let res: Vec<i32> =
+        conn.query("SELECT id FROM ob_test ORDER BY created DESC LIMIT 1, 2").await.unwrap();
+    assert_eq!(res, vec![3, 2]);
+
+    // A bare LIMIT with no ORDER BY still works.
+    let res: Vec<i32> = conn.query("SELECT id FROM ob_test LIMIT 2").await.unwrap();
+    assert_eq!(res.len(), 2);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

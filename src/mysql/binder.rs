@@ -4,9 +4,9 @@ use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, JoinOp, Plan, contains_a
 use crate::mysql::types::Value;
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
-    Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins,
-    Value as AstValue,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
+    ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, Statement, TableConstraint,
+    TableFactor, TableWithJoins, Value as AstValue,
 };
 use std::collections::HashMap;
 
@@ -327,6 +327,8 @@ impl Binder {
     }
 
     fn bind_query(&mut self, query: Query) -> Result<Plan, MySqlError> {
+        let order_by = query.order_by;
+        let limit_clause = query.limit_clause;
         match *query.body {
             SetExpr::Select(select) => {
                 let mut source =
@@ -335,6 +337,43 @@ impl Binder {
                 if let Some(selection) = select.selection {
                     let pred = self.bind_expr(selection)?;
                     source = Plan::Filter { source: Box::new(source), predicate: pred };
+                }
+
+                // `ORDER BY`/`LIMIT`/`OFFSET` sit between the row source and
+                // the projection (see `Plan::Sort`'s own doc comment for
+                // why), so this has to happen here, before `exprs`/`names`
+                // are built below.
+                let keys = match order_by {
+                    Some(sqlparser::ast::OrderBy {
+                        kind: OrderByKind::Expressions(exprs), ..
+                    }) => exprs
+                        .into_iter()
+                        .map(|e| {
+                            let asc = !matches!(e.options.sort, Some(OrderBySort::Desc));
+                            Ok((self.bind_expr(e.expr)?, asc))
+                        })
+                        .collect::<Result<Vec<_>, MySqlError>>()?,
+                    Some(sqlparser::ast::OrderBy { kind: OrderByKind::All(_), .. }) => {
+                        return Err(MySqlError::unsupported("ORDER BY ALL"));
+                    }
+                    None => Vec::new(),
+                };
+                let (limit, offset) = match limit_clause {
+                    Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+                        if !limit_by.is_empty() {
+                            return Err(MySqlError::unsupported("LIMIT BY"));
+                        }
+                        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
+                        let offset = offset.as_ref().map(|o| expr_to_u64(&o.value)).transpose()?;
+                        (limit, offset)
+                    }
+                    Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                        (Some(expr_to_u64(&limit)?), Some(expr_to_u64(&offset)?))
+                    }
+                    None => (None, None),
+                };
+                if !keys.is_empty() || limit.is_some() || offset.is_some() {
+                    source = Plan::Sort { source: Box::new(source), keys, limit, offset };
                 }
 
                 let group_exprs: Vec<Expr> = match select.group_by {
@@ -448,6 +487,22 @@ impl Binder {
                 } else {
                     Ok(Expr::ColName(ident.value.clone()))
                 }
+            }
+            // A qualified column reference (`table.col`, or even
+            // `db.table.col`) -- this engine resolves a plain `Expr::ColName`
+            // by name against whichever single table is in scope for the
+            // row being evaluated (see `Executor::eval_expr`'s `ColName`
+            // arm), so the table/db qualifier itself is dropped and only
+            // the final part (the actual column name) is kept. That's
+            // exactly right for the single-table queries this engine
+            // supports today; it would be ambiguous for a real join between
+            // two tables sharing a column name, but joins aren't bound
+            // through this path.
+            AstExpr::CompoundIdentifier(idents) => {
+                let last = idents
+                    .last()
+                    .ok_or_else(|| MySqlError::unsupported("empty compound identifier"))?;
+                Ok(Expr::ColName(last.value.clone()))
             }
             AstExpr::BinaryOp { left, op, right } => {
                 let l = self.bind_expr(*left)?;
@@ -589,4 +644,17 @@ impl Binder {
             Err(MySqlError::syntax_error("invalid table name"))
         }
     }
+}
+
+/// Extracts a `LIMIT`/`OFFSET` value: real MySQL only accepts a plain
+/// non-negative integer literal there (no expressions, no placeholders),
+/// so this rejects anything else rather than trying to evaluate it.
+fn expr_to_u64(expr: &AstExpr) -> Result<u64, MySqlError> {
+    if let AstExpr::Value(sqlparser::ast::ValueWithSpan { value: AstValue::Number(s, _), .. }) =
+        expr
+        && let Ok(n) = s.parse::<u64>()
+    {
+        return Ok(n);
+    }
+    Err(MySqlError::unsupported("LIMIT/OFFSET value"))
 }
