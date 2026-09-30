@@ -4,7 +4,8 @@
 use std::sync::OnceLock;
 
 use super::catalog::{
-    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, PG_CATALOG_NS, RelKind, Row, SeqValue,
+    ConstraintKind, DbState, INFORMATION_SCHEMA_NS, Index, PG_CATALOG_NS, RelKind, Row, SeqValue,
+    Table,
 };
 use super::error::PgResult;
 use super::exec::Ctx;
@@ -409,18 +410,26 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 let ncols = columns(name).len() as i64;
                 out.push(pg_class_row(oid, name, schema, kind, ncols, 0, false, 0, 0));
             }
+            // Foreign keys are triggers in Postgres; psql looks for them (to
+            // print "Foreign-key constraints" and "Referenced by") only when
+            // relhastriggers is set. Computed once, in a single pass over
+            // every table's constraints, rather than — as this used to —
+            // re-scanning every table for every table: with a schema the
+            // size of a real production app's (Gitea's own migration has
+            // ~115 tables), that quadratic-per-query cost adds up fast
+            // across the many catalog queries a real ORM issues at startup.
+            let mut tables_with_triggers: std::collections::HashSet<u32> =
+                std::collections::HashSet::new();
+            for o in db.tables.values() {
+                for c in &o.constraints {
+                    if let ConstraintKind::ForeignKey { ref_table, .. } = &c.kind {
+                        tables_with_triggers.insert(o.oid);
+                        tables_with_triggers.insert(*ref_table);
+                    }
+                }
+            }
             for tb in db.tables.values() {
-                // Foreign keys are triggers in Postgres; psql looks for them
-                // (to print "Foreign-key constraints" and "Referenced by")
-                // only when relhastriggers is set.
-                let has_triggers = db.tables.values().any(|o| {
-                    o.constraints.iter().any(|c| match &c.kind {
-                        ConstraintKind::ForeignKey { ref_table, .. } => {
-                            o.oid == tb.oid || *ref_table == tb.oid
-                        }
-                        _ => false,
-                    })
-                });
+                let has_triggers = tables_with_triggers.contains(&tb.oid);
                 let mut row = pg_class_row(
                     tb.oid,
                     &tb.name,
@@ -957,7 +966,7 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         t(&tb.name),
                         t(&idx.name),
                         NULL,
-                        index_def(db, idx.oid).map_or(NULL, t),
+                        t(index_def_for(db, tb, idx)),
                     ]);
                 }
             }
@@ -1692,35 +1701,46 @@ pub fn constraint_def(db: &DbState, oid: u32, path: &[String]) -> Option<String>
     None
 }
 
-/// `pg_get_indexdef`.
+/// The `CREATE INDEX ...` text for one index, given its owning table —
+/// callers that already have both in hand (like `pg_indexes` below) should
+/// call this directly instead of `index_def`, which has to re-find the
+/// owning table by scanning every table in the database.
+fn index_def_for(db: &DbState, tb: &Table, i: &Index) -> String {
+    let mut keys = vec![];
+    let mut exprs = i.exprs.iter();
+    for (k, c) in i.cols.iter().enumerate() {
+        let mut s = match c {
+            Some(idx) => super::funcs::quote_ident(&tb.columns[*idx].name),
+            None => format!("({})", exprs.next().cloned().unwrap_or_default()),
+        };
+        if i.desc.get(k).copied().unwrap_or(false) {
+            s.push_str(" DESC");
+        }
+        keys.push(s);
+    }
+    let mut s = format!(
+        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+        if i.unique { "UNIQUE " } else { "" },
+        super::funcs::quote_ident(&i.name),
+        super::funcs::quote_ident(db.schema_name(tb.schema)),
+        super::funcs::quote_ident(&tb.name),
+        i.method,
+        keys.join(", ")
+    );
+    if let Some(p) = &i.predicate {
+        s.push_str(&format!(" WHERE {p}"));
+    }
+    s
+}
+
+/// `pg_get_indexdef`: only has an oid to go on, so it has to search for the
+/// owning table. Not called in a per-row hot loop (unlike `pg_indexes`,
+/// which already has the table and calls `index_def_for` directly).
 pub fn index_def(db: &DbState, oid: u32) -> Option<String> {
     for tb in db.tables.values() {
-        let Some(i) = tb.indexes.iter().find(|i| i.oid == oid) else { continue };
-        let mut keys = vec![];
-        let mut exprs = i.exprs.iter();
-        for (k, c) in i.cols.iter().enumerate() {
-            let mut s = match c {
-                Some(idx) => super::funcs::quote_ident(&tb.columns[*idx].name),
-                None => format!("({})", exprs.next().cloned().unwrap_or_default()),
-            };
-            if i.desc.get(k).copied().unwrap_or(false) {
-                s.push_str(" DESC");
-            }
-            keys.push(s);
+        if let Some(i) = tb.indexes.iter().find(|i| i.oid == oid) {
+            return Some(index_def_for(db, tb, i));
         }
-        let mut s = format!(
-            "CREATE {}INDEX {} ON {}.{} USING {} ({})",
-            if i.unique { "UNIQUE " } else { "" },
-            super::funcs::quote_ident(&i.name),
-            super::funcs::quote_ident(db.schema_name(tb.schema)),
-            super::funcs::quote_ident(&tb.name),
-            i.method,
-            keys.join(", ")
-        );
-        if let Some(p) = &i.predicate {
-            s.push_str(&format!(" WHERE {p}"));
-        }
-        return Some(s);
     }
     None
 }
