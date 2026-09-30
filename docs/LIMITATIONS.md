@@ -416,9 +416,15 @@ literal-only `SELECT` expressions (numeric/string/NULL literals,
 `+ - * /`, integer division formats as a 4-decimal-place string matching
 MySQL's `div_precision_increment` default rather than a bare float,
 comparisons `= <> < <= > >=` with three-valued NULL logic, `AND`/`OR`)
-and real tables: `CREATE TABLE` (`INT`/`BIGINT`/`VARCHAR`/`TEXT`/
-`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
-`NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`), `INSERT INTO ...
+and real tables: `CREATE TABLE` (`INT`/`TINYINT`/`SMALLINT`/`MEDIUMINT`/
+`BIGINT` and their `UNSIGNED` forms/`VARCHAR`/`TEXT`/`MEDIUMTEXT`/
+`LONGTEXT`/`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
+`NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`, including a
+table-level `PRIMARY KEY (...)` clause — the form WordPress's own core
+schema always uses rather than a column option; `UNSIGNED` and the
+various display-width integer variants are accepted but not
+distinguished from their plain/signed counterparts, since every integer
+is stored as a plain `i64` regardless), `INSERT INTO ...
 VALUES (...), ...`, `SELECT` with `WHERE` and basic `INNER`/`LEFT`/cross
 `JOIN`, `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`,
 `SHOW DATABASES`/`SHOW TABLES`/`SHOW COLUMNS FROM`/`SHOW CREATE TABLE`,
@@ -500,6 +506,16 @@ to run against a `mysql_native_password`-configured reference server.
 - `LAST_INSERT_ID()` as a callable SQL function (the OK packet's own
   `last_insert_id` field is real — see above — but a session-persisted
   value queryable via SQL isn't implemented).
+- `UNIQUE`/`FOREIGN KEY`/`KEY`/`INDEX`/`FULLTEXT`/`SPATIAL` constraints,
+  column-level or table-level, are accepted (not a parse error) but
+  never enforced — no duplicate-key rejection, no referential integrity,
+  no real indexing. A table-level `PRIMARY KEY` is the one exception
+  that's tracked (see above), though still not enforced as unique.
+- `ALTER TABLE`.
+- Multiple semicolon-separated statements in one `COM_QUERY` (only the
+  first is executed).
+- `SHOW TABLES LIKE '...'` ignores the `LIKE` filter and returns every
+  table.
 - Authentication (every password is currently accepted).
 
 ## Memcached
