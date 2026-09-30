@@ -1,6 +1,7 @@
 use crate::mysql::binder::Binder;
 use crate::mysql::engine::Engine;
-use crate::mysql::plan::Plan;
+use crate::mysql::error::MySqlError;
+use crate::mysql::plan::{self, Plan};
 use crate::mysql::types::Value;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -26,11 +27,20 @@ struct Session {
     engine: Engine,
     stmt_id_counter: u32,
     prepared_stmts: HashMap<u32, (String, Plan, u16)>, // ID -> (sql, Plan, num_params)
+    // Parameter type codes from the last `COM_STMT_EXECUTE` that actually
+    // sent them (the `new-params-bound-flag` byte), keyed by stmt id. A
+    // real client is free to omit resending types on a later `EXECUTE` of
+    // the same statement, reusing what it sent before.
+    stmt_param_types: HashMap<u32, Vec<(u8, u8)>>,
 }
 
 fn serve(mut stream: TcpStream) -> io::Result<()> {
-    let mut session =
-        Session { engine: Engine::new(), stmt_id_counter: 1, prepared_stmts: HashMap::new() };
+    let mut session = Session {
+        engine: Engine::new(),
+        stmt_id_counter: 1,
+        prepared_stmts: HashMap::new(),
+        stmt_param_types: HashMap::new(),
+    };
 
     // Send Handshake
     let handshake = b"\x0a\x35\x2e\x35\x2e\x35\x2d\x31\x30\x2e\x34\x2e\x32\x32\x2d\x4d\x61\x72\x69\x61\x44\x42\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xff\xff\x21\x02\x00\x0f\xc0\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
@@ -77,14 +87,15 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                 // Init DB
                 let db = String::from_utf8_lossy(&payload[1..]);
                 session.engine.use_db(&db);
-                let _ = send_ok(&mut stream, seq.wrapping_add(1));
+                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0);
             }
             0x03 => {
                 // Query
                 let q = String::from_utf8_lossy(&payload[1..]);
                 match session.engine.execute(&q) {
                     Ok(rows) => {
-                        let _ = send_resultset(&mut stream, seq.wrapping_add(1), rows);
+                        let affected = session.engine.last_affected_rows;
+                        let _ = send_resultset(&mut stream, seq.wrapping_add(1), rows, affected);
                     }
                     Err(e) => {
                         let _ = send_err(
@@ -120,7 +131,7 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                                 let stmt_id = session.stmt_id_counter;
                                 session.stmt_id_counter += 1;
 
-                                let num_params = count_params(&plan) as u16;
+                                let num_params = plan::count_params(&plan) as u16;
                                 let num_columns: u16 = 0; // Simplified
 
                                 session
@@ -134,7 +145,28 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                                 prep_ok.extend_from_slice(&num_params.to_le_bytes());
                                 prep_ok.push(0x00); // filter
                                 prep_ok.extend_from_slice(&[0x00, 0x00]); // warnings
-                                let _ = write_packet(&mut stream, seq.wrapping_add(1), &prep_ok);
+                                let mut next_seq = seq.wrapping_add(1);
+                                let _ = write_packet(&mut stream, next_seq, &prep_ok);
+                                next_seq = next_seq.wrapping_add(1);
+
+                                // Real clients (e.g. mysql_async) parse the
+                                // protocol strictly: reporting a non-zero
+                                // `num_params` above commits us to actually
+                                // sending that many parameter-definition
+                                // packets (content is otherwise unused by
+                                // clients — the real type comes from
+                                // COM_STMT_EXECUTE's own type codes) plus a
+                                // closing EOF, or the client blocks forever
+                                // waiting for them.
+                                for _ in 0..num_params {
+                                    let coldef = column_def_packet("?", None);
+                                    let _ = write_packet(&mut stream, next_seq, &coldef);
+                                    next_seq = next_seq.wrapping_add(1);
+                                }
+                                if num_params > 0 {
+                                    let eof = b"\xfe\x00\x00\x02\x00";
+                                    let _ = write_packet(&mut stream, next_seq, eof);
+                                }
                             }
                             Err(e) => {
                                 let _ = send_err(
@@ -159,8 +191,12 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                 }
             }
             0x17 => {
-                // Stmt Execute
-                if payload.len() < 5 {
+                // Stmt Execute: header is
+                // 1 (command) + 4 (stmt-id) + 1 (flags) + 4 (iteration-count),
+                // then — only if num_params > 0 — a null-bitmap, a
+                // new-params-bound-flag byte, optionally per-parameter type
+                // codes, then the binary-protocol-encoded values.
+                if payload.len() < 10 {
                     let _ = send_err(
                         &mut stream,
                         seq.wrapping_add(1),
@@ -171,30 +207,11 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                     continue;
                 }
                 let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                let mut pos = 10;
 
-                if let Some((_sql, plan, _num_params)) = session.prepared_stmts.get(&stmt_id) {
-                    // For now, assume no parameters and execute the plan directly.
-                    // Parameter binding logic would require extracting the null bitmap
-                    // and types from the payload, then updating the plan params.
-                    let mut executor = crate::mysql::exec::Executor::new(
-                        session.engine.db.clone(),
-                        session.engine.current_db.clone(),
-                    );
-                    match executor.execute_plan(plan.clone()) {
-                        Ok(rows) => {
-                            let _ = send_resultset(&mut stream, seq.wrapping_add(1), rows);
-                        }
-                        Err(e) => {
-                            let _ = send_err(
-                                &mut stream,
-                                seq.wrapping_add(1),
-                                e.code,
-                                e.sql_state,
-                                &e.message,
-                            );
-                        }
-                    }
-                } else {
+                let Some((_sql, stmt_plan, num_params)) =
+                    session.prepared_stmts.get(&stmt_id).cloned()
+                else {
                     let _ = send_err(
                         &mut stream,
                         seq.wrapping_add(1),
@@ -202,6 +219,59 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                         "HY000",
                         "Unknown prepared statement handler",
                     );
+                    continue;
+                };
+
+                match decode_execute_params(
+                    &payload,
+                    &mut pos,
+                    stmt_id,
+                    num_params as usize,
+                    &mut session,
+                ) {
+                    Ok(params) => {
+                        let mut executor = crate::mysql::exec::Executor::new(
+                            session.engine.db.clone(),
+                            session.engine.current_db.clone(),
+                        );
+                        executor.params = params;
+                        match executor.execute_plan(stmt_plan) {
+                            Ok(rows) => {
+                                let affected = executor.last_affected_rows;
+                                // COM_STMT_EXECUTE's result set uses the
+                                // binary protocol row format, not the text
+                                // protocol format `send_resultset` (used for
+                                // COM_QUERY) sends — a real client (verified
+                                // against `mysql_async`) misreads the bytes
+                                // (silently, as garbage/NULL values, not an
+                                // error) if the two are mixed up.
+                                let _ = send_binary_resultset(
+                                    &mut stream,
+                                    seq.wrapping_add(1),
+                                    rows,
+                                    affected,
+                                );
+                            }
+                            Err(e) => {
+                                let _ = send_err(
+                                    &mut stream,
+                                    seq.wrapping_add(1),
+                                    e.code,
+                                    e.sql_state,
+                                    &e.message,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = send_err(
+                            &mut stream,
+                            seq.wrapping_add(1),
+                            e.code,
+                            e.sql_state,
+                            &e.message,
+                        );
+                    }
                 }
             }
             0x19 => {
@@ -214,10 +284,10 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
             }
             0x1a => {
                 // Stmt Reset
-                let _ = send_ok(&mut stream, seq.wrapping_add(1));
+                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0);
             }
             _ => {
-                let _ = send_ok(&mut stream, seq.wrapping_add(1));
+                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0);
             }
         }
     }
@@ -234,8 +304,14 @@ fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> io::Result<(
     Ok(())
 }
 
-fn send_ok(stream: &mut TcpStream, seq: u8) -> io::Result<()> {
-    write_packet(stream, seq, b"\x00\x00\x00\x02\x00\x00\x00")
+fn send_ok(stream: &mut TcpStream, seq: u8, affected_rows: u64) -> io::Result<()> {
+    let mut payload = Vec::new();
+    payload.push(0x00);
+    write_lenenc_int(&mut payload, affected_rows);
+    write_lenenc_int(&mut payload, 0); // last_insert_id: not tracked yet
+    payload.extend_from_slice(&0x0002u16.to_le_bytes()); // status flags: SERVER_STATUS_AUTOCOMMIT
+    payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
+    write_packet(stream, seq, &payload)
 }
 
 fn send_err(
@@ -290,9 +366,14 @@ fn column_def_packet(name: &str, val: Option<&Value>) -> Vec<u8> {
     p
 }
 
-fn send_resultset(stream: &mut TcpStream, mut seq: u8, rows: Vec<Vec<Value>>) -> io::Result<()> {
+fn send_resultset(
+    stream: &mut TcpStream,
+    mut seq: u8,
+    rows: Vec<Vec<Value>>,
+    affected_rows: u64,
+) -> io::Result<()> {
     if rows.is_empty() {
-        return send_ok(stream, seq);
+        return send_ok(stream, seq, affected_rows);
     }
 
     let cols = rows[0].len();
@@ -314,27 +395,10 @@ fn send_resultset(stream: &mut TcpStream, mut seq: u8, rows: Vec<Vec<Value>>) ->
     for row in rows {
         let mut row_payload = Vec::new();
         for val in row {
-            match val {
-                Value::Text(s) => {
-                    row_payload.push(s.len() as u8);
-                    row_payload.extend_from_slice(s.as_bytes());
-                }
-                Value::Int(i) => {
-                    let s = i.to_string();
-                    row_payload.push(s.len() as u8);
-                    row_payload.extend_from_slice(s.as_bytes());
-                }
-                Value::Float(f) => {
-                    let s = f.to_string();
-                    row_payload.push(s.len() as u8);
-                    row_payload.extend_from_slice(s.as_bytes());
-                }
-                Value::Null => {
-                    row_payload.push(0xfb);
-                }
-                _ => {
-                    row_payload.push(0);
-                }
+            if val.is_null() {
+                row_payload.push(0xfb);
+            } else {
+                encode_lenenc_value(&mut row_payload, &val);
             }
         }
         write_packet(stream, seq, &row_payload)?;
@@ -346,7 +410,251 @@ fn send_resultset(stream: &mut TcpStream, mut seq: u8, rows: Vec<Vec<Value>>) ->
     Ok(())
 }
 
-fn count_params(_plan: &Plan) -> usize {
-    // Basic stub for parameters count. Ideally, would traverse the `Plan` AST.
-    0
+/// Length-encodes one non-NULL value as text (a length-encoded string),
+/// the representation both the text protocol and (with `VAR_STRING`
+/// column typing) the binary protocol use for every value this engine
+/// produces. Callers handle `Value::Null` themselves — its wire
+/// representation (`0xfb`) isn't a length-prefixed value at all.
+fn encode_lenenc_value(payload: &mut Vec<u8>, val: &Value) {
+    let s = match val {
+        Value::Text(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Null => return,
+        _ => String::new(),
+    };
+    write_lenenc_int(payload, s.len() as u64);
+    payload.extend_from_slice(s.as_bytes());
+}
+
+/// Sends a `COM_STMT_EXECUTE` result set using the MySQL **binary**
+/// protocol row format (distinct from `send_resultset`'s text protocol
+/// format, which `COM_QUERY` uses). Every column is declared as
+/// `VAR_STRING` regardless of its value's real type — the binary
+/// protocol's per-column wire encoding is dictated by the declared column
+/// type (e.g. `LONG` means 4 raw little-endian bytes, not a
+/// length-encoded string), so claiming `VAR_STRING` lets every value use
+/// the one lenenc-string encoder above, matching this engine's
+/// "simple over performant" approach and how the text protocol path
+/// already represents every value as text on the wire.
+fn send_binary_resultset(
+    stream: &mut TcpStream,
+    mut seq: u8,
+    rows: Vec<Vec<Value>>,
+    affected_rows: u64,
+) -> io::Result<()> {
+    if rows.is_empty() {
+        return send_ok(stream, seq, affected_rows);
+    }
+
+    let cols = rows[0].len();
+    write_packet(stream, seq, &[cols as u8])?;
+    seq = seq.wrapping_add(1);
+
+    for i in 0..cols {
+        let name = format!("col{i}");
+        let coldef = column_def_packet(&name, None); // force VAR_STRING typing
+        write_packet(stream, seq, &coldef)?;
+        seq = seq.wrapping_add(1);
+    }
+
+    let eof = b"\xfe\x00\x00\x02\x00";
+    write_packet(stream, seq, eof)?;
+    seq = seq.wrapping_add(1);
+
+    // Binary Protocol Resultset Row: a 0x00 header byte, then a null
+    // bitmap covering the columns offset by 2 bits (the first 2 bits are
+    // reserved), then the non-NULL values in declared-type order.
+    let bitmap_len = (cols + 2).div_ceil(8);
+    for row in rows {
+        let mut row_payload = vec![0x00];
+        let mut bitmap = vec![0u8; bitmap_len];
+        for (i, val) in row.iter().enumerate() {
+            if val.is_null() {
+                let bit_pos = i + 2;
+                bitmap[bit_pos / 8] |= 1 << (bit_pos % 8);
+            }
+        }
+        row_payload.extend_from_slice(&bitmap);
+        for val in &row {
+            if !val.is_null() {
+                encode_lenenc_value(&mut row_payload, val);
+            }
+        }
+        write_packet(stream, seq, &row_payload)?;
+        seq = seq.wrapping_add(1);
+    }
+
+    write_packet(stream, seq, eof)?;
+    Ok(())
+}
+
+/// Decodes `COM_STMT_EXECUTE`'s parameter section (null-bitmap, optional
+/// per-parameter type codes, then binary-protocol-encoded values) into the
+/// `Value`s to substitute for `Expr::Param(0..num_params)`. `pos` is
+/// advanced past whatever's consumed (unused after this call, but kept as
+/// an out-param in case a caller wants to read more of the packet later).
+fn decode_execute_params(
+    payload: &[u8],
+    pos: &mut usize,
+    stmt_id: u32,
+    num_params: usize,
+    session: &mut Session,
+) -> Result<Vec<Value>, MySqlError> {
+    if num_params == 0 {
+        return Ok(Vec::new());
+    }
+
+    let null_bitmap_len = num_params.div_ceil(8);
+    if payload.len() < *pos + null_bitmap_len + 1 {
+        return Err(MySqlError::syntax_error("malformed COM_STMT_EXECUTE packet"));
+    }
+    let null_bitmap = &payload[*pos..*pos + null_bitmap_len];
+    let is_null = |i: usize| (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+    *pos += null_bitmap_len;
+
+    let new_params_bound = payload[*pos];
+    *pos += 1;
+
+    let types: Vec<(u8, u8)> = if new_params_bound == 1 {
+        let mut types = Vec::with_capacity(num_params);
+        for _ in 0..num_params {
+            if *pos + 2 > payload.len() {
+                return Err(MySqlError::syntax_error("malformed COM_STMT_EXECUTE packet"));
+            }
+            types.push((payload[*pos], payload[*pos + 1]));
+            *pos += 2;
+        }
+        session.stmt_param_types.insert(stmt_id, types.clone());
+        types
+    } else {
+        session.stmt_param_types.get(&stmt_id).cloned().ok_or_else(|| {
+            MySqlError::unsupported(
+                "COM_STMT_EXECUTE without parameter types and no cached types from a prior EXECUTE",
+            )
+        })?
+    };
+
+    let mut params = Vec::with_capacity(num_params);
+    for (i, (ty, _flag)) in types.iter().enumerate().take(num_params) {
+        if is_null(i) {
+            params.push(Value::Null);
+            continue;
+        }
+        let (val, consumed) = decode_binary_value(*ty, &payload[*pos..])?;
+        params.push(val);
+        *pos += consumed;
+    }
+    Ok(params)
+}
+
+/// Decodes one value from the MySQL binary protocol's per-parameter
+/// encoding, given its `COM_STMT_EXECUTE` type code. Returns the value and
+/// how many bytes it consumed. Covers the numeric and text/blob types real
+/// client libraries actually send for typical bound parameters; date/time
+/// types use a different (non length-encoded-string) binary layout this
+/// engine doesn't decode yet.
+fn decode_binary_value(ty: u8, buf: &[u8]) -> Result<(Value, usize), MySqlError> {
+    let need = |n: usize| -> Result<(), MySqlError> {
+        if buf.len() < n {
+            Err(MySqlError::syntax_error("truncated bound parameter value"))
+        } else {
+            Ok(())
+        }
+    };
+    match ty {
+        0x01 => {
+            need(1)?;
+            Ok((Value::Int(buf[0] as i8 as i64), 1)) // MYSQL_TYPE_TINY
+        }
+        0x02 => {
+            need(2)?;
+            Ok((Value::Int(i16::from_le_bytes([buf[0], buf[1]]) as i64), 2)) // SHORT
+        }
+        0x03 | 0x09 => {
+            need(4)?;
+            Ok((Value::Int(i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64), 4)) // LONG, INT24
+        }
+        0x08 => {
+            need(8)?;
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[0..8]);
+            Ok((Value::Int(i64::from_le_bytes(b)), 8)) // LONGLONG
+        }
+        0x04 => {
+            need(4)?;
+            let mut b = [0u8; 4];
+            b.copy_from_slice(&buf[0..4]);
+            Ok((Value::Float(f32::from_le_bytes(b) as f64), 4)) // FLOAT
+        }
+        0x05 => {
+            need(8)?;
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[0..8]);
+            Ok((Value::Float(f64::from_le_bytes(b)), 8)) // DOUBLE
+        }
+        // DECIMAL/NEWDECIMAL, and every text/blob/string type, are all
+        // sent as a length-encoded string on the wire.
+        0x00 | 0xf6 | 0xfc | 0xfd | 0xfe | 0x0f | 0xf9 | 0xfa | 0xfb => {
+            let (s, n) = read_lenenc_string(buf)?;
+            Ok((Value::Text(s), n))
+        }
+        0x06 => Ok((Value::Null, 0)), // MYSQL_TYPE_NULL (value should already be in the null-bitmap)
+        _ => Err(MySqlError::unsupported("bound parameter type")),
+    }
+}
+
+fn read_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
+    let first = *buf.first()?;
+    match first {
+        0xfc => {
+            if buf.len() < 3 {
+                return None;
+            }
+            Some((u16::from_le_bytes([buf[1], buf[2]]) as u64, 3))
+        }
+        0xfd => {
+            if buf.len() < 4 {
+                return None;
+            }
+            Some((u32::from_le_bytes([buf[1], buf[2], buf[3], 0]) as u64, 4))
+        }
+        0xfe => {
+            if buf.len() < 9 {
+                return None;
+            }
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[1..9]);
+            Some((u64::from_le_bytes(b), 9))
+        }
+        0xfb => Some((0, 1)), // NULL marker; not expected in this context
+        v => Some((v as u64, 1)),
+    }
+}
+
+fn read_lenenc_string(buf: &[u8]) -> Result<(String, usize), MySqlError> {
+    let (len, hdr) = read_lenenc_int(buf)
+        .ok_or_else(|| MySqlError::syntax_error("malformed length-encoded string"))?;
+    let len = len as usize;
+    if buf.len() < hdr + len {
+        return Err(MySqlError::syntax_error("malformed length-encoded string"));
+    }
+    let s = String::from_utf8_lossy(&buf[hdr..hdr + len]).to_string();
+    Ok((s, hdr + len))
+}
+
+/// Writes a length-encoded integer per the MySQL wire protocol.
+fn write_lenenc_int(buf: &mut Vec<u8>, val: u64) {
+    if val < 251 {
+        buf.push(val as u8);
+    } else if val < 0x1_0000 {
+        buf.push(0xfc);
+        buf.extend_from_slice(&(val as u16).to_le_bytes());
+    } else if val < 0x1_0000_0000 {
+        buf.push(0xfd);
+        buf.extend_from_slice(&(val as u32).to_le_bytes()[0..3]);
+    } else {
+        buf.push(0xfe);
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
 }

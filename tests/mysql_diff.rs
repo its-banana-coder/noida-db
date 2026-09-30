@@ -79,6 +79,18 @@ async fn test_mysql_diff() {
     .await;
     execute_query(&ref_pool, "TRUNCATE TABLE diff_test").await;
 
+    execute_query(
+        &noida_pool,
+        "CREATE TABLE diff_agg (id INT PRIMARY KEY, category VARCHAR(50), amount INT)",
+    )
+    .await;
+    execute_query(
+        &ref_pool,
+        "CREATE TABLE IF NOT EXISTS diff_agg (id INT PRIMARY KEY, category VARCHAR(50), amount INT)",
+    )
+    .await;
+    execute_query(&ref_pool, "TRUNCATE TABLE diff_agg").await;
+
     let mut compared = 0;
     for query in [
         "SELECT 1",
@@ -97,6 +109,28 @@ async fn test_mysql_diff() {
         "SELECT id, name FROM diff_test",
         "DELETE FROM diff_test WHERE id = 2",
         "SELECT id, name FROM diff_test",
+        // GROUP BY + aggregates
+        "INSERT INTO diff_agg VALUES (1, 'a', 10), (2, 'a', 30), (3, 'b', 5)",
+        "SELECT COUNT(*) FROM diff_agg",
+        "SELECT SUM(amount) FROM diff_agg",
+        // AVG is deliberately not compared here: MySQL returns a DECIMAL
+        // with server-specific scale for AVG(int_column), while this
+        // engine returns a plain float — a known, already-documented kind
+        // of formatting difference (see the `10 / 4` case above), not a
+        // correctness bug in the aggregate itself.
+        "SELECT MIN(amount) FROM diff_agg",
+        "SELECT MAX(amount) FROM diff_agg",
+        "SELECT category, COUNT(*) FROM diff_agg GROUP BY category",
+        "SELECT category, SUM(amount) FROM diff_agg GROUP BY category",
+        // transactions
+        "BEGIN",
+        "INSERT INTO diff_agg VALUES (4, 'c', 100)",
+        "ROLLBACK",
+        "SELECT COUNT(*) FROM diff_agg",
+        "START TRANSACTION",
+        "INSERT INTO diff_agg VALUES (4, 'c', 100)",
+        "COMMIT",
+        "SELECT COUNT(*) FROM diff_agg",
     ] {
         assert_same_result(&noida_pool, &ref_pool, query).await;
         compared += 1;

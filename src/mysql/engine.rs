@@ -3,6 +3,7 @@ use crate::mysql::catalog::DbState;
 use crate::mysql::error::MySqlError;
 use crate::mysql::exec::Executor;
 use crate::mysql::types::Value;
+use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use std::sync::{Arc, Mutex};
@@ -11,11 +12,27 @@ use std::sync::{Arc, Mutex};
 pub struct Engine {
     pub db: Arc<Mutex<DbState>>,
     pub current_db: Option<String>,
+    /// Rows affected by the most recent `INSERT`/`UPDATE`/`DELETE`, so
+    /// `server.rs` can put a real count in the OK packet.
+    pub last_affected_rows: u64,
+    /// A whole-`DbState` snapshot taken at `BEGIN`/`START TRANSACTION`,
+    /// restored verbatim on `ROLLBACK` and discarded on `COMMIT`. This is
+    /// deliberately the simplest thing that gives real commit/rollback
+    /// semantics for a single connection: no MVCC, no isolation levels, no
+    /// nested transactions (a second `BEGIN` while one is active just
+    /// replaces the snapshot, matching MySQL's implicit-commit-of-the-
+    /// previous-transaction behavior in spirit, not in detail).
+    tx_snapshot: Option<DbState>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
-        Self { db: Arc::new(Mutex::new(DbState::default())), current_db: None }
+        Self {
+            db: Arc::new(Mutex::new(DbState::default())),
+            current_db: None,
+            last_affected_rows: 0,
+            tx_snapshot: None,
+        }
     }
 }
 
@@ -35,11 +52,39 @@ impl Engine {
 
         let stmt = asts.remove(0);
 
+        // Transaction control statements are handled here, at the
+        // session/engine level, rather than as a `Plan` variant: they need
+        // state (`tx_snapshot`) that lives across separate `execute` calls,
+        // which `Executor` (built fresh per statement) doesn't have.
+        match &stmt {
+            Statement::StartTransaction { .. } => {
+                let state = self.db.lock().unwrap();
+                self.tx_snapshot = Some(state.clone());
+                self.last_affected_rows = 0;
+                return Ok(vec![]);
+            }
+            Statement::Commit { .. } => {
+                self.tx_snapshot = None;
+                self.last_affected_rows = 0;
+                return Ok(vec![]);
+            }
+            Statement::Rollback { .. } => {
+                if let Some(snapshot) = self.tx_snapshot.take() {
+                    let mut state = self.db.lock().unwrap();
+                    *state = snapshot;
+                }
+                self.last_affected_rows = 0;
+                return Ok(vec![]);
+            }
+            _ => {}
+        }
+
         let mut binder = Binder::new(self.current_db.clone());
         let plan = binder.bind_statement(stmt)?;
 
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
         let res = executor.execute_plan(plan)?;
+        self.last_affected_rows = executor.last_affected_rows;
 
         // Update current DB if USE was called
         if let Some(db) = executor.current_db {

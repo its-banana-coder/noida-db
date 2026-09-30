@@ -1,11 +1,11 @@
 use crate::mysql::catalog::{Column, ColumnType};
 use crate::mysql::error::MySqlError;
-use crate::mysql::plan::{ArithOp, CmpOp, Expr, JoinOp, Plan};
+use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, JoinOp, Plan, contains_agg};
 use crate::mysql::types::Value;
 use sqlparser::ast::{
-    Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, JoinConstraint, JoinOperator,
-    ObjectName, Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
-    Value as AstValue,
+    Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
+    Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as AstValue,
 };
 use std::collections::HashMap;
 
@@ -13,11 +13,16 @@ use std::collections::HashMap;
 pub struct Binder {
     pub current_db: Option<String>,
     pub prepared_types: HashMap<String, Vec<Value>>,
+    /// Assigns each `?` placeholder encountered while binding an
+    /// expression its positional index (0, 1, 2, ...), in left-to-right
+    /// order — matching how `COM_STMT_EXECUTE` lays out bound parameter
+    /// values on the wire.
+    param_counter: usize,
 }
 
 impl Binder {
     pub fn new(current_db: Option<String>) -> Self {
-        Self { current_db, prepared_types: HashMap::new() }
+        Self { current_db, prepared_types: HashMap::new(), param_counter: 0 }
     }
 
     pub fn bind_statement(&mut self, stmt: Statement) -> Result<Plan, MySqlError> {
@@ -289,6 +294,15 @@ impl Binder {
                     source = Plan::Filter { source: Box::new(source), predicate: pred };
                 }
 
+                let group_exprs: Vec<Expr> = match select.group_by {
+                    GroupByExpr::Expressions(exprs, _) => {
+                        exprs.into_iter().map(|e| self.bind_expr(e)).collect::<Result<_, _>>()?
+                    }
+                    GroupByExpr::All(_) => {
+                        return Err(MySqlError::unsupported("GROUP BY ALL"));
+                    }
+                };
+
                 let mut exprs = Vec::new();
                 let mut names = Vec::new();
                 for item in select.projection {
@@ -305,7 +319,11 @@ impl Binder {
                     }
                 }
 
-                Ok(Plan::Project { source: Box::new(source), exprs, names })
+                if !group_exprs.is_empty() || exprs.iter().any(contains_agg) {
+                    Ok(Plan::Aggregate { source: Box::new(source), group_exprs, exprs, names })
+                } else {
+                    Ok(Plan::Project { source: Box::new(source), exprs, names })
+                }
             }
             _ => Err(MySqlError::unsupported("query body")),
         }
@@ -372,6 +390,15 @@ impl Binder {
             AstExpr::Value(sqlparser::ast::ValueWithSpan { value: AstValue::Null, .. }) => {
                 Ok(Expr::Const(Value::Null))
             }
+            AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                value: AstValue::Placeholder(_),
+                ..
+            }) => {
+                let idx = self.param_counter;
+                self.param_counter += 1;
+                Ok(Expr::Param(idx))
+            }
+            AstExpr::Function(func) => self.bind_function(func),
             AstExpr::Identifier(ident) => {
                 if ident.value.starts_with("@@") {
                     Ok(Expr::SysVar(ident.value[2..].to_string()))
@@ -419,6 +446,68 @@ impl Binder {
                 }
             }
             _ => Err(MySqlError::unsupported("expr")),
+        }
+    }
+
+    /// Binds `COUNT`/`COUNT(*)`/`SUM`/`AVG`/`MIN`/`MAX` calls to
+    /// `Expr::Agg`. Any other function name is unsupported — this engine
+    /// has no scalar function library yet.
+    fn bind_function(&mut self, func: Function) -> Result<Expr, MySqlError> {
+        let name = func
+            .name
+            .0
+            .iter()
+            .filter_map(|p| match p {
+                sqlparser::ast::ObjectNamePart::Identifier(id) => Some(id.value.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        let upper = name.to_uppercase();
+
+        let args = match func.args {
+            FunctionArguments::List(list) => list.args,
+            FunctionArguments::None => vec![],
+            FunctionArguments::Subquery(_) => {
+                return Err(MySqlError::unsupported("function with subquery argument"));
+            }
+        };
+
+        match upper.as_str() {
+            "COUNT" => {
+                if args.len() == 1
+                    && matches!(&args[0], FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+                {
+                    Ok(Expr::Agg { func: AggFunc::CountStar, arg: None })
+                } else if args.len() == 1 {
+                    let arg = self.bind_function_arg(&args[0])?;
+                    Ok(Expr::Agg { func: AggFunc::Count, arg: Some(Box::new(arg)) })
+                } else {
+                    Err(MySqlError::unsupported("COUNT argument list"))
+                }
+            }
+            "SUM" | "AVG" | "MIN" | "MAX" => {
+                if args.len() != 1 {
+                    return Err(MySqlError::unsupported(&format!("{upper} argument list")));
+                }
+                let arg = self.bind_function_arg(&args[0])?;
+                let agg_func = match upper.as_str() {
+                    "SUM" => AggFunc::Sum,
+                    "AVG" => AggFunc::Avg,
+                    "MIN" => AggFunc::Min,
+                    "MAX" => AggFunc::Max,
+                    _ => unreachable!(),
+                };
+                Ok(Expr::Agg { func: agg_func, arg: Some(Box::new(arg)) })
+            }
+            _ => Err(MySqlError::unsupported(&format!("function {name}"))),
+        }
+    }
+
+    fn bind_function_arg(&mut self, arg: &FunctionArg) -> Result<Expr, MySqlError> {
+        match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => self.bind_expr(e.clone()),
+            _ => Err(MySqlError::unsupported("function argument form")),
         }
     }
 
