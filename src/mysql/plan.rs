@@ -159,6 +159,23 @@ pub enum Plan {
         exprs: Vec<Expr>,
         names: Vec<String>,
     },
+    /// `ORDER BY`/`LIMIT`/`OFFSET`. Sits between the row source (`Scan`/
+    /// `Filter`/`Join`) and the outer `Project`/`Aggregate`, evaluating
+    /// `keys` against the *pre-projection* row the same way `Filter`'s own
+    /// predicate does (real `ColName` resolution against the source
+    /// table's columns) -- this is what lets `ORDER BY` reference a
+    /// column that isn't in the `SELECT` list at all (real MySQL allows
+    /// this for a non-aggregated query, and real apps rely on it: e.g.
+    /// `SELECT id FROM t ORDER BY created_at DESC`). `keys` is empty when
+    /// there's a `LIMIT` with no `ORDER BY`. Not meaningful combined with
+    /// `Aggregate` when a key references the aggregated result rather
+    /// than a `GROUP BY` column -- not yet supported, see binder.
+    Sort {
+        source: Box<Plan>,
+        keys: Vec<(Expr, bool)>, // (expr, ascending)
+        limit: Option<u64>,
+        offset: Option<u64>,
+    },
 }
 
 /// Walks a bound `Plan` to find how many distinct positional `?`
@@ -190,6 +207,12 @@ pub fn count_params(plan: &Plan) -> usize {
                 }
             }
             Expr::Agg { arg: Some(a), .. } => expr_max(a, max),
+            Expr::InList { expr, list, .. } => {
+                expr_max(expr, max);
+                for e in list {
+                    expr_max(e, max);
+                }
+            }
             _ => {}
         }
     }
@@ -238,6 +261,12 @@ pub fn count_params(plan: &Plan) -> usize {
                 }
             }
             Plan::Delete { selection: Some(s), .. } => expr_max(s, max),
+            Plan::Sort { source, keys, .. } => {
+                plan_max(source, max);
+                for (e, _) in keys {
+                    expr_max(e, max);
+                }
+            }
             _ => {}
         }
     }

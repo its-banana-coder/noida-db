@@ -49,6 +49,7 @@ impl Executor {
             }
             Plan::Filter { source, .. } => self.resolve_table_context(source),
             Plan::Project { source, .. } => self.resolve_table_context(source),
+            Plan::Sort { source, .. } => self.resolve_table_context(source),
             _ => Ok(None),
         }
     }
@@ -377,6 +378,42 @@ impl Executor {
                 }
                 Ok(out_rows)
             }
+            Plan::Sort { source, keys, limit, offset } => {
+                let table_context = self.resolve_table_context(&source)?;
+                let mut rows = self.execute_plan(*source)?;
+
+                if !keys.is_empty() {
+                    // Evaluate every sort key once per row up front rather
+                    // than re-evaluating expressions on every comparison
+                    // during the sort.
+                    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let key = keys
+                            .iter()
+                            .map(|(e, _)| self.eval_expr(e, &row, table_context.as_ref()))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        keyed.push((key, row));
+                    }
+                    keyed.sort_by(|(ka, _), (kb, _)| {
+                        for (i, (_, asc)) in keys.iter().enumerate() {
+                            let ord = sort_cmp(&ka[i], &kb[i]);
+                            let ord = if *asc { ord } else { ord.reverse() };
+                            if ord != Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        Ordering::Equal
+                    });
+                    rows = keyed.into_iter().map(|(_, row)| row).collect();
+                }
+
+                let start = offset.unwrap_or(0) as usize;
+                rows = rows.into_iter().skip(start).collect();
+                if let Some(limit) = limit {
+                    rows.truncate(limit as usize);
+                }
+                Ok(rows)
+            }
             Plan::Join { left, right, op } => {
                 let l_rows = self.execute_plan(*left)?;
                 let r_rows = self.execute_plan(*right)?;
@@ -586,6 +623,23 @@ impl Executor {
             }
         }
     }
+}
+
+/// `ORDER BY`'s own comparator: unlike `value_partial_cmp` (used by
+/// `MIN`/`MAX`, which skip NULLs entirely), a sort has to place every row
+/// somewhere, so NULL sorts first in ascending order (real MySQL's rule;
+/// `Plan::Sort`'s execution reverses the whole comparison for `DESC`, which
+/// correctly puts NULLs last in that case too, matching MySQL). Two
+/// otherwise-incomparable values (e.g. text vs. a number) are treated as
+/// equal rather than panicking or being arbitrarily ordered.
+fn sort_cmp(a: &Value, b: &Value) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    value_partial_cmp(a, b).unwrap_or(Ordering::Equal)
 }
 
 /// Ordering used by `MIN`/`MAX`: numeric values compare numerically, text
