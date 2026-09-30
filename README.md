@@ -32,25 +32,56 @@ results are compared byte-for-byte against the real server. See
 every service follows, and [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for
 exactly what does not work yet or is intentionally out of scope.
 
+## Compatibility scorecard
+
+There's no single "% compatible" number — no such number is actually
+measured anywhere, and inventing one would be exactly the kind of claim
+this project tries not to make. What *is* measured, per service: how many
+real client libraries/ORMs/drivers are verified against it, how many real
+unmodified applications run against it end to end, and (where a fixed,
+countable target exists, like Redis's command set) direct coverage against
+that target. Everything not covered here is either a known, listed gap
+(`docs/LIMITATIONS.md`) or a deliberate scope exclusion (`COMPATIBILITY.md`)
+— never a silent wrong answer.
+
+| Service | Real clients/ORMs verified | Real apps, end to end | Protocol coverage | Known gaps |
+|---|---|---|---|---|
+| **Postgres** | 14 (psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, JDBC) | ✅ Gitea, ✅ Miniflux | DDL/DML, full-text search, range types, materialized views, cursors, catalogs (`pg_catalog`/`information_schema`) | PL/pgSQL, stored procedures/triggers, extensions, logical replication — see `docs/LIMITATIONS.md` |
+| **Redis** | 12 (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq) | — (not yet targeted; a Sidekiq-driven app is next) | 217 / 242 Redis 7.2 commands (`src/redis/README.md`) | Modules (RedisJSON, RediSearch), the 25 unimplemented commands, mostly production-only (`CLUSTER`, `DEBUG`, ...) |
+| **Kafka** | 5 (kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka) | ✅ Faust (streaming pipeline) | Full consumer groups, real transactional isolation (`read_committed`, producer fencing), cluster/config admin | Disk segment persistence (in progress — see below), multiple brokers |
+| **MySQL** | 1 driver-level (`mysql_async`); WordPress is the first real application | 🚧 WordPress — schema install and admin setup pass; blocked on `ORDER BY`/`LIMIT` in the frontend's post query (tracked, being worked on) | Prepared statements, transactions, `GROUP BY`/aggregates, `WHERE ... IN (...)`, real `AUTO_INCREMENT`/`last_insert_id`, cross-connection data sharing | `ORDER BY`/`LIMIT`/`HAVING`/subqueries, `ALTER TABLE`, multi-statement queries — see `docs/LIMITATIONS.md` |
+| **Elasticsearch** | 2 (official Java and Python clients) | — (not yet targeted; a Django + django-elasticsearch-dsl app is next) | `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp with real BM25 scoring, bucket/metric aggregations, verified against a real Elasticsearch 8.15 node | `query_string`, `search_after`, nested queries, highlighting — see `docs/LIMITATIONS.md`. Operating the ES *ecosystem* (Kibana, Grafana as a data source) is out of scope; a client library searching via the API is what's covered |
+
+✅ = passes end to end in CI, re-run on every relevant change (see
+`.github/workflows/real-apps.yml`). 🚧 = in progress, currently red in CI —
+listed here instead of hidden, since a real, currently-failing signal is
+more useful than silence. More apps are added over time; see "Tested
+against real applications" below for what each one actually exercises.
+
 ## Tested against real applications
 
 Beyond the compatibility test suite (real client libraries, ORMs and CLIs
 compared byte-for-byte against the real server), noida-db is validated by
 running actual, unmodified open-source applications against it as their
-database — not a synthetic client, a real app doing real work.
+database — not a synthetic client, a real app doing real work. These run
+as their own CI workflow (`real-apps.yml`), separate from the fast
+per-push suite since each takes minutes and hits real networks.
 
 | App | What it exercises | Result |
 |---|---|---|
 | [Gitea](https://about.gitea.com/) (Postgres + Redis) | Full production schema (~115 tables) via the xorm ORM; creating a repository, `git clone`/`git push` over HTTP, issues and comments, and a full pull-request workflow (branch push → PR → merge) via the REST API | ✅ All of the above works end to end |
 | [Miniflux](https://miniflux.app/) (Postgres) | Full schema migration (134 migrations, including a `DECLARE`/`FETCH`/`CLOSE` cursor); adding a real RSS feed, fetching and parsing its entries, marking one read, and full-text search over entry titles/content (a `setweight`+`||`-combined index, queried with `websearch_to_tsquery`) | ✅ All of the above works end to end |
 | [Faust](https://faust.readthedocs.io/) (Kafka) | Python streaming app pipeline (built on `aiokafka`); dynamically creating topics, concurrent consumer group joins, partition assignments via `SyncGroup`, maintaining continuous `Heartbeat` sessions through consumer rebalances, and actively streaming and decoding incoming records. | ✅ All of the above works end to end |
+| [WordPress](https://wordpress.org/) (MySQL) | Real core install via WP-CLI (~12 core tables, no ORM — plain `mysqli`-backed SQL), creating a post and comment, then reading both back through the real REST API | 🚧 Install and schema creation pass; the frontend's own post-listing query needs `ORDER BY`/`LIMIT`, not yet supported — being worked on |
 
 **RAM usage while running these workflows:** as low as 2MB idle after
 boot, peaking at 15MB during the heaviest activity (Gitea's schema-check
 phase), settling in the 5–15MB range at rest — well under the [footprint
 targets](COMPATIBILITY.md#footprint-targets).
 
-More applications are being added over time.
+More applications are being added over time: Ghost and Strapi (MySQL),
+Wagtail/django-cms (Postgres), Forem (Postgres + Redis + Elasticsearch),
+and a Spring Kafka application are next.
 
 ## Status
 
@@ -60,19 +91,37 @@ real server, and (for several) real unmodified applications:
 | Service | State |
 |---|---|
 | **Postgres** | wire protocol, catalogs, DDL/DML, full-text search, range types, materialized views, tested against psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql and JDBC, plus real applications (see above) |
-| **MySQL** | handshake, literal-expression `SELECT`, and real tables: `CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `INNER`/`LEFT`/cross `JOIN`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets — tested against `mysql_async` and a differential test against a real MySQL 8.0 server; prepared-statement parameter binding, `GROUP BY`/aggregates and transactions are the remaining gaps — see `docs/LIMITATIONS.md` |
+| **MySQL** | handshake, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `INNER`/`LEFT`/cross `JOIN`, `GROUP BY`/aggregates), prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `AUTO_INCREMENT`/`last_insert_id`/`affected_rows`, `WHERE ... IN (...)`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets, and data shared correctly across connections (not per-connection state) — tested against `mysql_async` and a differential test against a real MySQL 8.0 server, plus a real application (WordPress, in progress — see above); `ORDER BY`/`LIMIT`/`HAVING`/subqueries and `ALTER TABLE` are the remaining gaps — see `docs/LIMITATIONS.md` |
 | **Redis** | most of the protocol implemented (217 of 242 Redis 7.2 commands) and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq); real keyspace notifications (`notify-keyspace-events`) across generic/stream/HyperLogLog/hash/list/set/zset/string events — see [`src/redis/README.md`](src/redis/README.md) |
 | **Kafka** | native binary protocol, topics, consumer groups, cluster configs, and real transactional isolation (`read_committed` fetches, producer fencing on stale epochs) |
-| **Elasticsearch** | HTTP layer, index/document CRUD, bulk, `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp search with real BM25 scoring, and bucket/metric aggregations — see `docs/LIMITATIONS.md` for what's not built yet (`query_string`, `search_after`, nested queries, highlighting) |
+| **Elasticsearch** | HTTP layer, index/document CRUD, bulk, `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp search with real BM25 scoring, and bucket/metric aggregations, verified against a real Elasticsearch 8.15 node — see `docs/LIMITATIONS.md` for what's not built yet (`query_string`, `search_after`, nested queries, highlighting) |
 
 Each service is its own Cargo feature (on by default once merged) and can
 be switched on or off at build time and at runtime (`--only`); a disabled
 service allocates nothing.
 
-**Not built yet, for every service:** none of it persists across a
-restart today — everything lives in memory only. `--data-dir` is
-accepted but not yet wired to save or load anything; see
-`docs/LIMITATIONS.md` and `COMPATIBILITY.md` for the intended design.
+## Pending infrastructure
+
+Actively being worked on, not yet complete — listed here rather than left
+implicit:
+
+- **On-disk persistence.** Nothing survives a restart today — every
+  service is in-memory only, and `--data-dir` is accepted but unused. The
+  shared foundation (a shutdown-hook registry that saves a snapshot on a
+  clean SIGINT/SIGTERM, with atomic temp-file-then-rename writes so a save
+  interrupted mid-write can't corrupt the snapshot — see `src/persistence.rs`)
+  is in place; each service's own load/save is being added next, one small
+  PR per service. The model stays simple on purpose: a full snapshot on
+  clean shutdown, not incremental or continuous — a hard kill (`kill -9`)
+  loses whatever changed since the last clean shutdown, but never corrupts
+  the on-disk file.
+- **Benchmarking.** The [footprint targets](COMPATIBILITY.md#footprint-targets)
+  are targets, not (yet) continuously measured numbers; an automated,
+  re-runnable benchmark script (idle RAM per service and all-together,
+  basic throughput/latency for common operations) is planned to replace
+  them with real measurements.
+- **Real-app matrix expansion** — see "Tested against real applications"
+  above for what's next.
 
 ## Documentation
 
@@ -105,6 +154,12 @@ replies and error text, differential tests against the real server
 that install their own dependencies under `target/` and run with one
 command, e.g. `tests/clients/redis/run.sh`. CI runs all of it against real
 reference servers.
+
+Real, unmodified *applications* (Gitea, Miniflux, WordPress, ...) live
+under `tests/apps/` instead — the same one-command-per-app convention, but
+run as their own CI workflow (`real-apps.yml`) rather than on every push,
+since each takes minutes and hits real networks to download pinned,
+checksum-verified releases.
 
 ## License
 
