@@ -105,6 +105,14 @@ current count).
 
 ## Postgres
 
+Storage is now persistent (on-disk) and is saved to
+`<data_dir>/postgres.json` upon a clean process exit (SIGINT/SIGTERM),
+with no incremental autosave -- see `src/persistence.rs`. Everything
+transactional (schemas, tables and their rows, sequences, enum types,
+domains) survives a clean restart; a hard kill (`kill -9`) loses
+whatever changed since the last clean shutdown but never corrupts the
+on-disk snapshot.
+
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
 servers by `tests/postgres_diff.rs` (about 665 results) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM,
