@@ -3,9 +3,11 @@
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
+
 use super::numeric::{Numeric, cmp_num};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Json {
     Null,
     Bool(bool),

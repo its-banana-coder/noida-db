@@ -23,8 +23,10 @@ use pgwire::messages::{
 };
 use sqlparser::ast as a;
 
+use std::path::Path;
+
 use super::auth::{AuthMethod, Scram, ScramError};
-use super::engine::{Engine, Portal, Prepared, Session, StmtResult, TxStatus};
+use super::engine::{Engine, Portal, Prepared, Session, Snapshot, StmtResult, TxStatus};
 use super::error::{PgError, PgResult, code};
 use super::plan::OutCol;
 use super::types::{self, Type, Value};
@@ -60,6 +62,71 @@ impl Default for Config {
 /// Binds `addr` and serves Postgres on background threads.
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     spawn_with(addr, Config::default())
+}
+
+pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
+    spawn_persistent_with(addr, data_dir, Config::default())
+}
+
+pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Result<SocketAddr> {
+    let (addr, save) = spawn_persistent_with_for_test(addr, data_dir, cfg)?;
+    crate::persistence::on_shutdown(save);
+    Ok(addr)
+}
+
+/// Like `spawn_persistent_with`, but also returns a closure that performs
+/// exactly the save the real shutdown hook would perform, so a test can
+/// trigger a save directly instead of going through
+/// `persistence::on_shutdown`'s process-wide hook registry -- that
+/// registry runs *every* hook ever registered in the process, which is
+/// unsafe to trigger from a single test once more than one persistent
+/// server has been started in the same test binary (as happens once other
+/// services' persistence tests exist alongside this one).
+pub fn spawn_persistent_with_for_test(
+    addr: &str,
+    data_dir: &Path,
+    cfg: Config,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+
+    let path = data_dir.join("postgres.json");
+    let engine = if path.exists() {
+        let bytes = std::fs::read(&path)?;
+        let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse postgres snapshot: {e}"),
+            )
+        })?;
+        Engine::new_persistent(snapshot)
+    } else {
+        Engine::new()
+    };
+
+    let save_engine = engine.clone();
+    let save = move || {
+        let snapshot = save_engine.snapshot();
+        let bytes = serde_json::to_vec(&snapshot).expect("postgres snapshot serialization failed");
+        let _ = crate::persistence::write_snapshot_atomically(&path, &bytes);
+    };
+
+    let cfg = Arc::new(cfg);
+    std::thread::Builder::new().name("postgres-accept".into()).stack_size(STACK_SIZE).spawn(
+        move || {
+            for stream in listener.incoming().flatten() {
+                let engine = engine.clone();
+                let cfg = cfg.clone();
+                let _ = std::thread::Builder::new()
+                    .name("postgres-conn".into())
+                    .stack_size(STACK_SIZE)
+                    .spawn(move || {
+                        let _ = serve(stream, engine, cfg);
+                    });
+            }
+        },
+    )?;
+    Ok((local, save))
 }
 
 pub fn spawn_with(addr: &str, cfg: Config) -> io::Result<SocketAddr> {

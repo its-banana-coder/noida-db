@@ -3,13 +3,14 @@
 //! Stored as a decimal digit string (one digit per byte) plus a scale.
 //! Slow but simple: performance is not a goal.
 
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 /// Postgres's NUMERIC_MIN_SIG_DIGITS and display-scale bounds.
 const MIN_SIG_DIGITS: i64 = 16;
 const MAX_DISPLAY_SCALE: i64 = 1000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Numeric {
     NaN,
     /// `true` for -Infinity.
@@ -18,7 +19,7 @@ pub enum Numeric {
 }
 
 /// A finite decimal: `(-1)^neg * digits * 10^-scale`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Dec {
     pub neg: bool,
     /// Most significant first, no leading zeros; empty means zero.
