@@ -321,3 +321,45 @@ async fn test_mysql_wordpress_style_column_types() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// Data written on one connection must be visible from a completely
+/// separate connection -- the exact pattern a real app hits constantly
+/// (a fresh connection per request/process, a connection pool
+/// reconnecting, ...). This is precisely what WordPress's `wp core
+/// install` (one PHP process/connection) followed by `wp db tables` (a
+/// separate one) does, and it used to fail with "the site you have
+/// requested is not installed" because each connection got its own
+/// fresh, empty, unshared database.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_data_visible_across_connections() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+
+    {
+        let pool = Pool::new(url.as_str());
+        let mut conn = pool.get_conn().await.unwrap();
+        conn.query_drop("USE test").await.unwrap();
+        conn.query_drop("CREATE TABLE cross_conn_test (id INT, value VARCHAR(255))").await.unwrap();
+        conn.query_drop("INSERT INTO cross_conn_test (id, value) VALUES (1, 'from conn 1')")
+            .await
+            .unwrap();
+        drop(conn);
+        pool.disconnect().await.unwrap();
+    }
+
+    // A brand new pool/connection to the same still-running server.
+    {
+        let pool = Pool::new(url.as_str());
+        let mut conn = pool.get_conn().await.unwrap();
+        conn.query_drop("USE test").await.unwrap();
+        let res: Vec<(i32, String)> =
+            conn.query("SELECT id, value FROM cross_conn_test").await.unwrap();
+        assert_eq!(res, vec![(1, "from conn 1".to_string())]);
+        drop(conn);
+        pool.disconnect().await.unwrap();
+    }
+}

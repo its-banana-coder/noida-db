@@ -410,6 +410,17 @@ Verified against the official MongoDB Rust driver and a differential test agains
 
 ## MySQL
 
+The database is shared across every connection to the same server (one
+`CREATE TABLE`/`INSERT` on one connection is visible from any other,
+including a brand new one) — session-local state like `current_db` and
+`last_insert_id` is still per-connection. This matches real MySQL and
+every other service here, but was a real bug until fixed alongside the
+WordPress real-app test: each connection used to get its own fresh,
+empty, unshared database, invisible to any test that only ever used one
+connection but fatal for a real app making more than one (WordPress's
+`wp core install` succeeding on one connection, then `wp db tables` on a
+separate one reporting "the site you have requested is not installed").
+
 Handshake (`mysql_native_password`, any password accepted — no real
 credential check yet), `COM_INIT_DB`, and `COM_QUERY` for both
 literal-only `SELECT` expressions (numeric/string/NULL literals,
