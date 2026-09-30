@@ -5,11 +5,13 @@ use std::cmp::Ordering;
 
 use super::datetime::{self, Ctx, DtErr, Interval};
 use super::error::{PgError, PgResult, code};
+use serde::{Deserialize, Serialize};
+
 use super::json::{self, Json};
 use super::numeric::{Dec, NumError, Numeric, cmp_num};
 use super::tz::Zone;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Base {
     Bool,
     Bytea,
@@ -213,7 +215,7 @@ pub static TYPES: &[TypeInfo] = &[
 ];
 
 /// A column/expression type. Postgres arrays of any dimension share a type.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct Type {
     pub base: Base,
     pub array: bool,
@@ -415,7 +417,7 @@ impl Type {
 // ---------------------------------------------------------------------------
 // Values
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Array {
     /// (length, lower bound) per dimension; empty for an empty array.
     pub dims: Vec<(i32, i32)>,
@@ -436,7 +438,7 @@ impl Array {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),
