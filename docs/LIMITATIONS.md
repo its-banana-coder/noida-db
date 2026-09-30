@@ -586,9 +586,10 @@ Milestone 1 (index/document CRUD) and the first half of milestone 2
 (analysis + `_search`) are implemented. The HTTP server returns the
 required `X-Elastic-Product` header and supports index create/get/delete,
 mapping and settings endpoints, document get/index/create/update/delete,
-`_mget`, bulk indexing/deletion, aliases, and index templates. Storage is in
-memory and is lost when the process exits. Bulk chunked transfer encoding
-is accepted.
+`_mget`, bulk indexing/deletion, aliases, and index templates. Storage is
+now persistent (on-disk) and is saved to `<data_dir>/elasticsearch.json`
+upon a clean process exit (SIGINT/SIGTERM), with no incremental
+autosave. Bulk chunked transfer encoding is accepted.
 
 `_search` and `_count` work for `match_all`/`match_none`, `match`,
 `match_phrase`, `multi_match`, `term`, `terms`, `range`, `exists`, `prefix`,
