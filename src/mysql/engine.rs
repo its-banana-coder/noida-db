@@ -2,6 +2,7 @@ use crate::mysql::binder::Binder;
 use crate::mysql::catalog::DbState;
 use crate::mysql::error::MySqlError;
 use crate::mysql::exec::Executor;
+use crate::mysql::plan;
 use crate::mysql::types::Value;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
@@ -23,6 +24,11 @@ pub struct Engine {
     /// the `LAST_INSERT_ID()` SQL function (not yet implemented), which
     /// *does* persist across intervening statements.
     pub last_insert_id: u64,
+    /// The real column names of the most recent statement's result set
+    /// (empty for a statement that doesn't return rows), so `server.rs`
+    /// can report them in the wire column-definition packets instead of
+    /// placeholders. See `plan::column_names`.
+    pub last_column_names: Vec<String>,
     /// A whole-`DbState` snapshot taken at `BEGIN`/`START TRANSACTION`,
     /// restored verbatim on `ROLLBACK` and discarded on `COMMIT`. This is
     /// deliberately the simplest thing that gives real commit/rollback
@@ -40,6 +46,7 @@ impl Default for Engine {
             current_db: None,
             last_affected_rows: 0,
             last_insert_id: 0,
+            last_column_names: Vec::new(),
             tx_snapshot: None,
         }
     }
@@ -70,11 +77,13 @@ impl Engine {
                 let state = self.db.lock().unwrap();
                 self.tx_snapshot = Some(state.clone());
                 self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
             Statement::Commit { .. } => {
                 self.tx_snapshot = None;
                 self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
             Statement::Rollback { .. } => {
@@ -83,6 +92,7 @@ impl Engine {
                     *state = snapshot;
                 }
                 self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
             _ => {}
@@ -90,6 +100,7 @@ impl Engine {
 
         let mut binder = Binder::new(self.current_db.clone());
         let plan = binder.bind_statement(stmt)?;
+        self.last_column_names = plan::column_names(&plan);
 
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
         let res = executor.execute_plan(plan)?;

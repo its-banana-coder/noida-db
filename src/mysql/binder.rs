@@ -390,8 +390,25 @@ impl Binder {
                 for item in select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
+                            // Real MySQL labels an unaliased plain column
+                            // reference with the column's own name (this is
+                            // the overwhelmingly common case real apps hit:
+                            // `SELECT option_name, option_value FROM
+                            // wp_options`), and labels anything else with
+                            // the expression's own source text -- not
+                            // replicated here (`"?"` stays as a placeholder
+                            // for those), since it needs the original SQL
+                            // slice, not just the parsed AST.
+                            let name = match &expr {
+                                AstExpr::Identifier(ident) => ident.value.clone(),
+                                AstExpr::CompoundIdentifier(idents) => idents
+                                    .last()
+                                    .map(|i| i.value.clone())
+                                    .unwrap_or_else(|| "?".to_string()),
+                                _ => "?".to_string(),
+                            };
                             exprs.push(self.bind_expr(expr)?);
-                            names.push("?".to_string());
+                            names.push(name);
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
                             exprs.push(self.bind_expr(expr)?);
