@@ -749,34 +749,48 @@ impl EngineState {
                         if fetch_offset < 0 || fetch_offset > part_state.high_watermark {
                             part_res.error_code = 1; // OFFSET_OUT_OF_RANGE
                         } else if fetch_offset < visible_up_to {
-                            // Batches aren't one record each, so find the
-                            // batch whose base_offset covers fetch_offset
-                            // (the last one starting at or before it) and
-                            // return it whole, same as real Kafka — the
-                            // client skips already-consumed records inside
-                            // it by their own relative offset.
-                            if let Some((base, batch)) = part_state
+                            // Batches aren't one record each: find the batch
+                            // whose base_offset covers fetch_offset (the
+                            // last one starting at or before it), then
+                            // concatenate it and every following batch up to
+                            // visible_up_to — real Kafka's Fetch response is
+                            // as many whole batches as fit, not just one, and
+                            // returning only one made every poll() need one
+                            // extra round-trip per batch, which a real
+                            // client's default poll budget doesn't always
+                            // afford (this is what made the transactional
+                            // producer integration test flaky/incomplete,
+                            // not a transactions bug: see docs/specs/kafka.md).
+                            let start = part_state
                                 .record_batches
                                 .iter()
-                                .rev()
-                                .find(|(base, _)| *base <= fetch_offset)
-                            {
-                                // Real Kafka includes an aborted batch's
-                                // bytes in the fetch response too, relying
-                                // on the client to discard it using
-                                // aborted_transactions below. This engine
-                                // doesn't replicate that client-side
-                                // bookkeeping, so it simplifies to: a
-                                // read_committed fetch never serves a batch
-                                // whose base_offset is a known aborted
-                                // transaction's start.
-                                let is_this_batch_aborted = read_committed
-                                    && part_state
-                                        .aborted_txns
-                                        .iter()
-                                        .any(|&(_, first_offset)| first_offset == *base);
-                                if !is_this_batch_aborted {
-                                    part_res.records = Some(bytes::Bytes::from(batch.clone()));
+                                .rposition(|(base, _)| *base <= fetch_offset);
+                            if let Some(start) = start {
+                                let mut out = Vec::new();
+                                for (base, batch) in &part_state.record_batches[start..] {
+                                    if *base >= visible_up_to {
+                                        break;
+                                    }
+                                    // Real Kafka includes an aborted batch's
+                                    // bytes in the fetch response too,
+                                    // relying on the client to discard it
+                                    // using aborted_transactions below. This
+                                    // engine doesn't replicate that
+                                    // client-side bookkeeping, so it
+                                    // simplifies to: a read_committed fetch
+                                    // never serves a batch whose base_offset
+                                    // is a known aborted transaction's start.
+                                    let is_this_batch_aborted = read_committed
+                                        && part_state
+                                            .aborted_txns
+                                            .iter()
+                                            .any(|&(_, first_offset)| first_offset == *base);
+                                    if !is_this_batch_aborted {
+                                        out.extend_from_slice(batch);
+                                    }
+                                }
+                                if !out.is_empty() {
+                                    part_res.records = Some(bytes::Bytes::from(out));
                                 }
                             }
                         }

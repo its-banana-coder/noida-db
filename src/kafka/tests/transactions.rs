@@ -16,22 +16,38 @@ use kafka_protocol::messages::txn_offset_commit_request::{
 };
 use kafka_protocol::messages::{GroupId, InitProducerIdRequest, TopicName, TransactionalId};
 use kafka_protocol::protocol::StrBytes;
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+};
 
 use super::T;
 
-/// A synthetic v2 record batch carrying one record, with the
-/// isTransactional attribute bit set (bit 4, 0x0010) — see Kafka's
-/// RecordBatch wire format.
+/// A real v2 record batch (via the same `RecordBatchEncoder` the engine
+/// itself uses for control batches) carrying one transactional data
+/// record — real byte-for-byte encoding, not hand-rolled offsets, so it
+/// round-trips through a real decoder like `RecordBatchDecoder::decode_all`
+/// the way a real producer's bytes would.
 fn make_transactional_batch(producer_id: i64, producer_epoch: i16, base_sequence: i32) -> Vec<u8> {
-    let mut buf = vec![0u8; 61];
-    buf[16] = 2; // magic v2
-    buf[21..23].copy_from_slice(&0x0010i16.to_be_bytes()); // attributes: isTransactional
-    buf[23..27].copy_from_slice(&0i32.to_be_bytes()); // last_offset_delta: 1 record
-    buf[43..51].copy_from_slice(&producer_id.to_be_bytes());
-    buf[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
-    buf[53..57].copy_from_slice(&base_sequence.to_be_bytes());
-    buf.extend_from_slice(b"payload");
-    buf
+    let record = Record {
+        transactional: true,
+        control: false,
+        delete_horizon: false,
+        partition_leader_epoch: 0,
+        producer_id,
+        producer_epoch,
+        timestamp_type: TimestampType::Creation,
+        offset: 0,
+        sequence: base_sequence,
+        timestamp: 0,
+        key: None,
+        value: Some(bytes::Bytes::from_static(b"payload")),
+        headers: Default::default(),
+    };
+    let mut buf = bytes::BytesMut::new();
+    let options = RecordEncodeOptions { version: 2, compression: Compression::None };
+    RecordBatchEncoder::encode(&mut buf, std::iter::once(&record), &options)
+        .expect("encoding a single uncompressed transactional record cannot fail");
+    buf.to_vec()
 }
 
 fn fetch(
@@ -54,10 +70,22 @@ fn fetch(
 }
 
 /// `PartitionData::default()`'s `records` field is `Some(Bytes::new())`,
-/// not `None` — so "no records visible" has to be checked by byte length,
-/// not `Option::is_none()`.
+/// not `None` — so "no records visible" can't be checked by
+/// `Option::is_none()`, and can't be checked by raw byte length either
+/// now that a fetch response may legitimately carry a non-empty control
+/// batch (e.g. an EndTxn marker) with zero actual application records —
+/// a real client's own decoder sees exactly this and correctly reports
+/// no records to the application, filtering control records out first.
 fn has_records(part: &kafka_protocol::messages::fetch_response::PartitionData) -> bool {
-    part.records.as_ref().map(|b| !b.is_empty()).unwrap_or(false)
+    let Some(bytes) = &part.records else { return false };
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut buf = bytes.clone();
+    let Ok(sets) = kafka_protocol::records::RecordBatchDecoder::decode_all(&mut buf) else {
+        return false;
+    };
+    sets.iter().any(|s| s.records.iter().any(|r| !r.control))
 }
 
 #[test]
