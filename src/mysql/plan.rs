@@ -296,11 +296,11 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
         Plan::Project { source, exprs, names } | Plan::Aggregate { source, exprs, names, .. } => {
             let mut out = Vec::with_capacity(names.len());
             for (expr, name) in exprs.iter().zip(names) {
-                if matches!(expr, Expr::Wildcard) {
-                    if let Some(table) = source_table(source, db) {
-                        out.extend(table.columns.iter().map(|c| c.name.clone()));
-                        continue;
-                    }
+                if matches!(expr, Expr::Wildcard)
+                    && let Some(table) = source_table(source, db)
+                {
+                    out.extend(table.columns.iter().map(|c| c.name.clone()));
+                    continue;
                 }
                 out.push(name.clone());
             }
