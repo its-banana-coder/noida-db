@@ -41,6 +41,14 @@ answer as *unknown*.
 
 The full list, with how it is verified, is in [`src/redis/README.md`](../src/redis/README.md).
 
+Storage is now persistent (on-disk) and is saved to
+`<data_dir>/redis.json` upon a clean process exit (SIGINT/SIGTERM), with
+no incremental autosave -- see `src/persistence.rs`. All 16 logical
+databases, every key's value (strings, hashes, lists, sets, sorted sets,
+streams including consumer groups) and its expiry survive a clean
+restart; `DUMP`/`RESTORE`/real RDB/AOF file compatibility is still out
+of scope (see below).
+
 Target: Redis 7.2 behaviour, RESP2 and RESP3. Of Redis 7.2's 242 commands,
 217 are implemented, 22 are out of scope (below) and 3 are not built yet (as of
 this writing; `cargo test --test redis_coverage -- --nocapture` prints the
