@@ -115,6 +115,22 @@ pub struct Session {
     pub in_implicit_tx: bool,
 }
 
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotDb {
+    pub oid: u32,
+    pub name: String,
+    pub db: DbState,
+    pub seqs: BTreeMap<u32, SeqValue>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub databases: BTreeMap<String, SnapshotDb>,
+    pub next_db_oid: u32,
+}
+
 struct GlobalDb {
     oid: u32,
     name: String,
@@ -154,6 +170,43 @@ impl Default for Engine {
 }
 
 impl Engine {
+    pub fn snapshot(&self) -> Snapshot {
+        let g = self.global.lock().unwrap();
+        let mut databases = BTreeMap::new();
+        for (name, db) in &g.databases {
+            databases.insert(
+                name.clone(),
+                SnapshotDb {
+                    oid: db.oid,
+                    name: db.name.clone(),
+                    db: db.db.clone(),
+                    seqs: db.seqs.clone(),
+                },
+            );
+        }
+        Snapshot { databases, next_db_oid: g.next_db_oid }
+    }
+
+    pub fn new_persistent(snapshot: Snapshot) -> Engine {
+        let mut databases = BTreeMap::new();
+        for (name, db) in snapshot.databases {
+            databases.insert(
+                name.clone(),
+                GlobalDb { oid: db.oid, name: db.name, db: db.db, seqs: db.seqs },
+            );
+        }
+        Engine {
+            global: Arc::new(Mutex::new(Global {
+                databases,
+                writer: None,
+                sessions: BTreeMap::new(),
+                next_id: 1,
+                next_db_oid: snapshot.next_db_oid,
+            })),
+            next_pid: Arc::new(AtomicI32::new(10_000)),
+        }
+    }
+
     pub fn new() -> Engine {
         let mut databases = BTreeMap::new();
         databases.insert(

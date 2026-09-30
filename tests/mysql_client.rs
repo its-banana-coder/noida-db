@@ -467,3 +467,60 @@ async fn test_mysql_order_by_limit() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// Real MySQL reports the actual selected column's name in the wire
+/// column-definition packets, not a placeholder -- this is what lets a
+/// real client fetch a row by column name, e.g. PHP's `mysqli`/`$wpdb`
+/// (what WordPress uses everywhere via `stdClass` rows) or PDO's
+/// associative fetch mode. Covers COM_QUERY (text protocol) and a
+/// prepared statement's COM_STMT_EXECUTE (binary protocol), both an
+/// unaliased plain column and an explicit alias.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_real_column_names() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop(
+        "CREATE TABLE col_name_test (option_name VARCHAR(255), option_value VARCHAR(255))",
+    )
+    .await
+    .unwrap();
+    conn.query_drop(
+        "INSERT INTO col_name_test (option_name, option_value) VALUES ('siteurl', 'http://x')",
+    )
+    .await
+    .unwrap();
+
+    // COM_QUERY: unaliased plain columns.
+    let row: mysql_async::Row = conn
+        .query_first("SELECT option_name, option_value FROM col_name_test")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<String, _>("option_name"), Some("siteurl".to_string()));
+    assert_eq!(row.get::<String, _>("option_value"), Some("http://x".to_string()));
+
+    // COM_QUERY: an explicit alias.
+    let row: mysql_async::Row =
+        conn.query_first("SELECT option_value AS val FROM col_name_test").await.unwrap().unwrap();
+    assert_eq!(row.get::<String, _>("val"), Some("http://x".to_string()));
+
+    // COM_STMT_EXECUTE (prepared statement, binary protocol row format).
+    let stmt = conn
+        .prep("SELECT option_name, option_value FROM col_name_test WHERE option_name = ?")
+        .await
+        .unwrap();
+    let row: mysql_async::Row = conn.exec_first(&stmt, ("siteurl",)).await.unwrap().unwrap();
+    assert_eq!(row.get::<String, _>("option_name"), Some("siteurl".to_string()));
+    assert_eq!(row.get::<String, _>("option_value"), Some("http://x".to_string()));
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

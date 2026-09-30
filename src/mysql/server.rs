@@ -111,12 +111,14 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                     Ok(rows) => {
                         let affected = session.engine.last_affected_rows;
                         let insert_id = session.engine.last_insert_id;
+                        let names = session.engine.last_column_names.clone();
                         let _ = send_resultset(
                             &mut stream,
                             seq.wrapping_add(1),
                             rows,
                             affected,
                             insert_id,
+                            &names,
                         );
                     }
                     Err(e) => {
@@ -257,6 +259,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             session.engine.current_db.clone(),
                         );
                         executor.params = params;
+                        let names = plan::column_names(&stmt_plan);
                         match executor.execute_plan(stmt_plan) {
                             Ok(rows) => {
                                 let affected = executor.last_affected_rows;
@@ -276,6 +279,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                                     rows,
                                     affected,
                                     insert_id,
+                                    &names,
                                 );
                             }
                             Err(e) => {
@@ -403,6 +407,7 @@ fn send_resultset(
     rows: Vec<Vec<Value>>,
     affected_rows: u64,
     last_insert_id: u64,
+    names: &[String],
 ) -> io::Result<()> {
     if rows.is_empty() {
         return send_ok(stream, seq, affected_rows, last_insert_id);
@@ -413,9 +418,13 @@ fn send_resultset(
     seq = seq.wrapping_add(1);
 
     for i in 0..cols {
-        let name = format!("col{i}");
+        // Real column names ("col{i}" only as a last-resort fallback --
+        // e.g. a computed expression like `1+1` with no alias, whose real
+        // MySQL label is its own source text, not reconstructed here).
+        let fallback = format!("col{i}");
+        let name = names.get(i).filter(|n| n.as_str() != "?").unwrap_or(&fallback);
         let sample = rows[0].get(i);
-        let coldef = column_def_packet(&name, sample);
+        let coldef = column_def_packet(name, sample);
         write_packet(stream, seq, &coldef)?;
         seq = seq.wrapping_add(1);
     }
@@ -475,6 +484,7 @@ fn send_binary_resultset(
     rows: Vec<Vec<Value>>,
     affected_rows: u64,
     last_insert_id: u64,
+    names: &[String],
 ) -> io::Result<()> {
     if rows.is_empty() {
         return send_ok(stream, seq, affected_rows, last_insert_id);
@@ -485,8 +495,9 @@ fn send_binary_resultset(
     seq = seq.wrapping_add(1);
 
     for i in 0..cols {
-        let name = format!("col{i}");
-        let coldef = column_def_packet(&name, None); // force VAR_STRING typing
+        let fallback = format!("col{i}");
+        let name = names.get(i).filter(|n| n.as_str() != "?").unwrap_or(&fallback);
+        let coldef = column_def_packet(name, None); // force VAR_STRING typing
         write_packet(stream, seq, &coldef)?;
         seq = seq.wrapping_add(1);
     }

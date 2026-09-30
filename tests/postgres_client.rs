@@ -446,3 +446,71 @@ fn two_connections_share_data() {
     tx.commit().unwrap();
     assert_eq!(b.query_one("SELECT count(*) FROM t", &[]).unwrap().get::<_, i64>(0), 2);
 }
+
+#[test]
+fn persistence_maintains_tables_and_sequences() {
+    let dir = std::env::temp_dir().join(format!("noida-postgres-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Uses `spawn_persistent_with_for_test` (not the generic
+    // `services::start_persistent` dispatcher) so the save closure it
+    // returns can be called directly below -- `on_shutdown`'s own
+    // registry is process-wide and runs every hook ever registered, so
+    // triggering it from here would also fire any other persistent server
+    // started elsewhere in this same test binary.
+    let (addr, save) = noida::postgres::server::spawn_persistent_with_for_test(
+        "127.0.0.1:0",
+        &dir,
+        noida::postgres::server::Config::default(),
+    )
+    .unwrap();
+    {
+        let mut c = connect(addr);
+        c.batch_execute("CREATE TABLE t (id serial primary key, name varchar(20))").unwrap();
+        c.execute("INSERT INTO t (name) VALUES ('a'), ('b')", &[]).unwrap();
+        let rows = c.query("SELECT id, name FROM t ORDER BY id", &[]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<_, i32>(0), 1);
+        assert_eq!(rows[1].get::<_, i32>(0), 2);
+    }
+
+    // Trigger save
+    save();
+
+    // Start a second server from the same data dir
+    let addr2 =
+        noida::services::start_persistent("postgres", "127.0.0.1:0", &dir).unwrap().unwrap();
+    {
+        let mut c = connect(addr2);
+        let rows = c.query("SELECT id, name FROM t ORDER BY id", &[]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get::<_, i32>(0), 1);
+        assert_eq!(rows[0].get::<_, &str>(1), "a");
+        assert_eq!(rows[1].get::<_, i32>(0), 2);
+        assert_eq!(rows[1].get::<_, &str>(1), "b");
+
+        // Sequence must continue correctly
+        c.execute("INSERT INTO t (name) VALUES ('c')", &[]).unwrap();
+        let rows = c.query("SELECT id FROM t WHERE name = 'c'", &[]).unwrap();
+        assert_eq!(rows[0].get::<_, i32>(0), 3);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn persistent_server_starts_empty_when_no_data_dir() {
+    let dir =
+        std::env::temp_dir().join(format!("noida-postgres-test-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let addr = noida::services::start_persistent("postgres", "127.0.0.1:0", &dir).unwrap().unwrap();
+    let mut c = connect(addr);
+
+    // Check built in schemas exist
+    let row = c.query_one("SELECT oid FROM pg_class WHERE relname = 'pg_type'", &[]).unwrap();
+    assert!(row.get::<_, u32>(0) > 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
