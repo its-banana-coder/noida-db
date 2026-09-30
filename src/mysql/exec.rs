@@ -1,6 +1,6 @@
 use crate::mysql::catalog::{DbState, Table};
 use crate::mysql::error::MySqlError;
-use crate::mysql::plan::{ArithOp, CmpOp, Expr, JoinOp, Plan};
+use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, JoinOp, Plan};
 use crate::mysql::types::Value;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
@@ -8,11 +8,20 @@ use std::sync::{Arc, Mutex};
 pub struct Executor {
     pub db: Arc<Mutex<DbState>>,
     pub current_db: Option<String>,
+    /// Values bound to `Expr::Param(i)` placeholders for this execution
+    /// (from `COM_STMT_EXECUTE`'s parameter section), indexed the same way
+    /// `Binder::param_counter` assigned them. Empty for a plain `COM_QUERY`
+    /// or a parameterless prepared statement.
+    pub params: Vec<Value>,
+    /// Rows actually affected by the last `INSERT`/`UPDATE`/`DELETE` this
+    /// executor ran, so the caller can report a real count in the OK
+    /// packet instead of always claiming 0.
+    pub last_affected_rows: u64,
 }
 
 impl Executor {
     pub fn new(db: Arc<Mutex<DbState>>, current_db: Option<String>) -> Self {
-        Self { db, current_db }
+        Self { db, current_db, params: Vec::new(), last_affected_rows: 0 }
     }
 
     /// Finds the `Table` a plan's rows ultimately come from, for resolving
@@ -156,6 +165,7 @@ impl Executor {
                     .get_mut(&table)
                     .ok_or_else(|| MySqlError::unknown_table(&table))?;
                 let t_mut = Arc::make_mut(t);
+                let affected = rows.len() as u64;
 
                 for row_exprs in rows {
                     let mut new_row = vec![Value::Null; t_mut.columns.len()];
@@ -209,6 +219,7 @@ impl Executor {
                     t_mut.rows.push(new_row);
                 }
 
+                self.last_affected_rows = affected;
                 Ok(vec![])
             }
             Plan::Update { db, table, assignments, selection } => {
@@ -221,6 +232,7 @@ impl Executor {
                     .get_mut(&table)
                     .ok_or_else(|| MySqlError::unknown_table(&table))?;
                 let t_mut = Arc::make_mut(t);
+                let mut affected = 0u64;
 
                 for i in 0..t_mut.rows.len() {
                     let mut matches = true;
@@ -232,6 +244,7 @@ impl Executor {
                     }
 
                     if matches {
+                        affected += 1;
                         for (col_name, expr) in &assignments {
                             let idx = t_mut
                                 .columns
@@ -244,6 +257,7 @@ impl Executor {
                     }
                 }
 
+                self.last_affected_rows = affected;
                 Ok(vec![])
             }
             Plan::Delete { db, table, selection } => {
@@ -271,6 +285,7 @@ impl Executor {
                         new_rows.push(row.clone());
                     }
                 }
+                self.last_affected_rows = (t_mut.rows.len() - new_rows.len()) as u64;
                 t_mut.rows = new_rows;
 
                 Ok(vec![])
@@ -306,6 +321,48 @@ impl Executor {
                     let mut out_row = Vec::new();
                     for expr in &exprs {
                         out_row.push(self.eval_expr(expr, &row, table_context.as_ref())?);
+                    }
+                    out_rows.push(out_row);
+                }
+                Ok(out_rows)
+            }
+            Plan::Aggregate { source, group_exprs, exprs, .. } => {
+                let table_context = self.resolve_table_context(&source)?;
+                let rows = self.execute_plan(*source)?;
+
+                // Group rows by the evaluated GROUP BY key. `Value`'s
+                // `PartialEq` (via `Vec<Value>`) is enough to compare keys
+                // here — linear search per row is fine at this project's
+                // "simple over performant, local-use only" scale. No
+                // GROUP BY clause but an aggregate in the projection means
+                // the whole input is a single implicit group (possibly
+                // empty, e.g. `SELECT COUNT(*) FROM t` on an empty table).
+                let mut groups: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
+                if group_exprs.is_empty() {
+                    groups.push((Vec::new(), rows));
+                } else {
+                    for row in rows {
+                        let key = group_exprs
+                            .iter()
+                            .map(|e| self.eval_expr(e, &row, table_context.as_ref()))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if let Some(g) = groups.iter_mut().find(|(k, _)| *k == key) {
+                            g.1.push(row);
+                        } else {
+                            groups.push((key, vec![row]));
+                        }
+                    }
+                }
+
+                let mut out_rows = Vec::new();
+                for (_key, group_rows) in &groups {
+                    let mut out_row = Vec::new();
+                    for expr in &exprs {
+                        out_row.push(self.eval_group_expr(
+                            expr,
+                            group_rows,
+                            table_context.as_ref(),
+                        )?);
                     }
                     out_rows.push(out_row);
                 }
@@ -372,7 +429,7 @@ impl Executor {
     ) -> Result<Value, MySqlError> {
         match expr {
             Expr::Const(v) => Ok(v.clone()),
-            Expr::Param(_) => Err(MySqlError::unsupported("parameters in execution")),
+            Expr::Param(i) => Ok(self.params.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::Col(i) => Ok(row.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::ColName(name) => {
                 if let Some(t) = table
@@ -440,6 +497,149 @@ impl Executor {
             }
             _ => Err(MySqlError::unsupported("expr in execution")),
         }
+    }
+
+    /// Evaluates a projection expression against one group of rows
+    /// (`Plan::Aggregate`'s output). Any `Expr::Agg` found — including
+    /// nested inside arithmetic/boolean combinators, e.g. `COUNT(x) + 1`
+    /// — is computed over the whole group; every other leaf expression
+    /// (a bare grouped column, a literal, `?`, `@@var`) is evaluated
+    /// against the group's first row, since a non-aggregated column in a
+    /// `GROUP BY` query is only meaningful when it's constant within the
+    /// group (matching every real column reference this binder produces:
+    /// the `GROUP BY` key columns themselves).
+    fn eval_group_expr(
+        &self,
+        expr: &Expr,
+        rows: &[Vec<Value>],
+        table: Option<&Table>,
+    ) -> Result<Value, MySqlError> {
+        match expr {
+            Expr::Agg { func, arg } => {
+                if matches!(func, AggFunc::CountStar) {
+                    return Ok(Value::Int(rows.len() as i64));
+                }
+                let arg = arg
+                    .as_ref()
+                    .ok_or_else(|| MySqlError::unsupported("aggregate without argument"))?;
+                let vals: Vec<Value> =
+                    rows.iter().map(|r| self.eval_expr(arg, r, table)).collect::<Result<_, _>>()?;
+                Ok(compute_agg(*func, &vals))
+            }
+            Expr::Arith { op, left, right } => {
+                let l = self.eval_group_expr(left, rows, table)?;
+                let r = self.eval_group_expr(right, rows, table)?;
+                eval_arith(*op, l, r)
+            }
+            Expr::Compare { op, left, right } => {
+                let l = self.eval_group_expr(left, rows, table)?;
+                let r = self.eval_group_expr(right, rows, table)?;
+                eval_compare(*op, l, r)
+            }
+            Expr::And(exprs) => {
+                let mut res = Value::Int(1);
+                for e in exprs {
+                    let v = self.eval_group_expr(e, rows, table)?;
+                    if v.is_null() {
+                        res = Value::Null;
+                    } else if v == Value::Int(0) {
+                        return Ok(Value::Int(0));
+                    }
+                }
+                Ok(res)
+            }
+            Expr::Or(exprs) => {
+                let mut res = Value::Int(0);
+                for e in exprs {
+                    let v = self.eval_group_expr(e, rows, table)?;
+                    if v == Value::Int(1) {
+                        return Ok(Value::Int(1));
+                    } else if v.is_null() {
+                        res = Value::Null;
+                    }
+                }
+                Ok(res)
+            }
+            _ => {
+                if let Some(row) = rows.first() {
+                    self.eval_expr(expr, row, table)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+        }
+    }
+}
+
+/// Ordering used by `MIN`/`MAX`: numeric values compare numerically, text
+/// compares lexically, matching `eval_compare`'s own rules. `None` (e.g.
+/// comparing a number against text) means the two aren't ordered against
+/// each other — the caller treats that as "keep the earlier value".
+fn value_partial_cmp(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => x.partial_cmp(y),
+        _ => {
+            let as_f64 = |v: &Value| match v {
+                Value::Int(i) => Some(*i as f64),
+                Value::Float(f) => Some(*f),
+                _ => None,
+            };
+            match (as_f64(a), as_f64(b)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over one group's evaluated values.
+/// `COUNT(*)` is handled by the caller before reaching here (it needs the
+/// row count, not evaluated values). NULLs are skipped, matching MySQL;
+/// an all-NULL (or empty) group's `SUM`/`AVG`/`MIN`/`MAX` is NULL.
+fn compute_agg(func: AggFunc, vals: &[Value]) -> Value {
+    let non_null: Vec<&Value> = vals.iter().filter(|v| !v.is_null()).collect();
+    match func {
+        AggFunc::CountStar => Value::Int(vals.len() as i64),
+        AggFunc::Count => Value::Int(non_null.len() as i64),
+        AggFunc::Sum => {
+            if non_null.is_empty() {
+                return Value::Null;
+            }
+            let all_int = non_null.iter().all(|v| matches!(v, Value::Int(_)));
+            let sum: f64 = non_null
+                .iter()
+                .map(|v| match v {
+                    Value::Int(i) => *i as f64,
+                    Value::Float(f) => *f,
+                    _ => 0.0,
+                })
+                .sum();
+            if all_int { Value::Int(sum as i64) } else { Value::Float(sum) }
+        }
+        AggFunc::Avg => {
+            if non_null.is_empty() {
+                return Value::Null;
+            }
+            let sum: f64 = non_null
+                .iter()
+                .map(|v| match v {
+                    Value::Int(i) => *i as f64,
+                    Value::Float(f) => *f,
+                    _ => 0.0,
+                })
+                .sum();
+            Value::Float(sum / non_null.len() as f64)
+        }
+        AggFunc::Min => non_null
+            .into_iter()
+            .cloned()
+            .min_by(|a, b| value_partial_cmp(a, b).unwrap_or(Ordering::Equal))
+            .unwrap_or(Value::Null),
+        AggFunc::Max => non_null
+            .into_iter()
+            .cloned()
+            .max_by(|a, b| value_partial_cmp(a, b).unwrap_or(Ordering::Equal))
+            .unwrap_or(Value::Null),
     }
 }
 

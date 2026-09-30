@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
+| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
@@ -427,23 +427,72 @@ client libraries (e.g. mysql_async) needs (`version`, `version_comment`,
 `max_allowed_packet`, `wait_timeout`, `socket`, `lower_case_table_names`).
 A real unsupported statement now gets a real MySQL `ERR` packet
 (previously a silent `OK`, indistinguishable from "0 rows, no error").
-Basic prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`) work for
-parameterless statements; parameter binding from the client isn't wired
-up yet (`EXECUTE` always runs the plan as originally prepared, ignoring
-any bound values). Verified against `mysql_async` and a differential
-test against a real MySQL 8.0 server (`tests/mysql_diff.rs`,
-`NOIDA_MYSQL_REF=host:port`).
+
+Prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`) support
+real parameter binding: `EXECUTE`'s null-bitmap and (when sent —
+per-statement type codes are cached across executions of the same
+statement id so a client that only sends them once still works) typed
+parameter values are decoded from the wire per the MySQL binary protocol
+and substituted for the `?` placeholders the statement was prepared
+with, so re-executing the same prepared plan with different bound values
+actually runs against those values. Supported bound-parameter wire types:
+`TINY`/`SHORT`/`LONG`/`INT24`/`LONGLONG` (integers), `FLOAT`/`DOUBLE`,
+and `DECIMAL`/`VARCHAR`/`VAR_STRING`/`STRING`/`BLOB` (as text) — bound
+`DATE`/`DATETIME`/`TIME` parameters are not decoded yet (their binary
+layout isn't length-encoded text) and are rejected with a real error
+rather than silently misread.
+
+`GROUP BY` and the five aggregate functions `COUNT`/`COUNT(*)`/`SUM`/
+`AVG`/`MIN`/`MAX` work, including with no `GROUP BY` clause at all (the
+whole result set is then one implicit group, so `SELECT COUNT(*) FROM t`
+on an empty table correctly returns `0` rather than no rows). Grouping
+compares keys with simple equality (linear scan per row, matching this
+project's "simple over performant, local-use only" scale) rather than
+hashing, so it doesn't need `Value` to implement `Hash`/`Ord`. `HAVING`
+and mixing aggregates with non-aggregated, non-grouped columns in the
+same projection (undefined in standard SQL, and MySQL's own behavior
+there depends on `ONLY_FULL_GROUP_BY`) are not handled specially.
+
+`BEGIN`/`START TRANSACTION`, `COMMIT`, and `ROLLBACK` give a single
+connection real commit/rollback semantics: `BEGIN` snapshot-clones the
+entire in-memory database state, `ROLLBACK` restores that snapshot
+verbatim, and `COMMIT` discards it and keeps whatever's current. This is
+deliberately the simplest thing that's still correct for one connection,
+not a real transaction engine — there's no MVCC, no isolation levels
+(every statement always sees the latest state, even from other
+connections, whether or not a transaction is open), and no nested
+transactions (a `BEGIN` while a transaction is already open just replaces
+the snapshot rather than erroring or stacking).
+
+`OK` packets now report a real `affected_rows` count for
+`INSERT`/`UPDATE`/`DELETE` (a client's `.affected_rows()` — e.g.
+`mysql_async`'s `Conn::affected_rows()` — reflects rows actually
+inserted/matched/deleted); `last_insert_id` is still always reported as 0
+even for an `AUTO_INCREMENT` insert.
+
+Verified against `mysql_async` (`tests/mysql_client.rs`, including the
+prepared-statement, `GROUP BY`, transaction and `affected_rows` behavior
+above) and a differential test against a real MySQL 8.0 server
+(`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`). In this sandbox, a
+server was reachable on the default port but authenticates with
+`sha256_password`, which `mysql_async` itself doesn't support
+(`Driver(UnknownAuthPlugin { name: "sha256_password" })`) — that's a
+pre-existing gap in the test's own client dependency, not something this
+change introduced or could work around, and it reproduces identically on
+`main` before this change. The new scenarios are in the test file ready
+to run against a `mysql_native_password`-configured reference server.
 
 **Not yet**
-- Prepared-statement parameter binding (`?` placeholders are parsed but
-  not substituted at `EXECUTE` time — every execution reuses the literal
-  values, if any, from the original `PREPARE` text).
-- `GROUP BY` and aggregate functions (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`).
-- Transactions, authentication (every password is currently accepted).
-- `OK` packets never report a real `affected_rows` count for
-  `INSERT`/`UPDATE`/`DELETE` — always 0, even when rows were actually
-  affected. A client can't rely on "did my UPDATE match anything?"
-  through the wire protocol yet.
+- Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
+  above).
+- `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, subqueries, window functions.
+- Isolation levels, nested/savepoint transactions, and any cross-
+  connection isolation (a transaction only protects against its own
+  connection's later `ROLLBACK`, not against seeing concurrent writes
+  from other connections).
+- `last_insert_id` in the OK packet (always 0, even after an
+  `AUTO_INCREMENT` insert).
+- Authentication (every password is currently accepted).
 
 ## Memcached
 
