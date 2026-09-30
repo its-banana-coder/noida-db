@@ -69,6 +69,24 @@ pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
 }
 
 pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Result<SocketAddr> {
+    let (addr, save) = spawn_persistent_with_for_test(addr, data_dir, cfg)?;
+    crate::persistence::on_shutdown(save);
+    Ok(addr)
+}
+
+/// Like `spawn_persistent_with`, but also returns a closure that performs
+/// exactly the save the real shutdown hook would perform, so a test can
+/// trigger a save directly instead of going through
+/// `persistence::on_shutdown`'s process-wide hook registry -- that
+/// registry runs *every* hook ever registered in the process, which is
+/// unsafe to trigger from a single test once more than one persistent
+/// server has been started in the same test binary (as happens once other
+/// services' persistence tests exist alongside this one).
+pub fn spawn_persistent_with_for_test(
+    addr: &str,
+    data_dir: &Path,
+    cfg: Config,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
 
@@ -87,11 +105,11 @@ pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Re
     };
 
     let save_engine = engine.clone();
-    crate::persistence::on_shutdown(move || {
+    let save = move || {
         let snapshot = save_engine.snapshot();
         let bytes = serde_json::to_vec(&snapshot).expect("postgres snapshot serialization failed");
         let _ = crate::persistence::write_snapshot_atomically(&path, &bytes);
-    });
+    };
 
     let cfg = Arc::new(cfg);
     std::thread::Builder::new().name("postgres-accept".into()).stack_size(STACK_SIZE).spawn(
@@ -108,7 +126,7 @@ pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Re
             }
         },
     )?;
-    Ok(local)
+    Ok((local, save))
 }
 
 pub fn spawn_with(addr: &str, cfg: Config) -> io::Result<SocketAddr> {

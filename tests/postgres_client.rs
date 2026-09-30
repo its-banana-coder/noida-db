@@ -453,7 +453,18 @@ fn persistence_maintains_tables_and_sequences() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    let addr = noida::services::start_persistent("postgres", "127.0.0.1:0", &dir).unwrap().unwrap();
+    // Uses `spawn_persistent_with_for_test` (not the generic
+    // `services::start_persistent` dispatcher) so the save closure it
+    // returns can be called directly below -- `on_shutdown`'s own
+    // registry is process-wide and runs every hook ever registered, so
+    // triggering it from here would also fire any other persistent server
+    // started elsewhere in this same test binary.
+    let (addr, save) = noida::postgres::server::spawn_persistent_with_for_test(
+        "127.0.0.1:0",
+        &dir,
+        noida::postgres::server::Config::default(),
+    )
+    .unwrap();
     {
         let mut c = connect(addr);
         c.batch_execute("CREATE TABLE t (id serial primary key, name varchar(20))").unwrap();
@@ -464,8 +475,8 @@ fn persistence_maintains_tables_and_sequences() {
         assert_eq!(rows[1].get::<_, i32>(0), 2);
     }
 
-    // Call the shutdown hooks to trigger snapshot save
-    noida::persistence::run_hooks_for_test();
+    // Trigger save
+    save();
 
     // Start a second server from the same data dir
     let addr2 =
@@ -486,6 +497,7 @@ fn persistence_maintains_tables_and_sequences() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 #[test]
 fn persistent_server_starts_empty_when_no_data_dir() {
     let dir =
