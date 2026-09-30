@@ -3,6 +3,7 @@
 
 use std::io::{self, BufReader, BufWriter, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -27,6 +28,64 @@ struct Shared {
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let password = std::env::var("NOIDA_REDIS_PASSWORD").ok().filter(|p| !p.is_empty());
     spawn_with(addr, password.as_deref())
+}
+
+/// Like `spawn_persistent_for_test`, but registers the save closure via
+/// `persistence::on_shutdown` instead of returning it -- the real,
+/// production entry point used by `services::start_persistent`.
+pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
+    let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
+    crate::persistence::on_shutdown(save);
+    Ok(addr)
+}
+
+/// Like `spawn`, but loads `<data_dir>/redis.json` on startup if it
+/// exists (the 16 logical databases only -- `Engine`'s other fields are
+/// either derived, e.g. `next_client_id`, or genuinely connection/
+/// process-local state, e.g. `clients`/`pubsub`/the Lua script cache/the
+/// `clock` closure, none of which make sense to "restore" across a
+/// restart), and returns a closure that saves a fresh snapshot back --
+/// callable directly (what a test should do) or registered via
+/// `persistence::on_shutdown` (what `spawn_persistent` does) to save on
+/// a clean process exit. Full snapshot every time, not incremental.
+pub fn spawn_persistent_for_test(
+    addr: &str,
+    data_dir: &Path,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+    let path = data_dir.join("redis.json");
+
+    let mut engine = Engine::new();
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Ok(dbs) = serde_json::from_slice::<Vec<super::engine::Db>>(&bytes)
+    {
+        engine.dbs = dbs;
+    }
+    let engine = Arc::new(Shared { engine: Mutex::new(engine), replies: Condvar::new() });
+
+    let save_shared = engine.clone();
+    let save_path = path.clone();
+    let save = move || {
+        let dbs = &save_shared.engine.lock().unwrap().dbs;
+        if let Ok(bytes) = serde_json::to_vec(dbs) {
+            let _ = crate::persistence::write_snapshot_atomically(&save_path, &bytes);
+        }
+    };
+
+    let sweeper = Arc::clone(&engine);
+    thread::Builder::new().name("redis-expire".into()).stack_size(STACK_SIZE).spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            sweeper.engine.lock().unwrap().purge_expired();
+        }
+    })?;
+
+    thread::Builder::new()
+        .name("redis-accept".into())
+        .stack_size(STACK_SIZE)
+        .spawn(move || accept_loop(listener, engine))?;
+    Ok((local, save))
 }
 
 /// Like `spawn`, with `requirepass` set: new connections must AUTH first.

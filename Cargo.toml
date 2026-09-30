@@ -99,6 +99,10 @@ name = "redis_coverage"
 required-features = ["redis"]
 
 [[test]]
+name = "redis_persistence"
+required-features = ["redis"]
+
+[[test]]
 name = "longdouble_oracle"
 required-features = ["redis"]
 
