@@ -2,8 +2,44 @@ use super::engine::{Engine, error};
 use serde_json::Value;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
+
+pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+    let snapshot_path = data_dir.join("elasticsearch.json");
+
+    let engine = if let Ok(bytes) = std::fs::read(&snapshot_path) {
+        Engine::load(&bytes)
+    } else {
+        Engine::default()
+    };
+
+    let hook_engine = engine.clone();
+    crate::persistence::on_shutdown(move || {
+        let snapshot = hook_engine.snapshot();
+        let _ = crate::persistence::write_snapshot_atomically(&snapshot_path, &snapshot);
+    });
+
+    thread::Builder::new().name("elasticsearch-listener".into()).spawn(move || {
+        for incoming in listener.incoming() {
+            match incoming {
+                Ok(stream) => {
+                    let engine = engine.clone();
+                    let _ = thread::Builder::new().name("elasticsearch-client".into()).spawn(
+                        move || {
+                            let _ = serve(stream, engine);
+                        },
+                    );
+                }
+                Err(e) => eprintln!("elasticsearch accept: {e}"),
+            }
+        }
+    })?;
+    Ok(local)
+}
 
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;

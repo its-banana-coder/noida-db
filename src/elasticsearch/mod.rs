@@ -10,3 +10,4 @@ mod server;
 mod tests;
 
 pub use server::spawn;
+pub use server::spawn_persistent;
