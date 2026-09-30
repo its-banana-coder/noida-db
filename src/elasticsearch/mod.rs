@@ -11,3 +11,4 @@ mod tests;
 
 pub use server::spawn;
 pub use server::spawn_persistent;
+pub use server::spawn_persistent_for_test;

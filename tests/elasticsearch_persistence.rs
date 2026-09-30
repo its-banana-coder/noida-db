@@ -82,9 +82,14 @@ fn elasticsearch_persistence_save_and_load() {
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
-    // Start ephemeral behavior on empty dir
-    let addr1 =
-        noida::services::start_persistent("elasticsearch", "127.0.0.1:0", &dir).unwrap().unwrap();
+    // Start ephemeral behavior on empty dir. Uses `spawn_persistent_for_test`
+    // (not the generic `services::start_persistent` dispatcher) so the save
+    // closure it returns can be called directly below -- `on_shutdown`'s own
+    // registry is process-wide and runs every hook ever registered, so
+    // triggering it from here would also fire any other persistent server
+    // started elsewhere in this same test binary.
+    let (addr1, save1) =
+        noida::elasticsearch::spawn_persistent_for_test("127.0.0.1:0", &dir).unwrap();
 
     // Create an index
     let create = br#"{"settings":{"index":{"number_of_shards":"1"}}, "mappings": {"properties": {"title": {"type": "text"}}}}"#;
@@ -100,7 +105,7 @@ fn elasticsearch_persistence_save_and_load() {
     assert_eq!(res.status, 201);
 
     // Trigger save
-    noida::persistence::run_shutdown_hooks_for_test();
+    save1();
 
     // Verify snapshot file exists
     assert!(dir.join("elasticsearch.json").exists());
