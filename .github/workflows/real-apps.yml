@@ -1,0 +1,42 @@
+name: real-apps
+
+# Runs the heavier real, unmodified application tests under tests/apps/
+# (Gitea, Miniflux, WordPress, ...) -- each is a multi-minute end-to-end
+# workflow against a real toolchain (git, PHP, ...) and real networks
+# (downloading pinned, checksum-verified releases), so these are kept out
+# of the fast per-push `ci` workflow and instead run:
+#   - on any push/PR that touches tests/apps/** (so a change to one of
+#     these scripts, or a fix aimed at unblocking one, gets real signal)
+#   - on a daily schedule, as ongoing regression coverage
+#   - on manual dispatch
+on:
+  push:
+    paths:
+      - "tests/apps/**"
+      - ".github/workflows/real-apps.yml"
+  pull_request:
+    paths:
+      - "tests/apps/**"
+      - ".github/workflows/real-apps.yml"
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  real-apps:
+    runs-on: ubuntu-latest
+    # No service containers needed -- each script under tests/apps/ starts
+    # its own noida-db instance with the services it needs.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: mysqli
+      # Real Gitea (git server) against noida-db's Postgres + Redis.
+      - run: tests/apps/gitea/run.sh
+      # Real Miniflux (RSS reader) against noida-db's Postgres.
+      - run: tests/apps/miniflux/run.sh
+      # Real WordPress (via WP-CLI) against noida-db's MySQL.
+      - run: tests/apps/wordpress/run.sh
