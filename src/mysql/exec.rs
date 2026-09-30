@@ -482,6 +482,14 @@ impl Executor {
                 let r = self.eval_expr(right, row, table)?;
                 eval_compare(*op, l, r)
             }
+            Expr::InList { expr, list, negated } => {
+                let l = self.eval_expr(expr, row, table)?;
+                let mut items = Vec::with_capacity(list.len());
+                for item in list {
+                    items.push(self.eval_expr(item, row, table)?);
+                }
+                eval_in_list(l, &items, *negated)
+            }
             Expr::SysVar(name) => {
                 if name.eq_ignore_ascii_case("version") {
                     Ok(Value::Text("8.0.33".to_string()))
@@ -743,4 +751,28 @@ fn eval_compare(op: CmpOp, l: Value, r: Value) -> Result<Value, MySqlError> {
         CmpOp::Ge => ordering != Ordering::Less,
     };
     Ok(Value::Int(result as i64))
+}
+
+/// `l [NOT] IN (items...)`, matching real MySQL's three-valued semantics:
+/// true if `l` equals any non-NULL item (via `eval_compare`'s own
+/// equality, so the same type-coercion/ordering rules apply), else NULL
+/// if `l` or any item is NULL, else false. `negated` flips true/false but
+/// leaves NULL as NULL, the same way `NOT NULL` (the boolean operator, not
+/// the column constraint) does.
+fn eval_in_list(l: Value, items: &[Value], negated: bool) -> Result<Value, MySqlError> {
+    let mut any_null = l.is_null();
+    let mut found = false;
+    for item in items {
+        if item.is_null() {
+            any_null = true;
+            continue;
+        }
+        if eval_compare(CmpOp::Eq, l.clone(), item.clone())? == Value::Int(1) {
+            found = true;
+        }
+    }
+    if any_null && !found {
+        return Ok(Value::Null); // NOT NULL is still NULL
+    }
+    Ok(Value::Int((found != negated) as i64))
 }
