@@ -187,3 +187,50 @@ async fn test_mysql_affected_rows() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_last_insert_id() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop(
+        "CREATE TABLE lii_test (id INT AUTO_INCREMENT PRIMARY KEY, value VARCHAR(255))",
+    )
+    .await
+    .unwrap();
+
+    conn.query_drop("INSERT INTO lii_test (value) VALUES ('a')").await.unwrap();
+    assert_eq!(conn.last_insert_id(), Some(1));
+
+    conn.query_drop("INSERT INTO lii_test (value) VALUES ('b')").await.unwrap();
+    assert_eq!(conn.last_insert_id(), Some(2));
+
+    // A multi-row INSERT reports the id generated for the *first* row, not
+    // the last -- matching real MySQL's `LAST_INSERT_ID()`/OK-packet
+    // semantics.
+    conn.query_drop("INSERT INTO lii_test (value) VALUES ('c'), ('d'), ('e')").await.unwrap();
+    assert_eq!(conn.last_insert_id(), Some(3));
+
+    // A statement that doesn't generate an id (a SELECT here) reports 0/None
+    // in its own OK-packet field -- matching real MySQL, where
+    // `mysqli_insert_id()` only reflects the immediately preceding
+    // statement, not a persisted session value (that's what the separate
+    // `LAST_INSERT_ID()` SQL function is for).
+    let _res: Vec<(i32, String)> = conn.query("SELECT id, value FROM lii_test").await.unwrap();
+    assert_eq!(conn.last_insert_id(), None);
+
+    // Explicit non-NULL values into an AUTO_INCREMENT column don't
+    // generate a new id either.
+    conn.query_drop("INSERT INTO lii_test (id, value) VALUES (100, 'explicit')").await.unwrap();
+    assert_eq!(conn.last_insert_id(), None);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
