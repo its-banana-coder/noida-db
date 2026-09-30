@@ -330,7 +330,14 @@ impl Executor {
                 for row in rows {
                     let mut out_row = Vec::new();
                     for expr in &exprs {
-                        out_row.push(self.eval_expr(expr, &row, table_context.as_ref())?);
+                        if matches!(expr, Expr::Wildcard) {
+                            // Expands to every column of the current row,
+                            // not one value -- see `Expr::Wildcard`'s own
+                            // doc comment.
+                            out_row.extend(row.iter().cloned());
+                        } else {
+                            out_row.push(self.eval_expr(expr, &row, table_context.as_ref())?);
+                        }
                     }
                     out_rows.push(out_row);
                 }

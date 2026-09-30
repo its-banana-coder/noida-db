@@ -1,3 +1,4 @@
+use super::catalog::{DbState, Table};
 use super::types::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,6 +39,13 @@ pub enum Expr {
     Param(usize),
     Col(usize),
     ColName(String),
+    /// `*` or `table.*` -- this engine only ever binds a single table into
+    /// scope per query, so a qualifier (if any) is dropped the same way
+    /// `AstExpr::CompoundIdentifier` already is. Expands to every column
+    /// of the current row at `Plan::Project` execution time (see
+    /// `Executor`'s own handling), not evaluated as a single value the
+    /// way every other `Expr` variant is.
+    Wildcard,
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Compare {
@@ -283,12 +291,24 @@ pub fn count_params(plan: &Plan) -> usize {
 /// `stdClass` rows -- PDO's associative fetch mode, any ORM) depends on
 /// these being real: a placeholder like `"col0"` silently breaks every
 /// such access with no error, just a missing property.
-pub fn column_names(plan: &Plan) -> Vec<String> {
+pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
     match plan {
-        Plan::Project { names, .. } | Plan::Aggregate { names, .. } => names.clone(),
-        Plan::Filter { source, .. } | Plan::Sort { source, .. } => column_names(source),
+        Plan::Project { source, exprs, names } | Plan::Aggregate { source, exprs, names, .. } => {
+            let mut out = Vec::with_capacity(names.len());
+            for (expr, name) in exprs.iter().zip(names) {
+                if matches!(expr, Expr::Wildcard) {
+                    if let Some(table) = source_table(source, db) {
+                        out.extend(table.columns.iter().map(|c| c.name.clone()));
+                        continue;
+                    }
+                }
+                out.push(name.clone());
+            }
+            out
+        }
+        Plan::Filter { source, .. } | Plan::Sort { source, .. } => column_names(source, db),
         Plan::ShowDatabases => vec!["Database".to_string()],
-        Plan::ShowTables(db) => vec![format!("Tables_in_{db}")],
+        Plan::ShowTables(db_name) => vec![format!("Tables_in_{db_name}")],
         Plan::ShowColumns { .. } => ["Field", "Type", "Null", "Key", "Default", "Extra"]
             .into_iter()
             .map(String::from)
@@ -300,5 +320,21 @@ pub fn column_names(plan: &Plan) -> Vec<String> {
         // `Scan`/`Join`/`Dummy` is always wrapped by a `Project` in
         // practice, and the DDL/DML variants don't return rows at all).
         _ => Vec::new(),
+    }
+}
+
+/// Walks down to the single table a (non-`Join`) plan scans, for
+/// expanding `Expr::Wildcard` into real column names. `None` for
+/// anything this engine can't resolve a single source table for (a
+/// `Join`'s two tables would be ambiguous, so wildcards aren't expanded
+/// there -- `column_names` falls back to `"*"`, which `server.rs`
+/// already treats as "no better name" the same way it does `"?"`).
+fn source_table<'a>(plan: &Plan, db: &'a DbState) -> Option<&'a Table> {
+    match plan {
+        Plan::Scan { db: db_name, table } => {
+            db.schemas.get(db_name)?.tables.get(table).map(|t| &**t)
+        }
+        Plan::Filter { source, .. } | Plan::Sort { source, .. } => source_table(source, db),
+        _ => None,
     }
 }
