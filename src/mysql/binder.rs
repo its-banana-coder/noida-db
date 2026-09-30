@@ -5,7 +5,8 @@ use crate::mysql::types::Value;
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
-    Query, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value as AstValue,
+    Query, SelectItem, SetExpr, Statement, TableConstraint, TableFactor, TableWithJoins,
+    Value as AstValue,
 };
 use std::collections::HashMap;
 
@@ -79,9 +80,11 @@ impl Binder {
                 }
                 _ => Err(MySqlError::unsupported("USE statement format")),
             },
-            Statement::CreateTable(create_table) => {
-                self.bind_create_table(create_table.name, create_table.columns)
-            }
+            Statement::CreateTable(create_table) => self.bind_create_table(
+                create_table.name,
+                create_table.columns,
+                create_table.constraints,
+            ),
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => {
                 self.bind_update(update.table, update.assignments, update.selection)
@@ -101,6 +104,7 @@ impl Binder {
         &mut self,
         name: ObjectName,
         columns: Vec<ColumnDef>,
+        constraints: Vec<TableConstraint>,
     ) -> Result<Plan, MySqlError> {
         let (db, table) = self.resolve_table_name(&name)?;
         let mut cols = Vec::new();
@@ -108,8 +112,23 @@ impl Binder {
         for col_def in columns {
             let col_name = col_def.name.value.clone();
             let col_type = match &col_def.data_type {
-                DataType::Int(_) | DataType::Integer(_) => ColumnType::Int,
-                DataType::BigInt(_) => ColumnType::BigInt,
+                DataType::Int(_)
+                | DataType::Integer(_)
+                | DataType::IntUnsigned(_)
+                | DataType::IntegerUnsigned(_)
+                | DataType::TinyInt(_)
+                | DataType::TinyIntUnsigned(_)
+                | DataType::UTinyInt
+                | DataType::SmallInt(_)
+                | DataType::SmallIntUnsigned(_)
+                | DataType::MediumInt(_)
+                | DataType::MediumIntUnsigned(_) => ColumnType::Int,
+                // No dedicated unsigned/width-limited storage type -- values
+                // are stored as a plain i64 either way (see "simple over
+                // performant" in the project's own philosophy), so UNSIGNED
+                // and the various display-width variants are accepted but
+                // not distinguished from their signed/plain counterparts.
+                DataType::BigInt(_) | DataType::BigIntUnsigned(_) => ColumnType::BigInt,
                 DataType::Varchar(len) => {
                     let l = len
                         .as_ref()
@@ -122,7 +141,7 @@ impl Binder {
                         .unwrap_or(255);
                     ColumnType::Varchar(l)
                 }
-                DataType::Text => ColumnType::Text,
+                DataType::Text | DataType::MediumText | DataType::LongText => ColumnType::Text,
                 DataType::Float(_) => ColumnType::Float,
                 DataType::Double(_) => ColumnType::Double,
                 DataType::Decimal(exact) => {
@@ -181,6 +200,30 @@ impl Binder {
                 auto_increment,
                 primary_key,
             });
+        }
+
+        // A table-level `PRIMARY KEY (...)` clause (WordPress-style schemas
+        // always define it this way, never as a column option) was
+        // previously discarded entirely rather than just its enforcement --
+        // mark the referenced column(s) as the primary key so that metadata
+        // isn't lost, even though (like column-level `UNIQUE`, already a
+        // no-op above) uniqueness itself still isn't enforced anywhere in
+        // this engine. Other table-level constraint kinds (`UNIQUE`,
+        // `FOREIGN KEY`, `KEY`/`INDEX`, `FULLTEXT`/`SPATIAL`) are accepted
+        // but not tracked, for the same reason.
+        for constraint in &constraints {
+            if let TableConstraint::PrimaryKey(pk) = constraint {
+                for idx_col in &pk.columns {
+                    if let AstExpr::Identifier(ident) = &idx_col.column.expr {
+                        for col in cols.iter_mut() {
+                            if col.name == ident.value {
+                                col.primary_key = true;
+                                col.not_null = true;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(Plan::CreateTable { db, table, columns: cols })
