@@ -54,6 +54,8 @@ serde_json = { version = "1", optional = true }
 # Kafka: wire protocol message encoding/decoding.
 kafka-protocol = { version = "0.18.0", optional = true }
 bson = { version = "3.1.0", features = ["chrono-0_4", "uuid-1"] }
+# Persistence: catching SIGINT/SIGTERM to save a snapshot before exit.
+signal-hook = "0.3"
 
 # The whole point of noida is a small footprint: tune release builds for size.
 [profile.release]
