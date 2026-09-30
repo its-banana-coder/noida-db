@@ -239,7 +239,16 @@ echo "   $table_count wp_* tables created"
 # --- 2. start the real site with PHP's built-in server ----------------------
 echo "== starting php -S (WordPress site) on 127.0.0.1:$web_port"
 web_start=$(date +%s)
-(cd "$site_dir" && php -S "127.0.0.1:$web_port" >"$work/php-server.log" 2>&1) &
+# `index.php` as the router: without one, PHP's built-in server only
+# serves requests that map to a real file (or a directory's own
+# index.php/index.html) and 404s everything else -- it never falls back
+# to WordPress's own front controller, so pretty URLs like the REST API's
+# `/wp-json/` (there's no literal `wp-json/index.php` in a stock install)
+# can't be dispatched to WordPress at all. Passing `index.php` here makes
+# every request PHP can't resolve to a real file go through it instead,
+# which is what actually lets WordPress's own REQUEST_URI-based routing
+# (the same mechanism a real webserver's rewrite rules hand off to) work.
+(cd "$site_dir" && php -S "127.0.0.1:$web_port" index.php >"$work/php-server.log" 2>&1) &
 php_pid=$!
 
 base="http://127.0.0.1:$web_port"
