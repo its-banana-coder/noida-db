@@ -87,7 +87,7 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                 // Init DB
                 let db = String::from_utf8_lossy(&payload[1..]);
                 session.engine.use_db(&db);
-                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0);
+                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0, 0);
             }
             0x03 => {
                 // Query
@@ -95,7 +95,14 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                 match session.engine.execute(&q) {
                     Ok(rows) => {
                         let affected = session.engine.last_affected_rows;
-                        let _ = send_resultset(&mut stream, seq.wrapping_add(1), rows, affected);
+                        let insert_id = session.engine.last_insert_id;
+                        let _ = send_resultset(
+                            &mut stream,
+                            seq.wrapping_add(1),
+                            rows,
+                            affected,
+                            insert_id,
+                        );
                     }
                     Err(e) => {
                         let _ = send_err(
@@ -238,6 +245,8 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                         match executor.execute_plan(stmt_plan) {
                             Ok(rows) => {
                                 let affected = executor.last_affected_rows;
+                                session.engine.last_affected_rows = affected;
+                                session.engine.last_insert_id = executor.last_insert_id;
                                 // COM_STMT_EXECUTE's result set uses the
                                 // binary protocol row format, not the text
                                 // protocol format `send_resultset` (used for
@@ -245,11 +254,13 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
                                 // against `mysql_async`) misreads the bytes
                                 // (silently, as garbage/NULL values, not an
                                 // error) if the two are mixed up.
+                                let insert_id = executor.last_insert_id;
                                 let _ = send_binary_resultset(
                                     &mut stream,
                                     seq.wrapping_add(1),
                                     rows,
                                     affected,
+                                    insert_id,
                                 );
                             }
                             Err(e) => {
@@ -284,10 +295,10 @@ fn serve(mut stream: TcpStream) -> io::Result<()> {
             }
             0x1a => {
                 // Stmt Reset
-                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0);
+                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0, 0);
             }
             _ => {
-                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0);
+                let _ = send_ok(&mut stream, seq.wrapping_add(1), 0, 0);
             }
         }
     }
@@ -304,11 +315,16 @@ fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> io::Result<(
     Ok(())
 }
 
-fn send_ok(stream: &mut TcpStream, seq: u8, affected_rows: u64) -> io::Result<()> {
+fn send_ok(
+    stream: &mut TcpStream,
+    seq: u8,
+    affected_rows: u64,
+    last_insert_id: u64,
+) -> io::Result<()> {
     let mut payload = Vec::new();
     payload.push(0x00);
     write_lenenc_int(&mut payload, affected_rows);
-    write_lenenc_int(&mut payload, 0); // last_insert_id: not tracked yet
+    write_lenenc_int(&mut payload, last_insert_id);
     payload.extend_from_slice(&0x0002u16.to_le_bytes()); // status flags: SERVER_STATUS_AUTOCOMMIT
     payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
     write_packet(stream, seq, &payload)
@@ -371,9 +387,10 @@ fn send_resultset(
     mut seq: u8,
     rows: Vec<Vec<Value>>,
     affected_rows: u64,
+    last_insert_id: u64,
 ) -> io::Result<()> {
     if rows.is_empty() {
-        return send_ok(stream, seq, affected_rows);
+        return send_ok(stream, seq, affected_rows, last_insert_id);
     }
 
     let cols = rows[0].len();
@@ -442,9 +459,10 @@ fn send_binary_resultset(
     mut seq: u8,
     rows: Vec<Vec<Value>>,
     affected_rows: u64,
+    last_insert_id: u64,
 ) -> io::Result<()> {
     if rows.is_empty() {
-        return send_ok(stream, seq, affected_rows);
+        return send_ok(stream, seq, affected_rows, last_insert_id);
     }
 
     let cols = rows[0].len();

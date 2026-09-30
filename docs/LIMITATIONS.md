@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
+| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`/`last_insert_id`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
@@ -416,9 +416,15 @@ literal-only `SELECT` expressions (numeric/string/NULL literals,
 `+ - * /`, integer division formats as a 4-decimal-place string matching
 MySQL's `div_precision_increment` default rather than a bare float,
 comparisons `= <> < <= > >=` with three-valued NULL logic, `AND`/`OR`)
-and real tables: `CREATE TABLE` (`INT`/`BIGINT`/`VARCHAR`/`TEXT`/
-`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
-`NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`), `INSERT INTO ...
+and real tables: `CREATE TABLE` (`INT`/`TINYINT`/`SMALLINT`/`MEDIUMINT`/
+`BIGINT` and their `UNSIGNED` forms/`VARCHAR`/`TEXT`/`MEDIUMTEXT`/
+`LONGTEXT`/`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
+`NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`, including a
+table-level `PRIMARY KEY (...)` clause — the form WordPress's own core
+schema always uses rather than a column option; `UNSIGNED` and the
+various display-width integer variants are accepted but not
+distinguished from their plain/signed counterparts, since every integer
+is stored as a plain `i64` regardless), `INSERT INTO ...
 VALUES (...), ...`, `SELECT` with `WHERE` and basic `INNER`/`LEFT`/cross
 `JOIN`, `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`,
 `SHOW DATABASES`/`SHOW TABLES`/`SHOW COLUMNS FROM`/`SHOW CREATE TABLE`,
@@ -467,12 +473,19 @@ the snapshot rather than erroring or stacking).
 `OK` packets now report a real `affected_rows` count for
 `INSERT`/`UPDATE`/`DELETE` (a client's `.affected_rows()` — e.g.
 `mysql_async`'s `Conn::affected_rows()` — reflects rows actually
-inserted/matched/deleted); `last_insert_id` is still always reported as 0
-even for an `AUTO_INCREMENT` insert.
+inserted/matched/deleted) and a real `last_insert_id` for an
+`AUTO_INCREMENT` insert (a client's `.last_insert_id()` — e.g.
+`mysqli_insert_id()`, which WordPress's `$wpdb->insert_id` reads directly
+— reflects the id generated for the *first* row of a multi-row `INSERT`,
+matching real MySQL; like real MySQL, it's per-statement, reported as
+0/`None` on any statement that didn't itself generate one, not a value
+persisted across intervening statements — the `LAST_INSERT_ID()` SQL
+function, which *does* persist, is not yet implemented).
 
 Verified against `mysql_async` (`tests/mysql_client.rs`, including the
-prepared-statement, `GROUP BY`, transaction and `affected_rows` behavior
-above) and a differential test against a real MySQL 8.0 server
+prepared-statement, `GROUP BY`, transaction, `affected_rows` and
+`last_insert_id` behavior above) and a differential test against a real
+MySQL 8.0 server
 (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`). In this sandbox, a
 server was reachable on the default port but authenticates with
 `sha256_password`, which `mysql_async` itself doesn't support
@@ -490,8 +503,19 @@ to run against a `mysql_native_password`-configured reference server.
   connection isolation (a transaction only protects against its own
   connection's later `ROLLBACK`, not against seeing concurrent writes
   from other connections).
-- `last_insert_id` in the OK packet (always 0, even after an
-  `AUTO_INCREMENT` insert).
+- `LAST_INSERT_ID()` as a callable SQL function (the OK packet's own
+  `last_insert_id` field is real — see above — but a session-persisted
+  value queryable via SQL isn't implemented).
+- `UNIQUE`/`FOREIGN KEY`/`KEY`/`INDEX`/`FULLTEXT`/`SPATIAL` constraints,
+  column-level or table-level, are accepted (not a parse error) but
+  never enforced — no duplicate-key rejection, no referential integrity,
+  no real indexing. A table-level `PRIMARY KEY` is the one exception
+  that's tracked (see above), though still not enforced as unique.
+- `ALTER TABLE`.
+- Multiple semicolon-separated statements in one `COM_QUERY` (only the
+  first is executed).
+- `SHOW TABLES LIKE '...'` ignores the `LIKE` filter and returns every
+  table.
 - Authentication (every password is currently accepted).
 
 ## Memcached
