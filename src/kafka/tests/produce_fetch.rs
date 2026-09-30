@@ -68,11 +68,14 @@ fn test_produce_and_fetch_happy_path() {
     fetch_topic1.partitions.push(fetch_part1);
     fetch_req1.topics.push(fetch_topic1);
 
+    // A fetch from offset 0 returns every batch up to the high watermark
+    // concatenated (both messages), matching real Kafka's Fetch response —
+    // not just the single batch starting at the requested offset.
     let fetch_resp1 = t.engine.handle_fetch(&fetch_req1, 11);
     let f_part1 = &fetch_resp1.responses[0].partitions[0];
     assert_eq!(f_part1.error_code, 0);
     assert_eq!(f_part1.high_watermark, 2);
-    assert_eq!(f_part1.records.as_deref(), Some(b"msg-1-payload".as_ref()));
+    assert_eq!(f_part1.records.as_deref(), Some(b"msg-1-payloadmsg-2-payload".as_ref()));
 
     // Fetch offset 1
     let mut fetch_req2 = FetchRequest::default();

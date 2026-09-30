@@ -128,11 +128,7 @@ if command -v java >/dev/null; then
   if (cd "$here/java-gradle" && ./gradlew --console=plain -q compileJava >/dev/null 2>&1); then
     run "spring-kafka" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=SpringKafkaTest"
     run "compression-codecs" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=CompressionTest"
-    # Known gap, tracked in docs/specs/kafka.md's roadmap: transactions are
-    # protocol-shaped but not functionally real yet (no producer fencing, no
-    # aborted-record filtering for read_committed). This is expected to fail
-    # until that's implemented; left red on purpose rather than hidden.
-    run "transactional-producer (known gap, see kafka.md)" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=TransactionalProducerTest"
+    run "transactional-producer" bash -c "cd '$here/java-gradle' && NOIDA_KAFKA_PORT=$NOIDA_KAFKA_PORT ./gradlew --console=plain -q run -DmainClass=TransactionalProducerTest"
   else
     skip "spring-kafka" "could not build"
     skip "compression-codecs" "could not build"

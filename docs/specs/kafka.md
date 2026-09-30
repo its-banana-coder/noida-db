@@ -111,15 +111,19 @@ Also run directly against a live `kafka-clients` transactional producer
 producer-side behavior — `InitProducerId`/epoch bumping, `AddPartitionsToTxn`,
 correct fencing of a superseded producer instance (`ProducerFencedException`
 thrown client-side as expected) — was confirmed correct via the server's
-own request trace across a multi-transaction, multi-producer run. The
-test's `read_committed` consumer side did not reliably observe all
-expected records in this environment (looked like consumer-group
-join/poll timing rather than a transactions bug, since the trace showed
-every produce/commit/abort on the server processed exactly as expected) —
-not chased down further in this pass. `run.sh` still labels this test
-"known gap" pending that being resolved; the underlying feature itself is
-done and tested, this is specifically about getting the one integration
-test's consumer side to pass reliably.
+own request trace across a multi-transaction, multi-producer run.
+
+**Resolved (2026-09-30):** the `read_committed` consumer side's flaky/
+incomplete record delivery was never a transactions bug (that guess was
+wrong) or a consumer-group timing issue — it was `handle_fetch` only ever
+returning a single record batch per request (the one closest to
+`fetch_offset`), instead of every batch up to the high watermark/LSO
+concatenated, the way real Kafka's Fetch response works. With several
+short transactions each producing their own batch, a real consumer needed
+many more `poll()` round-trips than its default budget affords to walk
+through them one batch at a time. Fixed in `handle_fetch` to concatenate
+all in-range batches (still skipping any batch a `read_committed` fetch
+must hide); `run.sh` no longer labels this test a known gap.
 
 Whoever picks this branch up next: a handler with no test is not done here,
 and a real-client test that fails on a genuine gap should stay red and
