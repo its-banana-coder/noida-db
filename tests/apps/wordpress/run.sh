@@ -208,6 +208,17 @@ if ! wp config create \
   fail "wp config create"
 fi
 
+# WordPress spawns wp-cron via a loopback HTTP request to itself on
+# nearly every page load (unless disabled). PHP's built-in dev server is
+# single-threaded/sequential, so that self-request can't be served while
+# the original request that triggered it is still being handled --
+# without this, every real request would block on its own cron-spawn
+# request, either hanging or timing out. Standard practice for any
+# WP-CLI/php-built-in-server setup, not specific to noida-db.
+wp config set DISABLE_WP_CRON true --raw --type=constant \
+    --path="$site_dir" --allow-root >"$work/wp-config-set.log" 2>&1 \
+    || { cat "$work/wp-config-set.log"; fail "wp config set DISABLE_WP_CRON"; }
+
 # --- 1. WordPress's own installer: the real production schema --------------
 echo "== running WordPress core install (creates ~12 core tables) against noida-db mysql"
 install_start=$(date +%s)
