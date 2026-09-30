@@ -13,10 +13,25 @@ use std::thread;
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
+    // One `Engine` for the whole listener, shared (via its internal
+    // `Arc<Mutex<DbState>>`) across every connection by cloning it per
+    // connection -- each connection gets its own session-local fields
+    // (`current_db`, `last_insert_id`, ...) but the same underlying
+    // database, matching every other service here (see e.g.
+    // `postgres::server::spawn_with`). Building a fresh `Engine::new()`
+    // per connection instead, as this used to do, silently gave every
+    // connection its own empty, unshared database -- invisible to any
+    // test that only ever used one connection, but fatal for any real
+    // app: WordPress's `wp core install` (one PHP process/connection)
+    // followed by `wp db tables` (a separate one) saw "the site you have
+    // requested is not installed" because the second connection's tables
+    // were genuinely empty.
+    let engine = Engine::new();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
+            let engine = engine.clone();
             let _ = thread::spawn(move || {
-                let _ = serve(stream);
+                let _ = serve(stream, engine);
             });
         }
     });
@@ -34,9 +49,9 @@ struct Session {
     stmt_param_types: HashMap<u32, Vec<(u8, u8)>>,
 }
 
-fn serve(mut stream: TcpStream) -> io::Result<()> {
+fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     let mut session = Session {
-        engine: Engine::new(),
+        engine,
         stmt_id_counter: 1,
         prepared_stmts: HashMap::new(),
         stmt_param_types: HashMap::new(),
