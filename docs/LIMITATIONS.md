@@ -426,8 +426,9 @@ credential check yet), `COM_INIT_DB`, and `COM_QUERY` for both
 literal-only `SELECT` expressions (numeric/string/NULL literals,
 `+ - * /`, integer division formats as a 4-decimal-place string matching
 MySQL's `div_precision_increment` default rather than a bare float,
-comparisons `= <> < <= > >=` with three-valued NULL logic, `AND`/`OR`)
-and real tables: `CREATE TABLE` (`INT`/`TINYINT`/`SMALLINT`/`MEDIUMINT`/
+comparisons `= <> < <= > >=` with three-valued NULL logic, `AND`/`OR`,
+`[NOT] IN (...)` with the same three-valued NULL semantics, parenthesized/
+nested boolean expressions) and real tables: `CREATE TABLE` (`INT`/`TINYINT`/`SMALLINT`/`MEDIUMINT`/
 `BIGINT` and their `UNSIGNED` forms/`VARCHAR`/`TEXT`/`MEDIUMTEXT`/
 `LONGTEXT`/`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
 `NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`, including a

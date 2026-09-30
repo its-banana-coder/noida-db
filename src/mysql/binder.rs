@@ -488,6 +488,13 @@ impl Binder {
                     _ => Err(MySqlError::unsupported("binary operator")),
                 }
             }
+            AstExpr::InList { expr, list, negated } => {
+                let bound_expr = Box::new(self.bind_expr(*expr)?);
+                let bound_list =
+                    list.into_iter().map(|e| self.bind_expr(e)).collect::<Result<_, _>>()?;
+                Ok(Expr::InList { expr: bound_expr, list: bound_list, negated })
+            }
+            AstExpr::Nested(inner) => self.bind_expr(*inner),
             _ => Err(MySqlError::unsupported("expr")),
         }
     }

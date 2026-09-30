@@ -363,3 +363,51 @@ async fn test_mysql_data_visible_across_connections() {
         pool.disconnect().await.unwrap();
     }
 }
+
+/// `WHERE col IN (...)` -- used constantly by real apps (WordPress's own
+/// option-priming query, `SELECT option_name, option_value FROM wp_options
+/// WHERE option_name IN (...)`, runs on every single page load) but was
+/// entirely unhandled before, hitting the generic "expr" unsupported
+/// error. Also covers `NOT IN`, a NULL in the list/column, and a
+/// parenthesized (nested) boolean expression, another gap this shares a
+/// root cause with (`AstExpr::Nested` was unhandled too).
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_in_list() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop("CREATE TABLE in_test (id INT, name VARCHAR(255))").await.unwrap();
+    conn.query_drop(
+        "INSERT INTO in_test (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, NULL)",
+    )
+    .await
+    .unwrap();
+
+    let mut res: Vec<i32> =
+        conn.query("SELECT id FROM in_test WHERE name IN ('a', 'c')").await.unwrap();
+    res.sort();
+    assert_eq!(res, vec![1, 3]);
+
+    let mut res: Vec<i32> =
+        conn.query("SELECT id FROM in_test WHERE name NOT IN ('a', 'c')").await.unwrap();
+    res.sort();
+    // id=4's name is NULL, so `NULL NOT IN (...)` is NULL (excluded), not true.
+    assert_eq!(res, vec![2]);
+
+    // A parenthesized boolean expression (`AstExpr::Nested`), the other
+    // gap found alongside IN.
+    let mut res: Vec<i32> =
+        conn.query("SELECT id FROM in_test WHERE (id = 1 OR id = 2)").await.unwrap();
+    res.sort();
+    assert_eq!(res, vec![1, 2]);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

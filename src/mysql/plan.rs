@@ -40,11 +40,34 @@ pub enum Expr {
     ColName(String),
     And(Vec<Expr>),
     Or(Vec<Expr>),
-    Compare { op: CmpOp, left: Box<Expr>, right: Box<Expr> },
-    Arith { op: ArithOp, left: Box<Expr>, right: Box<Expr> },
-    Call { name: String, args: Vec<Expr> },
-    Agg { func: AggFunc, arg: Option<Box<Expr>> },
+    Compare {
+        op: CmpOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Agg {
+        func: AggFunc,
+        arg: Option<Box<Expr>>,
+    },
     SysVar(String),
+    /// `expr [NOT] IN (list...)`. Real MySQL's three-valued semantics:
+    /// true if `expr` equals any non-NULL list element, else NULL if
+    /// `expr` or any list element is NULL, else false -- `negated` flips
+    /// true/false but leaves NULL as NULL (matching `NOT (... IS NULL)`).
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
 }
 
 /// True if `expr` contains an aggregate function call anywhere within it
@@ -58,6 +81,7 @@ pub fn contains_agg(expr: &Expr) -> bool {
             contains_agg(left) || contains_agg(right)
         }
         Expr::Call { args, .. } => args.iter().any(contains_agg),
+        Expr::InList { expr, list, .. } => contains_agg(expr) || list.iter().any(contains_agg),
         _ => false,
     }
 }
