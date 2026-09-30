@@ -244,3 +244,170 @@ fn p0_search_bm25_scoring_matches_real_elasticsearch() {
     let _ = request(ours_addr, "DELETE", index, b"");
     println!("compared BM25 _score for {compared} hits against real Elasticsearch");
 }
+
+/// Compares one query's hit ids (order-independent — real Elasticsearch's
+/// tie-breaking among equally-scored docs isn't specified/guaranteed to
+/// match ours) and, for scored queries, each hit's `_score` within a
+/// tolerance the same way the BM25 test above does.
+fn compare_query(
+    label: &str,
+    real_addr: SocketAddr,
+    ours_addr: SocketAddr,
+    index: &str,
+    query: &[u8],
+    check_scores: bool,
+) {
+    let real = request(real_addr, "POST", &format!("{index}/_search"), query);
+    let ours = request(ours_addr, "POST", &format!("{index}/_search"), query);
+    expect_ok(&format!("real: {label}"), &real);
+    expect_ok(&format!("ours: {label}"), &ours);
+    assert_eq!(
+        ours.body["hits"]["total"]["value"], real.body["hits"]["total"]["value"],
+        "{label}: hit count mismatch. real response was: {}",
+        real.body
+    );
+
+    let mut real_ids: Vec<String> = real.body["hits"]["hits"]
+        .as_array()
+        .expect("real hits")
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap().to_string())
+        .collect();
+    let mut ours_ids: Vec<String> = ours.body["hits"]["hits"]
+        .as_array()
+        .expect("our hits")
+        .iter()
+        .map(|h| h["_id"].as_str().unwrap().to_string())
+        .collect();
+    real_ids.sort();
+    ours_ids.sort();
+    assert_eq!(ours_ids, real_ids, "{label}: matched id set mismatch");
+
+    if check_scores {
+        let real_by_id: std::collections::HashMap<&str, f64> = real.body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| (h["_id"].as_str().unwrap(), h["_score"].as_f64().unwrap()))
+            .collect();
+        for h in ours.body["hits"]["hits"].as_array().unwrap() {
+            let id = h["_id"].as_str().unwrap();
+            let os = h["_score"].as_f64().unwrap();
+            let rs = real_by_id[id];
+            let tolerance = (rs.abs() * 1e-5).max(1e-6);
+            assert!(
+                (rs - os).abs() <= tolerance,
+                "{label}: _score mismatch for id {id:?}: real={rs} ours={os}"
+            );
+        }
+    }
+}
+
+/// The four query types added after the P0 milestones
+/// (match_phrase/multi_match/wildcard/regexp) were only verified
+/// self-consistently when they landed (no Docker in that sandbox) — this
+/// is the real-server verification for them, run wherever
+/// NOIDA_ELASTICSEARCH_REF is a real node (CI's service container).
+#[test]
+fn p0_new_query_types_match_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_query_types";
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    let create = br#"{"settings":{"index":{"number_of_shards":"1","number_of_replicas":"0"}}}"#;
+    expect_ok("real: PUT index", &request(real_addr, "PUT", index, create));
+    expect_ok("ours: PUT index", &request(ours_addr, "PUT", index, create));
+
+    let mapping = br#"{"properties":{"sku":{"type":"keyword"}}}"#;
+    expect_ok(
+        "real: PUT mapping",
+        &request(real_addr, "PUT", &format!("{index}/_mapping"), mapping),
+    );
+    expect_ok(
+        "ours: PUT mapping",
+        &request(ours_addr, "PUT", &format!("{index}/_mapping"), mapping),
+    );
+
+    let docs: [(&str, &[u8]); 6] = [
+        ("1", br#"{"body":"the quick brown fox jumps","title":"rust programming","sku":"BOOK-1234"}"#),
+        ("2", br#"{"body":"a fox that is quick and brown","title":"a book","sku":"BOOK-5678"}"#),
+        ("3", br#"{"body":"quick brown fox","title":"cooking","sku":"DISC-1234"}"#),
+        ("4", br#"{"body":"no matches here","title":"rust rust rust systems programming","sku":"AB-100"}"#),
+        ("5", br#"{"body":"unrelated","title":"unrelated","sku":"AB-250"}"#),
+        ("6", br#"{"body":"unrelated","title":"unrelated","sku":"CD-100"}"#),
+    ];
+    for (id, d) in docs.iter() {
+        let path = format!("{index}/_doc/{id}");
+        expect_ok("real: PUT doc", &request(real_addr, "PUT", &path, d));
+        expect_ok("ours: PUT doc", &request(ours_addr, "PUT", &path, d));
+    }
+    expect_ok("real: refresh", &request(real_addr, "POST", &format!("{index}/_refresh"), b""));
+    expect_ok("ours: refresh", &request(ours_addr, "POST", &format!("{index}/_refresh"), b""));
+
+    compare_query(
+        "match_phrase",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"match_phrase":{"body":"quick brown fox"}}}"#,
+        true,
+    );
+    compare_query(
+        "multi_match best_fields",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"multi_match":{"query":"rust","fields":["title","body"]}}}"#,
+        true,
+    );
+    compare_query(
+        "multi_match operator=and",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"multi_match":{"query":"quick fox","fields":["title","body"],"operator":"and"}}}"#,
+        false,
+    );
+    compare_query(
+        "wildcard prefix",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"wildcard":{"sku":"BOOK-*"}}}"#,
+        false,
+    );
+    compare_query(
+        "wildcard single-char",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"wildcard":{"sku":"BOOK-1?34"}}}"#,
+        false,
+    );
+    compare_query(
+        "regexp",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"regexp":{"sku":"AB-[0-9]+"}}}"#,
+        false,
+    );
+    compare_query(
+        "regexp anchored",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"regexp":{"sku":"AB-1[0-9]{2}"}}}"#,
+        false,
+    );
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!("compared match_phrase/multi_match/wildcard/regexp against real Elasticsearch");
+}

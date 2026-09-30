@@ -549,14 +549,14 @@ is accepted.
 `match_phrase`, `multi_match`, `term`, `terms`, `range`, `exists`, `prefix`,
 `wildcard`, `regexp`, `ids`, `bool` (must/should/filter/must_not,
 minimum_should_match) and `constant_score`, across a single index, a
-comma-separated list, a `name*` prefix, or `_all`/`*`. `match` and
-`match_phrase` score with BM25 (k1=1.2, b=0.75), including Lucene's lossy
-per-document field-length norm encoding, so ranking and `_score` should
-match real Elasticsearch for the same data (see `tests/elasticsearch_diff.rs`
-— note its coverage predates `match_phrase`/`multi_match`/`wildcard`/
-`regexp`, which are only verified by the engine-level tests in
-`src/elasticsearch/tests/mod.rs`, self-consistently, not against a real
-node; no Elasticsearch/Docker is reachable in this sandbox); everything else
+comma-separated list, a `name*` prefix, or `_all`/`*`. `match`,
+`match_phrase` and `multi_match` score with BM25 (k1=1.2, b=0.75),
+including Lucene's lossy per-document field-length norm encoding, so
+ranking and `_score` should match real Elasticsearch for the same data —
+verified against a real node in `tests/elasticsearch_diff.rs`'s
+`p0_new_query_types_match_real_elasticsearch` (runs against
+`NOIDA_ELASTICSEARCH_REF`, e.g. CI's service container) alongside the
+engine-level tests in `src/elasticsearch/tests/mod.rs`; everything else
 (`term`, `range`, `wildcard`, `regexp`, etc.) uses a constant score, matching
 how Elasticsearch's structured queries are evaluated. `from`/`size`, `sort`
 (field or `_score`, asc/desc), `_source` filtering
