@@ -17,6 +17,8 @@ pub const TS_NEG_INF: i64 = i64::MIN;
 const MIN_TS: i64 = -211_813_488_000_000_000;
 const MAX_TS: i64 = 9_223_371_331_200_000_000;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, PartialEq)]
 pub enum DtErr {
     Syntax,
@@ -25,7 +27,7 @@ pub enum DtErr {
     Zone(String),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Interval {
     pub months: i32,
     pub days: i32,

@@ -54,7 +54,7 @@ mlua = { version = "0.12", default-features = false, features = ["lua51", "vendo
 # src/persistence.rs and each service's own spawn_persistent), plus
 # Elasticsearch's document storage -- unconditional (not feature-gated)
 # since persistence applies across services regardless of which are built.
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # Kafka: wire protocol message encoding/decoding.
 kafka-protocol = { version = "0.18.0", optional = true }

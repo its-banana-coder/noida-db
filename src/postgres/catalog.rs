@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::error::{PgError, PgResult, code};
+use serde::{Deserialize, Serialize};
+
 use super::types::{Type, Value};
 
 pub type Row = Vec<Value>;
@@ -19,7 +21,7 @@ pub const DATABASE_OID: u32 = 16384;
 /// First OID handed to user objects.
 pub const FIRST_USER_OID: u32 = 16385;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     pub ty: Type,
@@ -51,7 +53,7 @@ impl Column {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FkAction {
     NoAction,
     Restrict,
@@ -81,7 +83,7 @@ impl FkAction {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ConstraintKind {
     PrimaryKey,
     Unique,
@@ -95,7 +97,7 @@ pub enum ConstraintKind {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Constraint {
     pub oid: u32,
     pub name: String,
@@ -119,7 +121,7 @@ impl Constraint {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Index {
     pub oid: u32,
     pub name: String,
@@ -136,14 +138,14 @@ pub struct Index {
     pub nulls_not_distinct: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RelKind {
     Table,
     View,
     MaterializedView,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Table {
     pub oid: u32,
     pub name: String,
@@ -203,7 +205,7 @@ impl Table {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Sequence {
     pub oid: u32,
     pub name: String,
@@ -220,7 +222,7 @@ pub struct Sequence {
     pub comment: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Schema {
     pub oid: u32,
     pub name: String,
@@ -228,7 +230,7 @@ pub struct Schema {
     pub comment: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnumType {
     pub oid: u32,
     pub name: String,
@@ -238,7 +240,7 @@ pub struct EnumType {
     pub comment: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Domain {
     pub oid: u32,
     pub name: String,
@@ -252,14 +254,14 @@ pub struct Domain {
 
 /// Sequence counters live outside transactional state: nextval is never
 /// rolled back.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SeqValue {
     pub last: i64,
     pub is_called: bool,
 }
 
 /// All transactional schema and data.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbState {
     pub schemas: BTreeMap<u32, Schema>,
     pub tables: BTreeMap<u32, Arc<Table>>,

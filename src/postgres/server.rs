@@ -23,8 +23,10 @@ use pgwire::messages::{
 };
 use sqlparser::ast as a;
 
+use std::path::Path;
+
 use super::auth::{AuthMethod, Scram, ScramError};
-use super::engine::{Engine, Portal, Prepared, Session, StmtResult, TxStatus};
+use super::engine::{Engine, Portal, Prepared, Session, Snapshot, StmtResult, TxStatus};
 use super::error::{PgError, PgResult, code};
 use super::plan::OutCol;
 use super::types::{self, Type, Value};
@@ -60,6 +62,53 @@ impl Default for Config {
 /// Binds `addr` and serves Postgres on background threads.
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     spawn_with(addr, Config::default())
+}
+
+pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
+    spawn_persistent_with(addr, data_dir, Config::default())
+}
+
+pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Result<SocketAddr> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+
+    let path = data_dir.join("postgres.json");
+    let engine = if path.exists() {
+        let bytes = std::fs::read(&path)?;
+        let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse postgres snapshot: {e}"),
+            )
+        })?;
+        Engine::new_persistent(snapshot)
+    } else {
+        Engine::new()
+    };
+
+    let save_engine = engine.clone();
+    crate::persistence::on_shutdown(move || {
+        let snapshot = save_engine.snapshot();
+        let bytes = serde_json::to_vec(&snapshot).expect("postgres snapshot serialization failed");
+        let _ = crate::persistence::write_snapshot_atomically(&path, &bytes);
+    });
+
+    let cfg = Arc::new(cfg);
+    std::thread::Builder::new().name("postgres-accept".into()).stack_size(STACK_SIZE).spawn(
+        move || {
+            for stream in listener.incoming().flatten() {
+                let engine = engine.clone();
+                let cfg = cfg.clone();
+                let _ = std::thread::Builder::new()
+                    .name("postgres-conn".into())
+                    .stack_size(STACK_SIZE)
+                    .spawn(move || {
+                        let _ = serve(stream, engine, cfg);
+                    });
+            }
+        },
+    )?;
+    Ok(local)
 }
 
 pub fn spawn_with(addr: &str, cfg: Config) -> io::Result<SocketAddr> {

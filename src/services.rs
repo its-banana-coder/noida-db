@@ -19,6 +19,8 @@ use std::path::Path;
 #[allow(clippy::match_single_binding)]
 pub fn start_persistent(name: &str, addr: &str, data_dir: &Path) -> Option<io::Result<SocketAddr>> {
     match name {
+        #[cfg(feature = "postgres")]
+        "postgres" => Some(crate::postgres::server::spawn_persistent(addr, data_dir)),
         _ => {
             let _ = data_dir;
             start(name, addr)

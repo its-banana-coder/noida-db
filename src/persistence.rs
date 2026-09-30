@@ -33,6 +33,13 @@ pub fn on_shutdown(hook: impl Fn() + Send + Sync + 'static) {
     hooks().lock().unwrap().push(Box::new(hook));
 }
 
+/// Runs all registered hooks immediately. For testing only.
+pub fn run_hooks_for_test() {
+    for hook in hooks().lock().unwrap().iter() {
+        hook();
+    }
+}
+
 /// Installs a SIGINT/SIGTERM handler that runs every hook registered via
 /// `on_shutdown` (in registration order) and then exits the process with
 /// status 0. Call once from `main`, before starting any service.
