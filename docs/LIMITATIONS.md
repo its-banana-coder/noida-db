@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`, `ORDER BY`/`LIMIT`/`OFFSET`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`/`last_insert_id`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
+| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`, `ORDER BY`/`LIMIT`/`OFFSET`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`/`last_insert_id`, real column names in result sets, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
@@ -458,6 +458,15 @@ client libraries (e.g. mysql_async) needs (`version`, `version_comment`,
 `max_allowed_packet`, `wait_timeout`, `socket`, `lower_case_table_names`).
 A real unsupported statement now gets a real MySQL `ERR` packet
 (previously a silent `OK`, indistinguishable from "0 rows, no error").
+
+Result sets report real column names in the wire column-definition
+packets (a bare column reference is labeled with the column's own name,
+an alias with the alias) — what lets a real client fetch a row by column
+name (PHP's `mysqli`/`$wpdb`, PDO's associative fetch mode, any ORM's
+row hydration) rather than only by position. A genuinely unaliased
+non-column expression (a literal, a function call, arithmetic — real
+MySQL labels these with their own source SQL text) still falls back to
+a synthesized name, not yet reconstructed from the original SQL.
 
 Prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`) support
 real parameter binding: `EXECUTE`'s null-bitmap and (when sent —
