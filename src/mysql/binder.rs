@@ -168,6 +168,7 @@ impl Binder {
             let mut not_null = false;
             let mut auto_increment = false;
             let mut primary_key = false;
+            let mut default = None;
 
             for opt in &col_def.options {
                 match &opt.option {
@@ -188,6 +189,19 @@ impl Binder {
                             auto_increment = true;
                         }
                     }
+                    // A default that's a literal (the overwhelmingly common
+                    // case: `DEFAULT 0`, `DEFAULT ''`, `DEFAULT NULL`,
+                    // including WordPress's own schema's `DEFAULT '0'` on
+                    // NOT NULL columns like comment_count) binds to a
+                    // `Const`, which is stored directly. A non-constant
+                    // default (`DEFAULT CURRENT_TIMESTAMP`, an expression)
+                    // isn't evaluated here -- falls back to no default,
+                    // same as before this existed at all.
+                    sqlparser::ast::ColumnOption::Default(expr) => {
+                        if let Ok(Expr::Const(v)) = self.bind_expr(expr.clone()) {
+                            default = Some(v);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -196,7 +210,7 @@ impl Binder {
                 name: col_name,
                 ty: col_type,
                 not_null,
-                default: None, // TODO
+                default,
                 auto_increment,
                 primary_key,
             });
@@ -413,6 +427,18 @@ impl Binder {
                         SelectItem::ExprWithAlias { expr, alias } => {
                             exprs.push(self.bind_expr(expr)?);
                             names.push(alias.value);
+                        }
+                        // `SELECT *` and `SELECT table.*` -- the qualifier
+                        // (if any) is dropped the same way a qualified
+                        // column reference already is: this engine only
+                        // ever binds one table into scope per query.
+                        // Expanded to the real per-column values (and, in
+                        // `plan::column_names`, the real per-column names)
+                        // at execution time, not here -- the binder has no
+                        // catalog access to look the table's columns up.
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                            exprs.push(Expr::Wildcard);
+                            names.push("*".to_string());
                         }
                         _ => return Err(MySqlError::unsupported("select item")),
                     }
