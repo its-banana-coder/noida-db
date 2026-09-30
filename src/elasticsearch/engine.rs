@@ -9,13 +9,15 @@ use super::search::{self, CommittedDoc};
 #[derive(Clone)]
 pub struct Engine(Arc<Mutex<State>>);
 
-#[derive(Default)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Default, Serialize, Deserialize)]
 struct State {
     indices: HashMap<String, Index>,
     templates: HashMap<String, Value>,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Index {
     settings: Value,
     mappings: Value,
@@ -26,6 +28,7 @@ struct Index {
     opened: bool,
     /// The last-refreshed, searchable snapshot (near-real-time semantics:
     /// `_search` sees this, real-time GET reads `docs` directly).
+    #[serde(skip)]
     committed: Vec<CommittedDoc>,
 }
 
@@ -46,6 +49,7 @@ impl Index {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct Document {
     source: Value,
     version: i64,
@@ -57,6 +61,24 @@ static IDS: AtomicU64 = AtomicU64::new(1);
 impl Default for Engine {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(State::default())))
+    }
+}
+
+impl Engine {
+    pub(crate) fn load(bytes: &[u8]) -> Self {
+        let mut state: State = serde_json::from_slice(bytes).unwrap_or_default();
+        let names: Vec<String> = state.indices.keys().cloned().collect();
+        for name in names {
+            if let Some(index) = state.indices.get_mut(&name) {
+                index.refresh(&name);
+            }
+        }
+        Self(Arc::new(Mutex::new(state)))
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<u8> {
+        let state = self.0.lock().unwrap();
+        serde_json::to_vec(&*state).unwrap()
     }
 }
 
