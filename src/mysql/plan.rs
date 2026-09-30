@@ -274,3 +274,31 @@ pub fn count_params(plan: &Plan) -> usize {
     plan_max(plan, &mut max);
     max
 }
+
+/// The real column names a `Plan`'s result set should report on the wire,
+/// derived from the plan itself rather than the executed rows (so the
+/// server doesn't need to thread names through `Executor::execute_plan`'s
+/// recursive row-producing path). Any real client that accesses a row by
+/// column name (PHP's `mysqli` -- what WordPress's `$wpdb` uses via its
+/// `stdClass` rows -- PDO's associative fetch mode, any ORM) depends on
+/// these being real: a placeholder like `"col0"` silently breaks every
+/// such access with no error, just a missing property.
+pub fn column_names(plan: &Plan) -> Vec<String> {
+    match plan {
+        Plan::Project { names, .. } | Plan::Aggregate { names, .. } => names.clone(),
+        Plan::Filter { source, .. } | Plan::Sort { source, .. } => column_names(source),
+        Plan::ShowDatabases => vec!["Database".to_string()],
+        Plan::ShowTables(db) => vec![format!("Tables_in_{db}")],
+        Plan::ShowColumns { .. } => ["Field", "Type", "Null", "Key", "Default", "Extra"]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        Plan::ShowCreateTable { .. } => {
+            vec!["Table".to_string(), "Create Table".to_string()]
+        }
+        // Not meaningful as a top-level SELECT's own output (a bare
+        // `Scan`/`Join`/`Dummy` is always wrapped by a `Project` in
+        // practice, and the DDL/DML variants don't return rows at all).
+        _ => Vec::new(),
+    }
+}

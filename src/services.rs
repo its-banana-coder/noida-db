@@ -11,14 +11,12 @@ use std::path::Path;
 /// that hasn't wired persistence up yet falls back to `start`'s plain
 /// ephemeral behavior, so this is always safe to call from `main`
 /// regardless of how many services have been migrated.
-// Deliberately a `match` with just one arm for now: each service's own
-// persistence PR adds a real arm here (`"name" =>
-// crate::<service>::spawn_persistent(addr, data_dir)`) as it lands, so
-// keeping the `match` shape (instead of collapsing to the fallback body)
-// is what makes each of those PRs a small, easy diff.
-#[allow(clippy::match_single_binding)]
+// Each service's own persistence PR adds a real arm here (`"name" =>
+// crate::<service>::spawn_persistent(addr, data_dir)`) as it lands.
 pub fn start_persistent(name: &str, addr: &str, data_dir: &Path) -> Option<io::Result<SocketAddr>> {
     match name {
+        #[cfg(feature = "postgres")]
+        "postgres" => Some(crate::postgres::server::spawn_persistent(addr, data_dir)),
         #[cfg(feature = "elasticsearch")]
         "elasticsearch" => Some(crate::elasticsearch::spawn_persistent(addr, data_dir)),
         #[cfg(feature = "redis")]
