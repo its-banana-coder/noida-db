@@ -4,6 +4,7 @@
 //! a sorted Vec plus a score index is enough. The listpack/skiplist
 //! distinction is tracked only for OBJECT ENCODING.
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -61,6 +62,30 @@ pub struct Zset {
     scores: HashMap<Vec<u8>, f64>,
     /// Converted to a skiplist; like Redis, never converts back by itself.
     big: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ZsetSnapshot {
+    items: Vec<(f64, Vec<u8>)>,
+    big: bool,
+}
+
+// `scores` is a derived lookup index (member -> score, for O(1) ZSCORE),
+// fully reconstructible from `items` -- not persisted directly, partly
+// because it's a `HashMap<Vec<u8>, _>` and would hit serde_json's
+// "map key must be a string" restriction anyway.
+impl Serialize for Zset {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        ZsetSnapshot { items: self.items.clone(), big: self.big }.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Zset {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let snap = ZsetSnapshot::deserialize(d)?;
+        let scores = snap.items.iter().map(|(score, member)| (member.clone(), *score)).collect();
+        Ok(Zset { items: snap.items, scores, big: snap.big })
+    }
 }
 
 fn cmp(a: (f64, &[u8]), b: (f64, &[u8])) -> Ordering {

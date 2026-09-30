@@ -4,6 +4,8 @@
 //! an intset is sorted, a listpack keeps insertion order, and a hashtable
 //! has no defined order.
 
+use serde::{Deserialize, Serialize};
+
 use super::engine::{
     Command, Ctx, Data, Entry, Limits, Reply, cmd, eq_ic, positive_long, range_long, syntax,
     wrong_type,
@@ -33,7 +35,7 @@ pub static COMMANDS: &[Command] = &[
     cmd("sscan", sscan),
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Set {
     /// Sorted integers.
     Int(Vec<i64>),

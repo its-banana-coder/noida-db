@@ -4,6 +4,7 @@
 //! exact: Redis's `~` only drops whole listpack nodes, which noida-db doesn't
 //! model, so `~` trims like `=`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::blocking::{BlockKind, timeout_ms_arg};
@@ -12,6 +13,38 @@ use super::engine::{
     syntax, wrong_type,
 };
 use super::resp::Value;
+
+/// Serializes a `BTreeMap`/`HashMap` as a JSON array of `[key, value]`
+/// pairs instead of a JSON object -- needed for any map keyed by
+/// something other than a string (here: a stream entry `Id`, a `(u64,
+/// u64)` tuple, or a `Vec<u8>` consumer/group name), since serde_json
+/// errors at runtime ("key must be a string") serializing those as
+/// object keys directly. Used via `#[serde(with = "map_as_vec")]`.
+mod map_as_vec {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S, M, K, V>(map: &M, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        for<'a> &'a M: IntoIterator<Item = (&'a K, &'a V)>,
+        K: Serialize + 'static,
+        V: Serialize + 'static,
+    {
+        let entries: Vec<(&K, &V)> = map.into_iter().collect();
+        entries.serialize(s)
+    }
+
+    pub fn deserialize<'de, D, M, K, V>(d: D) -> Result<M, D::Error>
+    where
+        D: Deserializer<'de>,
+        M: FromIterator<(K, V)>,
+        K: Deserialize<'de>,
+        V: Deserialize<'de>,
+    {
+        let entries: Vec<(K, V)> = Vec::deserialize(d)?;
+        Ok(entries.into_iter().collect())
+    }
+}
 
 pub static COMMANDS: &[Command] = &[
     cmd("xadd", xadd),
@@ -46,13 +79,15 @@ static XINFO: &[Command] =
 /// A stream entry ID.
 pub type Id = (u64, u64);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Stream {
+    #[serde(with = "map_as_vec")]
     pub entries: BTreeMap<Id, Vec<Vec<u8>>>,
     pub last_id: Id,
     pub max_deleted_id: Id,
     pub entries_added: u64,
     /// Consumer groups by name; Redis's radix tree reports them sorted.
+    #[serde(with = "map_as_vec")]
     pub groups: BTreeMap<Vec<u8>, Group>,
 }
 
@@ -726,14 +761,14 @@ fn rewrite_ids(a: &[Vec<u8>], streams_arg: usize, n: usize, ids: &[Id]) -> Vec<V
 
 /// A pending entry: which consumer holds it, when it was delivered and how
 /// often (`streamNACK`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Nack {
     pub consumer: Vec<u8>,
     pub delivery_time: u64,
     pub delivery_count: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Consumer {
     pub seen_time: u64,
     pub active_time: u64,
@@ -742,12 +777,14 @@ pub struct Consumer {
 
 /// Consumers, like groups, are kept sorted by name: the order Redis's
 /// radix tree reports them in.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Group {
     pub last_id: Id,
     /// `entries_read`, or `None` for Redis's "invalid" counter.
     pub entries_read: Option<i64>,
+    #[serde(with = "map_as_vec")]
     pub pending: BTreeMap<Id, Nack>,
+    #[serde(with = "map_as_vec")]
     pub consumers: BTreeMap<Vec<u8>, Consumer>,
 }
 
