@@ -19,6 +19,7 @@ tests/clients/kafka/java-gradle/build/
 tests/clients/kafka/faust_app/worker*.log
 tests/clients/kafka/faust_app/received_messages.log
 tests/clients/kafka/faust_app/faust_env/
+tests/clients/memcached/noida.log
 hello-app-data/
 node_modules/
 __pycache__/
