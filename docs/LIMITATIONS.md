@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`/`last_insert_id`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
+| MySQL | handshake, literal-expression `SELECT`, real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `JOIN`, `ORDER BY`/`LIMIT`/`OFFSET`), `GROUP BY`/aggregates, prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `affected_rows`/`last_insert_id`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets (see below) | yes, for `mysql_async` |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
@@ -437,8 +437,13 @@ schema always uses rather than a column option; `UNSIGNED` and the
 various display-width integer variants are accepted but not
 distinguished from their plain/signed counterparts, since every integer
 is stored as a plain `i64` regardless), `INSERT INTO ...
-VALUES (...), ...`, `SELECT` with `WHERE` and basic `INNER`/`LEFT`/cross
-`JOIN`, `UPDATE ... SET ... WHERE ...`, `DELETE FROM ... WHERE ...`,
+VALUES (...), ...`, `SELECT` with `WHERE`, qualified column references
+(`table.col`, anywhere an expression is allowed, not just `WHERE`) and
+basic `INNER`/`LEFT`/cross `JOIN`, `ORDER BY`/`LIMIT`/`OFFSET` on a
+non-aggregated query (both `LIMIT n OFFSET m` and MySQL's own
+`LIMIT m, n`; sorting/limiting by a column that isn't in the `SELECT`
+list at all works too, matching real MySQL), `UPDATE ... SET ... WHERE
+...`, `DELETE FROM ... WHERE ...`,
 `SHOW DATABASES`/`SHOW TABLES`/`SHOW COLUMNS FROM`/`SHOW CREATE TABLE`,
 `USE`, and `@@`-prefixed session variables the connection setup of real
 client libraries (e.g. mysql_async) needs (`version`, `version_comment`,
@@ -510,7 +515,11 @@ to run against a `mysql_native_password`-configured reference server.
 **Not yet**
 - Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
   above).
-- `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, subqueries, window functions.
+- `HAVING`, subqueries, window functions.
+- `ORDER BY`/`LIMIT`/`OFFSET` combined with `GROUP BY`/aggregates when
+  the sort key references the aggregated result rather than a grouped
+  column (plain, non-aggregated `ORDER BY`/`LIMIT` is supported — see
+  above).
 - Isolation levels, nested/savepoint transactions, and any cross-
   connection isolation (a transaction only protects against its own
   connection's later `ROLLBACK`, not against seeing concurrent writes
