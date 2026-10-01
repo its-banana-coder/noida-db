@@ -306,7 +306,7 @@ print($2)
 # --- 3. create a post via WP-CLI --------------------------------------------
 echo "== creating post via WP-CLI"
 post_title="Hello from noida-db"
-post_content="This post was created by the noida-db real-app test, stored in wp_posts served by noida-db's MySQL."
+post_content="This post was created by the noida-db real-app test, stored in wp_posts and served by noida-db MySQL."
 post_id=$(wp post create --post_title="$post_title" --post_content="$post_content" --post_status=publish --porcelain 2>"$work/post-create.log")
 [ -n "$post_id" ] && [ "$post_id" -gt 0 ] 2>/dev/null || { cat "$work/post-create.log"; fail "wp post create did not return a numeric post id (got: '$post_id')"; }
 echo "   post created: id=$post_id"
@@ -340,9 +340,16 @@ status=$(http_status "$work/rest-post.json" "$base/index.php?rest_route=/wp/v2/p
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
 [ "$rest_title" = "$post_title" ] || fail "REST API post title '$rest_title' != expected '$post_title'"
+# The REST API's rendered content is run through WordPress's own content
+# filters (wpautop() wraps it in <p>...</p>, wptexturize() turns a
+# straight apostrophe into &#8217;, etc.) -- real, expected WordPress
+# behavior, not something noida-db does. Decode entities and strip tags
+# before comparing, the way any real client consuming this field would,
+# instead of requiring a byte-exact substring match.
 python3 -c "
-import sys
-content = '''$rest_content'''
+import html, re, sys
+content = html.unescape('''$rest_content''')
+content = re.sub('<[^>]+>', '', content)
 expected = '''$post_content'''
 if expected not in content:
     print('-- diagnostic: expected repr:', repr(expected))
