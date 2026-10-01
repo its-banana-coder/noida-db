@@ -65,6 +65,22 @@ impl Engine {
         Self::default()
     }
 
+    /// Clones out the shared database state for an on-disk snapshot. Only
+    /// `db` is persisted -- see the persistence spec, §4.4, for why every
+    /// other field here is per-connection/per-statement and deliberately
+    /// excluded.
+    pub fn snapshot(&self) -> DbState {
+        self.db.lock().unwrap().clone()
+    }
+
+    /// Builds an `Engine` whose shared database state is `db` (loaded from
+    /// an on-disk snapshot), with every per-connection field at its
+    /// ordinary just-connected default -- same as `Engine::new()`, just
+    /// with real data instead of an empty `DbState`.
+    pub fn new_persistent(db: DbState) -> Self {
+        Self { db: Arc::new(Mutex::new(db)), ..Self::default() }
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
         let mut asts = Parser::parse_sql(&dialect, sql)

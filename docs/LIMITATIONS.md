@@ -233,15 +233,18 @@ constraints.
 Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Kafka binary protocol on port 9092. Supported and verified against real clients (kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka): topic DDL (`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `Metadata`), producer/consumer data operations (`Produce`, `Fetch`, `ListOffsets`, `InitProducerId`, every compression codec), consumer group coordinator (`FindCoordinator`, `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`, `OffsetFetch`, multi-consumer rebalance), group admin & cluster configs (`DescribeGroups`, `ListGroups`, `DeleteGroups`, `DescribeConfigs`, `AlterConfigs`, `IncrementalAlterConfigs`, `DescribeCluster`, `OffsetForLeaderEpoch`, `DescribeLogDirs`, `SaslHandshake`).
 
 The transaction APIs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`) are functionally real: a `read_committed` fetch never returns a still-open or aborted transaction's records (tracked per-partition via a last-stable-offset and an aborted-transactions list, reported in `FetchResponse` for API version 4+), a `read_uncommitted` fetch (the default) is unaffected, and a stale producer epoch — a zombie instance superseded by a newer `InitProducerId` for the same `transactional.id` — is fenced (`INVALID_PRODUCER_EPOCH`) on `Produce`, `AddPartitionsToTxn` and `EndTxn`. `EndTxn` appends a control batch to every partition the transaction touched, same as real Kafka. Verified by an engine-level test that produces, aborts and commits real transactional record batches and checks both isolation levels see exactly what they should.
+ 
+Storage is now persistent (on-disk) and is saved to `<data_dir>/kafka.json` upon a clean process exit (SIGINT/SIGTERM), with no incremental autosave -- see `src/persistence.rs`. Topics, record batches, committed consumer group offsets, and idempotent producer sequence state survive a clean restart; open in-flight transactions are resolved to aborted at save time, and live consumer group membership is reset (members transparently rejoin on restart). A hard kill (`kill -9`) loses whatever changed since the last clean shutdown but never corrupts the on-disk snapshot.
 
 **Differs**
 - Real Kafka's client discards an aborted batch's bytes itself using the `aborted_transactions` list (the bytes are still on the wire either way); this server simplifies to never serving an aborted batch to a `read_committed` fetch in the first place. Same observable behavior for any real consumer, simpler to implement.
+- Consumer group membership reset across restarts: real Kafka can, in some configurations, preserve group membership across a graceful controlled shutdown via static group membership (`group.instance.id`); this engine always resets live membership to empty and relies on the normal consumer rejoin flow.
 
 **By design**
 - Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
 
 **Not yet**
-- Disk segment persistence (records live in-memory).
+- Real log segment files and retention/compaction policies — data persists as an on-disk JSON snapshot on clean shutdown, not Kafka's log segment format.
 
 ## ClickHouse
 
@@ -426,6 +429,8 @@ Verified against the official MongoDB Rust driver and a differential test agains
 - Authentication (SCRAM).
 
 ## MySQL
+
+Storage is now persistent (on-disk) and is saved to `<data_dir>/mysql.json` upon a clean process exit (SIGINT/SIGTERM), with no incremental autosave -- see `src/persistence.rs`. All schemas, tables, rows, and schema-level `AUTO_INCREMENT` state survive a clean restart; session-scoped fields (`current_db`, `last_insert_id`, mid-transaction uncommitted state) are deliberately excluded and reset on reconnect. A hard kill (`kill -9`) loses whatever changed since the last clean shutdown but never corrupts the on-disk snapshot.
 
 The database is shared across every connection to the same server (one
 `CREATE TABLE`/`INSERT` on one connection is visible from any other,

@@ -1,4 +1,5 @@
 use crate::mysql::binder::Binder;
+use crate::mysql::catalog::DbState;
 use crate::mysql::engine::Engine;
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{self, Plan};
@@ -8,7 +9,60 @@ use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::thread;
+
+/// Binds `addr`, loads a snapshot from `data_dir/mysql.json` if one exists,
+/// and registers a shutdown hook (via `crate::persistence::on_shutdown`) to
+/// save one back on a clean exit.
+pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
+    let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
+    crate::persistence::on_shutdown(save);
+    Ok(addr)
+}
+
+/// Like `spawn_persistent`, but also returns the save closure so tests can
+/// trigger a save directly without going through the process-wide shutdown
+/// hook (which is unsafe to trigger from a single test once multiple
+/// persistent services exist in the same test binary).
+pub fn spawn_persistent_for_test(
+    addr: &str,
+    data_dir: &Path,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    let listener = TcpListener::bind(addr)?;
+    let local = listener.local_addr()?;
+
+    let path = data_dir.join("mysql.json");
+    let engine = if path.exists() {
+        let bytes = std::fs::read(&path)?;
+        let db: DbState = serde_json::from_slice(&bytes).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to parse mysql snapshot: {e}"),
+            )
+        })?;
+        Engine::new_persistent(db)
+    } else {
+        Engine::new()
+    };
+
+    let save_engine = engine.clone();
+    let save = move || {
+        let db = save_engine.snapshot();
+        let bytes = serde_json::to_vec(&db).expect("mysql snapshot serialization failed");
+        let _ = crate::persistence::write_snapshot_atomically(&path, &bytes);
+    };
+
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let engine = engine.clone();
+            let _ = thread::spawn(move || {
+                let _ = serve(stream, engine);
+            });
+        }
+    });
+    Ok((local, save))
+}
 
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;

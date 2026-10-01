@@ -37,7 +37,7 @@ See `noida-db help` for the full option list, or jump to
 | 📦 **34 real client libraries & ORMs** verified | psycopg, SQLAlchemy, Django, redis-py, ioredis, kafkajs, Sequelize, GORM, JDBC, and more |
 | 🪶 **~2MB idle**, ~15MB under real app load | vs. the multi-gigabyte real stack |
 | ⚡ **Sub-100µs** reads on Redis/Elasticsearch paths | measured, not claimed — see [Benchmarks](#benchmarks) |
-| 💾 **On-disk persistence** for Postgres, Redis, Elasticsearch | survives a clean restart; MySQL and Kafka next |
+| 💾 **On-disk persistence** for Postgres, Redis, Elasticsearch, MySQL, Kafka | survives a clean restart |
 | 🔍 **Every gap tracked, not hidden** | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — updated by every PR |
 
 ## Why noida-db
@@ -169,11 +169,9 @@ progress in [docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## What's next
 
-- **Persistence for MySQL and Kafka** — Postgres, Redis and Elasticsearch
-  already save a full snapshot on clean shutdown
-  (`<data_dir>/<service>.json`, atomic temp-file-then-rename writes so an
-  interrupted save can't corrupt the file — see `src/persistence.rs`);
-  the same model lands for the remaining two next.
+- **Binary releases and package managers** — automated cross-platform builds
+  for Linux, macOS and Windows, plus npm, PyPI, Homebrew, and crates.io
+  distribution.
 - **Wider benchmark coverage** — a native long-lived Kafka client for
   producer/fetch numbers, plus index and persistence-cost benchmarks.
 - **More real applications** — see [the table above](#tested-against-real-applications).

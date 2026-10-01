@@ -1,10 +1,11 @@
 use crate::mysql::types::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub type Row = Vec<Value>;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
     Int,
     BigInt,
@@ -18,7 +19,7 @@ pub enum ColumnType {
     Boolean,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     pub ty: ColumnType,
@@ -28,7 +29,7 @@ pub struct Column {
     pub primary_key: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
@@ -42,13 +43,13 @@ impl Table {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Schema {
     pub name: String,
     pub tables: BTreeMap<String, Arc<Table>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbState {
     pub schemas: BTreeMap<String, Schema>,
 }
