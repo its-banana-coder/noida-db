@@ -437,6 +437,23 @@ connection but fatal for a real app making more than one (WordPress's
 `wp core install` succeeding on one connection, then `wp db tables` on a
 separate one reporting "the site you have requested is not installed").
 
+A database named directly in the connection string (`mysql://user@host/db`,
+what every real client does — `mysqli_real_connect()`, PyMySQL,
+node-mysql2) is selected from the handshake response itself, not just via
+a later explicit `USE`; this was also a real bug until fixed, since every
+one of this project's own tests happened to issue an explicit `USE` as an
+unnoticed workaround and no real client-shaped test ever exercised the
+handshake path until WordPress did.
+
+Comparing or doing arithmetic between a `Text` value and a numeric one
+(e.g. a `VARCHAR` column compared against an integer literal) coerces the
+string to a number the way real MySQL does (parsing the longest leading
+numeric prefix, falling back to 0 for anything else), rather than
+hard-erroring — found via a real WordPress REST API request (`WP_Query`'s
+revision-count subquery joining `wp_posts.post_parent` against a literal)
+that used to fail outright where real MySQL just returns the matching
+rows.
+
 Handshake (`mysql_native_password`, any password accepted — no real
 credential check yet), `COM_INIT_DB`, and `COM_QUERY` for both
 literal-only `SELECT` expressions (numeric/string/NULL literals,
@@ -526,16 +543,18 @@ function, which *does* persist, is not yet implemented).
 
 Verified against `mysql_async` (`tests/mysql_client.rs`, including the
 prepared-statement, `GROUP BY`, transaction, `affected_rows` and
-`last_insert_id` behavior above) and a differential test against a real
-MySQL 8.0 server
-(`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`). In this sandbox, a
-server was reachable on the default port but authenticates with
-`sha256_password`, which `mysql_async` itself doesn't support
-(`Driver(UnknownAuthPlugin { name: "sha256_password" })`) — that's a
-pre-existing gap in the test's own client dependency, not something this
-change introduced or could work around, and it reproduces identically on
-`main` before this change. The new scenarios are in the test file ready
-to run against a `mysql_native_password`-configured reference server.
+`last_insert_id` behavior above), a 50-query e-commerce differential
+suite shared with Postgres and translated to MySQL's own dialect
+(`tests/ecommerce_mysql_diff.rs`), and a differential test against a real
+MySQL server (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`). CI
+runs a `mysql:5.7` service for this — 5.7, not 8, because MySQL 8's
+default `caching_sha2_password` auth plugin isn't supported by
+`mysql_async` (`Driver(UnknownAuthPlugin { name: "caching_sha2_password" })`,
+same underlying gap as `sha256_password`), a pre-existing limitation in
+the test's own client dependency, not something noida-db does. Locally,
+a server reachable on the default port that uses either of those auth
+plugins will cause the same SKIPPED/connection-error behavior — point
+`NOIDA_MYSQL_REF` at a `mysql_native_password`-configured server instead.
 
 **Not yet**
 - Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
