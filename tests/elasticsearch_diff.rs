@@ -7,7 +7,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 struct Reply {
     status: u16,
@@ -410,4 +410,464 @@ fn p0_new_query_types_match_real_elasticsearch() {
     let _ = request(real_addr, "DELETE", index, b"");
     let _ = request(ours_addr, "DELETE", index, b"");
     println!("compared match_phrase/multi_match/wildcard/regexp against real Elasticsearch");
+}
+
+/// Deep JSON equality, except a `Number`-vs-`Number` pair compares within
+/// a small relative tolerance rather than exactly. Real Elasticsearch
+/// dynamically maps a decimal field as 32-bit `float`, so an `avg` over
+/// it carries the f32-widened-to-f64 rounding that comes with that
+/// (`4.450000047683716`); this engine's own metric aggregations compute
+/// purely in f64 (`4.449999999999999` -- the closer of the two to the
+/// actual decimal average, not a less correct answer), so an exact
+/// `assert_eq!` on aggregation bodies flags that real, harmless
+/// precision difference as a mismatch. The same tolerance the BM25
+/// `_score` comparison above already uses.
+fn agg_approx_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            let tolerance = (x.abs() * 1e-6).max(1e-9);
+            (x - y).abs() <= tolerance
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| agg_approx_eq(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, xv)| y.get(k).is_some_and(|yv| agg_approx_eq(xv, yv)))
+        }
+        _ => a == b,
+    }
+}
+
+/// A small e-commerce-shaped product fixture, shared by the tests below --
+/// `term`/`terms`/`bool`/`range`/`exists` are all implemented
+/// (`src/elasticsearch/search.rs`) but were previously only verified by
+/// this crate's own internal unit tests, never against a real node.
+fn seed_products(real_addr: SocketAddr, ours_addr: SocketAddr, index: &str) {
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    let create = br#"{"settings":{"index":{"number_of_shards":"1","number_of_replicas":"0"}}}"#;
+    expect_ok("real: PUT index", &request(real_addr, "PUT", index, create));
+    expect_ok("ours: PUT index", &request(ours_addr, "PUT", index, create));
+
+    // brand/category explicitly keyword: real Elasticsearch's dynamic
+    // mapping would otherwise make these `text` fields, which disable
+    // fielddata (and so aggregating/sorting on them) by default -- a
+    // real `brand` field in a real mapping is keyword, exactly like
+    // this, not an accident of dynamic mapping.
+    let mapping = br#"{"properties":{"brand":{"type":"keyword"},"category":{"type":"keyword"}}}"#;
+    expect_ok(
+        "real: PUT mapping",
+        &request(real_addr, "PUT", &format!("{index}/_mapping"), mapping),
+    );
+    expect_ok(
+        "ours: PUT mapping",
+        &request(ours_addr, "PUT", &format!("{index}/_mapping"), mapping),
+    );
+
+    let docs: [(&str, &[u8]); 5] = [
+        ("101", br#"{"name":"Apple MacBook Pro 14","category":"laptops","brand":"Apple","price":189999,"discount_price":174999,"rating":4.8,"tags":["laptop","apple","professional"]}"#),
+        ("102", br#"{"name":"Apple MacBook Air","category":"laptops","brand":"Apple","price":124999,"discount_price":114999,"rating":4.7,"tags":["laptop","apple","ultrabook"]}"#),
+        ("103", br#"{"name":"Dell XPS 14","category":"laptops","brand":"Dell","price":149999,"rating":4.5,"tags":["laptop","windows","premium"]}"#),
+        ("104", br#"{"name":"Sony WH-1000XM6","category":"headphones","brand":"Sony","price":39999,"discount_price":34999,"rating":4.6,"tags":["headphones","wireless","noise-cancelling"]}"#),
+        ("105", br#"{"name":"Sony WH-CH720N","category":"headphones","brand":"Sony","price":12999,"rating":4.3,"tags":["headphones","wireless","budget"]}"#),
+    ];
+    for (id, d) in docs.iter() {
+        let path = format!("{index}/_doc/{id}");
+        expect_ok("real: PUT doc", &request(real_addr, "PUT", &path, d));
+        expect_ok("ours: PUT doc", &request(ours_addr, "PUT", &path, d));
+    }
+    expect_ok("real: refresh", &request(real_addr, "POST", &format!("{index}/_refresh"), b""));
+    expect_ok("ours: refresh", &request(ours_addr, "POST", &format!("{index}/_refresh"), b""));
+}
+
+#[test]
+fn p1_term_bool_range_exists_queries_match_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_term_bool_range";
+    seed_products(real_addr, ours_addr, index);
+
+    compare_query(
+        "term brand",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"term":{"brand":"Apple"}}}"#,
+        false,
+    );
+    compare_query(
+        "terms brand",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"terms":{"brand":["Apple","Dell"]}}}"#,
+        false,
+    );
+    compare_query(
+        "range price",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"range":{"price":{"gte":100000,"lte":150000}}}}"#,
+        false,
+    );
+    compare_query(
+        "exists discount_price",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"exists":{"field":"discount_price"}}}"#,
+        false,
+    );
+    compare_query(
+        "bool must+filter+must_not",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"bool":{"must":[{"match":{"name":"wireless"}}],"filter":[{"term":{"brand":"Sony"}},{"range":{"price":{"lte":40000}}}],"must_not":[{"term":{"tags":"budget"}}]}}}"#,
+        false,
+    );
+    compare_query(
+        "bool should",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"bool":{"should":[{"term":{"brand":"Apple"}},{"term":{"brand":"Dell"}}]}}}"#,
+        false,
+    );
+    compare_query(
+        "bool must_not",
+        real_addr,
+        ours_addr,
+        index,
+        br#"{"query":{"bool":{"must_not":[{"term":{"brand":"Sony"}}]}}}"#,
+        false,
+    );
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!("compared term/terms/range/exists/bool against real Elasticsearch");
+}
+
+#[test]
+fn p1_sort_pagination_source_filtering_match_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_sort_pagination";
+    seed_products(real_addr, ours_addr, index);
+
+    // Single-field sort: must compare exact ORDER, not just the matched
+    // id set, so this calls _search directly rather than compare_query.
+    for (label, body) in [
+        ("sort price asc", br#"{"query":{"match_all":{}},"sort":[{"price":"asc"}]}"# as &[u8]),
+        ("sort price desc", br#"{"query":{"match_all":{}},"sort":[{"price":"desc"}]}"#),
+        (
+            "multi-field sort",
+            br#"{"query":{"match_all":{}},"sort":[{"rating":"desc"},{"price":"asc"}]}"#,
+        ),
+    ] {
+        let real = request(real_addr, "POST", &format!("{index}/_search"), body);
+        let ours = request(ours_addr, "POST", &format!("{index}/_search"), body);
+        expect_ok(&format!("real: {label}"), &real);
+        expect_ok(&format!("ours: {label}"), &ours);
+        let real_ids: Vec<&str> = real.body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap())
+            .collect();
+        let ours_ids: Vec<&str> = ours.body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ours_ids, real_ids, "{label}: order mismatch");
+    }
+
+    // Pagination: from/size pages must partition the full (sorted) result
+    // set with no overlap and no gaps.
+    let mut seen = std::collections::HashSet::new();
+    for from in [0, 2, 4] {
+        let body = format!(
+            r#"{{"query":{{"match_all":{{}}}},"sort":[{{"price":"asc"}}],"from":{from},"size":2}}"#
+        );
+        let real = request(real_addr, "POST", &format!("{index}/_search"), body.as_bytes());
+        let ours = request(ours_addr, "POST", &format!("{index}/_search"), body.as_bytes());
+        expect_ok("real: page", &real);
+        expect_ok("ours: page", &ours);
+        let real_ids: Vec<&str> = real.body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap())
+            .collect();
+        let ours_ids: Vec<&str> = ours.body["hits"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ours_ids, real_ids, "page from={from}: mismatch");
+        for id in &real_ids {
+            assert!(seen.insert(id.to_string()), "page from={from}: id {id} seen twice");
+        }
+    }
+    assert_eq!(seen.len(), 5, "pagination should cover all 5 seeded products exactly once");
+
+    // _source filtering.
+    let body = br#"{"query":{"match_all":{}},"_source":["name","price"]}"#;
+    let real = request(real_addr, "POST", &format!("{index}/_search"), body);
+    let ours = request(ours_addr, "POST", &format!("{index}/_search"), body);
+    expect_ok("real: source filter", &real);
+    expect_ok("ours: source filter", &ours);
+    for h in ours.body["hits"]["hits"].as_array().unwrap() {
+        let src = h["_source"].as_object().unwrap();
+        let mut keys: Vec<&str> = src.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, vec!["name", "price"], "_source filter leaked extra fields");
+    }
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!("compared sort/pagination/_source filtering against real Elasticsearch");
+}
+
+#[test]
+fn p1_aggregations_match_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_aggregations";
+    seed_products(real_addr, ours_addr, index);
+
+    for (label, body) in [
+        ("terms brand", br#"{"size":0,"aggs":{"brands":{"terms":{"field":"brand"}}}}"# as &[u8]),
+        ("avg price", br#"{"size":0,"aggs":{"avg_price":{"avg":{"field":"price"}}}}"#),
+        ("stats price", br#"{"size":0,"aggs":{"price_stats":{"stats":{"field":"price"}}}}"#),
+        (
+            "filter agg",
+            br#"{"size":0,"aggs":{"sony":{"filter":{"term":{"brand":"Sony"}},"aggs":{"avg_price":{"avg":{"field":"price"}}}}}}"#,
+        ),
+        (
+            "nested terms+avg",
+            br#"{"size":0,"aggs":{"brands":{"terms":{"field":"brand"},"aggs":{"avg_price":{"avg":{"field":"price"}},"avg_rating":{"avg":{"field":"rating"}}}}}}"#,
+        ),
+        (
+            "filtered query scopes aggs",
+            br#"{"query":{"term":{"category":"laptops"}},"size":0,"aggs":{"brands":{"terms":{"field":"brand"}}}}"#,
+        ),
+    ] {
+        let real = request(real_addr, "POST", &format!("{index}/_search"), body);
+        let ours = request(ours_addr, "POST", &format!("{index}/_search"), body);
+        expect_ok(&format!("real: {label}"), &real);
+        expect_ok(&format!("ours: {label}"), &ours);
+        assert!(
+            agg_approx_eq(&ours.body["aggregations"], &real.body["aggregations"]),
+            "{label}: aggregations mismatch. real: {}, ours: {}",
+            real.body["aggregations"], ours.body["aggregations"]
+        );
+    }
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!("compared terms/avg/stats/filter/nested aggregations against real Elasticsearch");
+}
+
+#[test]
+fn p1_update_bulk_delete_match_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_update_bulk_delete";
+    seed_products(real_addr, ours_addr, index);
+
+    // Partial update.
+    let update = br#"{"doc":{"price":169999}}"#;
+    let real_u = request(real_addr, "POST", &format!("{index}/_update/101"), update);
+    let ours_u = request(ours_addr, "POST", &format!("{index}/_update/101"), update);
+    assert_eq!(ours_u.status, real_u.status, "update status");
+    assert_eq!(ours_u.body["result"], real_u.body["result"], "update result");
+
+    let real_get = request(real_addr, "GET", &format!("{index}/_doc/101"), b"");
+    let ours_get = request(ours_addr, "GET", &format!("{index}/_doc/101"), b"");
+    assert_eq!(ours_get.body["_source"]["price"], real_get.body["_source"]["price"]);
+    assert_eq!(
+        ours_get.body["_source"]["name"], real_get.body["_source"]["name"],
+        "update must not touch unrelated fields"
+    );
+
+    // Bulk: mixed index/update/delete in one request.
+    let bulk = concat!(
+        "{\"index\":{\"_id\":\"201\"}}\n",
+        "{\"name\":\"Bulk Product\",\"price\":5000}\n",
+        "{\"update\":{\"_id\":\"102\"}}\n",
+        "{\"doc\":{\"price\":99999}}\n",
+        "{\"delete\":{\"_id\":\"105\"}}\n",
+    );
+    let real_b = request(real_addr, "POST", &format!("{index}/_bulk"), bulk.as_bytes());
+    let ours_b = request(ours_addr, "POST", &format!("{index}/_bulk"), bulk.as_bytes());
+    assert_eq!(ours_b.body["errors"], real_b.body["errors"], "bulk errors flag");
+    expect_ok("real: refresh", &request(real_addr, "POST", &format!("{index}/_refresh"), b""));
+    expect_ok("ours: refresh", &request(ours_addr, "POST", &format!("{index}/_refresh"), b""));
+
+    let real_count = request(real_addr, "GET", &format!("{index}/_count"), b"");
+    let ours_count = request(ours_addr, "GET", &format!("{index}/_count"), b"");
+    assert_eq!(ours_count.body["count"], real_count.body["count"], "count after bulk");
+    assert_eq!(ours_count.body["count"], json!(5), "5 original - 1 deleted + 1 bulk-indexed");
+
+    let real_105 = request(real_addr, "GET", &format!("{index}/_doc/105"), b"");
+    let ours_105 = request(ours_addr, "GET", &format!("{index}/_doc/105"), b"");
+    assert_eq!(ours_105.status, real_105.status);
+    assert_eq!(ours_105.body["found"], json!(false), "bulk delete should have removed 105");
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!("compared update/bulk/delete against real Elasticsearch");
+}
+
+/// Zero-downtime alias switch: an alias pointed at one index, searched,
+/// repointed at a different index, searched again -- the search must
+/// follow the alias, not the name it was first created against.
+#[test]
+fn p1_aliases_match_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let v1 = "/noida_diff_alias_v1";
+    let v2 = "/noida_diff_alias_v2";
+    let _ = request(real_addr, "DELETE", v1, b"");
+    let _ = request(ours_addr, "DELETE", v1, b"");
+    let _ = request(real_addr, "DELETE", v2, b"");
+    let _ = request(ours_addr, "DELETE", v2, b"");
+    let create = br#"{"settings":{"index":{"number_of_shards":"1","number_of_replicas":"0"}}}"#;
+    for addr in [real_addr, ours_addr] {
+        expect_ok("PUT v1", &request(addr, "PUT", v1, create));
+        expect_ok("PUT v2", &request(addr, "PUT", v2, create));
+        expect_ok(
+            "doc v1",
+            &request(addr, "PUT", "/noida_diff_alias_v1/_doc/1", br#"{"tag":"v1"}"#),
+        );
+        expect_ok(
+            "doc v2",
+            &request(addr, "PUT", "/noida_diff_alias_v2/_doc/1", br#"{"tag":"v2"}"#),
+        );
+        expect_ok("refresh v1", &request(addr, "POST", "/noida_diff_alias_v1/_refresh", b""));
+        expect_ok("refresh v2", &request(addr, "POST", "/noida_diff_alias_v2/_refresh", b""));
+    }
+
+    let point_at_v1 =
+        br#"{"actions":[{"add":{"index":"noida_diff_alias_v1","alias":"noida_diff_alias_current"}}]}"#;
+    expect_ok("real: alias->v1", &request(real_addr, "POST", "/_aliases", point_at_v1));
+    expect_ok("ours: alias->v1", &request(ours_addr, "POST", "/_aliases", point_at_v1));
+
+    compare_query(
+        "search via alias (v1)",
+        real_addr,
+        ours_addr,
+        "/noida_diff_alias_current",
+        br#"{"query":{"match_all":{}}}"#,
+        false,
+    );
+    let real1 = request(real_addr, "GET", "/noida_diff_alias_current/_doc/1", b"");
+    let ours1 = request(ours_addr, "GET", "/noida_diff_alias_current/_doc/1", b"");
+    assert_eq!(ours1.body["_source"]["tag"], real1.body["_source"]["tag"]);
+    assert_eq!(ours1.body["_source"]["tag"], json!("v1"));
+
+    // Zero-downtime switch: remove from v1, add to v2, in one request.
+    let switch = br#"{"actions":[{"remove":{"index":"noida_diff_alias_v1","alias":"noida_diff_alias_current"}},{"add":{"index":"noida_diff_alias_v2","alias":"noida_diff_alias_current"}}]}"#;
+    expect_ok("real: alias->v2", &request(real_addr, "POST", "/_aliases", switch));
+    expect_ok("ours: alias->v2", &request(ours_addr, "POST", "/_aliases", switch));
+
+    let real2 = request(real_addr, "GET", "/noida_diff_alias_current/_doc/1", b"");
+    let ours2 = request(ours_addr, "GET", "/noida_diff_alias_current/_doc/1", b"");
+    assert_eq!(ours2.body["_source"]["tag"], real2.body["_source"]["tag"]);
+    assert_eq!(ours2.body["_source"]["tag"], json!("v2"), "alias should now resolve to v2");
+
+    let _ = request(real_addr, "DELETE", v1, b"");
+    let _ = request(ours_addr, "DELETE", v1, b"");
+    let _ = request(real_addr, "DELETE", v2, b"");
+    let _ = request(ours_addr, "DELETE", v2, b"");
+    println!("compared alias search + zero-downtime alias switch against real Elasticsearch");
+}
+
+/// Optimistic concurrency: an update against a stale `_seq_no`/
+/// `_primary_term` must be rejected with a real version conflict.
+#[test]
+fn p1_optimistic_concurrency_matches_real_elasticsearch() {
+    let Ok(reference) = std::env::var("NOIDA_ELASTICSEARCH_REF") else {
+        eprintln!("SKIPPED: no reference Elasticsearch (set NOIDA_ELASTICSEARCH_REF)");
+        return;
+    };
+    let real_addr = endpoint(&reference);
+    let ours_addr =
+        noida::elasticsearch::spawn("127.0.0.1:0").expect("start noida-db Elasticsearch");
+    let index = "/noida_diff_optimistic_concurrency";
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    let create = br#"{"settings":{"index":{"number_of_shards":"1","number_of_replicas":"0"}}}"#;
+    expect_ok("real: PUT index", &request(real_addr, "PUT", index, create));
+    expect_ok("ours: PUT index", &request(ours_addr, "PUT", index, create));
+
+    for addr in [real_addr, ours_addr] {
+        expect_ok("PUT doc", &request(addr, "PUT", &format!("{index}/_doc/1"), br#"{"n":1}"#));
+    }
+
+    let real_get = request(real_addr, "GET", &format!("{index}/_doc/1"), b"");
+    let ours_get = request(ours_addr, "GET", &format!("{index}/_doc/1"), b"");
+    let real_seq = real_get.body["_seq_no"].as_i64().unwrap();
+    let real_term = real_get.body["_primary_term"].as_i64().unwrap();
+    let ours_seq = ours_get.body["_seq_no"].as_i64().unwrap();
+    let ours_term = ours_get.body["_primary_term"].as_i64().unwrap();
+
+    // First update using the correct seq_no/primary_term succeeds.
+    let path_real = format!("{index}/_doc/1?if_seq_no={real_seq}&if_primary_term={real_term}");
+    let path_ours = format!("{index}/_doc/1?if_seq_no={ours_seq}&if_primary_term={ours_term}");
+    let real_ok = request(real_addr, "PUT", &path_real, br#"{"n":2}"#);
+    let ours_ok = request(ours_addr, "PUT", &path_ours, br#"{"n":2}"#);
+    assert_eq!(ours_ok.status, real_ok.status, "first conditional update should succeed on both");
+    assert!((200..300).contains(&ours_ok.status), "first conditional update should succeed");
+
+    // Reusing the now-stale seq_no/primary_term must conflict on both.
+    let real_conflict = request(real_addr, "PUT", &path_real, br#"{"n":3}"#);
+    let ours_conflict = request(ours_addr, "PUT", &path_ours, br#"{"n":3}"#);
+    assert_eq!(
+        real_conflict.status, 409,
+        "real Elasticsearch itself should reject the stale write"
+    );
+    assert_eq!(
+        ours_conflict.status, 409,
+        "noida-db should reject the stale write the same way: {}",
+        ours_conflict.body
+    );
+
+    let _ = request(real_addr, "DELETE", index, b"");
+    let _ = request(ours_addr, "DELETE", index, b"");
+    println!(
+        "compared optimistic concurrency (if_seq_no/if_primary_term) against real Elasticsearch"
+    );
 }

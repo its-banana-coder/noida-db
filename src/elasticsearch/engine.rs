@@ -117,7 +117,30 @@ impl Engine {
         if segments.is_empty() {
             return (200, json!({}));
         }
-        let index_name = segments[0];
+        // Resolves an alias to its real backing index for every
+        // document-level and admin operation below (GET/PUT a document,
+        // _bulk, _update, _mget, _mapping, _refresh, ...), the same way
+        // `resolve_indices` already does for `_search`/`_count` -- an
+        // alias pointing at more than one index picks the first
+        // (arbitrary but deterministic via BTree-like iteration order
+        // isn't guaranteed here; real Elasticsearch itself requires a
+        // single-document op's alias to resolve to exactly one index and
+        // errors otherwise, which this simplified version doesn't
+        // enforce, but every real caller of a write-alias only ever
+        // points it at one index at a time anyway).
+        let index_name = {
+            let s = self.0.lock().unwrap();
+            if s.indices.contains_key(segments[0]) {
+                segments[0].to_string()
+            } else {
+                s.indices
+                    .iter()
+                    .find(|(_, i)| i.aliases.contains_key(segments[0]))
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_else(|| segments[0].to_string())
+            }
+        };
+        let index_name = index_name.as_str();
         if segments.len() == 1 {
             return self.index_api(method, index_name, body);
         }
@@ -145,6 +168,15 @@ impl Engine {
     /// Index names/patterns matching Elasticsearch's rules for `_search`
     /// targets: an exact name, a comma-separated list, a `name*` prefix
     /// wildcard, or `_all`/`*` for every index.
+    /// Resolves an index name, wildcard pattern, OR alias to the real
+    /// index name(s) backing it. An alias pointing at more than one index
+    /// (every index it was `add`ed to) resolves to all of them, matching
+    /// real Elasticsearch's own "search across every index behind this
+    /// alias" behavior -- this is what makes a zero-downtime alias
+    /// switch (point `products-current` at `products-v2` instead of
+    /// `products-v1`, keep searching `products-current`) actually work,
+    /// rather than only letting `_aliases`/`_alias` manage the alias
+    /// metadata without `_search` ever being able to use it.
     fn resolve_indices(s: &State, pattern: &str) -> Vec<String> {
         if pattern == "_all" || pattern == "*" {
             let mut names: Vec<String> = s.indices.keys().cloned().collect();
@@ -161,6 +193,13 @@ impl Engine {
                 names.extend(s.indices.keys().filter(|k| k.starts_with(prefix)).cloned());
             } else if s.indices.contains_key(part) {
                 names.push(part.to_string());
+            } else {
+                names.extend(
+                    s.indices
+                        .iter()
+                        .filter(|(_, i)| i.aliases.contains_key(part))
+                        .map(|(name, _)| name.clone()),
+                );
             }
         }
         names.sort();
@@ -404,6 +443,23 @@ impl Engine {
             "PUT" | "POST" => {
                 if kind == "_create" && i.docs.contains_key(&id) {
                     return (409, version_conflict(index, &id));
+                }
+                // Optimistic concurrency: `?if_seq_no=...&if_primary_term=...`
+                // (the standard compare-and-swap pattern -- GET a document,
+                // write it back only if nothing else has touched it since)
+                // must reject a write made against a stale seq_no/
+                // primary_term with a real version conflict, not silently
+                // overwrite. `_primary_term` is always 1 in this engine (no
+                // real shard/replica model), matching what `doc_response`
+                // itself always reports.
+                if let (Some(want_seq), Some(want_term)) =
+                    (q.get("if_seq_no"), q.get("if_primary_term"))
+                {
+                    let want = want_seq.parse::<i64>().ok().zip(want_term.parse::<i64>().ok());
+                    let current = i.docs.get(&id).map(|d| (d.seq, 1i64));
+                    if current != want {
+                        return (409, version_conflict(index, &id));
+                    }
                 }
                 let Some(src) = parse_json(body) else {
                     return (
