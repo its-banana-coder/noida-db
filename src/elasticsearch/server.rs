@@ -81,6 +81,10 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
 }
 
 fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
+    // See the identical note in src/mysql/server.rs: disabling Nagle's
+    // algorithm here avoids the same class of request-latency stall for
+    // any response written in more than one syscall.
+    stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream);

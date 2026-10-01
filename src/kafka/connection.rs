@@ -13,6 +13,12 @@ use super::codec::{read_frame, write_frame};
 use super::engine::Engine;
 
 pub fn handle_connection(stream: TcpStream, engine: Engine) {
+    // Best-effort: this connection's own write path already batches a
+    // response's length header and payload into one `BufWriter` flush,
+    // so it doesn't show the specific ~40ms Nagle/delayed-ACK stall
+    // `src/mysql/server.rs` was measured hitting, but there's no reason
+    // to leave Nagle's algorithm enabled for a local-dev tool either.
+    let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 
