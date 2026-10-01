@@ -156,22 +156,29 @@ too (Kafka, Elasticsearch, RabbitMQ, MongoDB, ClickHouse).
 ## Installing
 
 ```sh
-# From source (works today)
-cargo install --path .
+# crates.io
+cargo install noida-db --all-features
+
+# npm (linux-x64 only for now -- see docs/PACKAGING.md)
+npm install -g noida-db
+
+# From source
+cargo install --path . --all-features
 
 # Docker
 docker build -t noida-db .
 docker run -p 5432:5432 -p 3306:3306 -p 6379:6379 -p 9092:9092 -p 9200:9200 noida-db
 ```
 
-crates.io, Homebrew, npm and PyPI packages are on the way — track
-progress in [docs/PACKAGING.md](docs/PACKAGING.md).
+Homebrew and PyPI packages are on the way — track progress in
+[docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## What's next
 
-- **Binary releases and package managers** — automated cross-platform builds
-  for Linux, macOS and Windows, plus npm, PyPI, Homebrew, and crates.io
-  distribution.
+- **Full cross-platform binary releases** — crates.io and npm are live
+  (npm is linux-x64 only until the automated 5-platform build runs); PyPI
+  and Homebrew publishing are wired into CI and waiting on one-time account
+  setup. See [docs/PACKAGING.md](docs/PACKAGING.md).
 - **Wider benchmark coverage** — a native long-lived Kafka client for
   producer/fetch numbers, plus index and persistence-cost benchmarks.
 - **More real applications** — see [the table above](#tested-against-real-applications).
