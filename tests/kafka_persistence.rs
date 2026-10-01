@@ -136,7 +136,11 @@ mod tests {
             .unwrap_or(-1)
     }
 
-    fn fetch_records_bytes(stream: &mut TcpStream, topic: &str, partition: i32) -> Option<bytes::Bytes> {
+    fn fetch_records_bytes(
+        stream: &mut TcpStream,
+        topic: &str,
+        partition: i32,
+    ) -> Option<bytes::Bytes> {
         let mut req = FetchRequest::default();
         req.max_wait_ms = 100;
         req.min_bytes = 0;
@@ -156,8 +160,7 @@ mod tests {
 
     #[test]
     fn persists_topics_and_consumer_offsets_across_a_restart() {
-        let dir =
-            std::env::temp_dir().join(format!("noida-kafka-persist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noida-kafka-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -237,10 +240,7 @@ mod tests {
         };
         topic.partitions.insert(0, part);
         state.topics.insert("my-topic".to_string(), topic);
-        state.committed_offsets.insert(
-            ("g1".to_string(), "my-topic".to_string(), 0),
-            42,
-        );
+        state.committed_offsets.insert(("g1".to_string(), "my-topic".to_string(), 0), 42);
 
         let snapshot = state.to_snapshot();
         let bytes = serde_json::to_vec(&snapshot).expect("must serialize");
@@ -252,9 +252,7 @@ mod tests {
         assert_eq!(prod_seqs.get(&(1001, 0)), Some(&(5, 0)));
         assert_eq!(prod_seqs.get(&(1002, 1)), Some(&(3, 10)));
 
-        let off = state2
-            .committed_offsets
-            .get(&("g1".to_string(), "my-topic".to_string(), 0));
+        let off = state2.committed_offsets.get(&("g1".to_string(), "my-topic".to_string(), 0));
         assert_eq!(off, Some(&42));
     }
 

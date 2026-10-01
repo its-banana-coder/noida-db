@@ -6,8 +6,8 @@
 
 #[cfg(feature = "mysql")]
 mod tests {
-    use mysql_async::prelude::*;
     use mysql_async::Pool;
+    use mysql_async::prelude::*;
     use noida::mysql::server::spawn_persistent_for_test;
     use std::net::SocketAddr;
 
@@ -18,8 +18,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_tables_and_schema_across_a_restart() {
-        let dir =
-            std::env::temp_dir().join(format!("noida-mysql-persist-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("noida-mysql-persist-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -69,14 +68,10 @@ mod tests {
             // ---- A table in the 'mysql' schema (always present) ----
             // Confirms more than just the default schema survives a restart.
             con.query_drop("USE mysql").await.unwrap();
-            con.query_drop(
-                "CREATE TABLE schema_check (id INT PRIMARY KEY, val TEXT)",
-            )
-            .await
-            .unwrap();
-            con.query_drop("INSERT INTO schema_check VALUES (1, 'in mysql schema')")
+            con.query_drop("CREATE TABLE schema_check (id INT PRIMARY KEY, val TEXT)")
                 .await
                 .unwrap();
+            con.query_drop("INSERT INTO schema_check VALUES (1, 'in mysql schema')").await.unwrap();
 
             drop(con);
             pool.disconnect().await.unwrap();
@@ -94,10 +89,8 @@ mod tests {
 
         // ---- Verify 'test' schema survived ----
         con.query_drop("USE test").await.unwrap();
-        let rows: Vec<(i64, String, i64)> = con
-            .query("SELECT id, name, score FROM persist_test ORDER BY id")
-            .await
-            .unwrap();
+        let rows: Vec<(i64, String, i64)> =
+            con.query("SELECT id, name, score FROM persist_test ORDER BY id").await.unwrap();
 
         assert_eq!(rows.len(), 3, "all 3 rows must survive restart");
 
@@ -133,10 +126,7 @@ mod tests {
         .unwrap();
         let new_ids: Vec<i64> =
             con.query("SELECT id FROM persist_test ORDER BY id DESC LIMIT 1").await.unwrap();
-        assert_eq!(
-            new_ids[0], 4,
-            "next AUTO_INCREMENT must continue from 4, not restart at 1"
-        );
+        assert_eq!(new_ids[0], 4, "next AUTO_INCREMENT must continue from 4, not restart at 1");
 
         // ---- 'mysql' schema survived ----
         con.query_drop("USE mysql").await.unwrap();
@@ -167,9 +157,7 @@ mod tests {
 
         let mut engine2 = Engine::new_persistent(loaded);
         engine2.execute("USE test").unwrap();
-        let rows = engine2
-            .execute("SELECT id, name, amt FROM foo ORDER BY id")
-            .unwrap();
+        let rows = engine2.execute("SELECT id, name, amt FROM foo ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2, "both rows must survive a serde round-trip");
     }
 }

@@ -2528,8 +2528,7 @@ impl EngineState {
                 if part_state.active_txns.is_empty() {
                     continue;
                 }
-                let open: Vec<(i64, i64)> =
-                    part_state.active_txns.drain().collect();
+                let open: Vec<(i64, i64)> = part_state.active_txns.drain().collect();
                 for (producer_id, first_offset) in open {
                     // Use epoch 0 if the producer's epoch is no longer in the map
                     // (safe: the fencing machinery only matters while a live
