@@ -100,6 +100,93 @@ Each service is its own Cargo feature (on by default once merged) and can
 be switched on or off at build time and at runtime (`--only`); a disabled
 service allocates nothing.
 
+## Benchmarks
+
+`benchmarks/noidadb_bench.py` measures the database engine itself —
+throughput, latency, CPU time and RSS for `insert`/`read`/`update`/
+`delete`/`scan`, across dataset size, record size and client concurrency
+— against Redis, Postgres, MySQL and Elasticsearch's own wire protocols
+(a hand-rolled client per service, no ORM or driver overhead in the
+numbers). It is deliberately not a production-traffic simulator: no
+users, QPS targets or business workflows are fabricated. Kafka isn't
+benchmarked yet — it needs a long-lived native Kafka-protocol client so
+producer/fetch costs aren't polluted by spawning a CLI per operation.
+
+**Hardware for the numbers below:** a shared WSL2 VM (1 physical / 2
+logical cores, ~6 GB RAM) — not a dedicated benchmarking rig, and the
+numbers should be read as directional, not as absolute capacity claims.
+Full methodology, how to reproduce, and how to run the larger `--profile
+full` sweep are in [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md); every
+run also writes a per-run `report.html` with the full set of scaling
+graphs plus `environment.json` (exact hardware/build/git revision) next
+to its raw `results.jsonl`.
+
+**At 1,000 records, 100-byte values, 1 client:**
+
+| Service | insert | read | update | delete | scan |
+|---|---:|---:|---:|---:|---:|
+| Redis | 70.0µs | 65.5µs | 65.8µs | 127.5µs | 296.4µs |
+| Postgres | 507.6µs | 412.7µs | 832.0µs | 1023.3µs | 3391.1µs |
+| MySQL | 58.4µs | 544.4µs | 113.6µs | 63.5µs† | 3709.4µs |
+| Elasticsearch | 235.8µs | 230.8µs | 239.5µs | 504.0µs | 231.4µs |
+
+p50 latency. † MySQL's `delete` benchmark issues a two-statement
+`DELETE ...; INSERT ...` per op (replacing the row it removes, to keep
+the dataset size constant) — noida-db's MySQL only executes the first
+statement of a multi-statement `COM_QUERY` (a documented gap, see
+`docs/LIMITATIONS.md`), so this number is a plain delete, and the
+table's row count drifts down over the course of that benchmark instead
+of staying constant the way it does for the other three services.
+
+**Dataset-size scaling** (`read`, 100B values, 1 client) — Redis and
+Elasticsearch do an ID-keyed lookup (flat regardless of how many other
+records exist); Postgres and MySQL have no real indexing yet (a
+documented, deliberate "simple over performant" tradeoff, not a bug),
+so a lookup is a linear scan and cost grows with table size:
+
+| Service | 1K records (p50) | 10K records (p50) |
+|---|---:|---:|
+| Redis | 65.5µs | 65.4µs (×1.0) |
+| Postgres | 412.7µs | 3057.1µs (×7.4) |
+| MySQL | 544.4µs | 4660.6µs (×8.6) |
+| Elasticsearch | 230.8µs | 231.0µs (×1.0) |
+
+**Concurrency scaling** (`read`, 1K records, 100B values) — all four
+roughly double throughput from 1→2 concurrent clients, then plateau by 4
+rather than keep scaling; each service here holds one global lock around
+its in-memory state for the duration of an operation (documented under
+"simple over performant" — real concurrent correctness, not a real
+concurrent *engine*):
+
+| Service | 1 client | 2 clients | 4 clients |
+|---|---:|---:|---:|
+| Redis | 14,710 ops/s | 33,133 ops/s | 33,303 ops/s |
+| Postgres | 2,354 ops/s | 2,927 ops/s | 2,995 ops/s |
+| MySQL | 1,716 ops/s | 3,136 ops/s | 3,244 ops/s |
+| Elasticsearch | 3,778 ops/s | 3,934 ops/s | 4,409 ops/s |
+
+**Record-size scaling** (`insert`, 1K records, 1 client) — at these
+small sizes the dominant cost is protocol/dispatch, not copying the
+value itself, so 100B→1KB barely moves the number:
+
+| Service | 100B (p50) | 1KB (p50) |
+|---|---:|---:|
+| Redis | 70.0µs | 70.8µs |
+| Postgres | 507.6µs | 663.6µs |
+| MySQL | 58.4µs | 66.3µs |
+| Elasticsearch | 235.8µs | 244.4µs |
+
+These numbers directly caught a real bug: MySQL's `read`/`scan` were
+originally measured in the tens of milliseconds (vs. Redis's
+microseconds) for no algorithmic reason — `src/postgres/server.rs`
+disabled Nagle's algorithm (`TCP_NODELAY`) on every accepted connection
+and `src/mysql/server.rs` never did, so MySQL's own two-syscall-per-
+packet wire protocol was stalling on the client's ~40ms delayed-ACK
+timer on every response. Fixed, and applied to every other service that
+was missing it too (Kafka, Elasticsearch, RabbitMQ, MongoDB, ClickHouse)
+— see `docs/LIMITATIONS.md` and the git history for
+`src/mysql/server.rs`.
+
 ## Pending infrastructure
 
 Actively being worked on, not yet complete — listed here rather than left
