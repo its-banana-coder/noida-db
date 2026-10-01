@@ -1,0 +1,51 @@
+name: real-apps
+
+# Runs the heavier real, unmodified application tests under tests/apps/
+# (Gitea, Miniflux, WordPress, ...) -- each is a multi-minute end-to-end
+# workflow against a real toolchain (git, PHP, ...) and real networks
+# (downloading pinned, checksum-verified releases), so these are kept out
+# of the fast per-push `ci` workflow and instead run:
+#   - on any push/PR that touches tests/apps/** (so a change to one of
+#     these scripts, or a fix aimed at unblocking one, gets real signal)
+#   - on a daily schedule, as ongoing regression coverage
+#   - on manual dispatch
+on:
+  push:
+    paths:
+      - "tests/apps/**"
+      - ".github/workflows/real-apps.yml"
+  pull_request:
+    paths:
+      - "tests/apps/**"
+      - ".github/workflows/real-apps.yml"
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  # Each app is its own job (not sequential steps in one job) so that one
+  # app's failure -- or flakiness, e.g. Gitea's own async merge-readiness
+  # checks -- can't prevent the others from running and reporting their
+  # own real signal.
+  gitea:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: tests/apps/gitea/run.sh
+  miniflux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: tests/apps/miniflux/run.sh
+  wordpress:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          extensions: mysqli
+      - run: tests/apps/wordpress/run.sh
