@@ -117,7 +117,30 @@ impl Engine {
         if segments.is_empty() {
             return (200, json!({}));
         }
-        let index_name = segments[0];
+        // Resolves an alias to its real backing index for every
+        // document-level and admin operation below (GET/PUT a document,
+        // _bulk, _update, _mget, _mapping, _refresh, ...), the same way
+        // `resolve_indices` already does for `_search`/`_count` -- an
+        // alias pointing at more than one index picks the first
+        // (arbitrary but deterministic via BTree-like iteration order
+        // isn't guaranteed here; real Elasticsearch itself requires a
+        // single-document op's alias to resolve to exactly one index and
+        // errors otherwise, which this simplified version doesn't
+        // enforce, but every real caller of a write-alias only ever
+        // points it at one index at a time anyway).
+        let index_name = {
+            let s = self.0.lock().unwrap();
+            if s.indices.contains_key(segments[0]) {
+                segments[0].to_string()
+            } else {
+                s.indices
+                    .iter()
+                    .find(|(_, i)| i.aliases.contains_key(segments[0]))
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_else(|| segments[0].to_string())
+            }
+        };
+        let index_name = index_name.as_str();
         if segments.len() == 1 {
             return self.index_api(method, index_name, body);
         }

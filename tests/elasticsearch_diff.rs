@@ -423,6 +423,21 @@ fn seed_products(real_addr: SocketAddr, ours_addr: SocketAddr, index: &str) {
     expect_ok("real: PUT index", &request(real_addr, "PUT", index, create));
     expect_ok("ours: PUT index", &request(ours_addr, "PUT", index, create));
 
+    // brand/category explicitly keyword: real Elasticsearch's dynamic
+    // mapping would otherwise make these `text` fields, which disable
+    // fielddata (and so aggregating/sorting on them) by default -- a
+    // real `brand` field in a real mapping is keyword, exactly like
+    // this, not an accident of dynamic mapping.
+    let mapping = br#"{"properties":{"brand":{"type":"keyword"},"category":{"type":"keyword"}}}"#;
+    expect_ok(
+        "real: PUT mapping",
+        &request(real_addr, "PUT", &format!("{index}/_mapping"), mapping),
+    );
+    expect_ok(
+        "ours: PUT mapping",
+        &request(ours_addr, "PUT", &format!("{index}/_mapping"), mapping),
+    );
+
     let docs: [(&str, &[u8]); 5] = [
         ("101", br#"{"name":"Apple MacBook Pro 14","category":"laptops","brand":"Apple","price":189999,"discount_price":174999,"rating":4.8,"tags":["laptop","apple","professional"]}"#),
         ("102", br#"{"name":"Apple MacBook Air","category":"laptops","brand":"Apple","price":124999,"discount_price":114999,"rating":4.7,"tags":["laptop","apple","ultrabook"]}"#),
