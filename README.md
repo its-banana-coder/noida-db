@@ -115,11 +115,11 @@ implicit:
   clean shutdown, not incremental or continuous — a hard kill (`kill -9`)
   loses whatever changed since the last clean shutdown, but never corrupts
   the on-disk file.
-- **Benchmarking.** The [footprint targets](COMPATIBILITY.md#footprint-targets)
-  are targets, not (yet) continuously measured numbers; an automated,
-  re-runnable benchmark script (idle RAM per service and all-together,
-  basic throughput/latency for common operations) is planned to replace
-  them with real measurements.
+- **Benchmarking.** The [infrastructure benchmark harness](docs/BENCHMARKING.md)
+  now captures repeatable Redis wire-protocol throughput, latency, server-only
+  CPU/RSS/IO, optional hardware counters, machine metadata, and SVG reports.
+  It is intentionally an engine-efficiency suite, not a production-traffic
+  simulation; adapters for equivalent operations in other services will follow.
 - **Real-app matrix expansion** — see "Tested against real applications"
   above for what's next.
 
