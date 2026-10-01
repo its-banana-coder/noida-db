@@ -15,8 +15,9 @@ mod tests {
     use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
     use kafka_protocol::messages::{
         ApiKey, CreateTopicsRequest, CreateTopicsResponse, FetchRequest, FetchResponse, GroupId,
-        OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
-        ProduceRequest, ProduceResponse, RequestHeader, ResponseHeader, TopicName,
+        MetadataRequest, MetadataResponse, OffsetCommitRequest, OffsetCommitResponse,
+        OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse, RequestHeader,
+        ResponseHeader, TopicName,
     };
     use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
     use noida::kafka::spawn_persistent_for_test;
@@ -299,6 +300,72 @@ mod tests {
         assert_eq!(
             part_after.high_watermark, hwm_before,
             "resolve_open_transactions_for_shutdown with no open txns must be a no-op"
+        );
+    }
+
+    #[test]
+    fn persists_with_updated_host_and_port_on_restart() {
+        let dir = std::env::temp_dir().join(format!("noida-kafka-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (_addr1, save1) = spawn_persistent_for_test("127.0.0.1:0", &dir).unwrap();
+        save1();
+        assert!(dir.join("kafka.json").exists());
+
+        // Second server starts on an ephemeral port (likely different from addr1).
+        let (addr2, _save2) = spawn_persistent_for_test("127.0.0.1:0", &dir).unwrap();
+        let mut stream = connect(addr2);
+
+        let meta_req = MetadataRequest::default();
+        let meta_resp: MetadataResponse =
+            send_request(&mut stream, ApiKey::Metadata, 9, 10, &meta_req);
+
+        assert_eq!(meta_resp.brokers.len(), 1);
+        let broker = &meta_resp.brokers[0];
+        assert_eq!(
+            broker.port,
+            addr2.port() as i32,
+            "metadata response must report the newly bound listener port, not the old snapshot port"
+        );
+    }
+
+    #[test]
+    fn end_txn_fails_after_shutdown_force_abort() {
+        use noida::kafka::engine::{EngineState, PartitionState, TopicState};
+        use std::collections::{HashMap, HashSet};
+
+        let mut state = EngineState::new("127.0.0.1".to_string(), 9999);
+        let mut part = PartitionState::new(0, 1);
+        part.active_txns.insert(1001i64, 0i64);
+        let mut topic = TopicState {
+            name: "txn-topic".to_string(),
+            is_internal: false,
+            partitions: HashMap::new(),
+            configs: HashMap::new(),
+        };
+        topic.partitions.insert(0, part);
+        state.topics.insert("txn-topic".to_string(), topic);
+        state
+            .txn_partitions
+            .insert("tx-1".to_string(), HashSet::from([("txn-topic".to_string(), 0)]));
+
+        // Shutdown resolution force-aborts open transactions and clears txn_partitions.
+        state.resolve_open_transactions_for_shutdown();
+
+        // A subsequent EndTxn commit attempt must be rejected with INVALID_TXN_STATE (48)
+        // rather than succeeding and appending a contradictory commit marker.
+        let mut end_req = kafka_protocol::messages::EndTxnRequest::default();
+        end_req.transactional_id =
+            kafka_protocol::messages::TransactionalId(StrBytes::from_string("tx-1".to_string()));
+        end_req.producer_id = kafka_protocol::messages::ProducerId(1001);
+        end_req.producer_epoch = 0;
+        end_req.committed = true;
+
+        let res = state.handle_end_txn(&end_req, 3);
+        assert_eq!(
+            res.error_code, 48,
+            "EndTxn must return INVALID_TXN_STATE (48) when transaction was force-aborted"
         );
     }
 }

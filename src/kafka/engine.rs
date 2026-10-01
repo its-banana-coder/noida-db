@@ -1718,35 +1718,38 @@ impl EngineState {
             return res;
         }
 
-        if let Some(partitions) = self.txn_partitions.remove(&tx_id) {
-            let now = self.now_ms();
-            for (topic_name, p_id) in partitions {
-                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
-                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
+        let Some(partitions) = self.txn_partitions.remove(&tx_id) else {
+            res.error_code = 48; // INVALID_TXN_STATE
+            return res;
+        };
 
-                if let Some(first_offset) = part_state.active_txns.remove(&producer_id)
-                    && !req.committed
-                {
-                    part_state.aborted_txns.push((producer_id, first_offset));
-                }
+        let now = self.now_ms();
+        for (topic_name, p_id) in partitions {
+            let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
+            let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
 
-                // Real Kafka appends a control batch (commit/abort marker)
-                // to every partition the transaction touched, advancing
-                // the log (and the LSO, once this partition has no other
-                // open transaction) past it — a read_committed fetch needs
-                // this offset to exist so the next fetch can move past
-                // where the transaction used to be pending.
-                let base_offset = part_state.high_watermark;
-                let control_batch = encode_control_batch(
-                    producer_id,
-                    producer_epoch,
-                    base_offset,
-                    req.committed,
-                    now,
-                );
-                part_state.record_batches.push((base_offset, control_batch));
-                part_state.high_watermark += 1;
+            // Only append a control batch if the transaction was genuinely active on this
+            // partition. If it was already force-aborted at shutdown, active_txns is empty
+            // and we must not append a contradictory commit marker.
+            let Some(first_offset) = part_state.active_txns.remove(&producer_id) else {
+                continue;
+            };
+
+            if !req.committed {
+                part_state.aborted_txns.push((producer_id, first_offset));
             }
+
+            // Real Kafka appends a control batch (commit/abort marker)
+            // to every partition the transaction touched, advancing
+            // the log (and the LSO, once this partition has no other
+            // open transaction) past it — a read_committed fetch needs
+            // this offset to exist so the next fetch can move past
+            // where the transaction used to be pending.
+            let base_offset = part_state.high_watermark;
+            let control_batch =
+                encode_control_batch(producer_id, producer_epoch, base_offset, req.committed, now);
+            part_state.record_batches.push((base_offset, control_batch));
+            part_state.high_watermark += 1;
         }
 
         res.error_code = 0;
@@ -2462,9 +2465,13 @@ impl Engine {
         state.to_snapshot()
     }
 
-    /// Builds an `Engine` from a previously saved `Snapshot`.
-    pub fn new_persistent(snapshot: Snapshot) -> Self {
-        let state = EngineState::from_snapshot(snapshot);
+    /// Builds an `Engine` from a previously saved `Snapshot`, updating `host`
+    /// and `port` to the current bind address so client metadata responses
+    /// reflect the actual listener rather than the stale address from the snapshot.
+    pub fn new_persistent(snapshot: Snapshot, host: String, port: i32) -> Self {
+        let mut state = EngineState::from_snapshot(snapshot);
+        state.host = host;
+        state.port = port;
         Self { state: Arc::new(Mutex::new(state)) }
     }
 }
@@ -2530,10 +2537,7 @@ impl EngineState {
                 }
                 let open: Vec<(i64, i64)> = part_state.active_txns.drain().collect();
                 for (producer_id, first_offset) in open {
-                    // Use epoch 0 if the producer's epoch is no longer in the map
-                    // (safe: the fencing machinery only matters while a live
-                    // connection holds the producer, and all connections are gone).
-                    let epoch = 0i16;
+                    let epoch = self.producer_epochs.get(&producer_id).copied().unwrap_or(0);
                     let base_offset = part_state.high_watermark;
                     let control_batch =
                         encode_control_batch(producer_id, epoch, base_offset, false, now);
@@ -2543,6 +2547,7 @@ impl EngineState {
                 }
             }
         }
+        self.txn_partitions.clear();
     }
 
     /// Converts live state into the serializable `Snapshot` DTO.

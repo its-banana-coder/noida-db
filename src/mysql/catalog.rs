@@ -52,6 +52,11 @@ pub struct Schema {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbState {
     pub schemas: BTreeMap<String, Schema>,
+    /// Pre-transaction database state if a transaction is currently open.
+    /// Excluded from on-disk serialization so a snapshot never stores
+    /// this internal recovery field.
+    #[serde(skip)]
+    pub tx_base: Option<Box<DbState>>,
 }
 
 impl Default for DbState {
@@ -64,6 +69,6 @@ impl Default for DbState {
                 Schema { name: name.to_string(), tables: BTreeMap::new() },
             );
         }
-        Self { schemas }
+        Self { schemas, tx_base: None }
     }
 }

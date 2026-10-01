@@ -69,8 +69,19 @@ impl Engine {
     /// `db` is persisted -- see the persistence spec, §4.4, for why every
     /// other field here is per-connection/per-statement and deliberately
     /// excluded.
+    ///
+    /// If an uncommitted transaction is in progress, the pre-transaction base
+    /// state (`tx_base`) is saved instead, ensuring uncommitted writes are
+    /// never made durable across a restart.
     pub fn snapshot(&self) -> DbState {
-        self.db.lock().unwrap().clone()
+        let state = self.db.lock().unwrap();
+        if let Some(base) = &state.tx_base {
+            let mut clean_base = (**base).clone();
+            clean_base.tx_base = None;
+            clean_base
+        } else {
+            state.clone()
+        }
     }
 
     /// Builds an `Engine` whose shared database state is `db` (loaded from
@@ -98,23 +109,32 @@ impl Engine {
         // which `Executor` (built fresh per statement) doesn't have.
         match &stmt {
             Statement::StartTransaction { .. } => {
-                let state = self.db.lock().unwrap();
-                self.tx_snapshot = Some(state.clone());
+                let mut state = self.db.lock().unwrap();
+                let base = state.clone();
+                if state.tx_base.is_none() {
+                    state.tx_base = Some(Box::new(base.clone()));
+                }
+                self.tx_snapshot = Some(base);
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
             Statement::Commit { .. } => {
+                let mut state = self.db.lock().unwrap();
+                state.tx_base = None;
                 self.tx_snapshot = None;
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
             Statement::Rollback { .. } => {
+                let mut state = self.db.lock().unwrap();
                 if let Some(snapshot) = self.tx_snapshot.take() {
-                    let mut state = self.db.lock().unwrap();
                     *state = snapshot;
+                } else if let Some(base) = state.tx_base.take() {
+                    *state = *base;
                 }
+                state.tx_base = None;
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);

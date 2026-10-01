@@ -58,7 +58,7 @@ pub fn spawn_persistent_for_test(
                 format!("failed to parse kafka snapshot: {e}"),
             )
         })?;
-        Engine::new_persistent(snapshot)
+        Engine::new_persistent(snapshot, local_addr.ip().to_string(), local_addr.port() as i32)
     } else {
         Engine::new(local_addr.ip().to_string(), local_addr.port() as i32)
     };

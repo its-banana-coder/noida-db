@@ -160,4 +160,52 @@ mod tests {
         let rows = engine2.execute("SELECT id, name, amt FROM foo ORDER BY id").unwrap();
         assert_eq!(rows.len(), 2, "both rows must survive a serde round-trip");
     }
+
+    #[tokio::test]
+    async fn uncommitted_transaction_is_discarded_across_restart() {
+        let dir =
+            std::env::temp_dir().join(format!("noida-mysql-uncommitted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (addr1, save1) = spawn_persistent_for_test("127.0.0.1:0", &dir).unwrap();
+        {
+            let pool = make_pool(addr1).await;
+            let mut con = pool.get_conn().await.unwrap();
+
+            con.query_drop("USE test").await.unwrap();
+            con.query_drop("CREATE TABLE tx_test (id INT PRIMARY KEY, val VARCHAR(50))")
+                .await
+                .unwrap();
+            con.query_drop("INSERT INTO tx_test VALUES (1, 'committed')").await.unwrap();
+
+            // Start a transaction and insert uncommitted data.
+            con.query_drop("START TRANSACTION").await.unwrap();
+            con.query_drop("INSERT INTO tx_test VALUES (2, 'uncommitted')").await.unwrap();
+
+            // Do NOT commit! Save while transaction is still open.
+            drop(con);
+            pool.disconnect().await.unwrap();
+        }
+
+        save1();
+        assert!(dir.join("mysql.json").exists());
+
+        // Restart server from the snapshot.
+        let (addr2, _save2) = spawn_persistent_for_test("127.0.0.1:0", &dir).unwrap();
+        let pool2 = make_pool(addr2).await;
+        let mut con = pool2.get_conn().await.unwrap();
+
+        con.query_drop("USE test").await.unwrap();
+        let rows: Vec<(i64, String)> =
+            con.query("SELECT id, val FROM tx_test ORDER BY id").await.unwrap();
+
+        // ONLY row 1 must survive; row 2 was uncommitted and must be discarded.
+        assert_eq!(rows.len(), 1, "uncommitted row must not survive restart");
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "committed");
+
+        drop(con);
+        pool2.disconnect().await.unwrap();
+    }
 }
