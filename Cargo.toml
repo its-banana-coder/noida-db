@@ -9,6 +9,12 @@ homepage = "https://github.com/its-banana-coder/noida-db"
 readme = "README.md"
 keywords = ["database", "postgres", "redis", "mysql", "devtools"]
 categories = ["development-tools", "emulators"]
+# Without this, `cargo publish` bundles the *entire* repo into the crate
+# tarball by default -- docs/, npm/, pip/, scripts/, benchmarks/, this
+# repo's own CI workflows, none of which a downstream `cargo install`
+# needs. Keep this an explicit whitelist (not a growing `exclude` list)
+# so a new top-level directory never ends up in the package by accident.
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
 
 # Its own workspace root, so cargo never reads the manifest of an enclosing
 # checkout (as when this repo is a worktree nested inside another).
