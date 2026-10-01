@@ -1,0 +1,9 @@
+{
+  "name": "@noida-db/darwin-x64",
+  "version": "0.1.0",
+  "description": "noida-db prebuilt binary for macOS x86_64",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "files": ["noida-db"],
+  "license": "MIT"
+}

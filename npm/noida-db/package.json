@@ -1,0 +1,22 @@
+{
+  "name": "noida-db",
+  "version": "0.1.0",
+  "description": "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka and Elasticsearch.",
+  "bin": {
+    "noida-db": "bin/noida-db.js"
+  },
+  "optionalDependencies": {
+    "@noida-db/linux-x64": "0.1.0",
+    "@noida-db/linux-arm64": "0.1.0",
+    "@noida-db/darwin-x64": "0.1.0",
+    "@noida-db/darwin-arm64": "0.1.0",
+    "@noida-db/win32-x64": "0.1.0"
+  },
+  "keywords": ["database", "postgres", "redis", "mysql", "devtools"],
+  "homepage": "https://github.com/its-banana-coder/noida-db",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/its-banana-coder/noida-db"
+  },
+  "license": "MIT"
+}

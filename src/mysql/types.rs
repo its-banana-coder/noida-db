@@ -1,8 +1,9 @@
 use crate::sql::json::Json;
 use crate::sql::numeric::{Numeric, cmp_num};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Bool(bool),

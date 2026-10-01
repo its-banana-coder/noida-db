@@ -1,6 +1,9 @@
 # Packaging and distribution
 
-How to get noida-db onto a machine today, and the plan for the rest.
+How to get noida-db onto a machine today, and the plan for the rest. This
+is the short summary — for exact workflow YAML, package layouts, and every
+tradeoff behind the choices below, see
+[docs/specs/release-binaries.md](specs/release-binaries.md).
 
 ## Today
 
@@ -46,15 +49,26 @@ What's needed before each is real, in order:
    (e.g. `its-banana-coder/homebrew-noida-db`) that downloads the release
    binary and its checksum from step 1. Needs a tap repo to exist under the
    user's account; the formula itself is small once step 1 lands.
-4. **npm** — a thin wrapper package (`package.json` + a `postinstall` script
-   that downloads the right platform binary from the GitHub Release and
-   drops it on `$PATH`), the same pattern `esbuild`/`swc` use. Needs an npm
-   account + publish token. The name `noida-db` is confirmed available.
-5. **PyPI** — the same wrapper idea via a `pyproject.toml` with
-   platform-specific wheel tags, each wheel just containing the downloaded
-   binary (no actual Python code to compile). Needs a PyPI account + publish
-   token. The name `noida-db` is confirmed available.
+4. **npm** — a thin meta package (`noida-db`) with no `postinstall` script,
+   whose `optionalDependencies` list one tiny per-platform package
+   (`@noida-db/linux-x64`, `@noida-db/darwin-arm64`, ...) each just
+   containing that platform's binary, the same pattern `esbuild`/`swc`
+   use — npm resolves only the matching one automatically. (A
+   `postinstall`-download script is the simpler-looking alternative but is
+   blocked by `--ignore-scripts` and many corporate/CI npm configs; don't
+   build that version — see the spec's §4.1 for the full reasoning.)
+   Needs an npm account + publish token. The name `noida-db` is confirmed
+   available.
+5. **PyPI** — per-platform wheels of the *same* package name
+   (`noida_db-0.2.0-...manylinux_2_17_x86_64.whl`,
+   `...-macosx_11_0_arm64.whl`, `...-win_amd64.whl`), each just embedding
+   that platform's prebuilt binary with a thin Python shim entry point —
+   `pip` picks the right one automatically from its filename tag, no
+   network access or compilation at install time. Needs a PyPI account,
+   ideally via Trusted Publishing (OIDC, no stored token) rather than a
+   classic API token. The name `noida-db` is confirmed available.
 
 Steps 2–5 can each be scaffolded ahead of time, but none can be *published*
 without the account credentials for that registry, which only the project
-owner holds.
+owner holds. Full build order, every workflow file, and every package
+layout: [docs/specs/release-binaries.md](specs/release-binaries.md).

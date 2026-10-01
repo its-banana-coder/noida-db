@@ -15,12 +15,16 @@ use std::path::Path;
 // crate::<service>::spawn_persistent(addr, data_dir)`) as it lands.
 pub fn start_persistent(name: &str, addr: &str, data_dir: &Path) -> Option<io::Result<SocketAddr>> {
     match name {
+        #[cfg(feature = "mysql")]
+        "mysql" => Some(crate::mysql::server::spawn_persistent(addr, data_dir)),
         #[cfg(feature = "postgres")]
         "postgres" => Some(crate::postgres::server::spawn_persistent(addr, data_dir)),
         #[cfg(feature = "elasticsearch")]
         "elasticsearch" => Some(crate::elasticsearch::spawn_persistent(addr, data_dir)),
         #[cfg(feature = "redis")]
         "redis" => Some(crate::redis::server::spawn_persistent(addr, data_dir)),
+        #[cfg(feature = "kafka")]
+        "kafka" => Some(crate::kafka::spawn_persistent(addr, data_dir)),
         _ => {
             let _ = data_dir;
             start(name, addr)

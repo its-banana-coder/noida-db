@@ -1724,28 +1724,31 @@ impl EngineState {
                 let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
                 let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
 
-                if let Some(first_offset) = part_state.active_txns.remove(&producer_id)
-                    && !req.committed
+                // Only append a control batch if the transaction was genuinely active on this
+                // partition. If it was already force-aborted at shutdown, active_txns is empty
+                // and a commit must be rejected with INVALID_TXN_STATE.
+                if let Some(first_offset) = part_state.active_txns.remove(&producer_id) {
+                    if !req.committed {
+                        part_state.aborted_txns.push((producer_id, first_offset));
+                    }
+                    let base_offset = part_state.high_watermark;
+                    let control_batch = encode_control_batch(
+                        producer_id,
+                        producer_epoch,
+                        base_offset,
+                        req.committed,
+                        now,
+                    );
+                    part_state.record_batches.push((base_offset, control_batch));
+                    part_state.high_watermark += 1;
+                } else if req.committed
+                    && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
                 {
-                    part_state.aborted_txns.push((producer_id, first_offset));
+                    // This transaction was already force-aborted (e.g. by shutdown resolution).
+                    // A subsequent commit cannot succeed.
+                    res.error_code = 48; // INVALID_TXN_STATE
+                    return res;
                 }
-
-                // Real Kafka appends a control batch (commit/abort marker)
-                // to every partition the transaction touched, advancing
-                // the log (and the LSO, once this partition has no other
-                // open transaction) past it — a read_committed fetch needs
-                // this offset to exist so the next fetch can move past
-                // where the transaction used to be pending.
-                let base_offset = part_state.high_watermark;
-                let control_batch = encode_control_batch(
-                    producer_id,
-                    producer_epoch,
-                    base_offset,
-                    req.committed,
-                    now,
-                );
-                part_state.record_batches.push((base_offset, control_batch));
-                part_state.high_watermark += 1;
             }
         }
 
@@ -2451,5 +2454,225 @@ impl Engine {
         version: i16,
     ) -> kafka_protocol::messages::SaslAuthenticateResponse {
         self.state.lock().unwrap().handle_sasl_authenticate(req, version)
+    }
+
+    /// Clones out the shared state (resolving any in-flight transactions as
+    /// aborted, per spec §5) and serializes it into a `Snapshot` DTO for
+    /// on-disk persistence.
+    pub fn snapshot(&self) -> Snapshot {
+        let mut state = self.state.lock().unwrap();
+        state.resolve_open_transactions_for_shutdown();
+        state.to_snapshot()
+    }
+
+    /// Builds an `Engine` from a previously saved `Snapshot`, updating `host`
+    /// and `port` to the current bind address so client metadata responses
+    /// reflect the actual listener rather than the stale address from the snapshot.
+    pub fn new_persistent(snapshot: Snapshot, host: String, port: i32) -> Self {
+        let mut state = EngineState::from_snapshot(snapshot);
+        state.host = host;
+        state.port = port;
+        Self { state: Arc::new(Mutex::new(state)) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot DTOs — a separate, serde-friendly representation of `EngineState`
+// that avoids the `serde_json` tuple-key limitation (see spec §4).
+// ---------------------------------------------------------------------------
+
+use serde::{Deserialize, Serialize};
+
+/// Snapshot of a single partition's persistent state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PartitionSnapshot {
+    pub id: i32,
+    pub leader: i32,
+    pub record_batches: Vec<(i64, Vec<u8>)>,
+    pub high_watermark: i64,
+    /// `HashMap<(i64, i16), (i32, i64)>` serialized as `Vec` to avoid tuple-key
+    /// serde_json limitation (§4).
+    pub producer_seqs: Vec<((i64, i16), (i32, i64))>,
+    pub aborted_txns: Vec<(i64, i64)>,
+    // active_txns intentionally absent — resolved to empty at save time (§5).
+}
+
+/// Snapshot of a single topic's persistent state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TopicSnapshot {
+    pub name: String,
+    pub is_internal: bool,
+    /// `HashMap<i32, PartitionState>` serialized as `Vec` for uniformity (§4).
+    pub partitions: Vec<(i32, PartitionSnapshot)>,
+    pub configs: HashMap<String, String>,
+}
+
+/// Full engine snapshot — the on-disk representation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// `HashMap<String, TopicState>` serialized as `Vec` (§4).
+    pub topics: Vec<(String, TopicSnapshot)>,
+    pub broker_id: i32,
+    pub host: String,
+    pub port: i32,
+    pub cluster_id: String,
+    pub next_producer_id: i64,
+    /// `HashMap<(String, String, i32), i64>` serialized as `Vec` — tuple key (§4).
+    pub committed_offsets: Vec<((String, String, i32), i64)>,
+    pub broker_configs: HashMap<String, String>,
+}
+
+impl EngineState {
+    /// Resolves every still-open transaction as aborted by appending an abort
+    /// control batch to each affected partition, exactly as `EndTxn`'s abort
+    /// path already does. Must be called before `to_snapshot()` so the
+    /// snapshot doesn't contain open transactions that can never be completed
+    /// (all producer connections are gone after a restart). See spec §5.
+    pub fn resolve_open_transactions_for_shutdown(&mut self) {
+        let now = self.now_ms();
+        for topic_state in self.topics.values_mut() {
+            for part_state in topic_state.partitions.values_mut() {
+                if part_state.active_txns.is_empty() {
+                    continue;
+                }
+                let open: Vec<(i64, i64)> = part_state.active_txns.drain().collect();
+                for (producer_id, first_offset) in open {
+                    let epoch = self.producer_epochs.get(&producer_id).copied().unwrap_or(0);
+                    let base_offset = part_state.high_watermark;
+                    let control_batch =
+                        encode_control_batch(producer_id, epoch, base_offset, false, now);
+                    part_state.record_batches.push((base_offset, control_batch));
+                    part_state.high_watermark += 1;
+                    part_state.aborted_txns.push((producer_id, first_offset));
+                }
+            }
+        }
+    }
+
+    /// Converts live state into the serializable `Snapshot` DTO.
+    pub fn to_snapshot(&self) -> Snapshot {
+        let topics = self
+            .topics
+            .iter()
+            .map(|(name, ts)| {
+                let partitions = ts
+                    .partitions
+                    .iter()
+                    .map(|(&pid, ps)| {
+                        let producer_seqs: Vec<_> =
+                            ps.producer_seqs.iter().map(|(&k, &v)| (k, v)).collect();
+                        (
+                            pid,
+                            PartitionSnapshot {
+                                id: ps.id,
+                                leader: ps.leader,
+                                record_batches: ps.record_batches.clone(),
+                                high_watermark: ps.high_watermark,
+                                producer_seqs,
+                                aborted_txns: ps.aborted_txns.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                (
+                    name.clone(),
+                    TopicSnapshot {
+                        name: ts.name.clone(),
+                        is_internal: ts.is_internal,
+                        partitions,
+                        configs: ts.configs.clone(),
+                    },
+                )
+            })
+            .collect();
+
+        let committed_offsets: Vec<_> =
+            self.committed_offsets.iter().map(|(k, &v)| (k.clone(), v)).collect();
+
+        Snapshot {
+            topics,
+            broker_id: self.broker_id,
+            host: self.host.clone(),
+            port: self.port,
+            cluster_id: self.cluster_id.clone(),
+            next_producer_id: self.next_producer_id,
+            committed_offsets,
+            broker_configs: self.broker_configs.clone(),
+        }
+    }
+
+    /// Rebuilds live state from a `Snapshot` DTO loaded from disk.
+    pub fn from_snapshot(s: Snapshot) -> EngineState {
+        let mut topics: HashMap<String, TopicState> = s
+            .topics
+            .into_iter()
+            .map(|(name, ts)| {
+                let partitions: HashMap<i32, PartitionState> = ts
+                    .partitions
+                    .into_iter()
+                    .map(|(pid, ps)| {
+                        let producer_seqs: HashMap<(i64, i16), (i32, i64)> =
+                            ps.producer_seqs.into_iter().collect();
+                        (
+                            pid,
+                            PartitionState {
+                                id: ps.id,
+                                leader: ps.leader,
+                                record_batches: ps.record_batches,
+                                high_watermark: ps.high_watermark,
+                                producer_seqs,
+                                active_txns: HashMap::new(), // always empty after save (§5)
+                                aborted_txns: ps.aborted_txns,
+                            },
+                        )
+                    })
+                    .collect();
+                (
+                    name.clone(),
+                    TopicState {
+                        name: ts.name,
+                        is_internal: ts.is_internal,
+                        partitions,
+                        configs: ts.configs,
+                    },
+                )
+            })
+            .collect();
+
+        // Ensure the __consumer_offsets internal topic always exists (re-create
+        // any partitions that might be missing if the snapshot predates it).
+        let broker_id = s.broker_id;
+        topics.entry("__consumer_offsets".to_string()).or_insert_with(|| {
+            let mut t = TopicState {
+                name: "__consumer_offsets".to_string(),
+                is_internal: true,
+                partitions: HashMap::new(),
+                configs: HashMap::new(),
+            };
+            for p in 0..50 {
+                t.partitions.insert(p, PartitionState::new(p, broker_id));
+            }
+            t
+        });
+
+        let committed_offsets: HashMap<(String, String, i32), i64> =
+            s.committed_offsets.into_iter().collect();
+
+        EngineState {
+            topics,
+            broker_id: s.broker_id,
+            host: s.host,
+            port: s.port,
+            cluster_id: s.cluster_id,
+            next_producer_id: s.next_producer_id,
+            next_member_counter: 1, // reset — no old member survives a restart (§3.2)
+            committed_offsets,
+            groups: HashMap::new(), // membership reset; offsets are in committed_offsets (§3.2)
+            broker_configs: s.broker_configs,
+            clock: None,
+            producer_epochs: HashMap::new(), // fencing state not persisted (§5)
+            txn_producers: HashMap::new(),
+            txn_partitions: HashMap::new(),
+        }
     }
 }

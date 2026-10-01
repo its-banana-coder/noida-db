@@ -1,0 +1,17 @@
+[project]
+name = "noida-db"
+version = "0.1.0"
+description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+
+[project.scripts]
+noida-db = "noida_db.cli:main"
+
+[tool.setuptools.package-data]
+noida_db = ["noida-db", "noida-db.exe"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

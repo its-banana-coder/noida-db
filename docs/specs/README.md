@@ -15,6 +15,19 @@ agent (or person) can pick one up without other context.
 | Elasticsearch | [elasticsearch.md](elasticsearch.md) | 9200 | building (`svc/elasticsearch`, milestone 2/3) |
 | ClickHouse | [clickhouse.md](clickhouse.md) | 8123, 9000 | building (`svc/clickhouse`) |
 
+## Cross-cutting specs (not one-per-service)
+
+These aren't about building a new service — Postgres/MySQL/Redis/Kafka/
+Elasticsearch are all done and merged to `main`. They're the remaining
+open work on top of that: making the rest of the core five persistent on
+disk, and getting real binaries out to users.
+
+| Spec | Status |
+|---|---|
+| [mysql-persistence.md](mysql-persistence.md) | open — MySQL is the one core-five service with no on-disk persistence yet |
+| [kafka-persistence.md](kafka-persistence.md) | open — same gap for Kafka; harder than MySQL's, read it second |
+| [release-binaries.md](release-binaries.md) | open — the GitHub Actions release workflow + crates.io/npm/pip/Homebrew/Docker publishing plan; independent of the two specs above, can be built in parallel |
+
 ## Read first, in this order
 
 1. `docs/SERVICE_GUIDE.md`: module layout, the four test layers, CI, commit

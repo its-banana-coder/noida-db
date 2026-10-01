@@ -144,6 +144,10 @@ name = "kafka_diff"
 required-features = ["kafka"]
 
 [[test]]
+name = "kafka_persistence"
+required-features = ["kafka"]
+
+[[test]]
 name = "clickhouse_client"
 required-features = ["clickhouse"]
 
@@ -194,6 +198,10 @@ required-features = ["mysql"]
 
 [[test]]
 name = "ecommerce_mysql_diff"
+required-features = ["mysql"]
+
+[[test]]
+name = "mysql_persistence"
 required-features = ["mysql"]
 
 [[test]]
