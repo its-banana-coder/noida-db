@@ -72,6 +72,18 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload)?;
 
+    // A client that names a database directly in its connection string
+    // (`mysql://user@host/dbname`, `mysqli_real_connect(..., $dbname)`,
+    // every real driver's own convention) sends it as part of this
+    // handshake response, not as a separate `COM_INIT_DB` -- without this,
+    // only a client that goes on to issue an explicit `USE dbname`
+    // afterward (as this project's own test helpers were doing) would ever
+    // see a database selected at all, and every other real client would
+    // hit "No database selected" on its very first query.
+    if let Some(db) = handshake_response_database(&payload) {
+        session.engine.use_db(&db);
+    }
+
     // Basic password validation placeholder according to docs
     let ok = b"\x00\x00\x00\x02\x00\x00\x00";
     let mut header = [0u8; 4];
@@ -328,6 +340,52 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+/// Extracts the database name a client's handshake response packet names,
+/// if `CLIENT_CONNECT_WITH_DB` (flag `0x00000008`) is set -- i.e. the
+/// client connected with a database already named in its connection
+/// string, the way every real driver does it, rather than via a later
+/// explicit `USE`. Returns `None` for a malformed packet or one that
+/// doesn't set the flag at all, in either case leaving the connection with
+/// no database selected (exactly as if this parsing weren't attempted).
+///
+/// Packet layout (protocol 4.1): 4-byte client flags, 4-byte max packet
+/// size, 1-byte charset, 23 filler bytes, NUL-terminated username, then
+/// the auth response (length-encoded if `CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA`
+/// is set, 1-byte-length-prefixed if `CLIENT_SECURE_CONNECTION` is set,
+/// NUL-terminated otherwise), then -- only if `CLIENT_CONNECT_WITH_DB` is
+/// set -- a NUL-terminated database name.
+fn handshake_response_database(payload: &[u8]) -> Option<String> {
+    const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+    const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+    const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+
+    if payload.len() < 33 {
+        return None;
+    }
+    let client_flags = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if client_flags & CLIENT_CONNECT_WITH_DB == 0 {
+        return None;
+    }
+
+    let mut offset = 32;
+    let username_end = payload[offset..].iter().position(|&b| b == 0)? + offset;
+    offset = username_end + 1;
+
+    if client_flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+        let (auth_len, n) = read_lenenc_int(&payload[offset..])?;
+        offset += n + auth_len as usize;
+    } else if client_flags & CLIENT_SECURE_CONNECTION != 0 {
+        let auth_len = *payload.get(offset)? as usize;
+        offset += 1 + auth_len;
+    } else {
+        let auth_end = payload[offset..].iter().position(|&b| b == 0)? + offset;
+        offset = auth_end + 1;
+    }
+
+    let db_end = payload[offset..].iter().position(|&b| b == 0)? + offset;
+    Some(String::from_utf8_lossy(&payload[offset..db_end]).into_owned())
 }
 
 fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> io::Result<()> {

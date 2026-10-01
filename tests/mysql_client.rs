@@ -659,3 +659,71 @@ async fn test_mysql_found_rows() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// A database named directly in the connection string (`mysql://user@host/db`,
+/// what every real client -- `mysqli_real_connect()`, PyMySQL, node-mysql2,
+/// this very test's own `Pool::new()` -- actually does) must be selected
+/// from the handshake response itself, not require a later explicit `USE`.
+/// Without this, only a client that happened to also issue `USE` (as this
+/// project's own earlier tests all did, as a workaround) ever saw a
+/// database selected at all.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_database_selected_via_connection_string() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    // No `USE test` here -- the connection string's own `/test` must be
+    // enough for this to succeed.
+    conn.query_drop("CREATE TABLE handshake_db_test (id INT)").await.unwrap();
+    conn.query_drop("INSERT INTO handshake_db_test (id) VALUES (1)").await.unwrap();
+    let id: i32 = conn.query_first("SELECT id FROM handshake_db_test").await.unwrap().unwrap();
+    assert_eq!(id, 1);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
+
+/// Comparing a string-typed column against a numeric literal (`WHERE
+/// varchar_col = 4`) must coerce the string to a number like real MySQL
+/// does, not hard-error -- found via a real WordPress REST API request
+/// (`WP_Query`'s revision-count query joins `wp_posts.post_parent` against
+/// an integer literal) that noida-db failed with "Truncated incorrect
+/// DOUBLE value" where real MySQL just returns the matching rows.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_text_column_compared_to_int_literal() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("USE test").await.unwrap();
+    conn.query_drop("CREATE TABLE text_cmp_test (parent VARCHAR(20))").await.unwrap();
+    conn.query_drop("INSERT INTO text_cmp_test (parent) VALUES ('4'), ('0'), ('abc')")
+        .await
+        .unwrap();
+
+    let matches: Vec<String> =
+        conn.query("SELECT parent FROM text_cmp_test WHERE parent = 4").await.unwrap();
+    assert_eq!(matches, vec!["4".to_string()]);
+
+    // A non-numeric string coerces to 0, matching 0 but not 4 -- it must
+    // not error the whole query either.
+    let zero_matches: Vec<String> =
+        conn.query("SELECT parent FROM text_cmp_test WHERE parent = 0").await.unwrap();
+    let mut zero_matches = zero_matches;
+    zero_matches.sort();
+    assert_eq!(zero_matches, vec!["0".to_string(), "abc".to_string()]);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
