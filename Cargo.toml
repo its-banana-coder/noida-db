@@ -184,6 +184,10 @@ name = "mysql_diff"
 required-features = ["mysql"]
 
 [[test]]
+name = "ecommerce_mysql_diff"
+required-features = ["mysql"]
+
+[[test]]
 name = "mongodb_client"
 required-features = ["mongodb"]
 
