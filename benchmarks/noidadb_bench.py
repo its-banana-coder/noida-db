@@ -246,12 +246,16 @@ def load(service: str, host: str, port: int, records: int, record_size: int) -> 
     c = client_for(service, host, port)
     if service == "redis": c.command(b"FLUSHDB")
     elif service == "postgres": c.query("DROP TABLE IF EXISTS bench; CREATE TABLE bench (id int primary key, value text)")
-    elif service == "mysql": c.query("DROP TABLE IF EXISTS bench"); c.query("CREATE TABLE bench (id INT PRIMARY KEY, value TEXT)")
+    elif service == "mysql": c.query("CREATE TABLE bench (id INT PRIMARY KEY, value TEXT)")
     else:
         try: c.query("DELETE", "/bench")
         except RuntimeError: pass  # A fresh benchmark index has no prior generation.
         c.query("PUT", "/bench", b'{"settings":{"number_of_shards":1,"number_of_replicas":0}}')
     for start in range(0, records, 1_000):
+        if service in ("postgres", "mysql"):
+            rows = ",".join(f"({i}, '{value.decode()}')" for i in range(start, min(records, start + 1_000)))
+            c.query(f"INSERT INTO bench VALUES {rows}")
+            continue
         for i in range(start, min(records, start + 1_000)):
             if service == "redis": c.command(b"SET", f"k:{i:012d}".encode(), value)
             elif service == "postgres": c.query(f"INSERT INTO bench VALUES ({i}, '{value.decode()}')")
