@@ -29,11 +29,25 @@ jobs:
           ES_JAVA_OPTS: -Xms512m -Xmx512m
         options: >-
           --health-cmd "curl -fs http://localhost:9200" --health-interval 10s --health-timeout 5s --health-retries 30
+      # 5.7, not 8: MySQL 8's default caching_sha2_password auth plugin
+      # isn't supported by mysql_async (the client this project's own
+      # differential tests use) -- see docs/LIMITATIONS.md's MySQL
+      # section. 5.7 defaults to mysql_native_password, which it does
+      # support.
+      mysql:
+        image: mysql:5.7
+        ports: ["3306:3306"]
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: yes
+          MYSQL_ROOT_HOST: "%"
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 --silent" --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       NOIDA_REDIS_REF: 127.0.0.1:6379
       NOIDA_POSTGRES_REF: 127.0.0.1:5432
       NOIDA_POSTGRES_REF_PASSWORD: postgres
       NOIDA_ELASTICSEARCH_REF: http://127.0.0.1:9200
+      NOIDA_MYSQL_REF: 127.0.0.1:3306
       PGTZ: UTC
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +60,10 @@ jobs:
       # Show how many replies were compared against the real servers.
       - run: cargo test --test redis_diff -- --nocapture
       - run: cargo test --features postgres --test postgres_diff -- --nocapture
+      - run: cargo test --features postgres --test ecommerce_diff -- --nocapture
       - run: cargo test --features elasticsearch --test elasticsearch_diff -- --nocapture
+      - run: cargo test --features mysql --test mysql_diff -- --nocapture
+      - run: cargo test --features mysql --test ecommerce_mysql_diff -- --nocapture
       - run: tests/clients/elasticsearch/run.sh
       # Real drivers and ORMs: psycopg, SQLAlchemy, node-postgres, JDBC.
       - run: tests/clients/postgres/run.sh
