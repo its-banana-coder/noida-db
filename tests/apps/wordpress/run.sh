@@ -320,6 +320,13 @@ echo "   comment created: id=$comment_id"
 # --- 5. fetch the post back via the real REST API ---------------------------
 echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id"
 status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id")
+if [ "$status" = "301" ] || [ "$status" = "302" ]; then
+  echo "-- diagnostic: redirect headers for GET /wp-json/wp/v2/posts/$post_id"
+  curl -sD - -o /dev/null "$base/wp-json/wp/v2/posts/$post_id"
+  echo "-- diagnostic: permalink_structure"
+  wp option get permalink_structure 2>&1 || true
+  echo "(empty above means Plain permalinks)"
+fi
 [ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id (HTTP $status)"; }
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
