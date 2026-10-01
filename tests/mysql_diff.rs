@@ -29,16 +29,27 @@ fn start_noida_mysql() -> SocketAddr {
     noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap()
 }
 
-/// Runs `query` against both servers and asserts the returned rows match,
-/// as `(text, i64)` pairs read back as strings for an easy comparison
-/// (real MySQL and noida-db send integers as MySQL text-protocol
-/// length-encoded strings on the wire either way).
-async fn assert_same_result(noida_pool: &Pool, ref_pool: &Pool, query: &str) {
-    let mut noida_conn = noida_pool.get_conn().await.unwrap();
-    let mut ref_conn = ref_pool.get_conn().await.unwrap();
+/// Every column of every row, read back as text (real MySQL and noida-db
+/// send integers as MySQL text-protocol length-encoded strings on the
+/// wire either way) -- not just the first column, so a multi-column
+/// `SELECT id, name FROM ...` doesn't panic trying to convert a whole row
+/// into a single `Option<String>`.
+async fn query_as_strings(
+    pool: &Pool,
+    query: &str,
+) -> Result<Vec<Vec<Option<String>>>, mysql_async::Error> {
+    let mut conn = pool.get_conn().await.unwrap();
+    let rows: Vec<mysql_async::Row> = conn.query(query).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (0..row.len()).map(|i| row.as_ref(i).map(|v| v.as_sql(false))).collect())
+        .collect())
+}
 
-    let noida_rows: Result<Vec<Option<String>>, _> = noida_conn.query(query).await;
-    let ref_rows: Result<Vec<Option<String>>, _> = ref_conn.query(query).await;
+/// Runs `query` against both servers and asserts the returned rows match.
+async fn assert_same_result(noida_pool: &Pool, ref_pool: &Pool, query: &str) {
+    let noida_rows = query_as_strings(noida_pool, query).await;
+    let ref_rows = query_as_strings(ref_pool, query).await;
 
     match (noida_rows, ref_rows) {
         (Ok(n), Ok(r)) => assert_eq!(n, r, "mismatch for query: {query}"),

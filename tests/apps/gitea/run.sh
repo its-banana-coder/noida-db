@@ -297,10 +297,26 @@ pr_index=$(json_get "$work/pr.json" "d['number']")
 echo "   PR #$pr_index opened"
 
 echo "== merging PR via API"
-status=$(http_status "$work/merge.json" "${auth[@]}" -H 'Content-Type: application/json' \
-  -d '{"Do":"merge"}' \
-  "$base/api/v1/repos/$admin_user/$repo_name/pulls/$pr_index/merge")
-[ "$status" = "200" ] || [ "$status" = "204" ] || { cat "$work/merge.json"; fail "merge pull request (HTTP $status)"; }
+# Gitea runs its own async merge-readiness checks (mergeability, required
+# status checks, ...) right after a PR opens, and returns 405 ("Please try
+# again later") until they finish -- retry with backoff rather than
+# treating that as a real failure.
+merge_ok=""
+for attempt in $(seq 1 10); do
+  status=$(http_status "$work/merge.json" "${auth[@]}" -H 'Content-Type: application/json' \
+    -d '{"Do":"merge"}' \
+    "$base/api/v1/repos/$admin_user/$repo_name/pulls/$pr_index/merge")
+  if [ "$status" = "200" ] || [ "$status" = "204" ]; then
+    merge_ok=1
+    break
+  fi
+  if [ "$status" != "405" ]; then
+    cat "$work/merge.json"
+    fail "merge pull request (HTTP $status)"
+  fi
+  sleep 2
+done
+[ -n "$merge_ok" ] || { cat "$work/merge.json"; fail "merge pull request (still HTTP 405 after retries)"; }
 
 echo "== verifying merged state via API"
 status=$(http_status "$work/pr-final.json" "${auth[@]}" "$base/api/v1/repos/$admin_user/$repo_name/pulls/$pr_index")
