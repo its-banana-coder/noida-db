@@ -359,7 +359,7 @@ impl Executor {
                 }
                 Ok(out_rows)
             }
-            Plan::Aggregate { source, group_exprs, exprs, .. } => {
+            Plan::Aggregate { source, group_exprs, exprs, having, .. } => {
                 let table_context = self.resolve_table_context(&source)?;
                 let rows = self.execute_plan(*source)?;
 
@@ -389,6 +389,13 @@ impl Executor {
 
                 let mut out_rows = Vec::new();
                 for (_key, group_rows) in &groups {
+                    if let Some(having) = &having {
+                        let val =
+                            self.eval_group_expr(having, group_rows, table_context.as_ref())?;
+                        if val.is_null() || val == Value::Int(0) {
+                            continue;
+                        }
+                    }
                     let mut out_row = Vec::new();
                     for expr in &exprs {
                         out_row.push(self.eval_group_expr(
