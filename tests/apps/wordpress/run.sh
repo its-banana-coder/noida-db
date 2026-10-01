@@ -278,8 +278,14 @@ echo "== WordPress site is up on $base (startup took $(( $(date +%s) - web_start
 
 http_status() {
   # http_status <file> <curl args...>   -> prints status code, body saved to <file>
+  #
+  # -L: WordPress's REST API 301-redirects a singular-resource request made
+  # under "Plain" permalinks (the default for a fresh install) to the same
+  # URL with a trailing slash appended -- real WordPress behavior, not a
+  # noida-db quirk, so the real fix is to follow it rather than special-case
+  # pretty permalinks in this script.
   local out="$1"; shift
-  curl -s -o "$out" -w "%{http_code}" "$@"
+  curl -sL -o "$out" -w "%{http_code}" "$@"
 }
 
 json_get() {
@@ -320,13 +326,6 @@ echo "   comment created: id=$comment_id"
 # --- 5. fetch the post back via the real REST API ---------------------------
 echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id"
 status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id")
-if [ "$status" = "301" ] || [ "$status" = "302" ]; then
-  echo "-- diagnostic: redirect headers for GET /wp-json/wp/v2/posts/$post_id"
-  curl -sD - -o /dev/null "$base/wp-json/wp/v2/posts/$post_id"
-  echo "-- diagnostic: permalink_structure"
-  wp option get permalink_structure 2>&1 || true
-  echo "(empty above means Plain permalinks)"
-fi
 [ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id (HTTP $status)"; }
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
