@@ -19,6 +19,7 @@ import platform
 import shutil
 import signal
 import socket
+import struct
 import statistics
 import subprocess
 import sys
@@ -133,16 +134,99 @@ class Redis:
         raise RuntimeError("Redis protocol error: " + self.file.readline().decode(errors="replace"))
 
 
-def wait_for_redis(host: str, port: int, process: subprocess.Popen[bytes] | None) -> None:
+class Postgres:
+    """Minimal simple-query client: protocol cost is included, CLI cost is not."""
+    def __init__(self, host: str, port: int):
+        self.sock = socket.create_connection((host, port), timeout=10)
+        payload = struct.pack("!I", 196608) + b"user\0postgres\0database\0postgres\0\0"
+        self.sock.sendall(struct.pack("!I", len(payload) + 4) + payload)
+        self._drain()
+
+    def close(self) -> None: self.sock.close()
+    def _packet(self) -> tuple[bytes, bytes]:
+        kind = self.sock.recv(1)
+        if not kind: raise RuntimeError("Postgres closed connection")
+        size = struct.unpack("!I", self.sock.recv(4))[0] - 4
+        data = b""
+        while len(data) < size: data += self.sock.recv(size - len(data))
+        return kind, data
+    def _drain(self) -> None:
+        while True:
+            kind, data = self._packet()
+            if kind == b"E": raise RuntimeError("Postgres error: " + data.decode(errors="replace"))
+            if kind == b"Z": return
+    def query(self, sql: str) -> None:
+        raw = sql.encode() + b"\0"
+        self.sock.sendall(b"Q" + struct.pack("!I", len(raw) + 4) + raw)
+        self._drain()
+
+
+class MySql:
+    """Minimal MySQL 4.1 handshake and COM_QUERY client for no-password root."""
+    CAPABILITIES = 0x00000008 | 0x00000200 | 0x00008000 | 0x00080000 | 0x00200000
+    def __init__(self, host: str, port: int):
+        self.sock = socket.create_connection((host, port), timeout=10); self.sequence = 0
+        self._packet()  # greeting; NoidaDB's default root account has no password.
+        payload = struct.pack("<IIB23s", self.CAPABILITIES, 16 * 1024 * 1024, 45, b"\0" * 23) + b"root\0\0test\0mysql_native_password\0"
+        self._send(payload, 1); self._packet()
+    def close(self) -> None: self.sock.close()
+    def _send(self, payload: bytes, sequence: int) -> None:
+        self.sock.sendall(struct.pack("<I", len(payload))[:3] + bytes([sequence]) + payload)
+    def _packet(self) -> bytes:
+        header = self.sock.recv(4)
+        if len(header) != 4: raise RuntimeError("MySQL closed connection")
+        size = int.from_bytes(header[:3], "little"); data = b""
+        while len(data) < size: data += self.sock.recv(size - len(data))
+        if data[:1] == b"\xff": raise RuntimeError("MySQL error: " + data.decode(errors="replace"))
+        return data
+    def query(self, sql: str) -> None:
+        self._send(b"\x03" + sql.encode(), 0); first = self._packet()
+        if first[:1] in (b"\0", b"\xff"): return
+        # Result-set column count, definitions, separator, rows, separator.
+        columns = first[0] if first[0] < 0xfb else 0
+        for _ in range(columns): self._packet()
+        self._packet()
+        while True:
+            packet = self._packet()
+            if packet[:1] == b"\xfe" and len(packet) < 9: return
+            if packet[:1] == b"\0": return
+
+
+class Elasticsearch:
+    def __init__(self, host: str, port: int): self.base = f"http://{host}:{port}"
+    def close(self) -> None: pass
+    def query(self, method: str, path: str, body: bytes = b"") -> None:
+        import urllib.request
+        request = urllib.request.Request(self.base + path, data=body or None, method=method, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response: response.read()
+        except Exception as exc: raise RuntimeError(f"Elasticsearch {method} {path}: {exc}") from exc
+
+
+def client_for(service: str, host: str, port: int) -> Any:
+    return {"redis": Redis, "postgres": Postgres, "mysql": MySql, "elasticsearch": Elasticsearch}[service](host, port)
+
+
+def ready(service: str, host: str, port: int) -> bool:
+    try:
+        c = client_for(service, host, port)
+        if service == "redis": ok = c.command(b"PING") == b"PONG"
+        elif service == "postgres": c.query("SELECT 1"); ok = True
+        elif service == "mysql": c.query("SELECT 1"); ok = True
+        else: c.query("GET", "/"); ok = True
+        c.close(); return ok
+    except Exception: return False
+
+
+def wait_for_service(service: str, host: str, port: int, process: subprocess.Popen[bytes] | None) -> None:
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if process and process.poll() is not None:
             raise RuntimeError("server exited before becoming ready")
         try:
-            c = Redis(host, port); ok = c.command(b"PING") == b"PONG"; c.close()
-            if ok: return
+            if ready(service, host, port): return
         except OSError: time.sleep(.05)
-    raise RuntimeError("timed out waiting for Redis")
+    raise RuntimeError(f"timed out waiting for {service}")
 
 
 def launch(args: argparse.Namespace, run_dir: Path) -> subprocess.Popen[bytes] | None:
@@ -150,25 +234,46 @@ def launch(args: argparse.Namespace, run_dir: Path) -> subprocess.Popen[bytes] |
     binary = Path(args.binary)
     if not binary.exists():
         raise RuntimeError(f"missing {binary}; run cargo build --release or pass --binary")
-    cmd = [str(binary), "start", "--only", "redis", "--redis-port", str(args.port), "--data-dir", str(run_dir / "data")]
+    cmd = [str(binary), "start", "--only", args.service, f"--{args.service}-port", str(args.port), "--data-dir", str(run_dir / "data")]
     if args.server_cpus and shutil.which("taskset"):
         cmd = ["taskset", "--cpu-list", args.server_cpus, *cmd]
     log = (run_dir / "server.log").open("wb")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
 
-def load(host: str, port: int, records: int, record_size: int) -> None:
+def load(service: str, host: str, port: int, records: int, record_size: int) -> None:
     value = b"x" * record_size
-    c = Redis(host, port)
-    c.command(b"FLUSHDB")
+    c = client_for(service, host, port)
+    if service == "redis": c.command(b"FLUSHDB")
+    elif service == "postgres": c.query("DROP TABLE IF EXISTS bench; CREATE TABLE bench (id int primary key, value text)")
+    elif service == "mysql": c.query("DROP TABLE IF EXISTS bench"); c.query("CREATE TABLE bench (id INT PRIMARY KEY, value TEXT)")
+    else:
+        try: c.query("DELETE", "/bench")
+        except RuntimeError: pass  # A fresh benchmark index has no prior generation.
+        c.query("PUT", "/bench", b'{"settings":{"number_of_shards":1,"number_of_replicas":0}}')
     for start in range(0, records, 1_000):
         for i in range(start, min(records, start + 1_000)):
-            c.command(b"SET", f"k:{i:012d}".encode(), value)
+            if service == "redis": c.command(b"SET", f"k:{i:012d}".encode(), value)
+            elif service == "postgres": c.query(f"INSERT INTO bench VALUES ({i}, '{value.decode()}')")
+            elif service == "mysql": c.query(f"INSERT INTO bench VALUES ({i}, '{value.decode()}')")
+            else: c.query("PUT", f"/bench/_doc/{i}", json.dumps({"value": value.decode(), "number": i}).encode())
     c.close()
 
 
-def operation(c: Redis, name: str, n: int, records: int, value: bytes) -> None:
+def operation(service: str, c: Any, name: str, n: int, records: int, value: bytes) -> None:
     key = f"k:{n % records:012d}".encode()
+    row = n % records
+    if service == "postgres":
+        sql = {"read": f"SELECT value FROM bench WHERE id = {row}", "update": f"UPDATE bench SET value = '{value.decode()}' WHERE id = {row}", "delete": f"DELETE FROM bench WHERE id = {row}; INSERT INTO bench VALUES ({row}, '{value.decode()}')", "insert": f"INSERT INTO bench VALUES ({records+n}, '{value.decode()}')", "scan": "SELECT * FROM bench"}[name]; c.query(sql); return
+    if service == "mysql":
+        sql = {"read": f"SELECT value FROM bench WHERE id = {row}", "update": f"UPDATE bench SET value = '{value.decode()}' WHERE id = {row}", "delete": f"DELETE FROM bench WHERE id = {row}; INSERT INTO bench VALUES ({row}, '{value.decode()}')", "insert": f"INSERT INTO bench VALUES ({records+n}, '{value.decode()}')", "scan": "SELECT * FROM bench"}[name]; c.query(sql); return
+    if service == "elasticsearch":
+        path = f"/bench/_doc/{row}"
+        if name == "read": c.query("GET", path)
+        elif name in ("update", "insert"): c.query("PUT", path if name == "update" else f"/bench/_doc/{records+n}", json.dumps({"value": value.decode(), "number": row}).encode())
+        elif name == "delete": c.query("DELETE", path); c.query("PUT", path, json.dumps({"value": value.decode(), "number": row}).encode())
+        else: c.query("POST", "/bench/_search", b'{"query":{"match_all":{}}}')
+        return
     if name == "read": c.command(b"GET", key)
     elif name == "update": c.command(b"SET", key, value)
     elif name == "delete": c.command(b"DEL", key); c.command(b"SET", key, value)
@@ -209,10 +314,10 @@ def run_case(args: argparse.Namespace, server_pid: int | None, records: int, rec
 
     def worker(worker_id: int) -> None:
         try:
-            c = Redis(args.host, args.port); barrier.wait(); n = worker_id
+            c = client_for(args.service, args.host, args.port); barrier.wait(); n = worker_id
             local: list[float] = []; count = 0
             while time.monotonic() < stop:
-                begin = time.perf_counter_ns(); operation(c, op, n, records, value)
+                begin = time.perf_counter_ns(); operation(args.service, c, op, n, records, value)
                 local.append((time.perf_counter_ns() - begin) / 1_000); count += 1; n += concurrency
             c.close(); latency.extend(local); counts.append(count)
         except Exception as exc: errors.append(repr(exc))
@@ -238,7 +343,7 @@ def run_case(args: argparse.Namespace, server_pid: int | None, records: int, rec
     operations = sum(counts)
     cpu_utilization = ((cpu["user_seconds"] + cpu["system_seconds"]) / elapsed * 100
                        if elapsed and cpu["user_seconds"] is not None else None)
-    return {"benchmark": op, "mode": "server", "cache_state": "cold" if cold else "warm", "dataset_records": records,
+    return {"service": args.service, "benchmark": op, "mode": "server", "cache_state": "cold" if cold else "warm", "dataset_records": records,
             "logical_size_bytes": records * record_size, "record_size_bytes": record_size, "concurrency": concurrency,
             "operations": operations, "duration_seconds": elapsed, "throughput_ops_sec": operations / elapsed if elapsed else 0,
             "latency_us": {"p50": percentile(latency, .50), "p95": percentile(latency, .95), "p99": percentile(latency, .99), "p999": percentile(latency, .999)},
@@ -293,6 +398,7 @@ def report(run_dir: Path, results: list[dict[str, Any]]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--profile", choices=["smoke", "full"], default="smoke")
+    p.add_argument("--service", choices=["redis", "postgres", "mysql", "elasticsearch"], default="redis")
     p.add_argument("--output", type=Path, default=Path("benchmark-results"))
     p.add_argument("--binary", default="target/release/noida-db"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=16379)
     p.add_argument("--sizes", help="comma-separated record counts"); p.add_argument("--record-sizes", help="comma-separated bytes"); p.add_argument("--concurrency", help="comma-separated clients")
@@ -311,11 +417,11 @@ def main() -> int:
     (run_dir / "environment.json").write_text(json.dumps(meta, indent=2) + "\n")
     process = launch(args, run_dir)
     try:
-        wait_for_redis(args.host, args.port, process)
+        wait_for_service(args.service, args.host, args.port, process)
         results: list[dict[str, Any]] = []
         for records in sizes:
             for record_size in record_sizes:
-                load(args.host, args.port, records, record_size)
+                load(args.service, args.host, args.port, records, record_size)
                 for op in args.operations.split(","):
                     for concurrency in concurrencies:
                         results.append(run_case(args, process.pid if process else None, records, record_size, concurrency, op, cold=False))

@@ -4,12 +4,14 @@
 resource cost. It is deliberately not a production-traffic simulator: no
 users, HTTP applications, QPS targets, or business workflows are fabricated.
 
-The initial adapter is Redis because it has an implemented, stable engine and
-wire protocol. It measures `insert`, `read`, `update`, `delete`, and `scan`
-over independently selected record counts, record sizes, and client
-concurrency. Operations unsupported by an adapter are not substituted with a
-different operation or silently reported as zero; they remain out of that
-adapter's report until a comparable implementation exists.
+The current native adapters are Redis, Postgres, MySQL, and Elasticsearch.
+They measure `insert`, `read`, `update`, `delete`, and `scan` over independently
+selected record counts, record sizes, and client concurrency. Operations
+unsupported by an adapter are not substituted with a different operation or
+silently reported as zero; they remain out of that adapter's report until a
+comparable implementation exists. Kafka is next: it requires a long-lived
+native Kafka-protocol client so that producer/fetch costs are not polluted by a
+per-operation command-line client.
 
 ## Run
 
@@ -18,8 +20,8 @@ directory. The smoke profile is intentionally small; it validates the
 measurement pipeline on a laptop.
 
 ```sh
-cargo build --release
-python3 benchmarks/noidadb_bench.py --profile smoke --output benchmark-results
+cargo build --release --all-features
+python3 benchmarks/noidadb_bench.py --service redis --profile smoke --output benchmark-results
 ```
 
 For a controlled machine, pin the server and client to disjoint CPUs. This
@@ -27,7 +29,7 @@ prevents the benchmark process from contaminating server CPU measurements.
 
 ```sh
 python3 benchmarks/noidadb_bench.py \
-  --profile full --server-cpus 0-3 --client-cpus 4-7 --perf \
+  --service postgres --profile full --server-cpus 0-3 --client-cpus 4-7 --perf \
   --seconds 20 --output benchmark-results
 ```
 
