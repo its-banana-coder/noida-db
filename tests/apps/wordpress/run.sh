@@ -344,6 +344,9 @@ python3 -c "
 import sys
 content = '''$rest_content'''
 expected = '''$post_content'''
+if expected not in content:
+    print('-- diagnostic: expected repr:', repr(expected))
+    print('-- diagnostic: actual repr:  ', repr(content))
 sys.exit(0 if expected in content else 1)
 " || fail "REST API post content did not contain the real posted content"
 echo "   REST API returned the real title and content for post $post_id"
