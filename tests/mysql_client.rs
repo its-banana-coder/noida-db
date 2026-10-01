@@ -727,3 +727,55 @@ async fn test_mysql_text_column_compared_to_int_literal() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// `HAVING` filtering groups by an aggregate expression (the common,
+/// overwhelming case -- `HAVING COUNT(*) > N`, not a SELECT-list alias).
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_having() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("CREATE TABLE having_test (id INT, category VARCHAR(20), amount INT)")
+        .await
+        .unwrap();
+    conn.query_drop(
+        "INSERT INTO having_test VALUES (1, 'a', 10), (2, 'a', 30), (3, 'b', 5), (4, 'c', 1), (5, 'c', 2)",
+    )
+    .await
+    .unwrap();
+
+    // HAVING COUNT(*) > 1 -- categories 'a' and 'c' have 2 rows each, 'b' has 1.
+    let mut rows: Vec<(String, i64)> = conn
+        .query("SELECT category, COUNT(*) FROM having_test GROUP BY category HAVING COUNT(*) > 1")
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![("a".to_string(), 2), ("c".to_string(), 2)]);
+
+    // HAVING on a SUM, combined with WHERE filtering rows before grouping.
+    let mut rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT category, SUM(amount) FROM having_test WHERE amount > 0 GROUP BY category HAVING SUM(amount) >= 10",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![("a".to_string(), 40)]);
+
+    // No GROUP BY at all: HAVING still applies to the single implicit group.
+    let no_match: Vec<i64> =
+        conn.query("SELECT COUNT(*) FROM having_test HAVING COUNT(*) > 100").await.unwrap();
+    assert!(no_match.is_empty());
+    let one_match: Vec<i64> =
+        conn.query("SELECT COUNT(*) FROM having_test HAVING COUNT(*) = 5").await.unwrap();
+    assert_eq!(one_match, vec![5]);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

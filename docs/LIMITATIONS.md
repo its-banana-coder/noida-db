@@ -93,9 +93,10 @@ current count).
   is not enforced.
 - Lua libraries `struct` and `bit`. `cjson`, `cmsgpack` and the `redis` table
   are available.
-- Persistence. All data lives in memory and is gone when noida-db stops.
-  `SAVE`, `BGSAVE` and `BGREWRITEAOF` succeed but write nothing. `--data-dir`
-  is not used by Redis yet.
+- Real RDB/AOF file format compatibility (`DUMP`/`RESTORE`, a real RDB
+  file another Redis could load) — see the persistence paragraph above:
+  data survives a clean restart via this project's own on-disk JSON
+  snapshot format, not Redis's actual binary formats.
 
 **Differs**
 
@@ -556,10 +557,20 @@ a server reachable on the default port that uses either of those auth
 plugins will cause the same SKIPPED/connection-error behavior — point
 `NOIDA_MYSQL_REF` at a `mysql_native_password`-configured server instead.
 
+`HAVING` filters groups by a directly-written aggregate or grouped-column
+expression (`HAVING COUNT(*) > 2`, `HAVING SUM(amount) >= 10`), the
+overwhelmingly common real-world shape, evaluated the same per-group way
+the projection's own aggregate expressions are. Referencing a
+`SELECT`-list alias instead (`SELECT COUNT(*) AS cnt ... HAVING cnt > 2`)
+isn't resolved yet — repeat the aggregate expression itself. Works with
+or without an explicit `GROUP BY` (no `GROUP BY` means the whole result
+is one implicit group, same as an aggregate in the `SELECT` list alone).
+
 **Not yet**
 - Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
   above).
-- `HAVING`, subqueries, window functions.
+- `HAVING` referencing a `SELECT`-list alias (see above); subqueries;
+  window functions.
 - `ORDER BY`/`LIMIT`/`OFFSET` combined with `GROUP BY`/aggregates when
   the sort key references the aggregated result rather than a grouped
   column (plain, non-aggregated `ORDER BY`/`LIMIT` is supported — see
@@ -683,13 +694,23 @@ via a nested `aggs`), and `avg`/`sum`/`min`/`max`/`stats`/`value_count`/
 `cardinality`/`top_hits` (metric aggregations) — see
 `src/elasticsearch/search.rs`.
 
+`term`/`terms`/`bool`/`range`/`exists` queries, `sort`/pagination/`_source`
+filtering, the aggregations above, `_update`/`_bulk`/delete, and alias
+search (including a zero-downtime alias switch — repointing an alias at a
+different index takes effect immediately for both `_search` and every
+document-level operation, `GET`/`PUT`/`_bulk`/`_update`/`_mget` included,
+not just `_search`) are all verified against a real Elasticsearch node in
+`tests/elasticsearch_diff.rs`. Optimistic concurrency
+(`?if_seq_no=...&if_primary_term=...` on a document write) is enforced: a
+write against a stale `seq_no` gets a real 409 version conflict, also
+verified against a real node.
+
 Not yet built: `query_string`, `simple_query_string`, `search_after`,
 scroll/PIT, nested field mappings and nested queries, highlighting,
-date-math ranges (`now-1d/d`), optimistic concurrency parameters (`version`,
-`if_seq_no`), gzip, `_cat`/`_cluster` endpoints, and exact Elasticsearch
-error/response parity for every path. This is not ready to replace
-Elasticsearch for application workflows that search with more than the
-query types above (aggregating is well covered).
+date-math ranges (`now-1d/d`), gzip, `_cat`/`_cluster` endpoints, and exact
+Elasticsearch error/response parity for every path. This is not ready to
+replace Elasticsearch for application workflows that search with more
+than the query types above (aggregating is well covered).
 
 ## Numbers we do not claim yet
 
