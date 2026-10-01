@@ -156,3 +156,76 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Publish
         run: cargo publish --all-features --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-npm:
+    name: Publish npm packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Set VERSION from tag
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # Each npm/platforms/<plat> package ships one platform's binary,
+      # extracted directly from the same archives the `build` job already
+      # produced (see npm/platforms/*/package.json's "files" field, and
+      # npm/noida-db/bin/noida-db.js, which require.resolve()s this exact
+      # path at runtime) -- not re-downloaded from the GitHub Release,
+      # since the build artifacts are already sitting right here.
+      - name: Populate and publish platform packages
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          declare -A TARGETS=(
+            [linux-x64]=x86_64-unknown-linux-gnu
+            [linux-arm64]=aarch64-unknown-linux-gnu
+            [darwin-x64]=x86_64-apple-darwin
+            [darwin-arm64]=aarch64-apple-darwin
+            [win32-x64]=x86_64-pc-windows-msvc
+          )
+          for plat in "${!TARGETS[@]}"; do
+            target="${TARGETS[$plat]}"
+            dir="npm/platforms/$plat"
+            if [ "$plat" = "win32-x64" ]; then
+              unzip -o "dist/noida-db-${VERSION}-${target}.zip" -d "$dir"
+            else
+              tar xzf "dist/noida-db-${VERSION}-${target}.tar.gz" -C "$dir"
+            fi
+            node -e "
+              const fs = require('fs');
+              const p = JSON.parse(fs.readFileSync('$dir/package.json'));
+              p.version = '${VERSION}';
+              fs.writeFileSync('$dir/package.json', JSON.stringify(p, null, 2) + '\n');
+            "
+            (cd "$dir" && npm publish --access public)
+          done
+
+      - name: Bump and publish the meta package
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('npm/noida-db/package.json'));
+            p.version = '${VERSION}';
+            for (const k of Object.keys(p.optionalDependencies)) {
+              p.optionalDependencies[k] = '${VERSION}';
+            }
+            fs.writeFileSync('npm/noida-db/package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+          (cd npm/noida-db && npm publish --access public)
