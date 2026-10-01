@@ -36,6 +36,8 @@ fn ack_if_confirming(
 }
 
 pub fn handle_connection(mut stream: TcpStream, mut engine: Engine) {
+    // See the identical note in src/mysql/server.rs.
+    let _ = stream.set_nodelay(true);
     let mut header = [0u8; 8];
     if stream.read_exact(&mut header).is_err() {
         return;

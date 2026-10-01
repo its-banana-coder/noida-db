@@ -50,6 +50,17 @@ struct Session {
 }
 
 fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
+    // Every real packet here is sent as two separate writes (a 4-byte
+    // length header, then the payload) -- without this, Nagle's
+    // algorithm holds the second write back waiting to coalesce with
+    // more outbound data, and the client's delayed-ACK timer (a stock
+    // Linux default, ~40ms) is what finally releases it. The result is a
+    // real, measured ~1000x latency regression on simple point queries
+    // (50ms vs Redis's ~65us for the same shape of request) -- found via
+    // benchmarks/noidadb_bench.py, not a micro-optimization guess. Every
+    // other service's own server that already had this (Postgres, Redis,
+    // Memcached) doesn't show this problem.
+    stream.set_nodelay(true)?;
     let mut session = Session {
         engine,
         stmt_id_counter: 1,

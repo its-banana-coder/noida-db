@@ -39,6 +39,8 @@ pub fn spawn(addr: &str) -> std::io::Result<SocketAddr> {
 }
 
 fn handle(stream: TcpStream, engine: &Engine) {
+    // See the identical note in src/mysql/server.rs.
+    let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,

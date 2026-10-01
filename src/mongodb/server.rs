@@ -25,6 +25,8 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
 }
 
 fn handle_client(mut stream: TcpStream, engine: Arc<Mutex<Engine>>) -> io::Result<()> {
+    // See the identical note in src/mysql/server.rs.
+    stream.set_nodelay(true)?;
     loop {
         let header = match MsgHeader::read_from(&mut stream) {
             Ok(h) => h,
