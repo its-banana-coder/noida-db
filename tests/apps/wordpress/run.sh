@@ -327,6 +327,11 @@ echo "   comment created: id=$comment_id"
 echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id"
 status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id")
 [ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id (HTTP $status)"; }
+if [ ! -s "$work/rest-post.json" ]; then
+  echo "-- diagnostic: HTTP 200 but empty body; full redirect chain + headers:"
+  curl -sL -D - -o /dev/null "$base/wp-json/wp/v2/posts/$post_id"
+  fail "GET /wp-json/wp/v2/posts/$post_id returned HTTP 200 with an empty body"
+fi
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
 [ "$rest_title" = "$post_title" ] || fail "REST API post title '$rest_title' != expected '$post_title'"
