@@ -26,49 +26,37 @@ work (the binary's own CLI default is `127.0.0.1`, which is correct for a
 bare-metal dev tool but would make a container silently unreachable). Data
 persists to the `/home/noida/.noida-db` volume.
 
-## Not yet — crates.io, Homebrew, npm, PyPI
+## Status as of the `v0.1.0` release
 
-Each of these distribution channels expects a **prebuilt release binary**
-per platform, fetched by the package manager rather than compiled on the
-user's machine (the exception is crates.io, which can build from source via
-`cargo install noida-db`, but still expects a published crate with full
-`[package]` metadata).
+| Channel | Status | Install |
+|---|---|---|
+| **crates.io** | Live | `cargo install noida-db --all-features` |
+| **npm** | Live (linux-x64 only for now) | `npm install -g noida-db` |
+| **Homebrew** | Tap repo exists, formula not published yet | — |
+| **PyPI** | Not published yet | — |
+| **Docker** | Works via local build; not published to a registry yet | `docker build -t noida-db .` (see above) |
 
-What's needed before each is real, in order:
+`.github/workflows/release.yml` builds all 5 platform targets and publishes
+crates.io/npm/PyPI/a Homebrew-formula PR automatically on any `v*.*.*` tag
+push. crates.io and npm's first release (`v0.1.0`) were published by hand
+from this sandbox instead, since it can only build the `linux-x64` target
+(no macOS toolchain, no Docker for cross-compiling aarch64) — the npm
+release is therefore **linux-x64 only**; the other 4 platform packages and
+a real PyPI/Homebrew release need the full CI workflow to actually run,
+which needs a few one-time account-level things only the project owner can
+set up:
 
-1. **A release workflow** — a GitHub Actions job that builds
-   `cargo build --release --all-features` for Linux (x86_64/aarch64), macOS
-   (x86_64/aarch64), and Windows (x86_64) on a version tag, and attaches the
-   binaries to a GitHub Release. Nothing below is possible without this; it
-   needs no external credentials (`GITHUB_TOKEN` is automatic).
-2. **crates.io** — `cargo publish` once `[package]` carries real metadata
-   (`repository`, `readme`, `keywords`, `categories` — already added to
-   `Cargo.toml`). Needs a crates.io account + API token. The name `noida-db`
-   is confirmed available.
-3. **Homebrew** — a formula (`Formula/noida-db.rb`) in a tap repository
-   (e.g. `its-banana-coder/homebrew-noida-db`) that downloads the release
-   binary and its checksum from step 1. Needs a tap repo to exist under the
-   user's account; the formula itself is small once step 1 lands.
-4. **npm** — a thin meta package (`noida-db`) with no `postinstall` script,
-   whose `optionalDependencies` list one tiny per-platform package
-   (`@noida-db/linux-x64`, `@noida-db/darwin-arm64`, ...) each just
-   containing that platform's binary, the same pattern `esbuild`/`swc`
-   use — npm resolves only the matching one automatically. (A
-   `postinstall`-download script is the simpler-looking alternative but is
-   blocked by `--ignore-scripts` and many corporate/CI npm configs; don't
-   build that version — see the spec's §4.1 for the full reasoning.)
-   Needs an npm account + publish token. The name `noida-db` is confirmed
-   available.
-5. **PyPI** — per-platform wheels of the *same* package name
-   (`noida_db-0.2.0-...manylinux_2_17_x86_64.whl`,
-   `...-macosx_11_0_arm64.whl`, `...-win_amd64.whl`), each just embedding
-   that platform's prebuilt binary with a thin Python shim entry point —
-   `pip` picks the right one automatically from its filename tag, no
-   network access or compilation at install time. Needs a PyPI account,
-   ideally via Trusted Publishing (OIDC, no stored token) rather than a
-   classic API token. The name `noida-db` is confirmed available.
+1. **`HOMEBREW_TAP_TOKEN`** repo secret — a GitHub PAT (repo scope) that
+   can push to `its-banana-coder/homebrew-noida-db` (already created). The
+   workflow's own `GITHUB_TOKEN` is scoped to this repo only and can't push
+   to a different one, even under the same account.
+2. **PyPI Trusted Publishing** — on pypi.org, Publishing → Trusted
+   Publishers → add a pending publisher for `noida-db` naming this repo,
+   the `release.yml` workflow filename, and the `publish-pip` job. OIDC-based,
+   no token to store or rotate.
+3. A real tag push (`git tag v0.2.0 && git push origin v0.2.0`, once
+   `Cargo.toml`'s version is bumped to match) to actually run the full
+   5-platform build and every publish job together.
 
-Steps 2–5 can each be scaffolded ahead of time, but none can be *published*
-without the account credentials for that registry, which only the project
-owner holds. Full build order, every workflow file, and every package
-layout: [docs/specs/release-binaries.md](specs/release-binaries.md).
+Full workflow YAML, every package layout, and the reasoning behind each
+choice: [docs/specs/release-binaries.md](specs/release-binaries.md).
