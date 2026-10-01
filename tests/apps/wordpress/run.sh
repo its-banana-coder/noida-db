@@ -278,14 +278,8 @@ echo "== WordPress site is up on $base (startup took $(( $(date +%s) - web_start
 
 http_status() {
   # http_status <file> <curl args...>   -> prints status code, body saved to <file>
-  #
-  # -L: WordPress's REST API 301-redirects a singular-resource request made
-  # under "Plain" permalinks (the default for a fresh install) to the same
-  # URL with a trailing slash appended -- real WordPress behavior, not a
-  # noida-db quirk, so the real fix is to follow it rather than special-case
-  # pretty permalinks in this script.
   local out="$1"; shift
-  curl -sL -o "$out" -w "%{http_code}" "$@"
+  curl -s -o "$out" -w "%{http_code}" "$@"
 }
 
 json_get() {
@@ -324,14 +318,17 @@ comment_id=$(wp comment create \
 echo "   comment created: id=$comment_id"
 
 # --- 5. fetch the post back via the real REST API ---------------------------
-echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id"
-status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id")
-[ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id (HTTP $status)"; }
-if [ ! -s "$work/rest-post.json" ]; then
-  echo "-- diagnostic: HTTP 200 but empty body; full redirect chain + headers:"
-  curl -sL -D - -o /dev/null "$base/wp-json/wp/v2/posts/$post_id"
-  fail "GET /wp-json/wp/v2/posts/$post_id returned HTTP 200 with an empty body"
-fi
+# Trailing slash: under "Plain" permalinks (the default for a fresh
+# install), this is the REST API's own canonical URL for a singular
+# resource -- requesting it without one gets a 301 to the same URL with
+# the slash added. Requesting the canonical form directly instead of
+# following that redirect also avoids a real curl -L footgun: across a
+# redirect hop, curl appends each response's body to the same -o target
+# rather than truncating between hops, so the 301's (empty) body and the
+# 200's JSON body would otherwise land concatenated in one file.
+echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id/"
+status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id/")
+[ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id/ (HTTP $status)"; }
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
 [ "$rest_title" = "$post_title" ] || fail "REST API post title '$rest_title' != expected '$post_title'"
@@ -343,9 +340,9 @@ sys.exit(0 if expected in content else 1)
 " || fail "REST API post content did not contain the real posted content"
 echo "   REST API returned the real title and content for post $post_id"
 
-echo "== fetching post list via REST API: GET /wp-json/wp/v2/posts"
-status=$(http_status "$work/rest-list.json" "$base/wp-json/wp/v2/posts")
-[ "$status" = "200" ] || { cat "$work/rest-list.json"; fail "GET /wp-json/wp/v2/posts (HTTP $status)"; }
+echo "== fetching post list via REST API: GET /wp-json/wp/v2/posts/"
+status=$(http_status "$work/rest-list.json" "$base/wp-json/wp/v2/posts/")
+[ "$status" = "200" ] || { cat "$work/rest-list.json"; fail "GET /wp-json/wp/v2/posts/ (HTTP $status)"; }
 found=$(json_get "$work/rest-list.json" "1 if any(p['id'] == $post_id for p in d) else 0")
 [ "$found" = "1" ] || { cat "$work/rest-list.json"; fail "post $post_id not present in REST API post listing"; }
 echo "   post $post_id present in REST API post listing"
