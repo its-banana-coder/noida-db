@@ -412,6 +412,34 @@ fn p0_new_query_types_match_real_elasticsearch() {
     println!("compared match_phrase/multi_match/wildcard/regexp against real Elasticsearch");
 }
 
+/// Deep JSON equality, except a `Number`-vs-`Number` pair compares within
+/// a small relative tolerance rather than exactly. Real Elasticsearch
+/// dynamically maps a decimal field as 32-bit `float`, so an `avg` over
+/// it carries the f32-widened-to-f64 rounding that comes with that
+/// (`4.450000047683716`); this engine's own metric aggregations compute
+/// purely in f64 (`4.449999999999999` -- the closer of the two to the
+/// actual decimal average, not a less correct answer), so an exact
+/// `assert_eq!` on aggregation bodies flags that real, harmless
+/// precision difference as a mismatch. The same tolerance the BM25
+/// `_score` comparison above already uses.
+fn agg_approx_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let (x, y) = (x.as_f64().unwrap(), y.as_f64().unwrap());
+            let tolerance = (x.abs() * 1e-6).max(1e-9);
+            (x - y).abs() <= tolerance
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| agg_approx_eq(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().all(|(k, xv)| y.get(k).is_some_and(|yv| agg_approx_eq(xv, yv)))
+        }
+        _ => a == b,
+    }
+}
+
 /// A small e-commerce-shaped product fixture, shared by the tests below --
 /// `term`/`terms`/`bool`/`range`/`exists` are all implemented
 /// (`src/elasticsearch/search.rs`) but were previously only verified by
@@ -650,8 +678,8 @@ fn p1_aggregations_match_real_elasticsearch() {
         let ours = request(ours_addr, "POST", &format!("{index}/_search"), body);
         expect_ok(&format!("real: {label}"), &real);
         expect_ok(&format!("ours: {label}"), &ours);
-        assert_eq!(
-            ours.body["aggregations"], real.body["aggregations"],
+        assert!(
+            agg_approx_eq(&ours.body["aggregations"], &real.body["aggregations"]),
             "{label}: aggregations mismatch. real: {}, ours: {}",
             real.body["aggregations"], ours.body["aggregations"]
         );
