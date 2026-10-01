@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
 license = "MIT"
+repository = "https://github.com/its-banana-coder/noida-db"
+homepage = "https://github.com/its-banana-coder/noida-db"
+readme = "README.md"
+keywords = ["database", "postgres", "redis", "mysql", "devtools"]
+categories = ["development-tools", "emulators"]
 
 # Its own workspace root, so cargo never reads the manifest of an enclosing
 # checkout (as when this repo is a worktree nested inside another).

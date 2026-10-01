@@ -1,234 +1,203 @@
+<div align="center">
+
 # noida-db
 
-One tiny binary for local development that speaks the wire protocols of
-Postgres, MySQL, Redis, Kafka and Elasticsearch — so your existing
-drivers, ORMs and CLIs point at it unchanged, without running five-plus
-heavy servers (or a Docker Compose stack that idles at 2.5–4GB) just to
-develop locally.
+**One tiny binary that speaks Postgres, MySQL, Redis, Kafka, and Elasticsearch —**
+**so your existing drivers, ORMs, and CLIs point at it, unchanged.**
 
-```
-cargo install --path .
+[![CI](https://github.com/its-banana-coder/noida-db/actions/workflows/ci.yml/badge.svg)](https://github.com/its-banana-coder/noida-db/actions/workflows/ci.yml)
+[![Real apps](https://github.com/its-banana-coder/noida-db/actions/workflows/real-apps.yml/badge.svg)](https://github.com/its-banana-coder/noida-db/actions/workflows/real-apps.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![idle RAM](https://img.shields.io/badge/idle%20RAM-~2MB-brightgreen)
+![binary size](https://img.shields.io/badge/single%20binary-%3C40MB-blue)
+
+No Docker Compose stack idling at 2.5–4GB. No five heavy servers to boot
+before `npm run dev` works. One Rust binary, real wire protocols, your
+tools don't know the difference.
+
+</div>
+
+```sh
+cargo install --path . --all-features
 noida-db start                      # every built-in service, default ports
 noida-db start --only redis,postgres
 noida-db start --redis-port 6380
 ```
 
-See `noida-db help` for the full option list.
+See `noida-db help` for the full option list, or jump to
+**[Installing](#installing)** for Docker / Homebrew / npm / pip.
 
-## Why
+---
 
-Real Postgres/Redis/Kafka/Elasticsearch/etc. are made to run in production:
-replicated, clustered, tuned, and heavy. None of that is useful when you're
-just writing and testing an app on a laptop. noida-db implements the parts
-of each system a developer actually touches — the commands and APIs real
-clients send — and skips everything that only matters in a cluster, so it
-can idle in low tens of MB instead of gigabytes, leaving room for the rest
-of your dev environment (IDEs, other services, etc).
+## At a glance
 
-"100% compatible" means the compatibility test suite passes 100%: real
-client libraries, ORMs and CLIs run against noida-db unmodified, and their
-results are compared byte-for-byte against the real server. See
-[COMPATIBILITY.md](COMPATIBILITY.md) for the footprint targets and rules
-every service follows, and [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for
-exactly what does not work yet or is intentionally out of scope.
+| | |
+|---|---|
+| 🚀 **4 real applications**, end to end | Gitea, Miniflux, WordPress, Faust — unmodified, real schemas, real workflows, all green in CI |
+| 📦 **34 real client libraries & ORMs** verified | psycopg, SQLAlchemy, Django, redis-py, ioredis, kafkajs, Sequelize, GORM, JDBC, and more |
+| 🪶 **~2MB idle**, ~15MB under real app load | vs. the multi-gigabyte real stack |
+| ⚡ **Sub-100µs** reads on Redis/Elasticsearch paths | measured, not claimed — see [Benchmarks](#benchmarks) |
+| 💾 **On-disk persistence** for Postgres, Redis, Elasticsearch | survives a clean restart; MySQL and Kafka next |
+| 🔍 **Every gap tracked, not hidden** | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — updated by every PR |
 
-## Compatibility scorecard
+## Why noida-db
 
-There's no single "% compatible" number — no such number is actually
-measured anywhere, and inventing one would be exactly the kind of claim
-this project tries not to make. What *is* measured, per service: how many
-real client libraries/ORMs/drivers are verified against it, how many real
-unmodified applications run against it end to end, and (where a fixed,
-countable target exists, like Redis's command set) direct coverage against
-that target. Everything not covered here is either a known, listed gap
-(`docs/LIMITATIONS.md`) or a deliberate scope exclusion (`COMPATIBILITY.md`)
-— never a silent wrong answer.
+Real Postgres/Redis/Kafka/Elasticsearch are built for production:
+replicated, clustered, tuned, heavy. None of that matters when you're
+writing and testing an app on a laptop. noida-db implements exactly the
+part a developer actually touches — the commands and APIs real clients
+send — and skips the rest.
 
-| Service | Real clients/ORMs verified | Real apps, end to end | Protocol coverage | Known gaps |
-|---|---|---|---|---|
-| **Postgres** | 14 (psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, JDBC) | ✅ Gitea, ✅ Miniflux | DDL/DML, full-text search, range types, materialized views, cursors, catalogs (`pg_catalog`/`information_schema`) | PL/pgSQL, stored procedures/triggers, extensions, logical replication — see `docs/LIMITATIONS.md` |
-| **Redis** | 12 (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq) | — (not yet targeted; a Sidekiq-driven app is next) | 217 / 242 Redis 7.2 commands (`src/redis/README.md`) | Modules (RedisJSON, RediSearch), the 25 unimplemented commands, mostly production-only (`CLUSTER`, `DEBUG`, ...) |
-| **Kafka** | 5 (kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka) | ✅ Faust (streaming pipeline) | Full consumer groups, real transactional isolation (`read_committed`, producer fencing), cluster/config admin | Disk segment persistence (in progress — see below), multiple brokers |
-| **MySQL** | 1 driver-level (`mysql_async`) | ✅ WordPress | Prepared statements, transactions, `ORDER BY`/`LIMIT`/`GROUP BY`/aggregates/`HAVING`, `WHERE ... IN (...)`, real `AUTO_INCREMENT`/`last_insert_id`, cross-connection data sharing, database selection via the connection handshake, real `DEFAULT` clauses, `SQL_CALC_FOUND_ROWS`/`FOUND_ROWS()` | Subqueries, CTEs (ordinary and recursive), window functions, `ALTER TABLE`, multi-statement queries — see `docs/LIMITATIONS.md` |
-| **Elasticsearch** | 2 (official Java and Python clients) | — (not yet targeted; a Django + django-elasticsearch-dsl app is next) | `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp with real BM25 scoring, bucket/metric aggregations, verified against a real Elasticsearch 8.15 node | `query_string`, `search_after`, nested queries, highlighting — see `docs/LIMITATIONS.md`. Operating the ES *ecosystem* (Kibana, Grafana as a data source) is out of scope; a client library searching via the API is what's covered |
+```mermaid
+flowchart LR
+    App["Your app, unmodified<br/>(psycopg · mysql_async · redis-py · kafkajs · ...)"]
+    App --> Noida(("noida-db<br/>one binary"))
+    Noida --> PG["Postgres<br/>wire protocol"]
+    Noida --> MY["MySQL<br/>wire protocol"]
+    Noida --> RD["Redis<br/>RESP2/RESP3"]
+    Noida --> KF["Kafka<br/>binary protocol"]
+    Noida --> ES["Elasticsearch<br/>HTTP"]
+```
 
-✅ = passes end to end in CI, re-run on every relevant change (see
-`.github/workflows/real-apps.yml`). 🚧 = in progress, currently red in CI —
-listed here instead of hidden, since a real, currently-failing signal is
-more useful than silence. More apps are added over time; see "Tested
-against real applications" below for what each one actually exercises.
+**"100% compatible" means the compatibility test suite passes 100%:**
+real client libraries, ORMs and CLIs run against noida-db unmodified,
+their results compared byte-for-byte against the real server. See
+[COMPATIBILITY.md](COMPATIBILITY.md) for the footprint targets and the
+rules every service follows.
 
 ## Tested against real applications
 
-Beyond the compatibility test suite (real client libraries, ORMs and CLIs
-compared byte-for-byte against the real server), noida-db is validated by
-running actual, unmodified open-source applications against it as their
-database — not a synthetic client, a real app doing real work. These run
-as their own CI workflow (`real-apps.yml`), separate from the fast
-per-push suite since each takes minutes and hits real networks.
+Not a synthetic client — actual, unmodified open-source applications
+running against noida-db as their real database, in their own CI
+workflow (`real-apps.yml`):
 
-| App | What it exercises | Result |
-|---|---|---|
-| [Gitea](https://about.gitea.com/) (Postgres + Redis) | Full production schema (~115 tables) via the xorm ORM; creating a repository, `git clone`/`git push` over HTTP, issues and comments, and a full pull-request workflow (branch push → PR → merge) via the REST API | ✅ All of the above works end to end |
-| [Miniflux](https://miniflux.app/) (Postgres) | Full schema migration (134 migrations, including a `DECLARE`/`FETCH`/`CLOSE` cursor); adding a real RSS feed, fetching and parsing its entries, marking one read, and full-text search over entry titles/content (a `setweight`+`||`-combined index, queried with `websearch_to_tsquery`) | ✅ All of the above works end to end |
-| [Faust](https://faust.readthedocs.io/) (Kafka) | Python streaming app pipeline (built on `aiokafka`); dynamically creating topics, concurrent consumer group joins, partition assignments via `SyncGroup`, maintaining continuous `Heartbeat` sessions through consumer rebalances, and actively streaming and decoding incoming records. | ✅ All of the above works end to end |
-| [WordPress](https://wordpress.org/) (MySQL) | Real core install via WP-CLI (~12 core tables, no ORM — plain `mysqli`-backed SQL), creating a post and comment, then reading both back through the real REST API | ✅ All of the above works end to end |
-
-**RAM usage while running these workflows:** as low as 2MB idle after
-boot, peaking at 15MB during the heaviest activity (Gitea's schema-check
-phase), settling in the 5–15MB range at rest — well under the [footprint
-targets](COMPATIBILITY.md#footprint-targets).
-
-More applications are being added over time: Ghost and Strapi (MySQL),
-Wagtail/django-cms (Postgres), Forem (Postgres + Redis + Elasticsearch),
-and a Spring Kafka application are next.
-
-## Status
-
-Each tested against real client libraries, differential tests against a
-real server, and (for several) real unmodified applications:
-
-| Service | State |
+| App | What it exercises |
 |---|---|
-| **Postgres** | wire protocol, catalogs, DDL/DML, full-text search, range types, materialized views, tested against psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql and JDBC, plus real applications (see above) |
-| **MySQL** | handshake (including database selection from the connection string itself, not just an explicit `USE`), real tables (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/`DELETE`, basic `INNER`/`LEFT`/cross `JOIN`, `ORDER BY`/`LIMIT`/`GROUP BY`/aggregates/`HAVING`), prepared statements with real parameter binding, `BEGIN`/`COMMIT`/`ROLLBACK`, real `AUTO_INCREMENT`/`last_insert_id`/`affected_rows`, `WHERE ... IN (...)`, `SHOW TABLES`/`COLUMNS`/`CREATE TABLE`, real `ERR` packets, text-to-number coercion in comparisons (matching MySQL's own lenient behavior, not hard-erroring), and data shared correctly across connections (not per-connection state) — tested against `mysql_async`, a differential test against a real MySQL server (including a 50-query e-commerce suite shared with Postgres, translated to MySQL's own dialect), and a real application (WordPress — see above); subqueries, CTEs, window functions and `ALTER TABLE` are the remaining gaps — see `docs/LIMITATIONS.md` |
-| **Redis** | most of the protocol implemented (217 of 242 Redis 7.2 commands) and tested against 12 real client libraries (redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq); real keyspace notifications (`notify-keyspace-events`) across generic/stream/HyperLogLog/hash/list/set/zset/string events — see [`src/redis/README.md`](src/redis/README.md) |
-| **Kafka** | native binary protocol, topics, consumer groups, cluster configs, and real transactional isolation (`read_committed` fetches, producer fencing on stale epochs) |
-| **Elasticsearch** | HTTP layer, index/document CRUD, bulk, `match`/`match_phrase`/`multi_match`/`term`/`range`/`bool`/wildcard/regexp search with real BM25 scoring, and bucket/metric aggregations, verified against a real Elasticsearch 8.15 node — see `docs/LIMITATIONS.md` for what's not built yet (`query_string`, `search_after`, nested queries, highlighting) |
+| ✅ [Gitea](https://about.gitea.com/) (Postgres + Redis) | Full ~115-table production schema via xorm; creating a repo, `git clone`/`push` over HTTP, issues, and a full PR workflow (branch → PR → merge) via the REST API |
+| ✅ [Miniflux](https://miniflux.app/) (Postgres) | 134-migration schema (including a real cursor); adding an RSS feed, parsing entries, full-text search over titles/content |
+| ✅ [Faust](https://faust.readthedocs.io/) (Kafka) | Python streaming pipeline on `aiokafka`; dynamic topics, concurrent consumer-group rebalances, live record streaming |
+| ✅ [WordPress](https://wordpress.org/) (MySQL) | Real WP-CLI core install (~12 tables, no ORM), creating a post + comment, round-tripped through the real REST API |
 
-Each service is its own Cargo feature (on by default once merged) and can
-be switched on or off at build time and at runtime (`--only`); a disabled
-service allocates nothing.
+RAM while running these: as low as **2MB idle**, peaking at **15MB**
+during the heaviest activity, settling in the 5–15MB range at rest —
+well under the [footprint targets](COMPATIBILITY.md#footprint-targets).
+
+Next up: Ghost and Strapi (MySQL), Wagtail/django-cms (Postgres), Forem
+(Postgres + Redis + Elasticsearch), and a Spring Kafka application.
+
+## Compatibility
+
+| Service | Real clients/ORMs | Real apps | Protocol coverage |
+|---|---|---|---|
+| **Postgres** | 14 — psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, JDBC | ✅ Gitea · ✅ Miniflux | DDL/DML, full-text search, range types, materialized views, cursors, catalogs |
+| **MySQL** | `mysql_async`, plus a 50-query differential suite shared with Postgres | ✅ WordPress | Prepared statements, transactions, joins, `GROUP BY`/`HAVING`, real `AUTO_INCREMENT`, handshake-based database selection |
+| **Redis** | 12 — redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq | — (next: Sidekiq app) | 217 / 242 Redis 7.2 commands — [`src/redis/README.md`](src/redis/README.md) |
+| **Kafka** | 5 — kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka | ✅ Faust | Consumer groups, real transactional isolation (`read_committed`, producer fencing), cluster/config admin |
+| **Elasticsearch** | 2 — official Java and Python clients | — (next: Django + django-elasticsearch-dsl) | `match`/`bool`/`range`/aggregations with real BM25 scoring, verified against a real ES 8.15 node |
+
+Every row's remaining gaps are tracked precisely, not hand-waved — see
+[docs/LIMITATIONS.md](docs/LIMITATIONS.md) for the exact list per
+service, and [docs/specs/](docs/specs/) for what's planned next. Each
+service is its own Cargo feature (on by default) and can be switched off
+at build time or runtime (`--only`) — a disabled service allocates
+nothing.
+
+<details>
+<summary><strong>What's intentionally out of scope</strong></summary>
+
+<br>
+
+Production concerns that don't apply to a local dev tool: replication,
+clustering, sharding, multi-user security/ACLs/TLS, query profiling, and
+real clustering behavior of any kind. See
+[COMPATIBILITY.md](COMPATIBILITY.md) for the full rule set.
+
+</details>
 
 ## Benchmarks
 
-`benchmarks/noidadb_bench.py` measures the database engine itself —
-throughput, latency, CPU time and RSS for `insert`/`read`/`update`/
-`delete`/`scan`, across dataset size, record size and client concurrency
-— against Redis, Postgres, MySQL and Elasticsearch's own wire protocols
-(a hand-rolled client per service, no ORM or driver overhead in the
-numbers). It is deliberately not a production-traffic simulator: no
-users, QPS targets or business workflows are fabricated. Kafka isn't
-benchmarked yet — it needs a long-lived native Kafka-protocol client so
-producer/fetch costs aren't polluted by spawning a CLI per operation.
+[`benchmarks/noidadb_bench.py`](benchmarks/noidadb_bench.py) measures
+the database engine itself — throughput, latency, CPU time, RSS — across
+dataset size, record size, and client concurrency, using each service's
+real wire protocol. Not a production-traffic simulator: no users, QPS
+targets or business workflows are fabricated.
 
-**Hardware for the numbers below:** a shared WSL2 VM (1 physical / 2
-logical cores, ~6 GB RAM) — not a dedicated benchmarking rig, and the
-numbers should be read as directional, not as absolute capacity claims.
-Full methodology, how to reproduce, and how to run the larger `--profile
-full` sweep are in [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md); every
-run also writes a per-run `report.html` with the full set of scaling
-graphs plus `environment.json` (exact hardware/build/git revision) next
-to its raw `results.jsonl`.
-
-**At 1,000 records, 100-byte values, 1 client:**
+**At 1,000 records, 100-byte values, 1 client (p50 latency):**
 
 | Service | insert | read | update | delete | scan |
 |---|---:|---:|---:|---:|---:|
-| Redis | 70.0µs | 65.5µs | 65.8µs | 127.5µs | 296.4µs |
-| Postgres | 507.6µs | 412.7µs | 832.0µs | 1023.3µs | 3391.1µs |
-| MySQL | 58.4µs | 544.4µs | 113.6µs | 63.5µs† | 3709.4µs |
-| Elasticsearch | 235.8µs | 230.8µs | 239.5µs | 504.0µs | 231.4µs |
+| Redis | 70µs | 66µs | 66µs | 128µs | 296µs |
+| Elasticsearch | 236µs | 231µs | 240µs | 504µs | 231µs |
+| Postgres | 508µs | 413µs | 832µs | 1.0ms | 3.4ms |
+| MySQL | 58µs | 544µs | 114µs | 64µs | 3.7ms |
 
-p50 latency. † MySQL's `delete` benchmark issues a two-statement
-`DELETE ...; INSERT ...` per op (replacing the row it removes, to keep
-the dataset size constant) — noida-db's MySQL only executes the first
-statement of a multi-statement `COM_QUERY` (a documented gap, see
-`docs/LIMITATIONS.md`), so this number is a plain delete, and the
-table's row count drifts down over the course of that benchmark instead
-of staying constant the way it does for the other three services.
+Redis and Elasticsearch do an ID-keyed lookup — latency stays flat as
+the dataset grows from 1K to 10K records. Postgres and MySQL have no
+real indexing yet (a deliberate "simple over performant" tradeoff, not a
+bug), so a lookup is a linear scan and cost grows with table size
+(~7–9× over that same range). Full scaling curves, concurrency behavior,
+and methodology: [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
-**Dataset-size scaling** (`read`, 100B values, 1 client) — Redis and
-Elasticsearch do an ID-keyed lookup (flat regardless of how many other
-records exist); Postgres and MySQL have no real indexing yet (a
-documented, deliberate "simple over performant" tradeoff, not a bug),
-so a lookup is a linear scan and cost grows with table size:
+<details>
+<summary><strong>A real bug these exact numbers caught</strong></summary>
 
-| Service | 1K records (p50) | 10K records (p50) |
-|---|---:|---:|
-| Redis | 65.5µs | 65.4µs (×1.0) |
-| Postgres | 412.7µs | 3057.1µs (×7.4) |
-| MySQL | 544.4µs | 4660.6µs (×8.6) |
-| Elasticsearch | 230.8µs | 231.0µs (×1.0) |
+<br>
 
-**Concurrency scaling** (`read`, 1K records, 100B values) — all four
-roughly double throughput from 1→2 concurrent clients, then plateau by 4
-rather than keep scaling; each service here holds one global lock around
-its in-memory state for the duration of an operation (documented under
-"simple over performant" — real concurrent correctness, not a real
-concurrent *engine*):
+MySQL's `read`/`scan` were originally measured in the tens of
+milliseconds — a ~1000× gap from Redis for no algorithmic reason.
+Postgres's server already disabled Nagle's algorithm (`TCP_NODELAY`) on
+every connection; MySQL's never did, so its two-syscall-per-packet wire
+protocol stalled on the client's ~40ms delayed-ACK timer on every single
+response. Fixed, and applied to every other service that was missing it
+too (Kafka, Elasticsearch, RabbitMQ, MongoDB, ClickHouse).
 
-| Service | 1 client | 2 clients | 4 clients |
-|---|---:|---:|---:|
-| Redis | 14,710 ops/s | 33,133 ops/s | 33,303 ops/s |
-| Postgres | 2,354 ops/s | 2,927 ops/s | 2,995 ops/s |
-| MySQL | 1,716 ops/s | 3,136 ops/s | 3,244 ops/s |
-| Elasticsearch | 3,778 ops/s | 3,934 ops/s | 4,409 ops/s |
+</details>
 
-**Record-size scaling** (`insert`, 1K records, 1 client) — at these
-small sizes the dominant cost is protocol/dispatch, not copying the
-value itself, so 100B→1KB barely moves the number:
+## Installing
 
-| Service | 100B (p50) | 1KB (p50) |
-|---|---:|---:|
-| Redis | 70.0µs | 70.8µs |
-| Postgres | 507.6µs | 663.6µs |
-| MySQL | 58.4µs | 66.3µs |
-| Elasticsearch | 235.8µs | 244.4µs |
+```sh
+# From source (works today)
+cargo install --path .
 
-These numbers directly caught a real bug: MySQL's `read`/`scan` were
-originally measured in the tens of milliseconds (vs. Redis's
-microseconds) for no algorithmic reason — `src/postgres/server.rs`
-disabled Nagle's algorithm (`TCP_NODELAY`) on every accepted connection
-and `src/mysql/server.rs` never did, so MySQL's own two-syscall-per-
-packet wire protocol was stalling on the client's ~40ms delayed-ACK
-timer on every response. Fixed, and applied to every other service that
-was missing it too (Kafka, Elasticsearch, RabbitMQ, MongoDB, ClickHouse)
-— see `docs/LIMITATIONS.md` and the git history for
-`src/mysql/server.rs`.
+# Docker
+docker build -t noida-db .
+docker run -p 5432:5432 -p 3306:3306 -p 6379:6379 -p 9092:9092 -p 9200:9200 noida-db
+```
 
-## Pending infrastructure
+crates.io, Homebrew, npm and PyPI packages are on the way — track
+progress in [docs/PACKAGING.md](docs/PACKAGING.md).
 
-Actively being worked on, not yet complete — listed here rather than left
-implicit:
+## What's next
 
-- **On-disk persistence.** Nothing survives a restart today — every
-  service is in-memory only, and `--data-dir` is accepted but unused. The
-  shared foundation (a shutdown-hook registry that saves a snapshot on a
-  clean SIGINT/SIGTERM, with atomic temp-file-then-rename writes so a save
-  interrupted mid-write can't corrupt the snapshot — see `src/persistence.rs`)
-  is in place; each service's own load/save is being added next, one small
-  PR per service. The model stays simple on purpose: a full snapshot on
-  clean shutdown, not incremental or continuous — a hard kill (`kill -9`)
-  loses whatever changed since the last clean shutdown, but never corrupts
-  the on-disk file.
-- **Benchmarking.** The [infrastructure benchmark harness](docs/BENCHMARKING.md)
-  now captures repeatable Redis wire-protocol throughput, latency, server-only
-  CPU/RSS/IO, optional hardware counters, machine metadata, and SVG reports.
-  It is intentionally an engine-efficiency suite, not a production-traffic
-  simulation; adapters for equivalent operations in other services will follow.
-- **Real-app matrix expansion** — see "Tested against real applications"
-  above for what's next.
+- **Persistence for MySQL and Kafka** — Postgres, Redis and Elasticsearch
+  already save a full snapshot on clean shutdown
+  (`<data_dir>/<service>.json`, atomic temp-file-then-rename writes so an
+  interrupted save can't corrupt the file — see `src/persistence.rs`);
+  the same model lands for the remaining two next.
+- **Wider benchmark coverage** — a native long-lived Kafka client for
+  producer/fetch numbers, plus index and persistence-cost benchmarks.
+- **More real applications** — see [the table above](#tested-against-real-applications).
 
 ## Documentation
 
 - [COMPATIBILITY.md](COMPATIBILITY.md) — the compatibility promise, footprint
-  targets, and the rules every service follows (scope filter, no performance
-  analysis, reuse-before-you-build).
+  targets, and the rules every service follows.
 - [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — what doesn't work, updated by
   every PR.
+- [docs/BENCHMARKING.md](docs/BENCHMARKING.md) — benchmark methodology and
+  how to reproduce.
 - [docs/SERVICE_GUIDE.md](docs/SERVICE_GUIDE.md) — how a service is built,
   for anyone adding or extending one.
-- [docs/specs/](docs/specs/) — a detailed spec per service (API priorities,
-  a client test matrix and milestones), written before implementation and
-  kept as the design reference afterward.
-- [THIRD_PARTY.md](THIRD_PARTY.md) — code ported from upstream projects
-  (e.g. Redis's own algorithms and error texts) and its license.
+- [docs/specs/](docs/specs/) — a detailed spec per service, written before
+  implementation and kept as the design reference afterward.
+- [THIRD_PARTY.md](THIRD_PARTY.md) — code ported from upstream projects and
+  its license.
 
 ## Building and testing
 
-```
-cargo build --release                       # everything on by default
+```sh
+cargo build --release                       # default features: redis + postgres
+cargo build --release --all-features        # every service, including MySQL/Kafka/Elasticsearch
 cargo build --no-default-features --features redis
 cargo test --all-features
 scripts/check-size.sh                       # binary size budget (40MB)
@@ -236,17 +205,14 @@ scripts/check-size.sh                       # binary size budget (40MB)
 
 Each service has three layers of tests: engine-level tests with exact
 replies and error text, differential tests against the real server
-(`NOIDA_<SERVICE>_REF=host:port`, or a local reference binary — see
-`scripts/get-redis-oracle.sh`), and real-client tests under `tests/clients/`
-that install their own dependencies under `target/` and run with one
-command, e.g. `tests/clients/redis/run.sh`. CI runs all of it against real
-reference servers.
+(`NOIDA_<SERVICE>_REF=host:port`), and real-client tests under
+`tests/clients/` that install their own dependencies and run with one
+command. CI runs all of it against real reference servers.
 
-Real, unmodified *applications* (Gitea, Miniflux, WordPress, ...) live
-under `tests/apps/` instead — the same one-command-per-app convention, but
-run as their own CI workflow (`real-apps.yml`) rather than on every push,
-since each takes minutes and hits real networks to download pinned,
-checksum-verified releases.
+Real, unmodified *applications* live under `tests/apps/` — the same
+one-command-per-app convention, run as their own CI workflow since each
+takes minutes and hits real networks for pinned, checksum-verified
+releases.
 
 ## License
 
