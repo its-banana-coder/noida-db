@@ -246,7 +246,12 @@ def load(service: str, host: str, port: int, records: int, record_size: int) -> 
     c = client_for(service, host, port)
     if service == "redis": c.command(b"FLUSHDB")
     elif service == "postgres": c.query("DROP TABLE IF EXISTS bench; CREATE TABLE bench (id int primary key, value text)")
-    elif service == "mysql": c.query("CREATE TABLE bench (id INT PRIMARY KEY, value TEXT)")
+    elif service == "mysql":
+        # DROP TABLE isn't implemented yet (see docs/LIMITATIONS.md), so
+        # reset by emptying the existing table instead of recreating it;
+        # CREATE TABLE only on the very first call.
+        try: c.query("DELETE FROM bench")
+        except RuntimeError: c.query("CREATE TABLE bench (id INT PRIMARY KEY, value TEXT)")
     else:
         try: c.query("DELETE", "/bench")
         except RuntimeError: pass  # A fresh benchmark index has no prior generation.
@@ -425,8 +430,22 @@ def main() -> int:
         results: list[dict[str, Any]] = []
         for records in sizes:
             for record_size in record_sizes:
-                load(args.service, args.host, args.port, records, record_size)
                 for op in args.operations.split(","):
+                    # Reloaded fresh per operation, not once for the whole
+                    # (records, record_size) combination: insert mutates
+                    # the table (grows it with every concurrency rep), so
+                    # without this, read/update/delete/scan measured right
+                    # after it would silently run against however many
+                    # rows insert happened to leave behind instead of the
+                    # requested `records` -- the dimensions stop being
+                    # independent, which is the whole point of this
+                    # harness. Not reloading between an operation's own
+                    # concurrency reps is deliberate: insert accumulating
+                    # across its own reps is what "insert more records"
+                    # means, and reloading before every single rep would
+                    # make large record counts prohibitively slow for
+                    # negligible extra rigor here.
+                    load(args.service, args.host, args.port, records, record_size)
                     for concurrency in concurrencies:
                         results.append(run_case(args, process.pid if process else None, records, record_size, concurrency, op, cold=False))
                         print(json.dumps(results[-1]), flush=True)
