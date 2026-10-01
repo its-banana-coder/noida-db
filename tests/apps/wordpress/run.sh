@@ -329,6 +329,11 @@ echo "   comment created: id=$comment_id"
 echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id/"
 status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id/")
 [ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id/ (HTTP $status)"; }
+echo "-- diagnostic: HTTP $status, body is $(wc -c < "$work/rest-post.json") bytes, first 400 shown below with control chars visible"
+head -c 400 "$work/rest-post.json" | cat -A
+echo
+echo "-- diagnostic: response headers for the same request"
+curl -s -D - -o /dev/null "$base/wp-json/wp/v2/posts/$post_id/"
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
 [ "$rest_title" = "$post_title" ] || fail "REST API post title '$rest_title' != expected '$post_title'"
