@@ -34,11 +34,18 @@ fn start_noida_mysql() -> SocketAddr {
 /// wire either way) -- not just the first column, so a multi-column
 /// `SELECT id, name FROM ...` doesn't panic trying to convert a whole row
 /// into a single `Option<String>`.
+///
+/// Takes a single already-open `Conn`, not a `Pool` -- `BEGIN`/`COMMIT`/
+/// `ROLLBACK` are session-scoped, so pulling a fresh connection from the
+/// pool for every query (as this used to do) meant a transaction's `BEGIN`
+/// and its `INSERT` could land on two different connections, making the
+/// later `ROLLBACK` a no-op against whichever connection actually ran the
+/// insert -- real MySQL then genuinely committed it, while this file's own
+/// query sequence assumed it hadn't.
 async fn query_as_strings(
-    pool: &Pool,
+    conn: &mut mysql_async::Conn,
     query: &str,
 ) -> Result<Vec<Vec<Option<String>>>, mysql_async::Error> {
-    let mut conn = pool.get_conn().await.unwrap();
     let rows: Vec<mysql_async::Row> = conn.query(query).await?;
     Ok(rows
         .into_iter()
@@ -46,10 +53,15 @@ async fn query_as_strings(
         .collect())
 }
 
-/// Runs `query` against both servers and asserts the returned rows match.
-async fn assert_same_result(noida_pool: &Pool, ref_pool: &Pool, query: &str) {
-    let noida_rows = query_as_strings(noida_pool, query).await;
-    let ref_rows = query_as_strings(ref_pool, query).await;
+/// Runs `query` against both servers (each on its own persistent
+/// connection) and asserts the returned rows match.
+async fn assert_same_result(
+    noida_conn: &mut mysql_async::Conn,
+    ref_conn: &mut mysql_async::Conn,
+    query: &str,
+) {
+    let noida_rows = query_as_strings(noida_conn, query).await;
+    let ref_rows = query_as_strings(ref_conn, query).await;
 
     match (noida_rows, ref_rows) {
         (Ok(n), Ok(r)) => assert_eq!(n, r, "mismatch for query: {query}"),
@@ -63,8 +75,7 @@ async fn assert_same_result(noida_pool: &Pool, ref_pool: &Pool, query: &str) {
     }
 }
 
-async fn execute_query(pool: &Pool, query: &str) {
-    let mut conn = pool.get_conn().await.unwrap();
+async fn execute_query(conn: &mut mysql_async::Conn, query: &str) {
     let _: Vec<mysql_async::Row> = conn.query(query).await.unwrap_or_default();
 }
 
@@ -79,28 +90,30 @@ async fn test_mysql_diff() {
 
     let noida_addr = start_noida_mysql();
     let noida_pool = Pool::new(format!("mysql://root@{noida_addr}/test").as_str());
+    let mut noida_conn = noida_pool.get_conn().await.unwrap();
+    let mut ref_conn = ref_pool.get_conn().await.unwrap();
 
     // Setup for diff tests
-    execute_query(&noida_pool, "CREATE TABLE diff_test (id INT PRIMARY KEY, name VARCHAR(50))")
+    execute_query(&mut noida_conn, "CREATE TABLE diff_test (id INT PRIMARY KEY, name VARCHAR(50))")
         .await;
     execute_query(
-        &ref_pool,
+        &mut ref_conn,
         "CREATE TABLE IF NOT EXISTS diff_test (id INT PRIMARY KEY, name VARCHAR(50))",
     )
     .await;
-    execute_query(&ref_pool, "TRUNCATE TABLE diff_test").await;
+    execute_query(&mut ref_conn, "TRUNCATE TABLE diff_test").await;
 
     execute_query(
-        &noida_pool,
+        &mut noida_conn,
         "CREATE TABLE diff_agg (id INT PRIMARY KEY, category VARCHAR(50), amount INT)",
     )
     .await;
     execute_query(
-        &ref_pool,
+        &mut ref_conn,
         "CREATE TABLE IF NOT EXISTS diff_agg (id INT PRIMARY KEY, category VARCHAR(50), amount INT)",
     )
     .await;
-    execute_query(&ref_pool, "TRUNCATE TABLE diff_agg").await;
+    execute_query(&mut ref_conn, "TRUNCATE TABLE diff_agg").await;
 
     let mut compared = 0;
     for query in [
@@ -143,12 +156,14 @@ async fn test_mysql_diff() {
         "COMMIT",
         "SELECT COUNT(*) FROM diff_agg",
     ] {
-        assert_same_result(&noida_pool, &ref_pool, query).await;
+        assert_same_result(&mut noida_conn, &mut ref_conn, query).await;
         compared += 1;
     }
 
     println!("compared {compared} queries against the real server");
 
+    drop(noida_conn);
+    drop(ref_conn);
     noida_pool.disconnect().await.unwrap();
     ref_pool.disconnect().await.unwrap();
 }
