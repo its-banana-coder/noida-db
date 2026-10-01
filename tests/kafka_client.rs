@@ -712,3 +712,190 @@ fn test_kafka_admin_describe_and_delete() {
         send_request(&mut stream, ApiKey::DeleteTopics, 4, 5, Some("admin"), &del_req);
     assert_eq!(del_resp.responses[0].error_code, 0);
 }
+
+/// Deterministic (not real Kafka's murmur2, but doesn't need to be --
+/// partitioning is a producer-side decision in real Kafka too, not
+/// something the broker computes) key-to-partition assignment, so "the
+/// same order_id always lands on the same partition" is actually true
+/// for this test, the same way a real keyed producer guarantees it.
+fn partition_for_key(key: &str, num_partitions: i32) -> i32 {
+    (key.bytes().map(u32::from).sum::<u32>() % num_partitions as u32) as i32
+}
+
+/// Produces one record (raw bytes, same convention `test_kafka_milestone_1_and_2`
+/// already uses rather than a real encoded RecordBatch) prefixed with its
+/// own 4-byte big-endian length, so many records fetched back
+/// concatenated in one Fetch response can be split apart again
+/// unambiguously.
+fn produce_length_prefixed(
+    stream: &mut TcpStream,
+    correlation_id: i32,
+    topic_name: &TopicName,
+    partition: i32,
+    payload: &[u8],
+) {
+    let mut framed = Vec::with_capacity(4 + payload.len());
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(payload);
+
+    let mut produce_req = ProduceRequest::default();
+    produce_req.acks = 1;
+    produce_req.timeout_ms = 2000;
+    let mut topic_prod = TopicProduceData::default();
+    topic_prod.name = topic_name.clone();
+    let mut part_prod = PartitionProduceData::default();
+    part_prod.index = partition;
+    part_prod.records = Some(bytes::Bytes::from(framed));
+    topic_prod.partition_data.push(part_prod);
+    produce_req.topic_data.push(topic_prod);
+
+    let resp: ProduceResponse = send_request(
+        stream,
+        ApiKey::Produce,
+        8,
+        correlation_id,
+        Some("ordering-test"),
+        &produce_req,
+    );
+    let part_res = &resp.responses[0].partition_responses[0];
+    assert_eq!(part_res.error_code, 0, "produce failed for partition {partition}");
+}
+
+/// Splits a Fetch response's concatenated length-prefixed records back
+/// into the individual payloads `produce_length_prefixed` wrote.
+fn split_length_prefixed(mut buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    while buf.len() >= 4 {
+        let len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+        if buf.len() < 4 + len {
+            break;
+        }
+        out.push(buf[4..4 + len].to_vec());
+        buf = &buf[4 + len..];
+    }
+    out
+}
+
+/// This is the single invariant the whole Kafka wire protocol exists to
+/// serve: events for the same key must come back in the order they were
+/// produced. Real concurrent producers (separate threads, separate
+/// connections) interleave across DIFFERENT order_ids -- real concurrency,
+/// not a sequential simulation -- while each order_id's own 5-event
+/// sequence is always written by a single thread in order, matching what
+/// a real keyed producer actually guarantees (Kafka never promises
+/// ordering across independent, uncoordinated producer connections
+/// writing the same key, only within one producer's own sequence).
+#[test]
+fn test_kafka_per_key_ordering_under_concurrent_production() {
+    let addr = noida::kafka::spawn("127.0.0.1:0").unwrap();
+    let mut admin = TcpStream::connect(addr).unwrap();
+
+    let topic_name = TopicName::from(StrBytes::from_static_str("order-events-ordering"));
+    const NUM_PARTITIONS: i32 = 6;
+    const NUM_ORDERS: usize = 60;
+    const NUM_THREADS: usize = 10;
+    const EVENTS: [&str; 5] =
+        ["ORDER_CREATED", "PAYMENT_PENDING", "PAYMENT_SUCCESS", "INVENTORY_RESERVED", "DELIVERED"];
+
+    let mut create_req = CreateTopicsRequest::default();
+    let mut topic = CreatableTopic::default();
+    topic.name = topic_name.clone();
+    topic.num_partitions = NUM_PARTITIONS;
+    topic.replication_factor = 1;
+    create_req.topics.push(topic);
+    let create_resp: CreateTopicsResponse =
+        send_request(&mut admin, ApiKey::CreateTopics, 5, 1, Some("admin"), &create_req);
+    assert_eq!(create_resp.topics[0].error_code, 0);
+
+    let order_ids: Vec<String> = (0..NUM_ORDERS).map(|i| format!("ORD-{i}")).collect();
+
+    // Each thread owns a disjoint slice of order_ids and its own
+    // connection -- real concurrent producers, never two threads writing
+    // the same order_id's sequence.
+    let handles: Vec<_> = order_ids
+        .chunks(NUM_ORDERS.div_ceil(NUM_THREADS))
+        .enumerate()
+        .map(|(thread_idx, chunk)| {
+            let chunk = chunk.to_vec();
+            let topic_name = topic_name.clone();
+            std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(addr).unwrap();
+                let mut correlation_id = 100 + (thread_idx as i32) * 1000;
+                for order_id in &chunk {
+                    let partition = partition_for_key(order_id, NUM_PARTITIONS);
+                    for (seq, event) in EVENTS.iter().enumerate() {
+                        let payload = format!("{order_id}|{seq}|{event}");
+                        produce_length_prefixed(
+                            &mut stream,
+                            correlation_id,
+                            &topic_name,
+                            partition,
+                            payload.as_bytes(),
+                        );
+                        correlation_id += 1;
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Fetch every partition in full and reconstruct each order_id's
+    // recovered event sequence.
+    let mut recovered: std::collections::HashMap<String, Vec<(usize, String)>> =
+        std::collections::HashMap::new();
+    for partition in 0..NUM_PARTITIONS {
+        let mut fetch_req = FetchRequest::default();
+        let mut fetch_topic = FetchTopic::default();
+        fetch_topic.topic = topic_name.clone();
+        let mut fetch_part = FetchPartition::default();
+        fetch_part.partition = partition;
+        fetch_part.fetch_offset = 0;
+        fetch_part.partition_max_bytes = 50_000_000;
+        fetch_topic.partitions.push(fetch_part);
+        fetch_req.topics.push(fetch_topic);
+        fetch_req.max_bytes = 50_000_000;
+
+        let fetch_resp: FetchResponse = send_request(
+            &mut admin,
+            ApiKey::Fetch,
+            11,
+            9000 + partition,
+            Some("verifier"),
+            &fetch_req,
+        );
+        let part_data = &fetch_resp.responses[0].partitions[0];
+        assert_eq!(part_data.error_code, 0, "fetch failed for partition {partition}");
+        let Some(records) = &part_data.records else { continue };
+        for payload in split_length_prefixed(records) {
+            let text = String::from_utf8(payload).unwrap();
+            let mut parts = text.splitn(3, '|');
+            let order_id = parts.next().unwrap().to_string();
+            let seq: usize = parts.next().unwrap().parse().unwrap();
+            let event = parts.next().unwrap().to_string();
+            recovered.entry(order_id).or_default().push((seq, event));
+        }
+    }
+
+    assert_eq!(recovered.len(), NUM_ORDERS, "every order_id should have a recovered sequence");
+    for order_id in &order_ids {
+        let seq = recovered.get(order_id).unwrap_or_else(|| panic!("missing {order_id}"));
+        assert_eq!(seq.len(), EVENTS.len(), "{order_id}: wrong event count: {seq:?}");
+        let recovered_seqs: Vec<usize> = seq.iter().map(|(s, _)| *s).collect();
+        let expected_seqs: Vec<usize> = (0..EVENTS.len()).collect();
+        assert_eq!(
+            recovered_seqs, expected_seqs,
+            "{order_id}: events arrived out of order: {seq:?}"
+        );
+        for (i, (_, event)) in seq.iter().enumerate() {
+            assert_eq!(event, EVENTS[i], "{order_id}: event {i} mismatch");
+        }
+    }
+
+    println!(
+        "verified strict per-key ordering for {NUM_ORDERS} orders ({} events each) across {NUM_PARTITIONS} partitions, produced by {NUM_THREADS} concurrent threads",
+        EVENTS.len()
+    );
+}
