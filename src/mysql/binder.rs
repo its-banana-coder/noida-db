@@ -141,7 +141,9 @@ impl Binder {
                         .unwrap_or(255);
                     ColumnType::Varchar(l)
                 }
-                DataType::Text | DataType::MediumText | DataType::LongText => ColumnType::Text,
+                DataType::Text | DataType::TinyText | DataType::MediumText | DataType::LongText => {
+                    ColumnType::Text
+                }
                 DataType::Float(_) => ColumnType::Float,
                 DataType::Double(_) => ColumnType::Double,
                 DataType::Decimal(exact) => {
@@ -386,8 +388,16 @@ impl Binder {
                     }
                     None => (None, None),
                 };
-                if !keys.is_empty() || limit.is_some() || offset.is_some() {
-                    source = Plan::Sort { source: Box::new(source), keys, limit, offset };
+                let calc_found_rows =
+                    select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
+                if !keys.is_empty() || limit.is_some() || offset.is_some() || calc_found_rows {
+                    source = Plan::Sort {
+                        source: Box::new(source),
+                        keys,
+                        limit,
+                        offset,
+                        calc_found_rows,
+                    };
                 }
 
                 let group_exprs: Vec<Expr> = match select.group_by {
@@ -647,6 +657,12 @@ impl Binder {
                     _ => unreachable!(),
                 };
                 Ok(Expr::Agg { func: agg_func, arg: Some(Box::new(arg)) })
+            }
+            "FOUND_ROWS" => {
+                if !args.is_empty() {
+                    return Err(MySqlError::unsupported("FOUND_ROWS argument list"));
+                }
+                Ok(Expr::FoundRows)
             }
             _ => Err(MySqlError::unsupported(&format!("function {name}"))),
         }
