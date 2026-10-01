@@ -115,6 +115,10 @@ name = "postgres_diff"
 required-features = ["postgres"]
 
 [[test]]
+name = "ecommerce_diff"
+required-features = ["postgres"]
+
+[[test]]
 name = "elasticsearch_diff"
 required-features = ["elasticsearch"]
 
