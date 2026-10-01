@@ -742,6 +742,32 @@ fn compute_agg(func: AggFunc, vals: &[Value]) -> Value {
     }
 }
 
+/// MySQL's lenient string-to-number coercion for a mixed-type comparison
+/// or arithmetic operand: parses the longest leading prefix of `s` that
+/// looks like a number (optional sign, digits, optional decimal point and
+/// more digits) and falls back to 0.0 for anything else, including empty
+/// input (e.g. `wp_posts.post_parent = 4` compared against a `Text`-typed
+/// "0"/"4" -- a real, common shape for WordPress's own generated SQL).
+/// Real MySQL only ever warns about this ("Truncated incorrect DOUBLE
+/// value"), it never aborts the query; this engine has no warnings
+/// channel to surface that softer signal through, so dropping the
+/// warning silently is the closest faithful behavior, not erroring
+/// outright.
+fn mysql_text_to_f64(s: &str) -> f64 {
+    let s = s.trim_start();
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        let ok = c.is_ascii_digit()
+            || (i == 0 && (c == '+' || c == '-'))
+            || (c == '.' && !s[..i].contains('.'));
+        if !ok {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    s[..end].parse::<f64>().unwrap_or(0.0)
+}
+
 /// Basic integer/float arithmetic. Only defined for the two numeric
 /// `Value` variants this engine's literal parser actually produces
 /// (`Int`/`Float`) — mixing in a float promotes the result to float,
@@ -750,6 +776,7 @@ fn eval_arith(op: ArithOp, l: Value, r: Value) -> Result<Value, MySqlError> {
     let as_f64 = |v: &Value| match v {
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) => Some(*f),
+        Value::Text(s) => Some(mysql_text_to_f64(s)),
         _ => None,
     };
     match (&l, &r) {
@@ -807,6 +834,7 @@ fn eval_compare(op: CmpOp, l: Value, r: Value) -> Result<Value, MySqlError> {
             let as_f64 = |v: &Value| match v {
                 Value::Int(i) => Some(*i as f64),
                 Value::Float(f) => Some(*f),
+                Value::Text(s) => Some(mysql_text_to_f64(s)),
                 _ => None,
             };
             match (as_f64(&l), as_f64(&r)) {
