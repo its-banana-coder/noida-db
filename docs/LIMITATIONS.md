@@ -587,7 +587,8 @@ is one implicit group, same as an aggregate in the `SELECT` list alone).
   never enforced — no duplicate-key rejection, no referential integrity,
   no real indexing. A table-level `PRIMARY KEY` is the one exception
   that's tracked (see above), though still not enforced as unique.
-- `ALTER TABLE`.
+- `ALTER TABLE`, `DROP TABLE` (found via `benchmarks/noidadb_bench.py`'s
+  own reset-between-runs logic hitting it).
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the
   first is executed).
 - `SHOW TABLES LIKE '...'` ignores the `LIKE` filter and returns every
