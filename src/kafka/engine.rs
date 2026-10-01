@@ -1718,38 +1718,38 @@ impl EngineState {
             return res;
         }
 
-        let Some(partitions) = self.txn_partitions.remove(&tx_id) else {
-            res.error_code = 48; // INVALID_TXN_STATE
-            return res;
-        };
+        if let Some(partitions) = self.txn_partitions.remove(&tx_id) {
+            let now = self.now_ms();
+            for (topic_name, p_id) in partitions {
+                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
+                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
 
-        let now = self.now_ms();
-        for (topic_name, p_id) in partitions {
-            let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
-            let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
-
-            // Only append a control batch if the transaction was genuinely active on this
-            // partition. If it was already force-aborted at shutdown, active_txns is empty
-            // and we must not append a contradictory commit marker.
-            let Some(first_offset) = part_state.active_txns.remove(&producer_id) else {
-                continue;
-            };
-
-            if !req.committed {
-                part_state.aborted_txns.push((producer_id, first_offset));
+                // Only append a control batch if the transaction was genuinely active on this
+                // partition. If it was already force-aborted at shutdown, active_txns is empty
+                // and a commit must be rejected with INVALID_TXN_STATE.
+                if let Some(first_offset) = part_state.active_txns.remove(&producer_id) {
+                    if !req.committed {
+                        part_state.aborted_txns.push((producer_id, first_offset));
+                    }
+                    let base_offset = part_state.high_watermark;
+                    let control_batch = encode_control_batch(
+                        producer_id,
+                        producer_epoch,
+                        base_offset,
+                        req.committed,
+                        now,
+                    );
+                    part_state.record_batches.push((base_offset, control_batch));
+                    part_state.high_watermark += 1;
+                } else if req.committed
+                    && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
+                {
+                    // This transaction was already force-aborted (e.g. by shutdown resolution).
+                    // A subsequent commit cannot succeed.
+                    res.error_code = 48; // INVALID_TXN_STATE
+                    return res;
+                }
             }
-
-            // Real Kafka appends a control batch (commit/abort marker)
-            // to every partition the transaction touched, advancing
-            // the log (and the LSO, once this partition has no other
-            // open transaction) past it — a read_committed fetch needs
-            // this offset to exist so the next fetch can move past
-            // where the transaction used to be pending.
-            let base_offset = part_state.high_watermark;
-            let control_batch =
-                encode_control_batch(producer_id, producer_epoch, base_offset, req.committed, now);
-            part_state.record_batches.push((base_offset, control_batch));
-            part_state.high_watermark += 1;
         }
 
         res.error_code = 0;
@@ -2547,7 +2547,6 @@ impl EngineState {
                 }
             }
         }
-        self.txn_partitions.clear();
     }
 
     /// Converts live state into the serializable `Snapshot` DTO.
