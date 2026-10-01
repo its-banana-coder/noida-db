@@ -18,9 +18,10 @@
 #   3. Creating a post via WP-CLI (`wp post create`).
 #   4. Adding a comment to that post via WP-CLI (`wp comment create`).
 #   5. Fetching the post back through WordPress's real REST API
-#      (`GET /wp-json/wp/v2/posts/<id>`) and asserting the real title/content
-#      round-tripped correctly — the actual "does noida-db's MySQL correctly
-#      serve a real production PHP app's query patterns" check.
+#      (`GET /index.php?rest_route=/wp/v2/posts/<id>`) and asserting the
+#      real title/content round-tripped correctly — the actual "does
+#      noida-db's MySQL correctly serve a real production PHP app's query
+#      patterns" check.
 #
 #   tests/apps/wordpress/run.sh
 #
@@ -252,20 +253,30 @@ echo "== starting php -S (WordPress site) on 127.0.0.1:$web_port"
 web_start=$(date +%s)
 # `index.php` as the router: without one, PHP's built-in server only
 # serves requests that map to a real file (or a directory's own
-# index.php/index.html) and 404s everything else -- it never falls back
-# to WordPress's own front controller, so pretty URLs like the REST API's
-# `/wp-json/` (there's no literal `wp-json/index.php` in a stock install)
-# can't be dispatched to WordPress at all. Passing `index.php` here makes
-# every request PHP can't resolve to a real file go through it instead,
-# which is what actually lets WordPress's own REQUEST_URI-based routing
-# (the same mechanism a real webserver's rewrite rules hand off to) work.
+# index.php/index.html) and 404s everything else, instead of falling back
+# to WordPress's own front controller for any pretty URL that doesn't
+# correspond to a real file on disk. This script's own REST API calls use
+# the `index.php?rest_route=...` query-string form specifically because
+# pretty `/wp-json/...` URLs aren't reliably dispatched by WordPress's
+# rewrite-rule matching under this server (see the REST API section
+# below), but other requests (admin-ajax.php, a real permalink, etc.)
+# still depend on this router for the same fallback reason.
 (cd "$site_dir" && php -S "127.0.0.1:$web_port" index.php >"$work/php-server.log" 2>&1) &
 php_pid=$!
 
 base="http://127.0.0.1:$web_port"
 up=""
 for i in $(seq 1 60); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" "$base/wp-json/" 2>/dev/null)
+  # index.php?rest_route=/ -- not /wp-json/: the pretty-URL rewrite rules
+  # WordPress's REST API registers (rest-api.php's rest_api_init()) aren't
+  # guaranteed to match under PHP's built-in server without a real flushed
+  # rewrite/.htaccess, and silently fall through to an ordinary front-end
+  # page render (HTTP 200, HTML, not JSON) when they don't -- a 200 here
+  # proved misleading in exactly that way. The query-string form is what
+  # WordPress's own REST responses advertise via their Link header
+  # (`rel="https://api.w.org/"`) as the one guaranteed to work regardless
+  # of permalink structure, so use that instead of guessing at pretty URLs.
+  code=$(curl -s -o /dev/null -w "%{http_code}" "$base/index.php?rest_route=/" 2>/dev/null)
   if [ "$code" = "200" ]; then
     up=1
     break
@@ -318,22 +329,14 @@ comment_id=$(wp comment create \
 echo "   comment created: id=$comment_id"
 
 # --- 5. fetch the post back via the real REST API ---------------------------
-# Trailing slash: under "Plain" permalinks (the default for a fresh
-# install), this is the REST API's own canonical URL for a singular
-# resource -- requesting it without one gets a 301 to the same URL with
-# the slash added. Requesting the canonical form directly instead of
-# following that redirect also avoids a real curl -L footgun: across a
-# redirect hop, curl appends each response's body to the same -o target
-# rather than truncating between hops, so the 301's (empty) body and the
-# 200's JSON body would otherwise land concatenated in one file.
-echo "== fetching post via REST API: GET /wp-json/wp/v2/posts/$post_id/"
-status=$(http_status "$work/rest-post.json" "$base/wp-json/wp/v2/posts/$post_id/")
-[ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET /wp-json/wp/v2/posts/$post_id/ (HTTP $status)"; }
-echo "-- diagnostic: HTTP $status, body is $(wc -c < "$work/rest-post.json") bytes, first 400 shown below with control chars visible"
-head -c 400 "$work/rest-post.json" | cat -A
-echo
-echo "-- diagnostic: response headers for the same request"
-curl -s -D - -o /dev/null "$base/wp-json/wp/v2/posts/$post_id/"
+# index.php?rest_route=... again, not a pretty /wp-json/... URL -- see the
+# readiness-check loop above for why: that pretty form was silently
+# falling through to an ordinary front-end page render (HTTP 200, full
+# HTML homepage, not JSON) instead of ever reaching the REST handler at
+# all, under PHP's built-in server with no real flushed rewrite rules.
+echo "== fetching post via REST API: GET /index.php?rest_route=/wp/v2/posts/$post_id"
+status=$(http_status "$work/rest-post.json" "$base/index.php?rest_route=/wp/v2/posts/$post_id")
+[ "$status" = "200" ] || { cat "$work/rest-post.json"; fail "GET rest_route=/wp/v2/posts/$post_id (HTTP $status)"; }
 rest_title=$(json_get "$work/rest-post.json" "d['title']['rendered']")
 rest_content=$(json_get "$work/rest-post.json" "d['content']['rendered']")
 [ "$rest_title" = "$post_title" ] || fail "REST API post title '$rest_title' != expected '$post_title'"
@@ -345,9 +348,9 @@ sys.exit(0 if expected in content else 1)
 " || fail "REST API post content did not contain the real posted content"
 echo "   REST API returned the real title and content for post $post_id"
 
-echo "== fetching post list via REST API: GET /wp-json/wp/v2/posts/"
-status=$(http_status "$work/rest-list.json" "$base/wp-json/wp/v2/posts/")
-[ "$status" = "200" ] || { cat "$work/rest-list.json"; fail "GET /wp-json/wp/v2/posts/ (HTTP $status)"; }
+echo "== fetching post list via REST API: GET /index.php?rest_route=/wp/v2/posts"
+status=$(http_status "$work/rest-list.json" "$base/index.php?rest_route=/wp/v2/posts")
+[ "$status" = "200" ] || { cat "$work/rest-list.json"; fail "GET rest_route=/wp/v2/posts (HTTP $status)"; }
 found=$(json_get "$work/rest-list.json" "1 if any(p['id'] == $post_id for p in d) else 0")
 [ "$found" = "1" ] || { cat "$work/rest-list.json"; fail "post $post_id not present in REST API post listing"; }
 echo "   post $post_id present in REST API post listing"
