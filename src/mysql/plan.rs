@@ -173,6 +173,15 @@ pub enum Plan {
         group_exprs: Vec<Expr>,
         exprs: Vec<Expr>,
         names: Vec<String>,
+        /// `HAVING`: evaluated per-group, the same way each of `exprs` is
+        /// (so it can reference an aggregate function or a grouped column
+        /// directly, e.g. `HAVING COUNT(*) > 2`), filtering out groups
+        /// where it's false/NULL -- same truthiness rule as `Filter`'s own
+        /// `WHERE` predicate. Referencing a `SELECT`-list alias instead of
+        /// repeating the aggregate expression (`HAVING cnt > 2` where
+        /// `cnt` is the projection's own alias) isn't resolved yet; only
+        /// a direct expression works.
+        having: Option<Expr>,
     },
     /// `ORDER BY`/`LIMIT`/`OFFSET`. Sits between the row source (`Scan`/
     /// `Filter`/`Join`) and the outer `Project`/`Aggregate`, evaluating

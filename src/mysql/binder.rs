@@ -454,8 +454,16 @@ impl Binder {
                     }
                 }
 
-                if !group_exprs.is_empty() || exprs.iter().any(contains_agg) {
-                    Ok(Plan::Aggregate { source: Box::new(source), group_exprs, exprs, names })
+                let having = select.having.map(|h| self.bind_expr(h)).transpose()?;
+
+                if !group_exprs.is_empty() || exprs.iter().any(contains_agg) || having.is_some() {
+                    Ok(Plan::Aggregate {
+                        source: Box::new(source),
+                        group_exprs,
+                        exprs,
+                        names,
+                        having,
+                    })
                 } else {
                     Ok(Plan::Project { source: Box::new(source), exprs, names })
                 }
