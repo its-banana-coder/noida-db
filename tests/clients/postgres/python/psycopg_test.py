@@ -192,6 +192,24 @@ def main():
         oid = conn.execute("SELECT 'jsonb'::regtype::oid").fetchone()[0]
         check("jsonb oid", oid, 3802)
 
+        # A *parameter* cast to regclass carries a relation name, resolved
+        # against the catalog -- SQLAlchemy's reflection compares an oid
+        # column against exactly this. Used to stay raw text and fail the
+        # implicit regclass->oid cast ("invalid input syntax for type oid").
+        rc = conn.execute(
+            "SELECT CAST(%s AS REGCLASS)", ("pg_catalog.pg_constraint",)
+        ).fetchone()[0]
+        check("regclass param prints as a name", rc, "pg_constraint")
+        n = conn.execute(
+            "SELECT count(*) FROM pg_class WHERE oid = CAST(%s AS REGCLASS)", ("people",)
+        ).fetchone()[0]
+        check("oid column = regclass param", n, 1)
+        try:
+            conn.execute("SELECT CAST(%s AS REGCLASS)", ("no_such_table",))
+            check("unknown regclass param errors", "no error", "UndefinedTable")
+        except psycopg.errors.UndefinedTable:
+            check("unknown regclass param errors", True, True)
+
         conn.execute("DROP TABLE items")
         conn.execute("DROP TABLE people")
 
