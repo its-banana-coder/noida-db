@@ -12,9 +12,10 @@ noida-db start --only redis,postgres
 noida-db start --redis-port 6380
 ```
 
-This release is **linux-x64 only** for now — the other platforms land once
-the project's own cross-platform build pipeline publishes them (see the
-main repo for status).
+Or without installing: `npx noida-db start`.
+
+Prebuilt for Linux (x64, arm64), macOS (Intel, Apple Silicon) and Windows
+(x64); npm installs the right one automatically.
 
 Full docs, compatibility matrix, benchmarks, and the complete list of what
 works today: **https://github.com/its-banana-coder/noida-db**

@@ -5,15 +5,22 @@ is the short summary — for exact workflow YAML, package layouts, and every
 tradeoff behind the choices below, see
 [docs/specs/release-binaries.md](specs/release-binaries.md).
 
-## Today
+## Install
 
-**From source** (works now, any platform with a Rust toolchain):
+Prebuilt binaries for 5 targets: Linux x64 and arm64, macOS Intel and
+Apple Silicon, Windows x64.
 
-```sh
-cargo install --path . --all-features
-```
+| Channel | Install |
+|---|---|
+| **npm** | `npm install -g noida-db` (or `npx noida-db start`) |
+| **PyPI** | `pip install noida-db` |
+| **Homebrew** | `brew install its-banana-coder/noida-db/noida-db` |
+| **crates.io** | `cargo install noida-db --all-features` (builds from source) |
+| **GitHub Releases** | an archive per target, with the binary inside |
+| **From source** | `cargo install --path . --all-features` |
 
-**Docker** (works now, a `Dockerfile` ships at the repo root):
+**Docker**: a `Dockerfile` ships at the repo root. The `Docker Publish`
+workflow pushes `ghcr.io/its-banana-coder/noida-db` on each release:
 
 ```sh
 docker build -t noida-db .
@@ -26,37 +33,17 @@ work (the binary's own CLI default is `127.0.0.1`, which is correct for a
 bare-metal dev tool but would make a container silently unreachable). Data
 persists to the `/home/noida/.noida-db` volume.
 
-## Status as of the `v0.1.0` release
+## How a release works
 
-| Channel | Status | Install |
-|---|---|---|
-| **crates.io** | Live | `cargo install noida-db --all-features` |
-| **npm** | Live (linux-x64 only for now) | `npm install -g noida-db` |
-| **Homebrew** | Tap repo exists, formula not published yet | — |
-| **PyPI** | Not published yet | — |
-| **Docker** | Works via local build; not published to a registry yet | `docker build -t noida-db .` (see above) |
-
-`.github/workflows/release.yml` builds all 5 platform targets and publishes
-crates.io/npm/PyPI/a Homebrew-formula PR automatically on any `v*.*.*` tag
-push. crates.io and npm's first release (`v0.1.0`) were published by hand
-from this sandbox instead, since it can only build the `linux-x64` target
-(no macOS toolchain, no Docker for cross-compiling aarch64) — the npm
-release is therefore **linux-x64 only**; the other 4 platform packages and
-a real PyPI/Homebrew release need the full CI workflow to actually run,
-which needs a few one-time account-level things only the project owner can
-set up:
-
-1. **`HOMEBREW_TAP_TOKEN`** repo secret — a GitHub PAT (repo scope) that
-   can push to `its-banana-coder/homebrew-noida-db` (already created). The
-   workflow's own `GITHUB_TOKEN` is scoped to this repo only and can't push
-   to a different one, even under the same account.
-2. **PyPI Trusted Publishing** — on pypi.org, Publishing → Trusted
-   Publishers → add a pending publisher for `noida-db` naming this repo,
-   the `release.yml` workflow filename, and the `publish-pip` job. OIDC-based,
-   no token to store or rotate.
-3. A real tag push (`git tag v0.2.0 && git push origin v0.2.0`, once
-   `Cargo.toml`'s version is bumped to match) to actually run the full
-   5-platform build and every publish job together.
+Bump `version` in `Cargo.toml`, merge, then push a matching tag
+(`git tag v0.1.4 && git push origin v0.1.4`).
+`.github/workflows/release.yml` checks the tag matches `Cargo.toml`, builds
+all 5 targets, then publishes crates.io, npm (one package per platform
+plus the `noida-db` meta package, whose `optionalDependencies` pick the
+right one), PyPI (Trusted Publishing), the GitHub Release, and opens a
+formula-update PR on `its-banana-coder/homebrew-noida-db` (merge it to
+update Homebrew). The tag also runs the `real-apps` and `Docker Publish`
+workflows.
 
 Full workflow YAML, every package layout, and the reasoning behind each
 choice: [docs/specs/release-binaries.md](specs/release-binaries.md).
