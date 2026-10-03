@@ -246,13 +246,16 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             continue;
                         }
                         let stmt = asts.remove(0);
-                        let mut binder = Binder::new(session.engine.current_db.clone());
+                        let mut binder =
+                            Binder::new(session.engine.current_db.clone()).with_sql(&sql);
                         match binder.bind_statement(stmt) {
                             Ok(plan) => {
                                 let stmt_id = session.stmt_id_counter;
                                 session.stmt_id_counter += 1;
 
-                                let num_params = plan::count_params(&plan) as u16;
+                                let num_params = plan::count_params(&plan)
+                                    .max(binder.placeholder_count())
+                                    as u16;
                                 let num_columns: u16 = 0; // Simplified
 
                                 session
@@ -705,10 +708,18 @@ fn send_binary_resultset(
     write_packet(stream, seq, &[cols as u8])?;
     seq = seq.wrapping_add(1);
 
+    // Each column is declared with its real type and its values encoded in
+    // that type's binary form. Found via testing before a public release:
+    // every column used to be declared VAR_STRING, so a prepared statement
+    // (mysql2's execute(), Go's database/sql, JDBC server-side prepares)
+    // got every integer, DATETIME and JSON value back as a string.
+    let mut types = Vec::with_capacity(cols);
     for i in 0..cols {
         let fallback = format!("col{i}");
         let name = names.get(i).filter(|n| n.as_str() != "?").unwrap_or(&fallback);
-        let coldef = column_def_packet(name, None); // force VAR_STRING typing
+        let sample = column_sample(&rows, i);
+        types.push(column_type_for(sample).0);
+        let coldef = column_def_packet(name, sample);
         write_packet(stream, seq, &coldef)?;
         seq = seq.wrapping_add(1);
     }
@@ -732,9 +743,9 @@ fn send_binary_resultset(
             }
         }
         row_payload.extend_from_slice(&bitmap);
-        for val in &row {
+        for (i, val) in row.iter().enumerate() {
             if !val.is_null() {
-                encode_lenenc_value(&mut row_payload, val);
+                encode_binary_value(&mut row_payload, types[i], val);
             }
         }
         write_packet(stream, seq, &row_payload)?;
@@ -912,5 +923,54 @@ fn write_lenenc_int(buf: &mut Vec<u8>, val: u64) {
     } else {
         buf.push(0xfe);
         buf.extend_from_slice(&val.to_le_bytes());
+    }
+}
+
+/// One non-NULL value in the binary result-row format for its column's
+/// declared `ty` (see `column_type_for`).
+fn encode_binary_value(out: &mut Vec<u8>, ty: u8, val: &Value) {
+    use crate::sql::datetime::{USECS_PER_DAY, ymd_from_date};
+    match (ty, val) {
+        (0x08, Value::Int(i)) => out.extend_from_slice(&i.to_le_bytes()),
+        (0x01, Value::Bool(b)) => out.push(u8::from(*b)),
+        (0x05, Value::Float(f)) => out.extend_from_slice(&f.to_le_bytes()),
+        (0x0a, Value::Date(d)) => {
+            let (y, m, d) = ymd_from_date(*d);
+            out.push(4);
+            out.extend_from_slice(&(y as u16).to_le_bytes());
+            out.extend_from_slice(&[m as u8, d as u8]);
+        }
+        (0x0c, Value::Ts(t)) => {
+            let (y, mo, d) = ymd_from_date(t.div_euclid(USECS_PER_DAY) as i32);
+            let us = t.rem_euclid(USECS_PER_DAY);
+            let (h, mi, s, frac) =
+                (us / 3_600_000_000, us / 60_000_000 % 60, us / 1_000_000 % 60, us % 1_000_000);
+            out.push(if frac == 0 { 7 } else { 11 });
+            out.extend_from_slice(&(y as u16).to_le_bytes());
+            out.extend_from_slice(&[mo as u8, d as u8, h as u8, mi as u8, s as u8]);
+            if frac != 0 {
+                out.extend_from_slice(&(frac as u32).to_le_bytes());
+            }
+        }
+        (0x0b, Value::Time(us)) => {
+            let neg = *us < 0;
+            let us = us.unsigned_abs();
+            let (days, rest) = (us / 86_400_000_000, us % 86_400_000_000);
+            let (h, mi, s, frac) = (
+                rest / 3_600_000_000,
+                rest / 60_000_000 % 60,
+                rest / 1_000_000 % 60,
+                rest % 1_000_000,
+            );
+            out.push(if frac == 0 { 8 } else { 12 });
+            out.push(u8::from(neg));
+            out.extend_from_slice(&(days as u32).to_le_bytes());
+            out.extend_from_slice(&[h as u8, mi as u8, s as u8]);
+            if frac != 0 {
+                out.extend_from_slice(&(frac as u32).to_le_bytes());
+            }
+        }
+        // DECIMAL, JSON, BLOB and strings: length-encoded bytes.
+        _ => encode_lenenc_value(out, val),
     }
 }

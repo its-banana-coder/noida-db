@@ -395,3 +395,51 @@ async fn implicit_transactions_and_per_connection_rollback() {
     drop(b);
     pool.disconnect().await.unwrap();
 }
+
+/// Prepared statements (the binary protocol: mysql2's execute(), Go's
+/// database/sql, JDBC server-side prepares). Found via testing before a
+/// public release: parameters were numbered in binding order rather than
+/// textual order (`SELECT ? ... WHERE id = ?` swapped them), a `?` in
+/// HAVING wasn't counted, `LIMIT ?` was rejected, and every result column
+/// came back as a string.
+#[tokio::test]
+async fn prepared_statement_parameters_and_binary_types() {
+    use mysql_async::Value as V;
+    let (pool, mut c) = connect().await;
+    c.query_drop(
+        "CREATE TABLE p (id INT PRIMARY KEY, name VARCHAR(10), qty INT, at DATETIME, price DECIMAL(6,2))",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO p VALUES (1, 'apple', 3, '2024-03-05 14:07:09', 9.99), \
+         (2, 'pear', NULL, NULL, 0.10), (3, 'fig', 7, NULL, 1.00)",
+    )
+    .await
+    .unwrap();
+
+    let r: Vec<(String, String)> =
+        c.exec("SELECT ? AS tag, name FROM p WHERE id = ?", ("x", 2)).await.unwrap();
+    assert_eq!(r, vec![("x".to_string(), "pear".to_string())]);
+
+    let r: Vec<String> = c
+        .exec("SELECT name FROM p GROUP BY name HAVING COUNT(*) >= ? ORDER BY name", (1,))
+        .await
+        .unwrap();
+    assert_eq!(r, vec!["apple", "fig", "pear"]);
+
+    let r: Vec<String> =
+        c.exec("SELECT name FROM p ORDER BY id LIMIT ? OFFSET ?", (1, 1)).await.unwrap();
+    assert_eq!(r, vec!["pear"]);
+
+    // Typed binary values, not strings.
+    let row: mysql_async::Row =
+        c.exec_first("SELECT id, qty, at, price FROM p WHERE id = ?", (1,)).await.unwrap().unwrap();
+    assert_eq!(row.as_ref(0), Some(&V::Int(1)));
+    assert_eq!(row.as_ref(1), Some(&V::Int(3)));
+    assert_eq!(row.as_ref(2), Some(&V::Date(2024, 3, 5, 14, 7, 9, 0)));
+    assert_eq!(row.as_ref(3), Some(&V::Bytes(b"9.99".to_vec())));
+
+    drop(c);
+    pool.disconnect().await.unwrap();
+}

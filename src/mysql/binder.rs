@@ -21,11 +21,44 @@ pub struct Binder {
     /// order — matching how `COM_STMT_EXECUTE` lays out bound parameter
     /// values on the wire.
     param_counter: usize,
+    /// Every `?`'s (line, column) in the statement's text, in textual
+    /// order. A placeholder's parameter index is its rank here, not the
+    /// order the binder happens to visit it in -- found via testing before
+    /// a public release: the SELECT list is bound before WHERE but HAVING
+    /// after GROUP BY, so `SELECT ? ... WHERE id = ?` swapped its
+    /// parameters and silently matched the wrong rows.
+    placeholder_at: Vec<(u64, u64)>,
 }
 
 impl Binder {
     pub fn new(current_db: Option<String>) -> Self {
-        Self { current_db, prepared_types: HashMap::new(), param_counter: 0 }
+        Self {
+            current_db,
+            prepared_types: HashMap::new(),
+            param_counter: 0,
+            placeholder_at: Vec::new(),
+        }
+    }
+
+    /// How many `?` placeholders the statement's text has (0 without
+    /// `with_sql`) -- the parameter count a prepared statement reports.
+    pub fn placeholder_count(&self) -> usize {
+        self.placeholder_at.len()
+    }
+
+    /// Numbers placeholders by their position in `sql` (see
+    /// `placeholder_at`). Without it, they're numbered in binding order.
+    pub fn with_sql(mut self, sql: &str) -> Self {
+        use sqlparser::tokenizer::{Token, Tokenizer};
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        if let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() {
+            self.placeholder_at = tokens
+                .iter()
+                .filter(|t| matches!(t.token, Token::Placeholder(_)))
+                .map(|t| (t.span.start.line, t.span.start.column))
+                .collect();
+        }
+        self
     }
 
     pub fn bind_statement(&mut self, stmt: Statement) -> Result<Plan, MySqlError> {
@@ -560,13 +593,13 @@ impl Binder {
         &mut self,
         order_by: Vec<sqlparser::ast::OrderByExpr>,
         limit: Option<AstExpr>,
-    ) -> Result<(OrderKeys, Option<u64>), MySqlError> {
+    ) -> Result<(OrderKeys, Option<Expr>), MySqlError> {
         let mut order = Vec::new();
         for item in order_by {
             let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
             order.push((self.bind_expr(item.expr)?, asc));
         }
-        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
+        let limit = limit.map(|e| self.bind_count(e)).transpose()?;
         Ok((order, limit))
     }
 
@@ -732,12 +765,14 @@ impl Binder {
                         if !limit_by.is_empty() {
                             return Err(MySqlError::unsupported("LIMIT BY"));
                         }
-                        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
-                        let offset = offset.as_ref().map(|o| expr_to_u64(&o.value)).transpose()?;
+                        let limit = limit.map(|e| self.bind_count(e)).transpose()?;
+                        let offset = offset.map(|o| self.bind_count(o.value)).transpose()?;
                         (limit, offset)
                     }
                     Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                        (Some(expr_to_u64(&limit)?), Some(expr_to_u64(&offset)?))
+                        // `LIMIT offset, count`: bind in textual order.
+                        let offset = self.bind_count(offset)?;
+                        (Some(self.bind_count(limit)?), Some(offset))
                     }
                     None => (None, None),
                 };
@@ -893,8 +928,12 @@ impl Binder {
             }
             AstExpr::Value(sqlparser::ast::ValueWithSpan {
                 value: AstValue::Placeholder(_),
-                ..
+                span,
             }) => {
+                let at = (span.start.line, span.start.column);
+                if let Ok(rank) = self.placeholder_at.binary_search(&at) {
+                    return Ok(Expr::Param(rank));
+                }
                 let idx = self.param_counter;
                 self.param_counter += 1;
                 Ok(Expr::Param(idx))
@@ -1392,14 +1431,24 @@ impl Binder {
 /// Extracts a `LIMIT`/`OFFSET` value: real MySQL only accepts a plain
 /// non-negative integer literal there (no expressions, no placeholders),
 /// so this rejects anything else rather than trying to evaluate it.
-fn expr_to_u64(expr: &AstExpr) -> Result<u64, MySqlError> {
-    if let AstExpr::Value(sqlparser::ast::ValueWithSpan { value: AstValue::Number(s, _), .. }) =
-        expr
-        && let Ok(n) = s.parse::<u64>()
-    {
-        return Ok(n);
+impl Binder {
+    /// A LIMIT/OFFSET: a non-negative integer literal or a `?`. Found via
+    /// testing before a public release: `LIMIT ?` (how every Node/Go/JDBC
+    /// app paginates with a prepared statement) was rejected.
+    fn bind_count(&mut self, expr: AstExpr) -> Result<Expr, MySqlError> {
+        match &expr {
+            AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                value: AstValue::Number(s, _), ..
+            }) if s.parse::<u64>().is_ok() => {
+                Ok(Expr::Const(Value::Int(s.parse::<i64>().unwrap_or(i64::MAX))))
+            }
+            AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                value: AstValue::Placeholder(_),
+                ..
+            }) => self.bind_expr(expr),
+            _ => Err(MySqlError::syntax_error("LIMIT/OFFSET must be an integer or ?")),
+        }
     }
-    Err(MySqlError::unsupported("LIMIT/OFFSET value"))
 }
 
 /// `CURRENT_TIMESTAMP`, `CURRENT_TIMESTAMP()`, `NOW()`, `LOCALTIMESTAMP`,

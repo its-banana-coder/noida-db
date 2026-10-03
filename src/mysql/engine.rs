@@ -338,7 +338,7 @@ impl Engine {
             _ => {}
         }
 
-        let mut binder = Binder::new(self.current_db.clone());
+        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql);
         let plan = binder.bind_statement(stmt)?;
         self.last_column_names = {
             let state = self.db.lock().unwrap();

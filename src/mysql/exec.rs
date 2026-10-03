@@ -441,7 +441,8 @@ impl Executor {
             Plan::Update { db, table, assignments, selection, order, limit } => {
                 let mut work = self.load_table(&db, &table)?;
                 let keys = work.keys();
-                let targets = self.dml_targets(&work, selection.as_ref(), &order, limit)?;
+                let targets =
+                    self.dml_targets(&work, selection.as_ref(), &order, limit.as_ref())?;
                 for &i in &targets {
                     self.apply_assignments(&mut work, i, &assignments)?;
                     if let Some((_, k)) = find_key_conflict(&work, &keys, &work.rows[i], Some(i)) {
@@ -454,7 +455,8 @@ impl Executor {
             }
             Plan::Delete { db, table, selection, order, limit } => {
                 let mut work = self.load_table(&db, &table)?;
-                let targets = self.dml_targets(&work, selection.as_ref(), &order, limit)?;
+                let targets =
+                    self.dml_targets(&work, selection.as_ref(), &order, limit.as_ref())?;
                 let mut keep = vec![true; work.rows.len()];
                 for &i in &targets {
                     keep[i] = false;
@@ -550,6 +552,8 @@ impl Executor {
                 Ok(out_rows)
             }
             Plan::Finish { source, order, hidden, distinct, limit, offset, calc_found_rows } => {
+                let limit = limit.map(|e| self.count(&e)).transpose()?;
+                let offset = offset.map(|e| self.count(&e)).transpose()?;
                 let mut rows = self.execute_plan(*source)?;
                 let key_index = |row: &[Value], key: &SortKey| match key {
                     SortKey::Output(i) => *i,
@@ -675,6 +679,20 @@ impl Executor {
         }
     }
 
+    /// A LIMIT/OFFSET value: a literal, or a bound `?` (drivers send it as
+    /// an integer or a numeric string).
+    fn count(&self, e: &Expr) -> Result<u64, MySqlError> {
+        match self.eval_expr(e, &[], None)? {
+            Value::Int(n) if n >= 0 => Ok(n as u64),
+            Value::Text(t) if t.trim().parse::<u64>().is_ok() => Ok(t.trim().parse().unwrap()),
+            v => Err(MySqlError::new(
+                1210,
+                "HY000",
+                format!("Incorrect arguments to LIMIT: {}", render_text(&v)),
+            )),
+        }
+    }
+
     fn load_table(&self, db: &str, table: &str) -> Result<Table, MySqlError> {
         let state = self.db.lock().unwrap();
         if let Some(t) = crate::mysql::infoschema::lookup_table(&state, db, table) {
@@ -710,8 +728,9 @@ impl Executor {
         t: &Table,
         selection: Option<&Expr>,
         order: &[(Expr, bool)],
-        limit: Option<u64>,
+        limit: Option<&Expr>,
     ) -> Result<Vec<usize>, MySqlError> {
+        let limit = limit.map(|e| self.count(e)).transpose()?;
         let mut targets = Vec::new();
         for (i, row) in t.rows.iter().enumerate() {
             if let Some(sel) = selection {
