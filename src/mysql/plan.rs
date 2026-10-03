@@ -204,6 +204,9 @@ pub enum Plan {
     Scan {
         db: String,
         table: String,
+        /// `FROM orders o`: the name this table's columns are qualified by
+        /// in a join (`o.id`), instead of the table's own name.
+        alias: Option<String>,
     },
     Join {
         left: Box<Plan>,
@@ -491,10 +494,38 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
 /// already treats as "no better name" the same way it does `"?"`).
 fn source_table(plan: &Plan, db: &DbState) -> Option<std::sync::Arc<Table>> {
     match plan {
-        Plan::Scan { db: db_name, table } => {
+        Plan::Scan { db: db_name, table, .. } => {
             crate::mysql::infoschema::lookup_table(db, db_name, table)
         }
         Plan::Filter { source, .. } | Plan::Finish { source, .. } => source_table(source, db),
         _ => None,
+    }
+}
+
+/// Rebuilds `e` bottom-up, passing every `ColName` through `f`.
+pub fn map_colnames(e: Expr, f: &dyn Fn(String) -> Expr) -> Expr {
+    let m = |x: Expr| map_colnames(x, f);
+    let mb = |x: Box<Expr>| Box::new(map_colnames(*x, f));
+    match e {
+        Expr::ColName(n) => f(n),
+        Expr::And(v) => Expr::And(v.into_iter().map(m).collect()),
+        Expr::Or(v) => Expr::Or(v.into_iter().map(m).collect()),
+        Expr::Compare { op, left, right } => Expr::Compare { op, left: mb(left), right: mb(right) },
+        Expr::Arith { op, left, right } => Expr::Arith { op, left: mb(left), right: mb(right) },
+        Expr::Call { name, args } => Expr::Call { name, args: args.into_iter().map(m).collect() },
+        Expr::Agg { func, arg, distinct } => Expr::Agg { func, arg: arg.map(mb), distinct },
+        Expr::InList { expr, list, negated } => {
+            Expr::InList { expr: mb(expr), list: list.into_iter().map(m).collect(), negated }
+        }
+        Expr::Not(x) => Expr::Not(mb(x)),
+        Expr::IsNull(x, neg) => Expr::IsNull(mb(x), neg),
+        Expr::Like { expr, pattern, escape, negated } => {
+            Expr::Like { expr: mb(expr), pattern: mb(pattern), escape: mb(escape), negated }
+        }
+        Expr::Case { conditions, else_result } => Expr::Case {
+            conditions: conditions.into_iter().map(|(c, r)| (m(c), m(r))).collect(),
+            else_result: else_result.map(mb),
+        },
+        other => other,
     }
 }

@@ -65,7 +65,19 @@ impl Executor {
     /// to `Value::Null` instead of erroring or working.
     fn resolve_table_context(&self, plan: &Plan) -> Result<Option<Table>, MySqlError> {
         match plan {
-            Plan::Scan { db, table } => Ok(Some(self.load_table(db, table)?)),
+            Plan::Scan { db, table, alias } => {
+                let mut t = self.load_table(db, table)?;
+                // Found via a differential test against real MySQL before a
+                // public release: joins qualified columns by table name
+                // only, so `oi.product_id` (alias `oi`) never matched and
+                // fell back to the *other* table's `product_id` -- turning
+                // `JOIN ... ON oi.product_id = p.product_id` into a
+                // cartesian product.
+                if let Some(a) = alias {
+                    t.name = a.clone();
+                }
+                Ok(Some(t))
+            }
             Plan::Filter { source, .. } => self.resolve_table_context(source),
             Plan::Project { source, .. } => self.resolve_table_context(source),
             Plan::Finish { source, .. } => self.resolve_table_context(source),
@@ -453,7 +465,7 @@ impl Executor {
                 self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
-            Plan::Scan { db, table } => Ok(self.load_table(&db, &table)?.rows),
+            Plan::Scan { db, table, .. } => Ok(self.load_table(&db, &table)?.rows),
             Plan::Filter { source, predicate } => {
                 let table_context = self.resolve_table_context(&source)?;
 
@@ -781,7 +793,7 @@ impl Executor {
             Expr::Col(i) => Ok(row.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::FoundRows => Ok(Value::Int(self.last_found_rows as i64)),
             Expr::ColName(name) => match table {
-                Some(t) => match resolve_column_index(&t.columns, name) {
+                Some(t) => match resolve_column(t, name)? {
                     Some(idx) => Ok(row.get(idx).cloned().unwrap_or(Value::Null)),
                     // Found via testing before a public release: a mistyped
                     // column used to evaluate to NULL, so `WHERE nosuch = 1`
@@ -1936,5 +1948,50 @@ fn column_default_text(col: &Column) -> Option<String> {
     match &col.default {
         None | Some(Value::Null) => None,
         Some(v) => Some(render_text(v)),
+    }
+}
+
+/// Resolves a column reference in an expression the way MySQL does:
+/// `t.col` must name a column of table (or alias) `t`; a bare `col` must be
+/// unique across the joined tables (error 1052 if it's in more than one).
+/// `None` means no such column (the caller reports 1054).
+fn resolve_column(t: &Table, sought: &str) -> Result<Option<usize>, MySqlError> {
+    let cols = &t.columns;
+    if let Some(i) =
+        cols.iter().position(|c| c.name == sought || c.name.eq_ignore_ascii_case(sought))
+    {
+        return Ok(Some(i));
+    }
+    let is_join = cols.iter().any(|c| c.name.contains('.'));
+    match sought.rsplit_once('.') {
+        // Qualified: in a single-table context the qualifier must be that
+        // table (or its alias); in a join, the exact-name match above was
+        // the only way to match.
+        Some((q, col)) => {
+            let q = q.rsplit('.').next().unwrap_or(q);
+            if is_join || !(q.eq_ignore_ascii_case(&t.name)) {
+                return Ok(None);
+            }
+            Ok(cols.iter().position(|c| c.name.eq_ignore_ascii_case(col)))
+        }
+        None => {
+            let matches: Vec<usize> = cols
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.name.rsplit('.').next().unwrap_or(&c.name).eq_ignore_ascii_case(sought)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            match matches.as_slice() {
+                [] => Ok(None),
+                [i] => Ok(Some(*i)),
+                _ => Err(MySqlError::new(
+                    1052,
+                    "23000",
+                    format!("Column '{sought}' in field list is ambiguous"),
+                )),
+            }
+        }
     }
 }

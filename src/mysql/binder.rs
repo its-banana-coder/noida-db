@@ -479,23 +479,28 @@ impl Binder {
         if !table.joins.is_empty() {
             return Err(MySqlError::unsupported("multi-table UPDATE"));
         }
-        let (db, table_name) = match &table.relation {
-            TableFactor::Table { name, .. } => self.resolve_table_name(name)?,
+        let (db, table_name, alias) = match &table.relation {
+            TableFactor::Table { name, alias, .. } => {
+                let (db, t) = self.resolve_table_name(name)?;
+                (db, t, alias.as_ref().map(|a| a.name.value.clone()))
+            }
             _ => return Err(MySqlError::unsupported("update target")),
         };
+        let alias = alias.as_deref();
 
         let mut out_assignments = Vec::new();
         for a in assignments {
             let col_name = assignment_column(&a.target)?;
-            let expr = self.bind_expr(a.value)?;
+            let expr = strip_alias(self.bind_expr(a.value)?, alias);
             out_assignments.push((col_name, expr));
         }
 
         let sel = match selection {
-            Some(expr) => Some(self.bind_expr(expr)?),
+            Some(expr) => Some(strip_alias(self.bind_expr(expr)?, alias)),
             None => None,
         };
         let (order, limit) = self.bind_dml_order_limit(order_by, limit)?;
+        let order = order.into_iter().map(|(e, asc)| (strip_alias(e, alias), asc)).collect();
 
         Ok(Plan::Update {
             db,
@@ -517,16 +522,21 @@ impl Binder {
         if from.len() != 1 || !from[0].joins.is_empty() {
             return Err(MySqlError::unsupported("multi-table DELETE"));
         }
-        let (db, table_name) = match &from[0].relation {
-            TableFactor::Table { name, .. } => self.resolve_table_name(name)?,
+        let (db, table_name, alias) = match &from[0].relation {
+            TableFactor::Table { name, alias, .. } => {
+                let (db, t) = self.resolve_table_name(name)?;
+                (db, t, alias.as_ref().map(|a| a.name.value.clone()))
+            }
             _ => return Err(MySqlError::unsupported("delete target")),
         };
+        let alias = alias.as_deref();
 
         let sel = match selection {
-            Some(expr) => Some(self.bind_expr(expr)?),
+            Some(expr) => Some(strip_alias(self.bind_expr(expr)?, alias)),
             None => None,
         };
         let (order, limit) = self.bind_dml_order_limit(order_by, limit)?;
+        let order = order.into_iter().map(|(e, asc)| (strip_alias(e, alias), asc)).collect();
 
         Ok(Plan::Delete { db, table: table_name, selection: sel, order, limit })
     }
@@ -812,9 +822,10 @@ impl Binder {
             {
                 Ok(Plan::Dummy)
             }
-            TableFactor::Table { name, .. } => {
+            TableFactor::Table { name, alias, .. } => {
                 let (db, table) = self.resolve_table_name(name)?;
-                Ok(Plan::Scan { db, table })
+                let alias = alias.as_ref().map(|a| a.name.value.clone());
+                Ok(Plan::Scan { db, table, alias })
             }
             _ => Err(MySqlError::unsupported("table factor")),
         }
@@ -1444,29 +1455,22 @@ fn assignment_column(target: &sqlparser::ast::AssignmentTarget) -> Result<String
 
 /// `new.col` (an `INSERT ... AS new` row alias) -> `VALUES(col)`.
 fn row_alias_to_values(e: Expr, alias: &str) -> Expr {
-    let f = |x: Expr| row_alias_to_values(x, alias);
-    let fb = |x: Box<Expr>| Box::new(row_alias_to_values(*x, alias));
-    match e {
-        Expr::ColName(ref n) => match n.split_once('.') {
-            Some((a, col)) if a.eq_ignore_ascii_case(alias) => Expr::Call {
-                name: "VALUES".to_string(),
-                args: vec![Expr::ColName(col.to_string())],
-            },
-            _ => e,
-        },
-        Expr::And(v) => Expr::And(v.into_iter().map(f).collect()),
-        Expr::Or(v) => Expr::Or(v.into_iter().map(f).collect()),
-        Expr::Compare { op, left, right } => Expr::Compare { op, left: fb(left), right: fb(right) },
-        Expr::Arith { op, left, right } => Expr::Arith { op, left: fb(left), right: fb(right) },
-        Expr::Call { name, args } => Expr::Call { name, args: args.into_iter().map(f).collect() },
-        Expr::Not(x) => Expr::Not(fb(x)),
-        Expr::IsNull(x, neg) => Expr::IsNull(fb(x), neg),
-        Expr::Case { conditions, else_result } => Expr::Case {
-            conditions: conditions.into_iter().map(|(c, r)| (f(c), f(r))).collect(),
-            else_result: else_result.map(fb),
-        },
-        other => other,
-    }
+    crate::mysql::plan::map_colnames(e, &|n| match n.split_once('.') {
+        Some((a, col)) if a.eq_ignore_ascii_case(alias) => {
+            Expr::Call { name: "VALUES".to_string(), args: vec![Expr::ColName(col.to_string())] }
+        }
+        _ => Expr::ColName(n),
+    })
+}
+
+/// `UPDATE users u ... WHERE u.id = 1`: drops the single target table's
+/// alias qualifier, leaving the plain column name.
+fn strip_alias(e: Expr, alias: Option<&str>) -> Expr {
+    let Some(alias) = alias else { return e };
+    crate::mysql::plan::map_colnames(e, &|n| match n.split_once('.') {
+        Some((a, col)) if a.eq_ignore_ascii_case(alias) => Expr::ColName(col.to_string()),
+        _ => Expr::ColName(n),
+    })
 }
 
 /// `ORDER BY` keys as (expression, ascending).

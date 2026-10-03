@@ -290,3 +290,62 @@ async fn json_enum_and_introspection() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// Found by the differential suite against real MySQL: table aliases were
+/// ignored, so `JOIN order_items oi ON oi.product_id = p.product_id`
+/// compared `p.product_id` with itself and every join was a cartesian
+/// product.
+#[tokio::test]
+async fn table_aliases_in_joins_and_dml() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE products (product_id INT PRIMARY KEY, name VARCHAR(20))")
+        .await
+        .unwrap();
+    c.query_drop("CREATE TABLE order_items (item_id INT PRIMARY KEY, product_id INT, qty INT)")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO products VALUES (1, 'lamp'), (2, 'desk')").await.unwrap();
+    c.query_drop("INSERT INTO order_items VALUES (10, 1, 3), (11, 1, 4), (12, 2, 1)")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &mut c,
+            "SELECT p.name, SUM(oi.qty) AS units FROM products p \
+             JOIN order_items oi ON oi.product_id = p.product_id \
+             GROUP BY p.name ORDER BY units DESC"
+        )
+        .await,
+        vec![vec![s("lamp"), s("7")], vec![s("desk"), s("1")]]
+    );
+    // A bare column that both sides have is ambiguous, as in MySQL.
+    assert_eq!(
+        err_code(
+            &mut c,
+            "SELECT product_id FROM products p JOIN order_items oi ON oi.product_id = p.product_id"
+        )
+        .await,
+        1052
+    );
+    // Once aliased, the table's own name no longer qualifies its columns.
+    assert_eq!(
+        err_code(
+            &mut c,
+            "SELECT products.name FROM products p JOIN order_items oi ON oi.product_id = p.product_id"
+        )
+        .await,
+        1054
+    );
+
+    assert_eq!(
+        affected(&mut c, "UPDATE order_items oi SET oi.qty = oi.qty + 1 WHERE oi.item_id = 12")
+            .await,
+        1
+    );
+    assert_eq!(one(&mut c, "SELECT qty FROM order_items WHERE item_id = 12").await, s("2"));
+    assert_eq!(affected(&mut c, "DELETE FROM order_items oi WHERE oi.product_id = 2").await, 1);
+
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
