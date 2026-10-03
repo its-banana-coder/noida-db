@@ -902,3 +902,152 @@ async fn test_mysql_create_database_and_index() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// Found via extensive real-client testing before a public release: every
+/// JOIN's ON condition was evaluated with no table context at all, so
+/// every column reference inside it resolved to NULL unconditionally --
+/// the condition was therefore always NULL, never true, and every single
+/// JOIN (of any kind) silently returned the wrong result (INNER: always
+/// empty; LEFT: always every left row with the right side all-NULL) with
+/// no error. This is likely the single most severe bug found this
+/// session -- JOIN is about as fundamental to SQL as it gets.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_joins_resolve_columns_correctly() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("CREATE TABLE join_customers (id INT, name VARCHAR(50))").await.unwrap();
+    conn.query_drop("CREATE TABLE join_orders (id INT, customer_id INT, amount INT)")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO join_customers VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO join_orders VALUES (1, 1, 100), (2, 1, 50), (3, 2, 75)")
+        .await
+        .unwrap();
+
+    // Plain, bare JOIN (no INNER keyword) -- a separate AST node from
+    // `INNER JOIN`, and was entirely unhandled on its own before this fix.
+    let mut rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT join_customers.name, join_orders.amount FROM join_customers JOIN join_orders ON join_customers.id = join_orders.customer_id",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("alice".to_string(), 50), ("alice".to_string(), 100), ("bob".to_string(), 75),]
+    );
+
+    // INNER JOIN, explicit keyword.
+    let mut rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT join_customers.name, join_orders.amount FROM join_customers INNER JOIN join_orders ON join_customers.id = join_orders.customer_id",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows.len(), 3);
+
+    // LEFT JOIN: carol has no orders, must still appear with NULL amount.
+    let mut rows: Vec<(String, Option<i64>)> = conn
+        .query(
+            "SELECT join_customers.name, join_orders.amount FROM join_customers LEFT JOIN join_orders ON join_customers.id = join_orders.customer_id",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), Some(50)),
+            ("alice".to_string(), Some(100)),
+            ("bob".to_string(), Some(75)),
+            ("carol".to_string(), None),
+        ]
+    );
+
+    // The critical regression: both tables have their own `id` column.
+    // Before this fix, a qualified reference to either side's `id`
+    // silently resolved to whichever table's `id` happened to come first
+    // in the join, regardless of which one was actually named.
+    let mut rows: Vec<(i64, i64, i64, String)> = conn
+        .query(
+            "SELECT join_orders.id, join_orders.customer_id, join_customers.id, join_customers.name FROM join_customers JOIN join_orders ON join_customers.id = join_orders.customer_id",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 1, 1, "alice".to_string()),
+            (2, 1, 1, "alice".to_string()),
+            (3, 2, 2, "bob".to_string()),
+        ]
+    );
+
+    // RIGHT JOIN -- every order preserved, matched to its real customer
+    // (this specifically exercises the side-swap implementation, which
+    // would silently produce garbage without the qualifier fix above).
+    let mut rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT join_customers.name, join_orders.amount FROM join_customers RIGHT JOIN join_orders ON join_customers.id = join_orders.customer_id",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("alice".to_string(), 50), ("alice".to_string(), 100), ("bob".to_string(), 75),]
+    );
+
+    // GROUP BY/aggregate over a joined table -- the same table-context
+    // resolution feeds Plan::Aggregate too, not just Project/Filter.
+    let mut rows: Vec<(String, i64)> = conn
+        .query(
+            "SELECT join_customers.name, SUM(join_orders.amount) FROM join_customers JOIN join_orders ON join_customers.id = join_orders.customer_id GROUP BY join_customers.name",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(rows, vec![("alice".to_string(), 150), ("bob".to_string(), 75)]);
+
+    // Three-way join, every table sharing an `id` column -- the deepest
+    // case the qualifier fix needs to keep working (incremental merge of
+    // an already-qualified context with a third table).
+    conn.query_drop("CREATE TABLE join_items (id INT, order_id INT, sku VARCHAR(20))")
+        .await
+        .unwrap();
+    conn.query_drop("INSERT INTO join_items VALUES (1, 1, 'A1'), (2, 1, 'A2'), (3, 3, 'B1')")
+        .await
+        .unwrap();
+    let mut rows: Vec<(String, i64, String)> = conn
+        .query(
+            "SELECT join_customers.name, join_items.id, join_items.sku FROM join_customers \
+             JOIN join_orders ON join_customers.id = join_orders.customer_id \
+             JOIN join_items ON join_orders.id = join_items.order_id",
+        )
+        .await
+        .unwrap();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("alice".to_string(), 1, "A1".to_string()),
+            ("alice".to_string(), 2, "A2".to_string()),
+            ("bob".to_string(), 3, "B1".to_string()),
+        ]
+    );
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}

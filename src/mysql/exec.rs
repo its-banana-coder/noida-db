@@ -1,4 +1,4 @@
-use crate::mysql::catalog::{DbState, Table};
+use crate::mysql::catalog::{Column, DbState, Table};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, JoinOp, Plan};
 use crate::mysql::types::Value;
@@ -66,6 +66,11 @@ impl Executor {
             Plan::Filter { source, .. } => self.resolve_table_context(source),
             Plan::Project { source, .. } => self.resolve_table_context(source),
             Plan::Sort { source, .. } => self.resolve_table_context(source),
+            Plan::Join { left, right, .. } => {
+                let l = self.resolve_table_context(left)?;
+                let r = self.resolve_table_context(right)?;
+                Ok(merge_table_contexts(l, r))
+            }
             _ => Ok(None),
         }
     }
@@ -485,6 +490,20 @@ impl Executor {
                 Ok(rows)
             }
             Plan::Join { left, right, op } => {
+                // Found via testing before a public release: every join's
+                // ON condition used to be evaluated with no table context
+                // at all (`eval_expr(&cond, &row, None)`), so every column
+                // reference inside it resolved to NULL unconditionally --
+                // meaning the condition was always NULL, never true, and
+                // every single JOIN (of any kind) silently returned the
+                // wrong result (INNER: always empty; LEFT: always every
+                // left row with the right side all-NULL) with no error at
+                // all. Resolving column names needs *both* sides' columns
+                // in scope, concatenated the same way the row itself is
+                // (`left columns ++ right columns`), not just one table's.
+                let l_table = self.resolve_table_context(&left)?;
+                let r_table = self.resolve_table_context(&right)?;
+                let join_table = merge_table_contexts(l_table, r_table);
                 let l_rows = self.execute_plan(*left)?;
                 let r_rows = self.execute_plan(*right)?;
                 let mut out_rows = Vec::new();
@@ -504,7 +523,7 @@ impl Executor {
                             for r in &r_rows {
                                 let mut row = l.clone();
                                 row.extend(r.clone());
-                                let val = self.eval_expr(&cond, &row, None)?;
+                                let val = self.eval_expr(&cond, &row, join_table.as_ref())?;
                                 if !val.is_null() && val != Value::Int(0) {
                                     out_rows.push(row);
                                 }
@@ -518,7 +537,7 @@ impl Executor {
                             for r in &r_rows {
                                 let mut row = l.clone();
                                 row.extend(r.clone());
-                                let val = self.eval_expr(&cond, &row, None)?;
+                                let val = self.eval_expr(&cond, &row, join_table.as_ref())?;
                                 if !val.is_null() && val != Value::Int(0) {
                                     out_rows.push(row);
                                     matched = true;
@@ -550,7 +569,7 @@ impl Executor {
             Expr::FoundRows => Ok(Value::Int(self.last_found_rows as i64)),
             Expr::ColName(name) => {
                 if let Some(t) = table
-                    && let Some(idx) = t.columns.iter().position(|c| c.name == *name)
+                    && let Some(idx) = resolve_column_index(&t.columns, name)
                 {
                     return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
                 }
@@ -855,6 +874,75 @@ fn mysql_text_to_f64(s: &str) -> f64 {
         end = i + c.len_utf8();
     }
     s[..end].parse::<f64>().unwrap_or(0.0)
+}
+
+/// Builds the combined column list a joined row's `ColName` lookups
+/// resolve against: the left side's real columns followed by the right
+/// side's, in the same order `Plan::Join`'s own execution concatenates the
+/// two rows (`left_row ++ right_row`) -- so a column's position in this
+/// synthetic `Table` always matches its position in the actual row data.
+/// Only the `columns` field is ever read back off the result (`rows` and
+/// `next_auto_increment` are meaningless for it), so those are left at
+/// `Table::new`'s own empty defaults.
+///
+/// Each merged column is renamed to `"<source table>.<column>"` (using
+/// the real table each side's `Table::name` carries), *not* left as its
+/// own bare name -- found via testing before a public release:
+/// `cust.id`/`orders.id` across a join both resolving by bare name to
+/// whichever table's `id` happened to come first, regardless of which one
+/// was actually named, silently returned the wrong table's value. Because
+/// `resolve_column_index` tries an exact match against the sought name
+/// before ever falling back to a bare-suffix match, a genuinely qualified
+/// reference (which the binder now always preserves in full, see its own
+/// `AstExpr::CompoundIdentifier` comment) matches its real column exactly;
+/// only a genuinely unqualified, genuinely ambiguous bare reference
+/// (uncommon, and real MySQL itself rejects it as ambiguous rather than
+/// picking one) still falls back to "whichever comes first".
+fn merge_table_contexts(left: Option<Table>, right: Option<Table>) -> Option<Table> {
+    match (left, right) {
+        (Some(l), Some(r)) => {
+            // A three-or-more-way join merges incrementally (this join's
+            // own left/right context may itself already be a previously
+            // merged, already-qualified "__join__" table) -- skip
+            // re-qualifying a column whose name is already qualified, so
+            // a chain of merges never produces a doubly-qualified name
+            // like `"__join__.a.x"` that would silently stop matching
+            // its own exact-qualified lookup.
+            let qualify = |t: Table| -> Vec<Column> {
+                t.columns
+                    .into_iter()
+                    .map(|mut c| {
+                        if !c.name.contains('.') {
+                            c.name = format!("{}.{}", t.name, c.name);
+                        }
+                        c
+                    })
+                    .collect()
+            };
+            let mut columns = qualify(l);
+            columns.extend(qualify(r));
+            Some(Table::new("__join__".to_string(), columns))
+        }
+        _ => None,
+    }
+}
+
+/// Resolves a (possibly qualified, e.g. `"orders.amount"`) column name
+/// against `columns`. Tries an exact match first -- the only way a
+/// reference to one specific side of a join (whose merged column list has
+/// every name qualified, see `merge_table_contexts`) finds *that* table's
+/// column instead of silently aliasing to whichever table's
+/// same-named column happens to come first. Falls back to matching by the
+/// last dot-separated component on both sides, so a plain unqualified
+/// reference (`"amount"`) still finds a qualified column (`"orders.amount"`)
+/// and a qualified reference against an ordinary single-table context
+/// (whose columns are never qualified) still finds its bare column.
+fn resolve_column_index(columns: &[Column], sought: &str) -> Option<usize> {
+    if let Some(idx) = columns.iter().position(|c| c.name == sought) {
+        return Some(idx);
+    }
+    let sought_last = sought.rsplit('.').next().unwrap_or(sought);
+    columns.iter().position(|c| c.name.rsplit('.').next().unwrap_or(&c.name) == sought_last)
 }
 
 /// Coerces a `Value` to a plain string the way `CONCAT`/`UPPER`/`LOWER`/
