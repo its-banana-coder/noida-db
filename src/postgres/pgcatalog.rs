@@ -334,6 +334,13 @@ fn system_relations() -> impl Iterator<Item = (&'static str, u32, char, u32)> {
     })
 }
 
+/// Every system relation as `(oid, schema oid, name)`, for rendering a
+/// `regclass` value that names a catalog relation (`pg_constraint`) instead
+/// of printing its bare OID.
+pub fn system_relation_names() -> impl Iterator<Item = (u32, u32, &'static str)> {
+    system_relations().map(|(name, oid, _, schema)| (oid, schema, name))
+}
+
 /// The schema oid of the table, view, index, sequence or catalog relation `oid`.
 pub fn relation_namespace(db: &DbState, oid: u32) -> Option<u32> {
     db.relation_name(oid)

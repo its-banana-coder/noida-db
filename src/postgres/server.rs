@@ -898,6 +898,7 @@ fn do_bind(
         )
     })?;
     let formats = &b.parameter_format_codes;
+    let search_path = session.rt.settings.search_path(&session.rt.user);
     let mut values = vec![];
     for (i, raw) in b.parameters.iter().enumerate() {
         let ty = prep.param_types.get(i).copied().unwrap_or(Type::TEXT);
@@ -922,7 +923,29 @@ fn do_bind(
                         now: session.rt.now,
                         zone: &session.rt.settings.fmt().zone,
                     };
-                    types::from_text(s, ty, &dctx)?
+                    // `regclass`/`regtype`/... text input is a *name*
+                    // (`'pg_catalog.pg_constraint'`), resolved against the
+                    // catalog -- which `types::from_text` can't see, so it
+                    // leaves these as raw text. The binder already resolves
+                    // a literal (`'x'::regclass`) at plan time; a parameter
+                    // only gets its value here, so resolve it here the same
+                    // way. Without this, `oid_col = CAST($1 AS regclass)`
+                    // (SQLAlchemy's own reflection query) handed the raw
+                    // name to the implicit regclass->oid cast, which failed
+                    // with "invalid input syntax for type oid".
+                    if ty.is_reg() && !ty.array {
+                        let name = s.to_string();
+                        let user = session.rt.user.clone();
+                        let oid = engine.with_db(session, |db| {
+                            super::pgcatalog::resolve_reg(db, &search_path, &user, ty.base, &name)
+                        });
+                        match oid {
+                            Some(o) => Value::Int(o),
+                            None => return Err(super::pgcatalog::undefined_reg(ty.base, &name)),
+                        }
+                    } else {
+                        types::from_text(s, ty, &dctx)?
+                    }
                 }
             }
         });
@@ -937,7 +960,6 @@ fn do_bind(
             ),
         ));
     }
-    let _ = engine;
     session.portals.insert(
         portal_name,
         Portal {

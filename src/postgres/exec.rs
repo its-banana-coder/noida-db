@@ -413,6 +413,11 @@ fn reg_names(ctx: &Ctx) -> types::RegNames {
 /// Names `reg*` values print as: identifiers quoted the way Postgres does.
 pub fn build_reg_names(db: &DbState, user: &str, path: &[String]) -> types::RegNames {
     let mut r = types::RegNames::default();
+    // Catalog relations first, so a user object can never be shadowed by
+    // one (OIDs don't collide in practice, but user objects should win).
+    for (oid, schema, name) in super::pgcatalog::system_relation_names() {
+        r.class.insert(oid, db.regclass_text(schema, name, path));
+    }
     for t in db.tables.values() {
         r.class.insert(t.oid, db.regclass_text(t.schema, &t.name, path));
         for i in &t.indexes {
