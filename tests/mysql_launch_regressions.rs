@@ -443,3 +443,69 @@ async fn prepared_statement_parameters_and_binary_types() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// Migration tools (Django, Rails, Laravel, Alembic) all ALTER tables;
+/// every ALTER used to be rejected. Also savepoints (Django's nested
+/// `atomic()`) and the functions Django probes.
+#[tokio::test]
+async fn alter_table_savepoints_and_django_probes() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE a (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(10))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO a (name) VALUES ('x'), ('y')").await.unwrap();
+    c.query_drop("ALTER TABLE a ADD COLUMN qty INT NOT NULL DEFAULT 5 AFTER id").await.unwrap();
+    assert_eq!(
+        rows(&mut c, "SELECT * FROM a WHERE id = 1").await,
+        vec![vec![s("1"), s("5"), s("x")]]
+    );
+    c.query_drop("ALTER TABLE a MODIFY name VARCHAR(50) NOT NULL").await.unwrap();
+    c.query_drop("ALTER TABLE a CHANGE qty quantity BIGINT NOT NULL").await.unwrap();
+    c.query_drop("ALTER TABLE a RENAME COLUMN name TO title").await.unwrap();
+    c.query_drop("ALTER TABLE a ADD UNIQUE KEY uq_title (title)").await.unwrap();
+    assert_eq!(err_code(&mut c, "INSERT INTO a (quantity, title) VALUES (1, 'x')").await, 1062);
+    // A UNIQUE key over existing duplicates is refused and changes nothing.
+    c.query_drop("INSERT INTO a (quantity, title) VALUES (5, 'z')").await.unwrap();
+    assert_eq!(err_code(&mut c, "ALTER TABLE a ADD UNIQUE (quantity)").await, 1062);
+    c.query_drop("ALTER TABLE a DROP INDEX uq_title").await.unwrap();
+    c.query_drop("INSERT INTO a (quantity, title) VALUES (1, 'x')").await.unwrap();
+    c.query_drop("ALTER TABLE a ALTER COLUMN quantity SET DEFAULT 9").await.unwrap();
+    c.query_drop("ALTER TABLE a ADD CONSTRAINT fk FOREIGN KEY (quantity) REFERENCES b (id)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE a DROP COLUMN quantity").await.unwrap();
+    c.query_drop("ALTER TABLE a RENAME TO items").await.unwrap();
+    assert_eq!(
+        rows(
+            &mut c,
+            "SELECT COLUMN_NAME FROM information_schema.columns WHERE table_name = 'items'"
+        )
+        .await,
+        vec![vec![s("id")], vec![s("title")]]
+    );
+    c.query_drop("CREATE UNIQUE INDEX one_title ON items (title, id)").await.unwrap();
+
+    c.query_drop("SET autocommit = 0").await.unwrap();
+    c.query_drop("INSERT INTO items (title) VALUES ('keep')").await.unwrap();
+    c.query_drop("SAVEPOINT s1").await.unwrap();
+    c.query_drop("INSERT INTO items (title) VALUES ('drop')").await.unwrap();
+    c.query_drop("ROLLBACK TO SAVEPOINT s1").await.unwrap();
+    c.query_drop("RELEASE SAVEPOINT s1").await.unwrap();
+    c.query_drop("COMMIT").await.unwrap();
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT GROUP_CONCAT(title ORDER BY title) FROM items WHERE title IN ('keep', 'drop')"
+        )
+        .await,
+        s("keep")
+    );
+    assert_eq!(
+        one(&mut c, "SELECT CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL").await,
+        s("1")
+    );
+    assert_eq!(one(&mut c, "SELECT JSON_CONTAINS('[1, 2, 3]', '2')").await, s("1"));
+
+    drop(c);
+    pool.disconnect().await.unwrap();
+}

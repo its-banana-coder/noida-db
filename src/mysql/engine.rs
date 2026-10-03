@@ -1,5 +1,5 @@
 use crate::mysql::binder::Binder;
-use crate::mysql::catalog::DbState;
+use crate::mysql::catalog::{DbState, Table, TxUndo};
 use crate::mysql::error::MySqlError;
 use crate::mysql::exec::Executor;
 use crate::mysql::plan::{self, Plan};
@@ -7,6 +7,7 @@ use crate::mysql::types::Value;
 use sqlparser::ast::{ShowStatementFilter, Statement};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -48,7 +49,13 @@ pub struct Engine {
     pub autocommit: bool,
     /// Whether a transaction is open (explicit BEGIN, or implicit).
     pub in_tx: bool,
+    /// Open savepoints, oldest first: each name with the tables the
+    /// transaction had written by then, as they stood at the savepoint.
+    savepoints: Vec<(String, TableImages)>,
 }
+
+/// Tables as they stood at a savepoint, by (database, table).
+type TableImages = BTreeMap<(String, String), Arc<Table>>;
 
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -65,6 +72,7 @@ impl Default for Engine {
             conn_id: NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             autocommit: true,
             in_tx: false,
+            savepoints: Vec::new(),
         }
     }
 }
@@ -129,6 +137,73 @@ impl Engine {
             self.db.lock().unwrap().open_txns.remove(&self.conn_id);
         }
         self.in_tx = false;
+        self.savepoints.clear();
+    }
+
+    /// `SAVEPOINT name`: remembers how every table the transaction has
+    /// written so far stands now (a table first written later is undone
+    /// back to its own pre-image). Django's nested `atomic()` uses these.
+    fn savepoint(&mut self, name: &str) {
+        if !self.in_tx && !self.autocommit {
+            self.in_tx = true;
+        }
+        if !self.in_tx {
+            return;
+        }
+        let state = self.db.lock().unwrap();
+        let tables: BTreeMap<_, _> = state
+            .open_txns
+            .get(&self.conn_id)
+            .map(|u| {
+                u.tables
+                    .keys()
+                    .filter_map(|(db, t)| {
+                        let cur = state.schemas.get(db)?.tables.get(t)?.clone();
+                        Some(((db.clone(), t.clone()), cur))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(state);
+        self.savepoints.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self.savepoints.push((name.to_string(), tables));
+    }
+
+    /// `ROLLBACK TO SAVEPOINT name`: undoes the writes made since it.
+    fn rollback_to(&mut self, name: &str) -> Result<(), MySqlError> {
+        let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(name))
+        else {
+            return Err(MySqlError::new(1305, "42000", format!("SAVEPOINT {name} does not exist")));
+        };
+        self.savepoints.truncate(pos + 1);
+        let at = self.savepoints[pos].1.clone();
+        let mut state = self.db.lock().unwrap();
+        let Some(undo) = state.open_txns.get(&self.conn_id).cloned() else { return Ok(()) };
+        // Tables written before the savepoint go back to how they stood
+        // then; tables first written after it, to their pre-transaction
+        // image (and leave the undo log).
+        let partial = TxUndo {
+            tables: undo
+                .tables
+                .iter()
+                .map(|(k, (before, ours))| {
+                    (
+                        k.clone(),
+                        (at.get(k).cloned().unwrap_or_else(|| before.clone()), ours.clone()),
+                    )
+                })
+                .collect(),
+        };
+        state.undo(&partial);
+        let mut kept = undo;
+        kept.tables.retain(|k, _| at.contains_key(k));
+        for (k, entry) in kept.tables.iter_mut() {
+            if let Some(now) = state.schemas.get(&k.0).and_then(|s| s.tables.get(&k.1)) {
+                entry.1 = now.clone();
+            }
+        }
+        state.open_txns.insert(self.conn_id, kept);
+        Ok(())
     }
 
     /// Transaction bookkeeping before a plan runs (shared with the
@@ -142,6 +217,7 @@ impl Engine {
             | Plan::DropTable { .. }
             | Plan::Truncate { .. }
             | Plan::CreateDatabase { .. }
+            | Plan::AlterTable { .. }
             | Plan::CreateIndex { .. } => {
                 self.commit();
                 None
@@ -323,7 +399,35 @@ impl Engine {
                 self.last_column_names = ["Level", "Code", "Message"].map(String::from).to_vec();
                 return Ok(vec![]);
             }
+            Statement::Savepoint { name } => {
+                self.savepoint(&name.value);
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
+            Statement::ReleaseSavepoint { name } => {
+                let Some(pos) =
+                    self.savepoints.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(&name.value))
+                else {
+                    return Err(MySqlError::new(
+                        1305,
+                        "42000",
+                        format!("SAVEPOINT {} does not exist", name.value),
+                    ));
+                };
+                self.savepoints.truncate(pos);
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
+            Statement::Rollback { savepoint: Some(name), .. } => {
+                self.rollback_to(&name.value)?;
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
             Statement::Rollback { .. } => {
+                self.savepoints.clear();
                 {
                     let mut state = self.db.lock().unwrap();
                     if let Some(undo) = state.open_txns.remove(&self.conn_id) {

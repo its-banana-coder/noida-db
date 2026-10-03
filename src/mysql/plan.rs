@@ -221,6 +221,12 @@ pub enum Plan {
         if_not_exists: bool,
     },
     /// `DROP TABLE [IF EXISTS] a, b`.
+    /// `ALTER TABLE t op, op, ...`.
+    AlterTable {
+        db: String,
+        table: String,
+        ops: Vec<AlterOp>,
+    },
     DropTable {
         tables: Vec<(String, String)>,
         if_exists: bool,
@@ -246,6 +252,8 @@ pub enum Plan {
         table: String,
         columns: Vec<String>,
         if_not_exists: bool,
+        /// `CREATE UNIQUE INDEX name ...` (enforced, like a UNIQUE key).
+        unique: Option<String>,
     },
     Insert {
         db: String,
@@ -537,4 +545,50 @@ pub fn map_colnames(e: Expr, f: &dyn Fn(String) -> Expr) -> Expr {
         },
         other => other,
     }
+}
+
+/// Where `ADD`/`MODIFY`/`CHANGE` put a column: `FIRST` or `AFTER col`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColumnPos {
+    First,
+    After(String),
+}
+
+/// One `ALTER TABLE` operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterOp {
+    AddColumn {
+        col: Column,
+        unique: Vec<UniqueKey>,
+        pos: Option<ColumnPos>,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    /// `MODIFY col def` (same name) or `CHANGE old new def`.
+    ReplaceColumn {
+        old: String,
+        col: Column,
+        unique: Vec<UniqueKey>,
+        pos: Option<ColumnPos>,
+    },
+    RenameColumn {
+        old: String,
+        new: String,
+    },
+    RenameTable(String),
+    AddUnique(UniqueKey),
+    AddPrimaryKey(Vec<String>),
+    DropKey(String),
+    DropPrimaryKey,
+    SetDefault {
+        col: String,
+        default: Option<Value>,
+        now: bool,
+    },
+    AutoIncrement(i64),
+    /// Accepted and ignored: foreign keys, plain indexes, ALGORITHM/LOCK.
+    Noop,
 }

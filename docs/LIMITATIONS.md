@@ -535,8 +535,10 @@ back, all as in MySQL. OK/EOF packets report `SERVER_STATUS_IN_TRANS` and
 connection's writes: tables nobody else touched get their pre-transaction
 contents back, and in a table another connection also wrote meanwhile,
 only this transaction's own row changes are reversed. `AUTO_INCREMENT` is
-not rolled back (as in MySQL). There is no isolation: uncommitted writes
-are visible to other connections immediately, and there are no savepoints.
+not rolled back (as in MySQL). `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and
+`RELEASE SAVEPOINT` work (Django's nested `atomic()`). There is no
+isolation: uncommitted writes are visible to other connections
+immediately.
 
 `OK` packets now report a real `affected_rows` count for
 `INSERT`/`UPDATE`/`DELETE` (a client's `.affected_rows()` — e.g.
@@ -612,12 +614,16 @@ DOUBLE|DATE|DATETIME|TIME|JSON)`; `NOW()` and its synonyms, `CURDATE()`,
 `d + INTERVAL n unit`, `DATEDIFF`, `TIMESTAMPDIFF`/`TIMESTAMPADD`,
 `UNIX_TIMESTAMP`, `FROM_UNIXTIME`; `JSON_EXTRACT`, `->`, `->>`,
 `JSON_UNQUOTE`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALID`, `JSON_TYPE`,
-`JSON_LENGTH`; `DATABASE()`, `USER()`, `VERSION()`, `CONNECTION_ID()`,
+`JSON_LENGTH`, `JSON_CONTAINS`, `JSON_CONTAINS_PATH`, `JSON_KEYS`;
+`CONVERT_TZ`; `DATABASE()`, `USER()`, `VERSION()`, `CONNECTION_ID()`,
 `LAST_INSERT_ID()`, `FOUND_ROWS()`. An unknown function is an error,
 never a silent NULL.
 
-DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF
-EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
+DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `ALTER TABLE`
+(`ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME COLUMN`, `RENAME TO`, `ADD`/`DROP`
+`UNIQUE`/`PRIMARY KEY`/`INDEX`, `ALTER COLUMN SET`/`DROP DEFAULT`,
+`AUTO_INCREMENT =`; foreign keys accepted, not enforced), `CREATE [UNIQUE]
+INDEX`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
 [LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
 DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
 `SET` (accepted, no effect), and `information_schema.SCHEMATA`/`TABLES`/
@@ -629,12 +635,12 @@ migration tools query.
   above).
 - Subqueries (`IN (SELECT ...)`, `EXISTS`, scalar subqueries, derived
   tables), CTEs (`WITH`), `UNION`, window functions, and `REGEXP`.
-- `ALTER TABLE`, and multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
+- Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
 - `FOREIGN KEY` constraints are accepted but not enforced (no
   referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
   `FULLTEXT` declarations are accepted and ignored; nothing is indexed.
-- Isolation levels and savepoints: other connections see a transaction's
-  uncommitted writes immediately (a rollback still undoes them).
+- Isolation levels: other connections see a transaction's uncommitted
+  writes immediately (a rollback still undoes them).
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the
   first is executed).
 - JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions
