@@ -147,12 +147,15 @@ Every service is its own module:
 
 ### MySQL (port 3306)
 - **In scope:**
-  - Shares the SQL engine with Postgres, with the MySQL dialect on top:
-    backtick quoting, `AUTO_INCREMENT`, `ON DUPLICATE KEY UPDATE`, `SHOW`
-    commands, `information_schema`, and MySQL's comparison and type
-    conversion rules.
-  - Login: `caching_sha2_password` and `mysql_native_password`.
-  - Connector/J, Hibernate, Flyway and mysql2 working.
+  - Its own SQL engine (sharing the date/time, numeric and JSON pieces
+    with Postgres) with the MySQL dialect: backtick quoting,
+    `AUTO_INCREMENT`, `ON DUPLICATE KEY UPDATE`, `SHOW` commands,
+    `information_schema`, and MySQL's comparison and type conversion rules.
+  - Login: `mysql_native_password` today (any password accepted);
+    `caching_sha2_password` is a target.
+  - Drivers and ORMs: verified with mysql_async, pymysql, SQLAlchemy,
+    Django, mysql2, Go `database/sql` + GORM and Connector/J; Hibernate and
+    Flyway are targets.
 - **Out of scope (for now):** stored procedures, triggers, multiple storage
   engines, replication.
 
