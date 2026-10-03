@@ -886,7 +886,19 @@ impl Executor {
                 } else if name.eq_ignore_ascii_case("socket") {
                     Ok(Value::Text("/tmp/mysql.sock".to_string()))
                 } else {
-                    Ok(Value::Text("".to_string()))
+                    // Everything else `SHOW VARIABLES` knows (`@@sql_mode`,
+                    // `@@character_set_server`, `@@transaction_isolation`,
+                    // ...), numbers as numbers; otherwise empty, never an
+                    // error -- drivers probe many variables on connect.
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    Ok(crate::mysql::engine::SESSION_VARIABLES
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(bare))
+                        .map(|(_, v)| match v.parse::<i64>() {
+                            Ok(n) => Value::Int(n),
+                            Err(_) => Value::Text(v.to_string()),
+                        })
+                        .unwrap_or_else(|| Value::Text(String::new())))
                 }
             }
             Expr::Not(e) => {

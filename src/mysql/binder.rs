@@ -28,6 +28,8 @@ pub struct Binder {
     /// after GROUP BY, so `SELECT ? ... WHERE id = ?` swapped its
     /// parameters and silently matched the wrong rows.
     placeholder_at: Vec<(u64, u64)>,
+    /// The statement's text (see `with_sql`), for labeling result columns.
+    sql: String,
 }
 
 impl Binder {
@@ -37,6 +39,7 @@ impl Binder {
             prepared_types: HashMap::new(),
             param_counter: 0,
             placeholder_at: Vec::new(),
+            sql: String::new(),
         }
     }
 
@@ -58,7 +61,85 @@ impl Binder {
                 .map(|t| (t.span.start.line, t.span.start.column))
                 .collect();
         }
+        self.sql = sql.to_string();
         self
+    }
+
+    /// An expression's text exactly as written in the statement: from its
+    /// parse span's start (1-based line/column, in characters) to the end
+    /// of the select item -- the next top-level `,` or clause keyword,
+    /// skipping over parentheses and quoted strings. (The span's own end
+    /// stops short of a function call's closing parenthesis.)
+    fn source_text(&self, e: &AstExpr) -> Option<String> {
+        use sqlparser::ast::Spanned;
+        if let AstExpr::Value(sqlparser::ast::ValueWithSpan {
+            value: AstValue::SingleQuotedString(s) | AstValue::DoubleQuotedString(s),
+            ..
+        }) = e
+        {
+            return Some(s.clone()); // MySQL labels a string literal by its value
+        }
+        if let AstExpr::UnaryOp { op: UnaryOperator::Minus, expr } = e {
+            return self.source_text(expr).map(|t| format!("-{t}"));
+        }
+        let span = e.span();
+        if self.sql.is_empty() || span.start.line == 0 {
+            return None;
+        }
+        let mut start = 0usize;
+        for (i, l) in self.sql.split('\n').enumerate() {
+            if i + 1 == span.start.line as usize {
+                start += (span.start.column as usize).saturating_sub(1);
+                break;
+            }
+            start += l.chars().count() + 1;
+        }
+        let chars: Vec<char> = self.sql.chars().collect();
+        let (mut depth, mut quote, mut end) = (0i32, None::<char>, chars.len());
+        let mut k = start;
+        while k < chars.len() {
+            let c = chars[k];
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '\'' | '"' | '`' => quote = Some(c),
+                    '(' => depth += 1,
+                    ')' if depth == 0 => {
+                        end = k;
+                        break;
+                    }
+                    ')' => depth -= 1,
+                    ',' | ';' if depth == 0 => {
+                        end = k;
+                        break;
+                    }
+                    c if depth == 0 && c.is_whitespace() => {
+                        let rest: String =
+                            chars[k..].iter().take(12).collect::<String>().to_ascii_uppercase();
+                        let rest = rest.trim_start();
+                        if [
+                            "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTO",
+                            "FOR", "WINDOW",
+                        ]
+                        .iter()
+                        .any(|kw| {
+                            rest.starts_with(kw)
+                                && !rest[kw.len()..]
+                                    .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                        }) {
+                            end = k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            k += 1;
+        }
+        let text: String = chars.get(start..end)?.iter().collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
     }
 
     pub fn bind_statement(&mut self, stmt: Statement) -> Result<Plan, MySqlError> {
@@ -640,21 +721,19 @@ impl Binder {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
                             // Real MySQL labels an unaliased plain column
-                            // reference with the column's own name (this is
-                            // the overwhelmingly common case real apps hit:
-                            // `SELECT option_name, option_value FROM
-                            // wp_options`), and labels anything else with
-                            // the expression's own source text -- not
-                            // replicated here (`"?"` stays as a placeholder
-                            // for those), since it needs the original SQL
-                            // slice, not just the parsed AST.
+                            // reference with the column's own name, and
+                            // anything else with the expression's source
+                            // text exactly as written (`count(*)`, `1`,
+                            // `price * 2`) -- what `row['COUNT(*)']`-style
+                            // code reads. Found via testing before a public
+                            // release: those used to be labeled `col0`.
                             let name = match &expr {
                                 AstExpr::Identifier(ident) => ident.value.clone(),
                                 AstExpr::CompoundIdentifier(idents) => idents
                                     .last()
                                     .map(|i| i.value.clone())
                                     .unwrap_or_else(|| "?".to_string()),
-                                _ => "?".to_string(),
+                                other => self.source_text(other).unwrap_or_else(|| "?".to_string()),
                             };
                             exprs.push(self.bind_expr(expr)?);
                             names.push(name);

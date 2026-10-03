@@ -132,7 +132,11 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
         stmt_param_types: HashMap::new(),
     };
 
-    // Send Handshake. Capability flags (lower 2 bytes `\xdf\xf7` = 0xf7df,
+    // Send Handshake: protocol 10, server version "8.0.33" -- the same
+    // version `SELECT VERSION()`/`@@version` report. Found via testing
+    // before a public release: the greeting used to claim
+    // "5.5.5-10.4.22-MariaDB", so SQLAlchemy, Doctrine and Prisma (which
+    // read it) chose their MariaDB SQL dialects. Capability flags (lower 2 bytes `\xdf\xf7` = 0xf7df,
     // upper 2 bytes `\x0f\x00` = 0x000f) advertise everything this server
     // actually does *except* CLIENT_SSL (0x0800), CLIENT_COMPRESS (0x0020)
     // and CLIENT_SSL_VERIFY_SERVER_CERT / CLIENT_REMEMBER_OPTIONS (upper
@@ -141,7 +145,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     // client whose default is "use SSL if the server offers it" (pymysql,
     // the stock `mysql` CLI's `--ssl-mode=PREFERRED`) started a TLS
     // handshake against a plaintext server and failed to connect at all.
-    let handshake = b"\x0a\x35\x2e\x35\x2e\x35\x2d\x31\x30\x2e\x34\x2e\x32\x32\x2d\x4d\x61\x72\x69\x61\x44\x42\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xdf\xf7\x21\x02\x00\x0f\x00\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
+    let handshake = b"\x0a\x38\x2e\x30\x2e\x33\x33\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xdf\xf7\x21\x02\x00\x0f\x00\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
     let mut header = [0u8; 4];
     header[0..3].copy_from_slice(&(handshake.len() as u32).to_le_bytes()[0..3]);
     header[3] = 0;

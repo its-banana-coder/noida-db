@@ -375,7 +375,7 @@ impl Engine {
 /// `SELECT @@var` already returns for the names `Executor` knows (version
 /// `8.0.33`, `max_allowed_packet`, `wait_timeout`, ...), so a driver that
 /// reads the same setting both ways sees one consistent answer.
-const SESSION_VARIABLES: &[(&str, &str)] = &[
+pub(crate) const SESSION_VARIABLES: &[(&str, &str)] = &[
     ("auto_increment_increment", "1"),
     ("auto_increment_offset", "1"),
     ("autocommit", "ON"),

@@ -491,13 +491,13 @@ A real unsupported statement now gets a real MySQL `ERR` packet
 (previously a silent `OK`, indistinguishable from "0 rows, no error").
 
 Result sets report real column names in the wire column-definition
-packets (a bare column reference is labeled with the column's own name,
-an alias with the alias) — what lets a real client fetch a row by column
-name (PHP's `mysqli`/`$wpdb`, PDO's associative fetch mode, any ORM's
-row hydration) rather than only by position. A genuinely unaliased
-non-column expression (a literal, a function call, arithmetic — real
-MySQL labels these with their own source SQL text) still falls back to
-a synthesized name, not yet reconstructed from the original SQL.
+packets, labeled the way MySQL labels them: a column by its name, an
+alias by the alias, and any other expression by its source text exactly
+as written (`count(*)`, `price * 2`; a string literal by its value). That
+is what lets a client fetch a row by column name (PHP's `$row['COUNT(*)']`,
+PDO's associative fetch mode, any ORM's row hydration). Prepared-statement
+(binary protocol) results carry real column types too: integers, doubles,
+DATE/DATETIME/TIME in their binary forms, DECIMAL and JSON as text.
 
 Prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`) support
 real parameter binding: `EXECUTE`'s null-bitmap and (when sent —
