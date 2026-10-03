@@ -140,7 +140,7 @@ matching what Postgres's Gitea/Miniflux entries already show.
 - Do not block the protocol/client-bootstrap milestones on a fully-built
   binder/executor. Implement a small bootstrap executor for constant
   selects, `SET`, `SHOW`, `USE` and catalog probes first (this is also
-  where the existing review findings in `docs/mysql-handoff.md` apply —
+  where the earlier review findings (in the now-removed `docs/mysql-handoff.md`; see git history) apply —
   fix those before building further on top of them), then build out the
   real binder/executor per 2.2.
 
