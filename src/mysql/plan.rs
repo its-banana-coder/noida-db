@@ -1,4 +1,4 @@
-use super::catalog::{DbState, Table};
+use super::catalog::{DbState, Table, UniqueKey};
 use super::types::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -32,6 +32,8 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `GROUP_CONCAT`; its argument is a `GROUP_CONCAT` call (see the binder).
+    GroupConcat,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -51,7 +53,7 @@ pub enum Expr {
     /// most recent query that used it, on this connection, persisting
     /// across intervening statements the same way MySQL's own
     /// `LAST_INSERT_ID()` does (a real SQL function, not the wire
-    /// protocol field). See `Plan::Sort`'s `calc_found_rows` and
+    /// protocol field). See `Plan::Finish`'s `calc_found_rows` and
     /// `Executor::last_found_rows`.
     FoundRows,
     And(Vec<Expr>),
@@ -73,6 +75,9 @@ pub enum Expr {
     Agg {
         func: AggFunc,
         arg: Option<Box<Expr>>,
+        /// `COUNT(DISTINCT x)`, `SUM(DISTINCT x)`, ...: duplicates among the
+        /// group's non-NULL values are dropped before aggregating.
+        distinct: bool,
     },
     SysVar(String),
     /// `expr [NOT] IN (list...)`. Real MySQL's three-valued semantics:
@@ -134,6 +139,31 @@ pub fn contains_agg(expr: &Expr) -> bool {
     }
 }
 
+/// Where a `Plan::Finish` sort key's value lives in an output row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SortKey {
+    /// A 0-based visible output column (`ORDER BY 2` when the column
+    /// count isn't known until `*` is expanded at execution time).
+    Output(usize),
+    /// The `n`th hidden trailing sort column.
+    Hidden(usize),
+}
+
+/// What an `INSERT` does when a row would duplicate a PRIMARY/UNIQUE key.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InsertMode {
+    /// Plain `INSERT`: error 1062.
+    Error,
+    /// `INSERT IGNORE`: skip the row.
+    Ignore,
+    /// `REPLACE INTO`: delete the conflicting row(s), then insert.
+    Replace,
+    /// `INSERT ... ON DUPLICATE KEY UPDATE col = expr, ...`: update the
+    /// existing row instead. `VALUES(col)` in an `expr` is the value the
+    /// row would have been inserted with.
+    Upsert(Vec<(String, Expr)>),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum JoinOp {
     Cross,
@@ -147,7 +177,12 @@ use crate::mysql::catalog::Column;
 pub enum Plan {
     Dummy, // SELECT 1
     ShowDatabases,
-    ShowTables(String),
+    /// `SHOW [FULL] TABLES [FROM db] [LIKE 'p']`.
+    ShowTables {
+        db: String,
+        like: Option<String>,
+        full: bool,
+    },
     ShowColumns {
         db: String,
         table: String,
@@ -169,6 +204,9 @@ pub enum Plan {
     Scan {
         db: String,
         table: String,
+        /// `FROM orders o`: the name this table's columns are qualified by
+        /// in a join (`o.id`), instead of the table's own name.
+        alias: Option<String>,
     },
     Join {
         left: Box<Plan>,
@@ -179,6 +217,18 @@ pub enum Plan {
         db: String,
         table: String,
         columns: Vec<Column>,
+        unique_keys: Vec<UniqueKey>,
+        if_not_exists: bool,
+    },
+    /// `DROP TABLE [IF EXISTS] a, b`.
+    DropTable {
+        tables: Vec<(String, String)>,
+        if_exists: bool,
+    },
+    /// `TRUNCATE [TABLE] t`: removes every row and resets AUTO_INCREMENT.
+    Truncate {
+        db: String,
+        table: String,
     },
     CreateDatabase {
         name: String,
@@ -202,17 +252,24 @@ pub enum Plan {
         table: String,
         columns: Vec<String>,
         rows: Vec<Vec<Expr>>,
+        mode: InsertMode,
     },
+    /// Single-table `UPDATE`, including MySQL's `ORDER BY ... LIMIT n`.
     Update {
         db: String,
         table: String,
         assignments: Vec<(String, Expr)>,
         selection: Option<Expr>,
+        order: Vec<(Expr, bool)>,
+        limit: Option<u64>,
     },
+    /// Single-table `DELETE`, including MySQL's `ORDER BY ... LIMIT n`.
     Delete {
         db: String,
         table: String,
         selection: Option<Expr>,
+        order: Vec<(Expr, bool)>,
+        limit: Option<u64>,
     },
     /// `GROUP BY` (possibly implicit, i.e. an empty `group_exprs` with at
     /// least one aggregate in `exprs` — the whole input is then one
@@ -233,26 +290,30 @@ pub enum Plan {
         /// a direct expression works.
         having: Option<Expr>,
     },
-    /// `ORDER BY`/`LIMIT`/`OFFSET`. Sits between the row source (`Scan`/
-    /// `Filter`/`Join`) and the outer `Project`/`Aggregate`, evaluating
-    /// `keys` against the *pre-projection* row the same way `Filter`'s own
-    /// predicate does (real `ColName` resolution against the source
-    /// table's columns) -- this is what lets `ORDER BY` reference a
-    /// column that isn't in the `SELECT` list at all (real MySQL allows
-    /// this for a non-aggregated query, and real apps rely on it: e.g.
-    /// `SELECT id FROM t ORDER BY created_at DESC`). `keys` is empty when
-    /// there's a `LIMIT` with no `ORDER BY`. Not meaningful combined with
-    /// `Aggregate` when a key references the aggregated result rather
-    /// than a `GROUP BY` column -- not yet supported, see binder.
-    Sort {
+    /// `ORDER BY` / `DISTINCT` / `LIMIT` / `OFFSET` / `SQL_CALC_FOUND_ROWS`,
+    /// applied to the *output* rows of the `Project`/`Aggregate` it wraps --
+    /// after aggregation, the way a real database does it. Found via
+    /// testing before a public release: these used to run on the input
+    /// rows *before* projection/aggregation, so `SELECT COUNT(*) FROM t
+    /// LIMIT 1` counted one row, `GROUP BY ... LIMIT 2` grouped only the
+    /// first two input rows, `ORDER BY <alias>`/`ORDER BY 2` didn't sort,
+    /// and `DISTINCT` was never applied at all.
+    ///
+    /// Every `ORDER BY` key that isn't a plain output position is
+    /// evaluated by the source itself as an extra trailing *hidden*
+    /// column (so a key can be any expression: a column not in the SELECT
+    /// list, an alias, an aggregate like `COUNT(*)`); those `hidden`
+    /// trailing columns are dropped before the rows reach the client.
+    Finish {
         source: Box<Plan>,
-        keys: Vec<(Expr, bool)>, // (expr, ascending)
+        order: Vec<(SortKey, bool)>, // (key, ascending)
+        hidden: usize,
+        distinct: bool,
         limit: Option<u64>,
         offset: Option<u64>,
         /// Real MySQL's `SQL_CALC_FOUND_ROWS` select modifier: when set,
         /// the row count *before* `limit`/`offset` truncation is recorded
-        /// (see `Executor`'s handling) for a later `FOUND_ROWS()` call to
-        /// read.
+        /// for a later `FOUND_ROWS()` call to read.
         calc_found_rows: bool,
     },
 }
@@ -339,28 +400,38 @@ pub fn count_params(plan: &Plan) -> usize {
                     JoinOp::Cross => {}
                 }
             }
-            Plan::Insert { rows, .. } => {
+            Plan::Insert { rows, mode, .. } => {
                 for r in rows {
                     for e in r {
                         expr_max(e, max);
                     }
                 }
+                if let InsertMode::Upsert(assignments) = mode {
+                    for (_, e) in assignments {
+                        expr_max(e, max);
+                    }
+                }
             }
-            Plan::Update { assignments, selection, .. } => {
+            Plan::Update { assignments, selection, order, .. } => {
                 for (_, e) in assignments {
                     expr_max(e, max);
                 }
                 if let Some(s) = selection {
                     expr_max(s, max);
                 }
-            }
-            Plan::Delete { selection: Some(s), .. } => expr_max(s, max),
-            Plan::Sort { source, keys, .. } => {
-                plan_max(source, max);
-                for (e, _) in keys {
+                for (e, _) in order {
                     expr_max(e, max);
                 }
             }
+            Plan::Delete { selection, order, .. } => {
+                if let Some(s) = selection {
+                    expr_max(s, max);
+                }
+                for (e, _) in order {
+                    expr_max(e, max);
+                }
+            }
+            Plan::Finish { source, .. } => plan_max(source, max),
             _ => {}
         }
     }
@@ -392,9 +463,15 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
             }
             out
         }
-        Plan::Filter { source, .. } | Plan::Sort { source, .. } => column_names(source, db),
+        Plan::Filter { source, .. } | Plan::Finish { source, .. } => column_names(source, db),
         Plan::ShowDatabases => vec!["Database".to_string()],
-        Plan::ShowTables(db_name) => vec![format!("Tables_in_{db_name}")],
+        Plan::ShowTables { db: db_name, full, .. } => {
+            let mut v = vec![format!("Tables_in_{db_name}")];
+            if *full {
+                v.push("Table_type".into());
+            }
+            v
+        }
         Plan::ShowColumns { .. } => ["Field", "Type", "Null", "Key", "Default", "Extra"]
             .into_iter()
             .map(String::from)
@@ -415,12 +492,40 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
 /// `Join`'s two tables would be ambiguous, so wildcards aren't expanded
 /// there -- `column_names` falls back to `"*"`, which `server.rs`
 /// already treats as "no better name" the same way it does `"?"`).
-fn source_table<'a>(plan: &Plan, db: &'a DbState) -> Option<&'a Table> {
+fn source_table(plan: &Plan, db: &DbState) -> Option<std::sync::Arc<Table>> {
     match plan {
-        Plan::Scan { db: db_name, table } => {
-            db.schemas.get(db_name)?.tables.get(table).map(|t| &**t)
+        Plan::Scan { db: db_name, table, .. } => {
+            crate::mysql::infoschema::lookup_table(db, db_name, table)
         }
-        Plan::Filter { source, .. } | Plan::Sort { source, .. } => source_table(source, db),
+        Plan::Filter { source, .. } | Plan::Finish { source, .. } => source_table(source, db),
         _ => None,
+    }
+}
+
+/// Rebuilds `e` bottom-up, passing every `ColName` through `f`.
+pub fn map_colnames(e: Expr, f: &dyn Fn(String) -> Expr) -> Expr {
+    let m = |x: Expr| map_colnames(x, f);
+    let mb = |x: Box<Expr>| Box::new(map_colnames(*x, f));
+    match e {
+        Expr::ColName(n) => f(n),
+        Expr::And(v) => Expr::And(v.into_iter().map(m).collect()),
+        Expr::Or(v) => Expr::Or(v.into_iter().map(m).collect()),
+        Expr::Compare { op, left, right } => Expr::Compare { op, left: mb(left), right: mb(right) },
+        Expr::Arith { op, left, right } => Expr::Arith { op, left: mb(left), right: mb(right) },
+        Expr::Call { name, args } => Expr::Call { name, args: args.into_iter().map(m).collect() },
+        Expr::Agg { func, arg, distinct } => Expr::Agg { func, arg: arg.map(mb), distinct },
+        Expr::InList { expr, list, negated } => {
+            Expr::InList { expr: mb(expr), list: list.into_iter().map(m).collect(), negated }
+        }
+        Expr::Not(x) => Expr::Not(mb(x)),
+        Expr::IsNull(x, neg) => Expr::IsNull(mb(x), neg),
+        Expr::Like { expr, pattern, escape, negated } => {
+            Expr::Like { expr: mb(expr), pattern: mb(pattern), escape: mb(escape), negated }
+        }
+        Expr::Case { conditions, else_result } => Expr::Case {
+            conditions: conditions.into_iter().map(|(c, r)| (m(c), m(r))).collect(),
+            else_result: else_result.map(mb),
+        },
+        other => other,
     }
 }

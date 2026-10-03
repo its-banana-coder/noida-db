@@ -122,8 +122,16 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
         stmt_param_types: HashMap::new(),
     };
 
-    // Send Handshake
-    let handshake = b"\x0a\x35\x2e\x35\x2e\x35\x2d\x31\x30\x2e\x34\x2e\x32\x32\x2d\x4d\x61\x72\x69\x61\x44\x42\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xff\xff\x21\x02\x00\x0f\xc0\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
+    // Send Handshake. Capability flags (lower 2 bytes `\xdf\xf7` = 0xf7df,
+    // upper 2 bytes `\x0f\x00` = 0x000f) advertise everything this server
+    // actually does *except* CLIENT_SSL (0x0800), CLIENT_COMPRESS (0x0020)
+    // and CLIENT_SSL_VERIFY_SERVER_CERT / CLIENT_REMEMBER_OPTIONS (upper
+    // 0xc000). Found via testing before a public release: this used to send
+    // 0xffff / 0xc00f -- claiming TLS support it doesn't have -- so any
+    // client whose default is "use SSL if the server offers it" (pymysql,
+    // the stock `mysql` CLI's `--ssl-mode=PREFERRED`) started a TLS
+    // handshake against a plaintext server and failed to connect at all.
+    let handshake = b"\x0a\x35\x2e\x35\x2e\x35\x2d\x31\x30\x2e\x34\x2e\x32\x32\x2d\x4d\x61\x72\x69\x61\x44\x42\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xdf\xf7\x21\x02\x00\x0f\x00\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
     let mut header = [0u8; 4];
     header[0..3].copy_from_slice(&(handshake.len() as u32).to_le_bytes()[0..3]);
     header[3] = 0;
@@ -337,6 +345,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                         );
                         executor.params = params;
                         executor.last_found_rows = session.engine.last_found_rows;
+                        executor.session_insert_id = session.engine.session_insert_id;
                         let names = {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)
@@ -346,6 +355,9 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                                 let affected = executor.last_affected_rows;
                                 session.engine.last_affected_rows = affected;
                                 session.engine.last_insert_id = executor.last_insert_id;
+                                if executor.last_insert_id != 0 {
+                                    session.engine.session_insert_id = executor.last_insert_id;
+                                }
                                 session.engine.last_found_rows = executor.last_found_rows;
                                 // COM_STMT_EXECUTE's result set uses the
                                 // binary protocol row format, not the text
@@ -500,23 +512,39 @@ fn send_err(
     write_packet(stream, seq, &payload)
 }
 
-fn column_type_for(val: Option<&Value>) -> (u8, u16) {
+/// The wire type (and charset) a text-protocol result column is declared
+/// as, from a sample of its values. Found via testing before a public
+/// release: everything that wasn't an Int/Float used to be declared
+/// VAR_STRING, so a driver handed DECIMAL/DATE/DATETIME values back as
+/// plain strings (pymysql: `'12.50'`, `'2024-03-05'`) instead of `Decimal`/
+/// `date`/`datetime`, and only row 0 was sampled, so a NULL there typed the
+/// whole column as a string.
+fn column_type_for(val: Option<&Value>) -> (u8, u16, u8) {
+    const BINARY: u16 = 0x3f;
+    const UTF8MB4: u16 = 0x2d;
     match val {
-        Some(Value::Int(_)) => (0x03, 0x3f), // MYSQL_TYPE_LONG, binary charset
-        Some(Value::Float(_)) => (0x05, 0x3f), // MYSQL_TYPE_DOUBLE, binary charset
-        _ => (0xfd, 0x2d),                   // MYSQL_TYPE_VAR_STRING, utf8mb4_general_ci
+        Some(Value::Int(_)) => (0x08, BINARY, 0), // LONGLONG (i64 storage)
+        Some(Value::Bool(_)) => (0x01, BINARY, 0), // TINY
+        Some(Value::Float(_)) => (0x05, BINARY, 31), // DOUBLE, 31 = not fixed
+        Some(Value::Num(n)) => (0xf6, BINARY, n.scale().min(30) as u8), // NEWDECIMAL
+        Some(Value::Date(_)) => (0x0a, BINARY, 0), // DATE
+        Some(Value::Ts(_)) => (0x0c, BINARY, 0),  // DATETIME
+        Some(Value::Time(_)) => (0x0b, BINARY, 0), // TIME
+        Some(Value::Json(_)) => (0xf5, UTF8MB4, 0), // JSON
+        Some(Value::Bytes(_)) => (0xfc, BINARY, 0), // BLOB
+        _ => (0xfd, UTF8MB4, 0),                  // VAR_STRING
     }
 }
 
 fn column_def_packet(name: &str, val: Option<&Value>) -> Vec<u8> {
-    let (col_type, charset) = column_type_for(val);
+    let (col_type, charset, decimals) = column_type_for(val);
     let mut p = Vec::new();
     p.push(3);
     p.extend_from_slice(b"def"); // catalog
     p.push(0); // schema
     p.push(0); // table
     p.push(0); // org_table
-    p.push(name.len() as u8);
+    write_lenenc_int(&mut p, name.len() as u64);
     p.extend_from_slice(name.as_bytes()); // name
     p.push(0); // org_name
     p.push(0x0c); // length of fixed-length fields below (always 12)
@@ -524,9 +552,38 @@ fn column_def_packet(name: &str, val: Option<&Value>) -> Vec<u8> {
     p.extend_from_slice(&255u32.to_le_bytes()); // column_length (4)
     p.push(col_type); // type (1)
     p.extend_from_slice(&0u16.to_le_bytes()); // flags (2)
-    p.push(0); // decimals (1)
+    p.push(decimals); // decimals (1)
     p.extend_from_slice(&[0, 0]); // filler (2, reserved)
     p
+}
+
+/// The first non-NULL value in column `i` across every row -- what decides
+/// the column's declared wire type.
+fn column_sample(rows: &[Vec<Value>], i: usize) -> Option<&Value> {
+    let mut vals = rows.iter().filter_map(|r| r.get(i)).filter(|v| !v.is_null());
+    let first = vals.next()?;
+    // A column whose rows hold different kinds of value (`CASE` branches,
+    // `COALESCE(int_col, 'n/a')`, DESCRIBE's Default column) is declared as
+    // a string: declaring it after the first row's type made drivers decode
+    // later rows with the wrong type (pymysql raised mid-result and the
+    // connection's packet stream was left out of sync).
+    let kind = std::mem::discriminant(first);
+    if vals.all(|v| std::mem::discriminant(v) == kind) { Some(first) } else { None }
+}
+
+/// How many result columns to declare: the rows' own width, or -- for a
+/// zero-row result -- the statement's own column list. Found via testing
+/// before a public release: a SELECT matching no rows used to send a bare
+/// OK packet with no column definitions at all, so drivers reported no
+/// result columns (pymysql's `cursor.description` was `None`) for the
+/// perfectly ordinary "no matches" case. `None` means the statement
+/// doesn't produce a result set (DML/DDL), so an OK packet is right.
+fn result_width(rows: &[Vec<Value>], names: &[String]) -> Option<usize> {
+    match rows.first() {
+        Some(r) => Some(r.len()),
+        None if !names.is_empty() => Some(names.len()),
+        None => None,
+    }
 }
 
 fn send_resultset(
@@ -537,11 +594,9 @@ fn send_resultset(
     last_insert_id: u64,
     names: &[String],
 ) -> io::Result<()> {
-    if rows.is_empty() {
+    let Some(cols) = result_width(&rows, names) else {
         return send_ok(stream, seq, affected_rows, last_insert_id);
-    }
-
-    let cols = rows[0].len();
+    };
     write_packet(stream, seq, &[cols as u8])?;
     seq = seq.wrapping_add(1);
 
@@ -551,7 +606,7 @@ fn send_resultset(
         // MySQL label is its own source text, not reconstructed here).
         let fallback = format!("col{i}");
         let name = names.get(i).filter(|n| n.as_str() != "?").unwrap_or(&fallback);
-        let sample = rows[0].get(i);
+        let sample = column_sample(&rows, i);
         let coldef = column_def_packet(name, sample);
         write_packet(stream, seq, &coldef)?;
         seq = seq.wrapping_add(1);
@@ -585,15 +640,18 @@ fn send_resultset(
 /// produces. Callers handle `Value::Null` themselves — its wire
 /// representation (`0xfb`) isn't a length-prefixed value at all.
 fn encode_lenenc_value(payload: &mut Vec<u8>, val: &Value) {
-    let s = match val {
-        Value::Text(s) => s.clone(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Null => return,
-        _ => String::new(),
+    if val.is_null() {
+        return;
+    }
+    // Found via testing before a public release: every value that wasn't
+    // Text/Int/Float (DECIMAL, DATE, DATETIME, JSON, ...) used to be sent as
+    // an *empty string*.
+    let bytes: Vec<u8> = match val {
+        Value::Bytes(b) => b.clone(),
+        other => crate::mysql::exec::render_text(other).into_bytes(),
     };
-    write_lenenc_int(payload, s.len() as u64);
-    payload.extend_from_slice(s.as_bytes());
+    write_lenenc_int(payload, bytes.len() as u64);
+    payload.extend_from_slice(&bytes);
 }
 
 /// Sends a `COM_STMT_EXECUTE` result set using the MySQL **binary**
@@ -614,11 +672,9 @@ fn send_binary_resultset(
     last_insert_id: u64,
     names: &[String],
 ) -> io::Result<()> {
-    if rows.is_empty() {
+    let Some(cols) = result_width(&rows, names) else {
         return send_ok(stream, seq, affected_rows, last_insert_id);
-    }
-
-    let cols = rows[0].len();
+    };
     write_packet(stream, seq, &[cols as u8])?;
     seq = seq.wrapping_add(1);
 

@@ -3,6 +3,8 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod exec;
+pub mod funcs;
+pub mod infoschema;
 pub mod plan;
 pub mod server;
 pub mod types;
@@ -57,7 +59,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Int(3));
         assert_eq!(rows[0][1], Value::Int(35));
-        assert_eq!(rows[0][2], Value::Float(35.0 / 3.0));
+        // Real MySQL: AVG of integers is a DECIMAL with
+        // `div_precision_increment` (4) extra digits -- 11.6667, not a float.
+        assert_eq!(rows[0][2], Value::Num(crate::sql::numeric::Numeric::parse("11.6667").unwrap()));
         assert_eq!(rows[0][3], Value::Int(5));
         assert_eq!(rows[0][4], Value::Int(20));
 
