@@ -18,14 +18,14 @@ tools don't know the difference.
 </div>
 
 ```sh
-cargo install --path . --all-features
+npm install -g noida-db             # or: pip install noida-db / brew install its-banana-coder/noida-db/noida-db
 noida-db start                      # every built-in service, default ports
 noida-db start --only redis,postgres
 noida-db start --redis-port 6380
 ```
 
 See `noida-db help` for the full option list, or jump to
-**[Installing](#installing)** for Docker / Homebrew / npm / pip.
+**[Installing](#installing)** for every install option.
 
 ---
 
@@ -90,7 +90,7 @@ Next up: Ghost and Strapi (MySQL), Wagtail/django-cms (Postgres), Forem
 | Service | Real clients/ORMs | Real apps | Protocol coverage |
 |---|---|---|---|
 | **Postgres** | 14 — psycopg, SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM, Sequelize, pgx, GORM, sqlx, Npgsql, JDBC | ✅ Gitea · ✅ Miniflux | DDL/DML, full-text search, range types, materialized views, cursors, catalogs |
-| **MySQL** | `mysql_async`, plus a 50-query differential suite shared with Postgres | ✅ WordPress | Prepared statements, transactions, joins, `GROUP BY`/`HAVING`, real `AUTO_INCREMENT`, handshake-based database selection |
+| **MySQL** | `mysql_async` in CI, plus differential suites against a real MySQL server; also verified with pymysql, SQLAlchemy, Django (migrations + ORM), Node's mysql2, Go `database/sql` + GORM, JDBC Connector/J and the `mysql` CLI | ✅ WordPress | Keys and upserts, `ALTER TABLE`, transactions and savepoints (incl. `autocommit=0`), prepared statements, joins, aggregates, JSON/ENUM, `information_schema` |
 | **Redis** | 12 — redis-py, node-redis, ioredis, go-redis, Jedis, Lettuce, Spring Data Redis, Redisson, BullMQ, RQ, Celery, Sidekiq | — (next: Sidekiq app) | 217 / 242 Redis 7.2 commands — [`src/redis/README.md`](src/redis/README.md) |
 | **Kafka** | 5 — kafkajs, confluent-kafka-python, kafka-go, Java kafka-clients, Spring Kafka | ✅ Faust | Consumer groups, real transactional isolation (`read_committed`, producer fencing), cluster/config admin |
 | **Elasticsearch** | 2 — official Java and Python clients | — (next: Django + django-elasticsearch-dsl) | `match`/`bool`/`range`/aggregations with real BM25 scoring, verified against a real ES 8.15 node |
@@ -155,30 +155,38 @@ too (Kafka, Elasticsearch, RabbitMQ, MongoDB, ClickHouse).
 
 ## Installing
 
+Prebuilt binaries for Linux (x64, arm64), macOS (Intel, Apple Silicon)
+and Windows (x64):
+
 ```sh
-# crates.io
+# npm
+npm install -g noida-db        # or run it once: npx noida-db start
+
+# pip
+pip install noida-db
+
+# Homebrew
+brew install its-banana-coder/noida-db/noida-db
+
+# crates.io (builds from source)
 cargo install noida-db --all-features
+```
 
-# npm (linux-x64 only for now -- see docs/PACKAGING.md)
-npm install -g noida-db
+Or download an archive from
+[GitHub Releases](https://github.com/its-banana-coder/noida-db/releases), or
+build the Docker image yourself:
 
-# From source
-cargo install --path . --all-features
-
-# Docker
+```sh
 docker build -t noida-db .
 docker run -p 5432:5432 -p 3306:3306 -p 6379:6379 -p 9092:9092 -p 9200:9200 noida-db
 ```
 
-Homebrew and PyPI packages are on the way — track progress in
-[docs/PACKAGING.md](docs/PACKAGING.md).
+Details for each channel: [docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## What's next
 
-- **Full cross-platform binary releases** — crates.io and npm are live
-  (npm is linux-x64 only until the automated 5-platform build runs); PyPI
-  and Homebrew publishing are wired into CI and waiting on one-time account
-  setup. See [docs/PACKAGING.md](docs/PACKAGING.md).
+- **A published Docker image** — the `Dockerfile` builds today; a
+  prebuilt image on `ghcr.io` is next.
 - **Wider benchmark coverage** — a native long-lived Kafka client for
   producer/fetch numbers, plus index and persistence-cost benchmarks.
 - **More real applications** — see [the table above](#tested-against-real-applications).
