@@ -217,6 +217,21 @@ fn find_conflict(t: &Table, row: &Row, target: Option<&[usize]>) -> Option<usize
 }
 
 fn exec_from_rows(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
+    // A lone subquery/VALUES/CTE has no width recorded in the plan, so it
+    // is read directly at its full width. Found via testing before a public
+    // release: projecting it through the SELECT below cut it to zero
+    // columns, so `UPDATE ... FROM (VALUES ...)` and `DELETE ... USING
+    // (SELECT ...)` silently matched no rows.
+    match f {
+        From::Cte(slot) => return Ok(ctx.ctes.get(*slot).cloned().flatten().unwrap_or_default()),
+        From::Sub(q) => {
+            ctx.outer.push(vec![]);
+            let r = exec::run_query(q, ctx);
+            ctx.outer.pop();
+            return r;
+        }
+        _ => {}
+    }
     // The executor's FROM is private; run it through a trivial SELECT.
     let sel = super::plan::Select {
         from: f.clone(),
