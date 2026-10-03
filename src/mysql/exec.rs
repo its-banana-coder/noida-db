@@ -1,7 +1,8 @@
-use crate::mysql::catalog::{Column, DbState, Table};
+use crate::mysql::catalog::{Column, ColumnType, DbState, Table};
 use crate::mysql::error::MySqlError;
-use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, JoinOp, Plan};
+use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SortKey};
 use crate::mysql::types::Value;
+use crate::sql::numeric::Numeric;
 use std::cmp::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +33,13 @@ pub struct Executor {
     /// MySQL -- it persists across intervening statements rather than
     /// resetting to 0 each time.
     pub last_found_rows: u64,
+    /// The row an `INSERT ... ON DUPLICATE KEY UPDATE` would have inserted,
+    /// while its assignments run, for `VALUES(col)` to read.
+    insert_row: Option<Vec<Value>>,
+    /// What `LAST_INSERT_ID()` returns: the connection's most recent
+    /// generated id, which -- unlike `last_insert_id` (this statement's
+    /// own) -- persists across later statements. Seeded by the caller.
+    pub session_insert_id: u64,
 }
 
 impl Executor {
@@ -43,6 +51,8 @@ impl Executor {
             last_affected_rows: 0,
             last_insert_id: 0,
             last_found_rows: 0,
+            insert_row: None,
+            session_insert_id: 0,
         }
     }
 
@@ -55,17 +65,10 @@ impl Executor {
     /// to `Value::Null` instead of erroring or working.
     fn resolve_table_context(&self, plan: &Plan) -> Result<Option<Table>, MySqlError> {
         match plan {
-            Plan::Scan { db, table } => {
-                let state = self.db.lock().unwrap();
-                let schema = state.schemas.get(db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t = schema.tables.get(table).ok_or_else(|| MySqlError::unknown_table(table))?;
-                Ok(Some((**t).clone()))
-            }
+            Plan::Scan { db, table } => Ok(Some(self.load_table(db, table)?)),
             Plan::Filter { source, .. } => self.resolve_table_context(source),
             Plan::Project { source, .. } => self.resolve_table_context(source),
-            Plan::Sort { source, .. } => self.resolve_table_context(source),
+            Plan::Finish { source, .. } => self.resolve_table_context(source),
             Plan::Join { left, right, .. } => {
                 let l = self.resolve_table_context(left)?;
                 let r = self.resolve_table_context(right)?;
@@ -78,13 +81,12 @@ impl Executor {
     pub fn execute_plan(&mut self, plan: Plan) -> Result<Vec<Vec<Value>>, MySqlError> {
         match plan {
             Plan::Dummy => Ok(vec![vec![]]),
-            Plan::ShowDatabases => Ok(vec![
-                vec![Value::Text("information_schema".to_string())],
-                vec![Value::Text("mysql".to_string())],
-                vec![Value::Text("performance_schema".to_string())],
-                vec![Value::Text("sys".to_string())],
-                vec![Value::Text("test".to_string())],
-            ]),
+            // Found via testing before a public release: this used to be a
+            // fixed list, so a `CREATE DATABASE` never showed up in it.
+            Plan::ShowDatabases => {
+                let state = self.db.lock().unwrap();
+                Ok(state.schemas.keys().map(|s| vec![Value::Text(s.clone())]).collect())
+            }
             Plan::Use(db) => {
                 let state = self.db.lock().unwrap();
                 if !state.schemas.contains_key(&db) {
@@ -97,82 +99,117 @@ impl Executor {
                 self.current_db = Some(db);
                 Ok(vec![])
             }
-            Plan::ShowTables(db) => {
+            Plan::ShowTables { db, like, full } => {
                 let state = self.db.lock().unwrap();
                 let schema = state.schemas.get(&db).ok_or_else(|| {
                     MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
                 })?;
                 let mut rows = Vec::new();
                 for table_name in schema.tables.keys() {
-                    rows.push(vec![Value::Text(table_name.clone())]);
+                    if let Some(p) = &like
+                        && !mysql_like(table_name, p, Some('\\'))
+                    {
+                        continue;
+                    }
+                    let mut row = vec![Value::Text(table_name.clone())];
+                    if full {
+                        row.push(Value::Text("BASE TABLE".into()));
+                    }
+                    rows.push(row);
                 }
                 Ok(rows)
             }
             Plan::ShowColumns { db, table } => {
-                let state = self.db.lock().unwrap();
-                let schema = state.schemas.get(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t =
-                    schema.tables.get(&table).ok_or_else(|| MySqlError::unknown_table(&table))?;
+                let t = self.load_table(&db, &table)?;
+                let keys = t.keys();
                 let mut rows = Vec::new();
-                for col in &t.columns {
+                for (i, col) in t.columns.iter().enumerate() {
+                    // MySQL's Key column: PRI, else UNI for a single-column
+                    // unique key, else MUL for the first column of any other
+                    // key.
+                    let key = if col.primary_key {
+                        "PRI"
+                    } else if keys.iter().any(|(_, c)| c.len() == 1 && c[0] == i) {
+                        "UNI"
+                    } else if keys.iter().any(|(_, c)| c[0] == i) {
+                        "MUL"
+                    } else {
+                        ""
+                    };
+                    let extra = if col.auto_increment {
+                        "auto_increment"
+                    } else if col.default_now && col.on_update_now {
+                        "DEFAULT_GENERATED on update CURRENT_TIMESTAMP"
+                    } else if col.default_now {
+                        "DEFAULT_GENERATED"
+                    } else {
+                        ""
+                    };
                     rows.push(vec![
                         Value::Text(col.name.clone()),
-                        Value::Text(format!("{:?}", col.ty)),
-                        Value::Text(if col.not_null {
-                            "NO".to_string()
-                        } else {
-                            "YES".to_string()
-                        }),
-                        Value::Text(if col.primary_key {
-                            "PRI".to_string()
-                        } else {
-                            "".to_string()
-                        }),
-                        col.default.clone().unwrap_or(Value::Null),
-                        Value::Text(if col.auto_increment {
-                            "auto_increment".to_string()
-                        } else {
-                            "".to_string()
-                        }),
+                        Value::Text(mysql_type_name(&col.ty)),
+                        Value::Text(if col.not_null { "NO" } else { "YES" }.to_string()),
+                        Value::Text(key.to_string()),
+                        column_default_text(col).map(Value::Text).unwrap_or(Value::Null),
+                        Value::Text(extra.to_string()),
                     ]);
                 }
                 Ok(rows)
             }
             Plan::ShowCreateTable { db, table } => {
-                let state = self.db.lock().unwrap();
-                let schema = state.schemas.get(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t =
-                    schema.tables.get(&table).ok_or_else(|| MySqlError::unknown_table(&table))?;
-
-                let mut sql = format!("CREATE TABLE `{}` (\n", t.name);
-                let mut cols_sql = Vec::new();
+                let t = self.load_table(&db, &table)?;
+                let mut lines = Vec::new();
                 for col in &t.columns {
-                    let mut col_sql = format!("  `{}` {:?}", col.name, col.ty);
+                    let mut l = format!("  `{}` {}", col.name, mysql_type_name(&col.ty));
                     if col.not_null {
-                        col_sql.push_str(" NOT NULL");
+                        l.push_str(" NOT NULL");
                     }
                     if col.auto_increment {
-                        col_sql.push_str(" AUTO_INCREMENT");
+                        l.push_str(" AUTO_INCREMENT");
+                    } else if let Some(d) = column_default_text(col) {
+                        if col.default_now {
+                            l.push_str(&format!(" DEFAULT {d}"));
+                        } else {
+                            l.push_str(&format!(" DEFAULT '{}'", d.replace('\'', "''")));
+                        }
+                    } else if !col.not_null {
+                        l.push_str(" DEFAULT NULL");
                     }
-                    if col.primary_key {
-                        col_sql.push_str(" PRIMARY KEY");
+                    if col.on_update_now {
+                        l.push_str(" ON UPDATE CURRENT_TIMESTAMP");
                     }
-                    cols_sql.push(col_sql);
+                    lines.push(l);
                 }
-                sql.push_str(&cols_sql.join(",\n"));
-                sql.push_str("\n) ENGINE=InnoDB");
-
+                let quote = |cols: &[usize]| {
+                    cols.iter()
+                        .map(|&c| format!("`{}`", t.columns[c].name))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                for (name, cols) in t.keys() {
+                    if name == "PRIMARY" {
+                        lines.push(format!("  PRIMARY KEY ({})", quote(&cols)));
+                    } else {
+                        lines.push(format!("  UNIQUE KEY `{name}` ({})", quote(&cols)));
+                    }
+                }
+                let sql = format!(
+                    "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+                    t.name,
+                    lines.join(",\n")
+                );
                 Ok(vec![vec![Value::Text(t.name.clone()), Value::Text(sql)]])
             }
-            Plan::CreateTable { db, table, columns } => {
+            Plan::CreateTable { db, table, columns, unique_keys, if_not_exists } => {
                 let mut state = self.db.lock().unwrap();
                 let schema = state.schemas.get_mut(&db).ok_or_else(|| {
                     MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
                 })?;
+                // Found via testing before a public release: IF NOT EXISTS
+                // was ignored, so every migration tool's second run failed.
+                if if_not_exists && schema.tables.contains_key(&table) {
+                    return Ok(vec![]);
+                }
                 if schema.tables.contains_key(&table) {
                     return Err(MySqlError::new(
                         1050,
@@ -180,7 +217,46 @@ impl Executor {
                         format!("Table '{}' already exists", table),
                     ));
                 }
-                schema.tables.insert(table.clone(), Arc::new(Table::new(table, columns)));
+                let mut t = Table::new(table.clone(), columns);
+                t.unique_keys = unique_keys;
+                schema.tables.insert(table, Arc::new(t));
+                Ok(vec![])
+            }
+            Plan::DropTable { tables, if_exists } => {
+                let mut state = self.db.lock().unwrap();
+                let missing: Vec<String> = tables
+                    .iter()
+                    .filter(|(db, t)| {
+                        !state.schemas.get(db).is_some_and(|s| s.tables.contains_key(t))
+                    })
+                    .map(|(db, t)| format!("{db}.{t}"))
+                    .collect();
+                if !missing.is_empty() && !if_exists {
+                    return Err(MySqlError::new(
+                        1051,
+                        "42S02",
+                        format!("Unknown table '{}'", missing.join(",")),
+                    ));
+                }
+                for (db, t) in &tables {
+                    if let Some(schema) = state.schemas.get_mut(db) {
+                        schema.tables.remove(t);
+                    }
+                }
+                Ok(vec![])
+            }
+            Plan::Truncate { db, table } => {
+                let mut state = self.db.lock().unwrap();
+                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
+                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
+                })?;
+                let t = schema
+                    .tables
+                    .get_mut(&table)
+                    .ok_or_else(|| MySqlError::unknown_table(&table))?;
+                let t_mut = Arc::make_mut(t);
+                t_mut.rows.clear();
+                t_mut.next_auto_increment = 1;
                 Ok(vec![])
             }
             Plan::CreateDatabase { name, if_not_exists } => {
@@ -219,57 +295,64 @@ impl Executor {
                 }
                 Ok(vec![])
             }
-            Plan::Insert { db, table, columns, rows } => {
-                let mut state = self.db.lock().unwrap();
-                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t = schema
-                    .tables
-                    .get_mut(&table)
-                    .ok_or_else(|| MySqlError::unknown_table(&table))?;
-                let t_mut = Arc::make_mut(t);
-                let affected = rows.len() as u64;
+            // INSERT/UPDATE/DELETE all work on a copy of the table and only
+            // store it back once the whole statement succeeded, so a
+            // statement that fails part-way (a duplicate key on row 3 of a
+            // multi-row INSERT) leaves the table untouched, as InnoDB does.
+            Plan::Insert { db, table, columns, rows, mode } => {
+                let mut work = self.load_table(&db, &table)?;
+                let keys = work.keys();
+                let mut affected = 0u64;
                 let mut first_generated_id: Option<i64> = None;
 
-                for row_exprs in rows {
-                    let mut new_row = vec![Value::Null; t_mut.columns.len()];
-
-                    let mut col_indices = Vec::new();
-                    if columns.is_empty() {
-                        for i in 0..t_mut.columns.len() {
-                            col_indices.push(i);
-                        }
-                    } else {
-                        for col_name in &columns {
-                            let idx = t_mut
-                                .columns
-                                .iter()
-                                .position(|c| c.name == *col_name)
-                                .ok_or_else(|| MySqlError::unknown_column(col_name))?;
-                            col_indices.push(idx);
-                        }
+                let mut col_indices = Vec::new();
+                if columns.is_empty() {
+                    col_indices.extend(0..work.columns.len());
+                } else {
+                    for col_name in &columns {
+                        let idx = resolve_column_index(&work.columns, col_name)
+                            .ok_or_else(|| MySqlError::unknown_column(col_name))?;
+                        col_indices.push(idx);
                     }
+                }
 
+                for (row_no, row_exprs) in rows.iter().enumerate() {
                     if row_exprs.len() != col_indices.len() {
                         return Err(MySqlError::new(
                             1136,
                             "21S01",
-                            "Column count doesn't match value count at row 1",
+                            format!("Column count doesn't match value count at row {}", row_no + 1),
                         ));
                     }
-
+                    let mut new_row = vec![Value::Null; work.columns.len()];
+                    let mut provided = vec![false; work.columns.len()];
                     for (i, expr) in row_exprs.iter().enumerate() {
-                        let val = self.eval_expr(expr, &[], None)?;
-                        new_row[col_indices[i]] = val;
+                        new_row[col_indices[i]] = self.eval_expr(expr, &[], None)?;
+                        provided[col_indices[i]] = true;
                     }
 
-                    for (i, col) in t_mut.columns.iter().enumerate() {
-                        if new_row[i].is_null() {
-                            if col.auto_increment {
-                                new_row[i] = Value::Int(t_mut.next_auto_increment);
-                                first_generated_id.get_or_insert(t_mut.next_auto_increment);
-                                t_mut.next_auto_increment += 1;
+                    let now = now_ts();
+                    for (i, col) in work.columns.iter().enumerate() {
+                        // MySQL generates an id for NULL *and* for 0 in an
+                        // AUTO_INCREMENT column (default sql_mode).
+                        if col.auto_increment
+                            && (new_row[i].is_null() || new_row[i] == Value::Int(0))
+                        {
+                            new_row[i] = Value::Int(work.next_auto_increment);
+                            first_generated_id.get_or_insert(work.next_auto_increment);
+                            work.next_auto_increment += 1;
+                        } else if provided[i] {
+                            // Found via testing before a public release: an
+                            // explicit NULL used to be replaced by the
+                            // column's DEFAULT. MySQL only uses the default
+                            // for an omitted column; an explicit NULL stays
+                            // NULL, or is an error in a NOT NULL column.
+                            if new_row[i].is_null() && col.not_null {
+                                return Err(column_cannot_be_null(&col.name));
+                            }
+                        } else if new_row[i].is_null() {
+                            if col.default_now {
+                                new_row[i] = Value::Ts(now);
                             } else if let Some(def) = &col.default {
                                 new_row[i] = def.clone();
                             } else if col.not_null {
@@ -282,90 +365,95 @@ impl Executor {
                         }
                     }
 
-                    t_mut.rows.push(new_row);
+                    // Store every value as its column's declared type (see
+                    // `coerce_to_column`), the way real MySQL converts on
+                    // write -- not as whatever shape the literal happened to
+                    // arrive in.
+                    for (i, col) in work.columns.iter().enumerate() {
+                        let v = std::mem::replace(&mut new_row[i], Value::Null);
+                        new_row[i] = coerce_to_column(v, &col.ty, &col.name)?;
+                        if col.auto_increment
+                            && let Value::Int(n) = new_row[i]
+                            && n >= work.next_auto_increment
+                        {
+                            // An explicit id moves the counter past it, so the
+                            // next generated id can't collide with it.
+                            work.next_auto_increment = n + 1;
+                        }
+                    }
+
+                    let conflict = find_key_conflict(&work, &keys, &new_row, None);
+                    match (&mode, conflict) {
+                        (_, None) => {
+                            work.rows.push(new_row);
+                            affected += 1;
+                        }
+                        (InsertMode::Error, Some((_, k))) => {
+                            return Err(duplicate_key_error(&work, &keys[k], &new_row));
+                        }
+                        (InsertMode::Ignore, Some(_)) => {}
+                        (InsertMode::Replace, Some(_)) => {
+                            while let Some((i, _)) = find_key_conflict(&work, &keys, &new_row, None)
+                            {
+                                work.rows.remove(i);
+                                affected += 1;
+                            }
+                            work.rows.push(new_row);
+                            affected += 1;
+                        }
+                        (InsertMode::Upsert(assignments), Some((i, _))) => {
+                            let before = work.rows[i].clone();
+                            self.insert_row = Some(new_row);
+                            let res = self.apply_assignments(&mut work, i, assignments);
+                            self.insert_row = None;
+                            res?;
+                            if let Some((_, k)) =
+                                find_key_conflict(&work, &keys, &work.rows[i], Some(i))
+                            {
+                                return Err(duplicate_key_error(&work, &keys[k], &work.rows[i]));
+                            }
+                            // MySQL: 2 for an updated row, 0 if the update
+                            // left it as it was.
+                            if work.rows[i] != before {
+                                affected += 2;
+                            }
+                        }
+                    }
                 }
 
+                self.store_table(&db, work)?;
                 self.last_affected_rows = affected;
                 self.last_insert_id = first_generated_id.map(|v| v as u64).unwrap_or(0);
                 Ok(vec![])
             }
-            Plan::Update { db, table, assignments, selection } => {
-                let mut state = self.db.lock().unwrap();
-                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t = schema
-                    .tables
-                    .get_mut(&table)
-                    .ok_or_else(|| MySqlError::unknown_table(&table))?;
-                let t_mut = Arc::make_mut(t);
-                let mut affected = 0u64;
-
-                for i in 0..t_mut.rows.len() {
-                    let mut matches = true;
-                    if let Some(sel) = &selection {
-                        let val = self.eval_expr(sel, &t_mut.rows[i], Some(&*t_mut))?;
-                        if val.is_null() || val == Value::Int(0) {
-                            matches = false;
-                        }
-                    }
-
-                    if matches {
-                        affected += 1;
-                        for (col_name, expr) in &assignments {
-                            let idx = t_mut
-                                .columns
-                                .iter()
-                                .position(|c| c.name == *col_name)
-                                .ok_or_else(|| MySqlError::unknown_column(col_name))?;
-                            let val = self.eval_expr(expr, &t_mut.rows[i], Some(&*t_mut))?;
-                            t_mut.rows[i][idx] = val;
-                        }
+            Plan::Update { db, table, assignments, selection, order, limit } => {
+                let mut work = self.load_table(&db, &table)?;
+                let keys = work.keys();
+                let targets = self.dml_targets(&work, selection.as_ref(), &order, limit)?;
+                for &i in &targets {
+                    self.apply_assignments(&mut work, i, &assignments)?;
+                    if let Some((_, k)) = find_key_conflict(&work, &keys, &work.rows[i], Some(i)) {
+                        return Err(duplicate_key_error(&work, &keys[k], &work.rows[i]));
                     }
                 }
-
-                self.last_affected_rows = affected;
+                self.store_table(&db, work)?;
+                self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
-            Plan::Delete { db, table, selection } => {
-                let mut state = self.db.lock().unwrap();
-                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t = schema
-                    .tables
-                    .get_mut(&table)
-                    .ok_or_else(|| MySqlError::unknown_table(&table))?;
-                let t_mut = Arc::make_mut(t);
-
-                let mut new_rows = Vec::new();
-                for row in &t_mut.rows {
-                    let mut matches = true;
-                    if let Some(sel) = &selection {
-                        let val = self.eval_expr(sel, row, Some(&*t_mut))?;
-                        if val.is_null() || val == Value::Int(0) {
-                            matches = false;
-                        }
-                    }
-
-                    if !matches {
-                        new_rows.push(row.clone());
-                    }
+            Plan::Delete { db, table, selection, order, limit } => {
+                let mut work = self.load_table(&db, &table)?;
+                let targets = self.dml_targets(&work, selection.as_ref(), &order, limit)?;
+                let mut keep = vec![true; work.rows.len()];
+                for &i in &targets {
+                    keep[i] = false;
                 }
-                self.last_affected_rows = (t_mut.rows.len() - new_rows.len()) as u64;
-                t_mut.rows = new_rows;
-
+                let mut k = keep.iter();
+                work.rows.retain(|_| *k.next().unwrap());
+                self.store_table(&db, work)?;
+                self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
-            Plan::Scan { db, table } => {
-                let state = self.db.lock().unwrap();
-                let schema = state.schemas.get(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t =
-                    schema.tables.get(&table).ok_or_else(|| MySqlError::unknown_table(&table))?;
-                Ok(t.rows.clone())
-            }
+            Plan::Scan { db, table } => Ok(self.load_table(&db, &table)?.rows),
             Plan::Filter { source, predicate } => {
                 let table_context = self.resolve_table_context(&source)?;
 
@@ -449,29 +537,29 @@ impl Executor {
                 }
                 Ok(out_rows)
             }
-            Plan::Sort { source, keys, limit, offset, calc_found_rows } => {
-                let table_context = self.resolve_table_context(&source)?;
+            Plan::Finish { source, order, hidden, distinct, limit, offset, calc_found_rows } => {
                 let mut rows = self.execute_plan(*source)?;
-
-                if calc_found_rows {
-                    self.last_found_rows = rows.len() as u64;
-                }
-
-                if !keys.is_empty() {
-                    // Evaluate every sort key once per row up front rather
-                    // than re-evaluating expressions on every comparison
-                    // during the sort.
-                    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
-                    for row in rows {
-                        let key = keys
-                            .iter()
-                            .map(|(e, _)| self.eval_expr(e, &row, table_context.as_ref()))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        keyed.push((key, row));
+                let key_index = |row: &[Value], key: &SortKey| match key {
+                    SortKey::Output(i) => *i,
+                    SortKey::Hidden(j) => row.len() - hidden + j,
+                };
+                for (key, _) in &order {
+                    if let (SortKey::Output(i), Some(row)) = (key, rows.first())
+                        && *i >= row.len() - hidden
+                    {
+                        return Err(MySqlError::new(
+                            1054,
+                            "42S22",
+                            format!("Unknown column '{}' in 'order clause'", i + 1),
+                        ));
                     }
-                    keyed.sort_by(|(ka, _), (kb, _)| {
-                        for (i, (_, asc)) in keys.iter().enumerate() {
-                            let ord = sort_cmp(&ka[i], &kb[i]);
+                }
+                if !order.is_empty() {
+                    // Stable, so rows equal on every key keep their order.
+                    rows.sort_by(|a, b| {
+                        for (key, asc) in &order {
+                            let (ia, ib) = (key_index(a, key), key_index(b, key));
+                            let ord = sort_cmp(&a[ia], &b[ib]);
                             let ord = if *asc { ord } else { ord.reverse() };
                             if ord != Ordering::Equal {
                                 return ord;
@@ -479,13 +567,32 @@ impl Executor {
                         }
                         Ordering::Equal
                     });
-                    rows = keyed.into_iter().map(|(_, row)| row).collect();
                 }
-
+                if distinct {
+                    // Duplicates are judged on the visible columns only; the
+                    // first (i.e. best-sorted) occurrence of each is kept.
+                    let mut kept: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        let visible = row.len() - hidden;
+                        if !kept.iter().any(|k| rows_distinct_equal(&k[..visible], &row[..visible]))
+                        {
+                            kept.push(row);
+                        }
+                    }
+                    rows = kept;
+                }
+                if calc_found_rows {
+                    self.last_found_rows = rows.len() as u64;
+                }
                 let start = offset.unwrap_or(0) as usize;
-                rows = rows.into_iter().skip(start).collect();
+                let mut rows: Vec<Vec<Value>> = rows.into_iter().skip(start).collect();
                 if let Some(limit) = limit {
                     rows.truncate(limit as usize);
+                }
+                if hidden > 0 {
+                    for row in rows.iter_mut() {
+                        row.truncate(row.len() - hidden);
+                    }
                 }
                 Ok(rows)
             }
@@ -556,6 +663,112 @@ impl Executor {
         }
     }
 
+    fn load_table(&self, db: &str, table: &str) -> Result<Table, MySqlError> {
+        let state = self.db.lock().unwrap();
+        if let Some(t) = crate::mysql::infoschema::lookup_table(&state, db, table) {
+            return Ok((*t).clone());
+        }
+        if !state.schemas.contains_key(db) {
+            return Err(MySqlError::new(1049, "42000", format!("Unknown database '{}'", db)));
+        }
+        Err(MySqlError::unknown_table(table))
+    }
+
+    fn store_table(&self, db: &str, t: Table) -> Result<(), MySqlError> {
+        if db.eq_ignore_ascii_case("information_schema") {
+            return Err(MySqlError::new(
+                1044,
+                "42000",
+                "Access denied for user 'root'@'localhost' to database 'information_schema'",
+            ));
+        }
+        let mut state = self.db.lock().unwrap();
+        let schema = state
+            .schemas
+            .get_mut(db)
+            .ok_or_else(|| MySqlError::new(1049, "42000", format!("Unknown database '{}'", db)))?;
+        schema.tables.insert(t.name.clone(), Arc::new(t));
+        Ok(())
+    }
+
+    /// The rows an UPDATE/DELETE acts on, in the order it acts on them:
+    /// those matching WHERE, sorted by ORDER BY, cut to LIMIT.
+    fn dml_targets(
+        &self,
+        t: &Table,
+        selection: Option<&Expr>,
+        order: &[(Expr, bool)],
+        limit: Option<u64>,
+    ) -> Result<Vec<usize>, MySqlError> {
+        let mut targets = Vec::new();
+        for (i, row) in t.rows.iter().enumerate() {
+            if let Some(sel) = selection {
+                let v = self.eval_expr(sel, row, Some(t))?;
+                if v.is_null() || v == Value::Int(0) {
+                    continue;
+                }
+            }
+            targets.push(i);
+        }
+        if !order.is_empty() {
+            let mut keyed = Vec::with_capacity(targets.len());
+            for i in targets {
+                let mut k = Vec::with_capacity(order.len());
+                for (e, _) in order {
+                    k.push(self.eval_expr(e, &t.rows[i], Some(t))?);
+                }
+                keyed.push((k, i));
+            }
+            keyed.sort_by(|(a, _), (b, _)| {
+                for (n, (_, asc)) in order.iter().enumerate() {
+                    let o = sort_cmp(&a[n], &b[n]);
+                    let o = if *asc { o } else { o.reverse() };
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                }
+                Ordering::Equal
+            });
+            targets = keyed.into_iter().map(|(_, i)| i).collect();
+        }
+        if let Some(n) = limit {
+            targets.truncate(n as usize);
+        }
+        Ok(targets)
+    }
+
+    /// Applies `SET` assignments to row `i`, one at a time, left to right:
+    /// MySQL's own single-table UPDATE semantics, where a later assignment
+    /// sees an earlier one's new value (`SET a = a + 1, b = a` sets b to the
+    /// new a). An `ON UPDATE CURRENT_TIMESTAMP` column the statement didn't
+    /// assign itself is set to now.
+    fn apply_assignments(
+        &self,
+        t: &mut Table,
+        i: usize,
+        assignments: &[(String, Expr)],
+    ) -> Result<(), MySqlError> {
+        let mut assigned = Vec::with_capacity(assignments.len());
+        for (col_name, expr) in assignments {
+            let idx = resolve_column_index(&t.columns, col_name)
+                .ok_or_else(|| MySqlError::unknown_column(col_name))?;
+            let val = self.eval_expr(expr, &t.rows[i], Some(&*t))?;
+            let col = &t.columns[idx];
+            if val.is_null() && col.not_null {
+                return Err(column_cannot_be_null(&col.name));
+            }
+            t.rows[i][idx] = coerce_to_column(val, &col.ty, &col.name)?;
+            assigned.push(idx);
+        }
+        let now = now_ts();
+        for idx in 0..t.columns.len() {
+            if t.columns[idx].on_update_now && !assigned.contains(&idx) {
+                t.rows[i][idx] = Value::Ts(now);
+            }
+        }
+        Ok(())
+    }
+
     fn eval_expr(
         &self,
         expr: &Expr,
@@ -567,14 +780,20 @@ impl Executor {
             Expr::Param(i) => Ok(self.params.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::Col(i) => Ok(row.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::FoundRows => Ok(Value::Int(self.last_found_rows as i64)),
-            Expr::ColName(name) => {
-                if let Some(t) = table
-                    && let Some(idx) = resolve_column_index(&t.columns, name)
-                {
-                    return Ok(row.get(idx).cloned().unwrap_or(Value::Null));
-                }
-                Ok(Value::Null) // For simplicity, return Null if column not found or no table context
-            }
+            Expr::ColName(name) => match table {
+                Some(t) => match resolve_column_index(&t.columns, name) {
+                    Some(idx) => Ok(row.get(idx).cloned().unwrap_or(Value::Null)),
+                    // Found via testing before a public release: a mistyped
+                    // column used to evaluate to NULL, so `WHERE nosuch = 1`
+                    // silently matched nothing instead of erroring.
+                    None => Err(MySqlError::new(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{name}' in 'field list'"),
+                    )),
+                },
+                None => Ok(Value::Null),
+            },
             Expr::And(exprs) => {
                 let mut res = Value::Int(1);
                 for e in exprs {
@@ -680,6 +899,35 @@ impl Executor {
                     None => Ok(Value::Null),
                 }
             }
+            // Session-level functions need the connection's own state, not
+            // just their arguments. SQLAlchemy calls `SELECT DATABASE()` on
+            // connect; connection pools and admin tools call the rest.
+            Expr::Call { name, .. } if name == "DATABASE" || name == "SCHEMA" => {
+                Ok(self.current_db.clone().map(Value::Text).unwrap_or(Value::Null))
+            }
+            Expr::Call { name, .. }
+                if matches!(
+                    name.as_str(),
+                    "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER"
+                ) =>
+            {
+                Ok(Value::Text("root@localhost".into()))
+            }
+            Expr::Call { name, args } if name == "VALUES" => {
+                let (Some(new_row), Some(t), Some(Expr::ColName(c))) =
+                    (&self.insert_row, table, args.first())
+                else {
+                    return Ok(Value::Null);
+                };
+                Ok(resolve_column_index(&t.columns, c)
+                    .and_then(|i| new_row.get(i).cloned())
+                    .unwrap_or(Value::Null))
+            }
+            Expr::Call { name, .. } if name == "CONNECTION_ID" => Ok(Value::Int(1)),
+            Expr::Call { name, .. } if name == "LAST_INSERT_ID" => {
+                Ok(Value::Int(self.session_insert_id as i64))
+            }
+            Expr::Call { name, .. } if name == "VERSION" => Ok(Value::Text("8.0.33".into())),
             Expr::Call { name, args } => {
                 let vals: Vec<Value> =
                     args.iter().map(|a| self.eval_expr(a, row, table)).collect::<Result<_, _>>()?;
@@ -704,71 +952,150 @@ impl Executor {
         rows: &[Vec<Value>],
         table: Option<&Table>,
     ) -> Result<Value, MySqlError> {
-        match expr {
-            Expr::Agg { func, arg } => {
+        // Compute every aggregate in `expr` over the whole group, splice the
+        // results in as constants, then evaluate what's left once against
+        // the group's first row. That works for any expression shape
+        // (`COALESCE(SUM(x), 0)`, `CASE WHEN COUNT(*) > 1 ...`, `ROUND(AVG(x),
+        // 2)`) instead of only the few combinators listed by hand before.
+        let folded = self.fold_aggs(expr, rows, table)?;
+        match rows.first() {
+            Some(row) => self.eval_expr(&folded, row, table),
+            None => self.eval_expr(&folded, &[], table),
+        }
+    }
+
+    /// `expr` with each `Expr::Agg` replaced by its value over `rows`.
+    /// `GROUP_CONCAT` over one group. `call` is the binder's
+    /// `GROUP_CONCAT(value, separator, key1, asc1, key2, asc2, ...)`.
+    fn group_concat(
+        &self,
+        call: &Expr,
+        distinct: bool,
+        rows: &[Vec<Value>],
+        table: Option<&Table>,
+    ) -> Result<Value, MySqlError> {
+        let Expr::Call { args, .. } = call else {
+            return Err(MySqlError::unsupported("GROUP_CONCAT shape"));
+        };
+        let sep = match args.get(1) {
+            Some(Expr::Const(v)) => render_text(v),
+            _ => ",".into(),
+        };
+        let order: Vec<(&Expr, bool)> = args[2..]
+            .chunks(2)
+            .map(|c| (&c[0], matches!(c.get(1), Some(Expr::Const(Value::Int(1))))))
+            .collect();
+        let mut items: Vec<(Vec<Value>, Value)> = Vec::new();
+        for r in rows {
+            let v = self.eval_expr(&args[0], r, table)?;
+            if v.is_null() {
+                continue;
+            }
+            if distinct && items.iter().any(|(_, u)| mysql_cmp(u, &v) == Some(Ordering::Equal)) {
+                continue;
+            }
+            let keys =
+                order.iter().map(|(e, _)| self.eval_expr(e, r, table)).collect::<Result<_, _>>()?;
+            items.push((keys, v));
+        }
+        if items.is_empty() {
+            return Ok(Value::Null);
+        }
+        items.sort_by(|(a, _), (b, _)| {
+            for (n, (_, asc)) in order.iter().enumerate() {
+                let o = sort_cmp(&a[n], &b[n]);
+                let o = if *asc { o } else { o.reverse() };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            Ordering::Equal
+        });
+        let parts: Vec<String> = items.iter().map(|(_, v)| render_text(v)).collect();
+        Ok(Value::Text(parts.join(&sep)))
+    }
+
+    fn fold_aggs(
+        &self,
+        expr: &Expr,
+        rows: &[Vec<Value>],
+        table: Option<&Table>,
+    ) -> Result<Expr, MySqlError> {
+        let f = |e: &Expr| self.fold_aggs(e, rows, table);
+        let fb = |e: &Expr| -> Result<Box<Expr>, MySqlError> { Ok(Box::new(f(e)?)) };
+        Ok(match expr {
+            Expr::Agg { func, arg, distinct } => {
                 if matches!(func, AggFunc::CountStar) {
-                    return Ok(Value::Int(rows.len() as i64));
+                    return Ok(Expr::Const(Value::Int(rows.len() as i64)));
+                }
+                if let (AggFunc::GroupConcat, Some(arg)) = (func, arg) {
+                    return Ok(Expr::Const(self.group_concat(arg, *distinct, rows, table)?));
                 }
                 let arg = arg
                     .as_ref()
                     .ok_or_else(|| MySqlError::unsupported("aggregate without argument"))?;
-                let vals: Vec<Value> =
+                let mut vals: Vec<Value> =
                     rows.iter().map(|r| self.eval_expr(arg, r, table)).collect::<Result<_, _>>()?;
-                Ok(compute_agg(*func, &vals))
+                if *distinct {
+                    // Found via testing before a public release: DISTINCT
+                    // inside an aggregate was ignored (`COUNT(DISTINCT x)`
+                    // counted every row).
+                    let mut unique: Vec<Value> = Vec::with_capacity(vals.len());
+                    for v in vals.into_iter().filter(|v| !v.is_null()) {
+                        if !unique.iter().any(|u| mysql_cmp(u, &v) == Some(Ordering::Equal)) {
+                            unique.push(v);
+                        }
+                    }
+                    vals = unique;
+                }
+                Expr::Const(compute_agg(*func, &vals))
+            }
+            Expr::And(v) => Expr::And(v.iter().map(f).collect::<Result<_, _>>()?),
+            Expr::Or(v) => Expr::Or(v.iter().map(f).collect::<Result<_, _>>()?),
+            Expr::Compare { op, left, right } => {
+                Expr::Compare { op: *op, left: fb(left)?, right: fb(right)? }
             }
             Expr::Arith { op, left, right } => {
-                let l = self.eval_group_expr(left, rows, table)?;
-                let r = self.eval_group_expr(right, rows, table)?;
-                eval_arith(*op, l, r)
+                Expr::Arith { op: *op, left: fb(left)?, right: fb(right)? }
             }
-            Expr::Compare { op, left, right } => {
-                let l = self.eval_group_expr(left, rows, table)?;
-                let r = self.eval_group_expr(right, rows, table)?;
-                eval_compare(*op, l, r)
-            }
-            Expr::And(exprs) => {
-                let mut res = Value::Int(1);
-                for e in exprs {
-                    let v = self.eval_group_expr(e, rows, table)?;
-                    if v.is_null() {
-                        res = Value::Null;
-                    } else if v == Value::Int(0) {
-                        return Ok(Value::Int(0));
-                    }
-                }
-                Ok(res)
-            }
-            Expr::Or(exprs) => {
-                let mut res = Value::Int(0);
-                for e in exprs {
-                    let v = self.eval_group_expr(e, rows, table)?;
-                    if v == Value::Int(1) {
-                        return Ok(Value::Int(1));
-                    } else if v.is_null() {
-                        res = Value::Null;
-                    }
-                }
-                Ok(res)
-            }
-            _ => {
-                if let Some(row) = rows.first() {
-                    self.eval_expr(expr, row, table)
-                } else {
-                    Ok(Value::Null)
-                }
-            }
-        }
+            Expr::Call { name, args } => Expr::Call {
+                name: name.clone(),
+                args: args.iter().map(f).collect::<Result<_, _>>()?,
+            },
+            Expr::InList { expr, list, negated } => Expr::InList {
+                expr: fb(expr)?,
+                list: list.iter().map(f).collect::<Result<_, _>>()?,
+                negated: *negated,
+            },
+            Expr::Not(x) => Expr::Not(fb(x)?),
+            Expr::IsNull(x, neg) => Expr::IsNull(fb(x)?, *neg),
+            Expr::Like { expr, pattern, escape, negated } => Expr::Like {
+                expr: fb(expr)?,
+                pattern: fb(pattern)?,
+                escape: fb(escape)?,
+                negated: *negated,
+            },
+            Expr::Case { conditions, else_result } => Expr::Case {
+                conditions: conditions.iter().map(|(c, r)| Ok((f(c)?, f(r)?))).collect::<Result<
+                    _,
+                    MySqlError,
+                >>(
+                )?,
+                else_result: else_result.as_ref().map(|e| fb(e)).transpose()?,
+            },
+            other => other.clone(),
+        })
     }
 }
 
 /// `ORDER BY`'s own comparator: unlike `value_partial_cmp` (used by
 /// `MIN`/`MAX`, which skip NULLs entirely), a sort has to place every row
 /// somewhere, so NULL sorts first in ascending order (real MySQL's rule;
-/// `Plan::Sort`'s execution reverses the whole comparison for `DESC`, which
-/// correctly puts NULLs last in that case too, matching MySQL). Two
-/// otherwise-incomparable values (e.g. text vs. a number) are treated as
-/// equal rather than panicking or being arbitrarily ordered.
-fn sort_cmp(a: &Value, b: &Value) -> Ordering {
+/// `Plan::Finish` reverses the whole comparison for `DESC`, which correctly
+/// puts NULLs last in that case too, matching MySQL). Two otherwise-
+/// incomparable values are treated as equal rather than panicking or being
+/// arbitrarily ordered.
+pub(crate) fn sort_cmp(a: &Value, b: &Value) -> Ordering {
     match (a.is_null(), b.is_null()) {
         (true, true) => return Ordering::Equal,
         (true, false) => return Ordering::Less,
@@ -783,20 +1110,7 @@ fn sort_cmp(a: &Value, b: &Value) -> Ordering {
 /// comparing a number against text) means the two aren't ordered against
 /// each other — the caller treats that as "keep the earlier value".
 fn value_partial_cmp(a: &Value, b: &Value) -> Option<Ordering> {
-    match (a, b) {
-        (Value::Text(x), Value::Text(y)) => x.partial_cmp(y),
-        _ => {
-            let as_f64 = |v: &Value| match v {
-                Value::Int(i) => Some(*i as f64),
-                Value::Float(f) => Some(*f),
-                _ => None,
-            };
-            match (as_f64(a), as_f64(b)) {
-                (Some(x), Some(y)) => x.partial_cmp(&y),
-                _ => None,
-            }
-        }
-    }
+    mysql_cmp(a, b)
 }
 
 /// `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` over one group's evaluated values.
@@ -806,46 +1120,72 @@ fn value_partial_cmp(a: &Value, b: &Value) -> Option<Ordering> {
 fn compute_agg(func: AggFunc, vals: &[Value]) -> Value {
     let non_null: Vec<&Value> = vals.iter().filter(|v| !v.is_null()).collect();
     match func {
+        // Computed by `Executor::group_concat`, which needs the rows.
+        AggFunc::GroupConcat => Value::Null,
         AggFunc::CountStar => Value::Int(vals.len() as i64),
         AggFunc::Count => Value::Int(non_null.len() as i64),
-        AggFunc::Sum => {
+        AggFunc::Sum | AggFunc::Avg => {
             if non_null.is_empty() {
                 return Value::Null;
             }
-            let all_int = non_null.iter().all(|v| matches!(v, Value::Int(_)));
-            let sum: f64 = non_null
+            // MySQL: an exact (INT/DECIMAL) input sums exactly; any
+            // approximate (FLOAT/DOUBLE, or a string coerced to a number)
+            // input makes the whole result a DOUBLE. AVG of exact values is
+            // a DECIMAL carrying `div_precision_increment` (4) more digits
+            // than the inputs (`AVG` of 1,2,2 is 1.6667, not 1.666666...).
+            let approximate = non_null
                 .iter()
-                .map(|v| match v {
-                    Value::Int(i) => *i as f64,
-                    Value::Float(f) => *f,
-                    _ => 0.0,
-                })
-                .sum();
-            if all_int { Value::Int(sum as i64) } else { Value::Float(sum) }
-        }
-        AggFunc::Avg => {
-            if non_null.is_empty() {
-                return Value::Null;
+                .any(|v| !matches!(v, Value::Int(_) | Value::Num(_) | Value::Bool(_)));
+            if approximate {
+                let sum: f64 = non_null.iter().map(|v| value_to_f64(v)).sum();
+                return match func {
+                    AggFunc::Sum => Value::Float(sum),
+                    _ => Value::Float(sum / non_null.len() as f64),
+                };
             }
-            let sum: f64 = non_null
-                .iter()
-                .map(|v| match v {
-                    Value::Int(i) => *i as f64,
-                    Value::Float(f) => *f,
-                    _ => 0.0,
-                })
-                .sum();
-            Value::Float(sum / non_null.len() as f64)
+            if matches!(func, AggFunc::Sum) && non_null.iter().all(|v| matches!(v, Value::Int(_))) {
+                let mut acc: i64 = 0;
+                let mut overflow = false;
+                for v in &non_null {
+                    if let Value::Int(i) = v {
+                        match acc.checked_add(*i) {
+                            Some(n) => acc = n,
+                            None => overflow = true,
+                        }
+                    }
+                }
+                if !overflow {
+                    return Value::Int(acc);
+                }
+            }
+            let mut sum = Numeric::zero();
+            let mut max_scale = 0u32;
+            for v in &non_null {
+                if let Some(n) = value_to_numeric(v) {
+                    max_scale = max_scale.max(n.scale());
+                    sum = sum.add(&n);
+                }
+            }
+            match func {
+                AggFunc::Sum => Value::Num(sum),
+                _ => {
+                    let count = Numeric::from_i64(non_null.len() as i64);
+                    match sum.div_scale(&count, max_scale as i64 + 4, false) {
+                        Ok(avg) => Value::Num(avg),
+                        Err(_) => Value::Null,
+                    }
+                }
+            }
         }
         AggFunc::Min => non_null
             .into_iter()
             .cloned()
-            .min_by(|a, b| value_partial_cmp(a, b).unwrap_or(Ordering::Equal))
+            .min_by(|a, b| mysql_cmp(a, b).unwrap_or(Ordering::Equal))
             .unwrap_or(Value::Null),
         AggFunc::Max => non_null
             .into_iter()
             .cloned()
-            .max_by(|a, b| value_partial_cmp(a, b).unwrap_or(Ordering::Equal))
+            .max_by(|a, b| mysql_cmp(a, b).unwrap_or(Ordering::Equal))
             .unwrap_or(Value::Null),
     }
 }
@@ -941,8 +1281,14 @@ fn resolve_column_index(columns: &[Column], sought: &str) -> Option<usize> {
     if let Some(idx) = columns.iter().position(|c| c.name == sought) {
         return Some(idx);
     }
+    // MySQL column names are case-insensitive (`SELECT NAME FROM users`).
+    if let Some(idx) = columns.iter().position(|c| c.name.eq_ignore_ascii_case(sought)) {
+        return Some(idx);
+    }
     let sought_last = sought.rsplit('.').next().unwrap_or(sought);
-    columns.iter().position(|c| c.name.rsplit('.').next().unwrap_or(&c.name) == sought_last)
+    columns.iter().position(|c| {
+        c.name.rsplit('.').next().unwrap_or(&c.name).eq_ignore_ascii_case(sought_last)
+    })
 }
 
 /// Coerces a `Value` to a plain string the way `CONCAT`/`UPPER`/`LOWER`/
@@ -951,15 +1297,8 @@ fn resolve_column_index(columns: &[Column], sought: &str) -> Option<usize> {
 /// caller decides how to propagate that), and the handful of variants this
 /// scalar-function library doesn't have a defined textual form for yet
 /// (`Bytes`/`Date`/`Time`/`Ts`/`Json`) return `None` rather than guessing.
-fn value_as_text(v: &Value) -> Option<String> {
-    match v {
-        Value::Text(s) => Some(s.clone()),
-        Value::Int(i) => Some(i.to_string()),
-        Value::Float(f) => Some(f.to_string()),
-        Value::Bool(b) => Some(if *b { "1".to_string() } else { "0".to_string() }),
-        Value::Num(n) => Some(n.to_string()),
-        _ => None,
-    }
+pub(crate) fn value_as_text(v: &Value) -> Option<String> {
+    if v.is_null() { None } else { Some(render_text(v)) }
 }
 
 /// `pattern [ESCAPE esc]` matching for `LIKE`: `%` matches any run of
@@ -969,7 +1308,7 @@ fn value_as_text(v: &Value) -> Option<String> {
 /// Same tokenize-then-backtrack algorithm as `postgres::funcs::like`
 /// (not shared code -- `mysql` and `postgres` are independent Cargo
 /// features, so mysql's own executor can't depend on postgres's module).
-fn mysql_like(s: &str, pattern: &str, esc: Option<char>) -> bool {
+pub(crate) fn mysql_like(s: &str, pattern: &str, esc: Option<char>) -> bool {
     enum Tok {
         Lit(char),
         One,
@@ -1039,7 +1378,7 @@ fn mysql_like(s: &str, pattern: &str, esc: Option<char>) -> bool {
 /// (`value_as_text` returning `None`, which includes `NULL`) makes the
 /// whole call `NULL`, matching real MySQL's own NULL-propagation for
 /// these functions.
-fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
+pub(crate) fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
     match name {
         "CONCAT" => {
             let mut out = String::new();
@@ -1105,7 +1444,16 @@ fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
                 Ok(args.get(1).cloned().unwrap_or(Value::Null))
             }
         }
-        _ => Err(MySqlError::unsupported(&format!("function {name}"))),
+        // The time of the statement. No session time zone exists, so these
+        // are UTC -- the same `now_ts()` a `DEFAULT CURRENT_TIMESTAMP`
+        // column is filled with, so the two always agree.
+        "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" => {
+            Ok(Value::Ts(now_ts()))
+        }
+        "CURDATE" | "CURRENT_DATE" => {
+            Ok(Value::Date(now_ts().div_euclid(crate::sql::datetime::USECS_PER_DAY) as i32))
+        }
+        _ => crate::mysql::funcs::eval(name, args),
     }
 }
 
@@ -1113,70 +1461,84 @@ fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
 /// `Value` variants this engine's literal parser actually produces
 /// (`Int`/`Float`) — mixing in a float promotes the result to float,
 /// matching MySQL's own numeric-promotion rule for `+ - * /`.
-fn eval_arith(op: ArithOp, l: Value, r: Value) -> Result<Value, MySqlError> {
-    let as_f64 = |v: &Value| match v {
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) => Some(*f),
-        Value::Text(s) => Some(mysql_text_to_f64(s)),
-        _ => None,
-    };
-    match (&l, &r) {
-        (Value::Int(a), Value::Int(b)) => match op {
-            ArithOp::Add => Ok(Value::Int(a + b)),
-            ArithOp::Sub => Ok(Value::Int(a - b)),
-            ArithOp::Mul => Ok(Value::Int(a * b)),
-            // MySQL's `/` on two integers returns a DECIMAL, scaled by
-            // `div_precision_increment` (default 4) beyond the operands'
-            // scale (0 for an integer) — i.e. always exactly 4 decimal
-            // places, not a bare float's shortest representation
-            // (`10/4` is "2.5000", never "2.5").
-            ArithOp::Div => {
-                if *b == 0 {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Text(format!("{:.4}", *a as f64 / *b as f64)))
-                }
-            }
-            // Unlike `/`, MySQL's `%`/`MOD` on two integers stays an
-            // integer (no DECIMAL promotion) and, like real MySQL,
-            // `x % 0` is NULL rather than a division-by-zero error.
+pub(crate) fn eval_arith(op: ArithOp, l: Value, r: Value) -> Result<Value, MySqlError> {
+    // Any arithmetic involving NULL is NULL (`views + 1` on a NULL `views`),
+    // never an error -- found via testing before a public release.
+    if l.is_null() || r.is_null() {
+        return Ok(Value::Null);
+    }
+    let is_exact = |v: &Value| matches!(v, Value::Int(_) | Value::Num(_) | Value::Bool(_));
+    if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+        let (a, b) = (*a, *b);
+        let checked = match op {
+            ArithOp::Add => a.checked_add(b),
+            ArithOp::Sub => a.checked_sub(b),
+            ArithOp::Mul => a.checked_mul(b),
             ArithOp::Mod => {
-                if *b == 0 {
-                    Ok(Value::Null)
-                } else {
-                    Ok(Value::Int(a % b))
-                }
+                // `x % 0` is NULL in MySQL, not a division-by-zero error.
+                return Ok(if b == 0 { Value::Null } else { Value::Int(a % b) });
             }
-        },
-        _ => {
-            let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) else {
-                return Err(MySqlError::new(
-                    1292,
-                    "22007",
-                    format!("Truncated incorrect DOUBLE value: {:?}", l),
-                ));
-            };
-            match op {
-                ArithOp::Add => Ok(Value::Float(a + b)),
-                ArithOp::Sub => Ok(Value::Float(a - b)),
-                ArithOp::Mul => Ok(Value::Float(a * b)),
-                ArithOp::Div => {
-                    if b == 0.0 {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(Value::Float(a / b))
-                    }
-                }
-                ArithOp::Mod => {
-                    if b == 0.0 {
-                        Ok(Value::Null)
-                    } else {
-                        Ok(Value::Float(a % b))
-                    }
-                }
-            }
+            ArithOp::Div => None, // handled exactly below
+        };
+        if let Some(v) = checked {
+            return Ok(Value::Int(v));
+        }
+        if !matches!(op, ArithOp::Div) {
+            return Err(MySqlError::new(
+                1690,
+                "22003",
+                format!("BIGINT value is out of range in '({a} {} {b})'", op_symbol(op)),
+            ));
         }
     }
+    if is_exact(&l) && is_exact(&r) {
+        // Exact DECIMAL arithmetic, the way MySQL does it for INT/DECIMAL
+        // operands: `price * 2` on a DECIMAL(10,2) stays exact, and `/`
+        // carries `div_precision_increment` (4) more digits than the
+        // dividend (`10/4` is 2.5000, `1/3` is 0.3333).
+        let (Some(a), Some(b)) = (value_to_numeric(&l), value_to_numeric(&r)) else {
+            return Ok(Value::Null);
+        };
+        return Ok(match op {
+            ArithOp::Add => Value::Num(a.add(&b)),
+            ArithOp::Sub => Value::Num(a.sub(&b)),
+            ArithOp::Mul => Value::Num(a.mul(&b)),
+            ArithOp::Div => {
+                if b.to_f64() == 0.0 {
+                    Value::Null
+                } else {
+                    match a.div_scale(&b, a.scale() as i64 + 4, false) {
+                        Ok(v) => Value::Num(v),
+                        Err(_) => Value::Null,
+                    }
+                }
+            }
+            ArithOp::Mod => {
+                let (x, y) = (a.to_f64(), b.to_f64());
+                if y == 0.0 { Value::Null } else { Value::Num(Numeric::from_f64(x % y)) }
+            }
+        });
+    }
+    let (a, b) = (value_to_f64(&l), value_to_f64(&r));
+    Ok(match op {
+        ArithOp::Add => Value::Float(a + b),
+        ArithOp::Sub => Value::Float(a - b),
+        ArithOp::Mul => Value::Float(a * b),
+        ArithOp::Div => {
+            if b == 0.0 {
+                Value::Null
+            } else {
+                Value::Float(a / b)
+            }
+        }
+        ArithOp::Mod => {
+            if b == 0.0 {
+                Value::Null
+            } else {
+                Value::Float(a % b)
+            }
+        }
+    })
 }
 
 /// MySQL's three-valued comparison logic: NULL on either side always
@@ -1186,28 +1548,7 @@ fn eval_compare(op: CmpOp, l: Value, r: Value) -> Result<Value, MySqlError> {
     if l.is_null() || r.is_null() {
         return Ok(Value::Null);
     }
-    let ordering = match (&l, &r) {
-        (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
-        _ => {
-            let as_f64 = |v: &Value| match v {
-                Value::Int(i) => Some(*i as f64),
-                Value::Float(f) => Some(*f),
-                Value::Text(s) => Some(mysql_text_to_f64(s)),
-                _ => None,
-            };
-            match (as_f64(&l), as_f64(&r)) {
-                (Some(a), Some(b)) => a.partial_cmp(&b),
-                _ => {
-                    return Err(MySqlError::new(
-                        1292,
-                        "22007",
-                        format!("Truncated incorrect DOUBLE value: {:?}", l),
-                    ));
-                }
-            }
-        }
-    };
-    let Some(ordering) = ordering else {
+    let Some(ordering) = mysql_cmp(&l, &r) else {
         return Ok(Value::Null);
     };
     let result = match op {
@@ -1243,4 +1584,357 @@ fn eval_in_list(l: Value, items: &[Value], negated: bool) -> Result<Value, MySql
         return Ok(Value::Null); // NOT NULL is still NULL
     }
     Ok(Value::Int((found != negated) as i64))
+}
+
+fn op_symbol(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+        ArithOp::Mod => "%",
+    }
+}
+
+/// The current time as a `DATETIME` value (microseconds since 2000-01-01,
+/// the encoding `Value::Ts` shares with the Postgres engine), truncated to
+/// whole seconds the way a plain `DATETIME`/`NOW()` is.
+pub(crate) fn now_ts() -> i64 {
+    let us = crate::sql::datetime::now_micros();
+    us - us.rem_euclid(crate::sql::datetime::USECS_PER_SEC)
+}
+
+fn datetime_ctx<R>(f: impl FnOnce(&crate::sql::datetime::Ctx) -> R) -> R {
+    let zone = crate::sql::tz::Zone::utc();
+    let ctx = crate::sql::datetime::Ctx { now: now_ts(), zone: &zone };
+    f(&ctx)
+}
+
+/// A `DATE` from text (`'2024-03-05'`, or the date part of a datetime).
+/// `None` for anything unparseable, including MySQL's own zero date
+/// `'0000-00-00'`, which callers keep as text rather than reject.
+pub(crate) fn parse_mysql_date(s: &str) -> Option<i32> {
+    datetime_ctx(|ctx| crate::sql::datetime::parse_date(s.trim(), ctx).ok())
+}
+
+/// A `DATETIME` from text (`'2024-03-05 14:07:09[.ffffff]'`, or a bare
+/// date at midnight). `None` for unparseable/zero values.
+pub(crate) fn parse_mysql_datetime(s: &str) -> Option<i64> {
+    datetime_ctx(|ctx| crate::sql::datetime::parse_timestamp(s.trim(), ctx).ok())
+}
+
+pub(crate) fn value_to_f64(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        Value::Num(n) => n.to_f64(),
+        Value::Bool(b) => *b as i64 as f64,
+        Value::Text(s) => mysql_text_to_f64(s),
+        _ => 0.0,
+    }
+}
+
+pub(crate) fn value_to_numeric(v: &Value) -> Option<Numeric> {
+    match v {
+        Value::Int(i) => Some(Numeric::from_i64(*i)),
+        Value::Num(n) => Some(n.clone()),
+        Value::Bool(b) => Some(Numeric::from_i64(*b as i64)),
+        Value::Float(f) => Some(Numeric::from_f64(*f)),
+        Value::Text(s) => {
+            Numeric::parse(s.trim()).ok().or_else(|| Some(Numeric::from_f64(mysql_text_to_f64(s))))
+        }
+        _ => None,
+    }
+}
+
+/// MySQL's comparison rules, shared by `=`/`<`/..., `IN`, `MIN`/`MAX` and
+/// `ORDER BY` so every one of them agrees:
+/// - text vs text: case-insensitive, like MySQL's default `_ci` collations
+///   (`WHERE email = 'Alice@X.com'` matches `alice@x.com`);
+/// - numbers: exact when both sides are exact (INT/DECIMAL), as doubles
+///   otherwise; text compared with a number is coerced to a number;
+/// - DATE/DATETIME: chronologically, including against a date string
+///   (`created_at >= '2024-01-01'`).
+///
+/// `None` only for a NaN.
+pub(crate) fn mysql_cmp(a: &Value, b: &Value) -> Option<Ordering> {
+    use Value::*;
+    let is_numeric = |v: &Value| matches!(v, Int(_) | Float(_) | Num(_) | Bool(_));
+    let is_temporal = |v: &Value| matches!(v, Date(_) | Ts(_));
+    match (a, b) {
+        (Text(x), Text(y)) => Some(x.to_lowercase().cmp(&y.to_lowercase())),
+        (Date(x), Date(y)) => Some(x.cmp(y)),
+        (Ts(x), Ts(y)) => Some(x.cmp(y)),
+        (Date(x), Ts(y)) => Some((*x as i64 * crate::sql::datetime::USECS_PER_DAY).cmp(y)),
+        (Ts(x), Date(y)) => Some(x.cmp(&(*y as i64 * crate::sql::datetime::USECS_PER_DAY))),
+        (Date(_) | Ts(_), Text(s)) => match parse_mysql_datetime(s) {
+            Some(t) => mysql_cmp(a, &Ts(t)),
+            None => Some(render_text(a).cmp(s)),
+        },
+        (Text(_), Date(_) | Ts(_)) => mysql_cmp(b, a).map(Ordering::reverse),
+        _ if is_temporal(a) || is_temporal(b) => Some(render_text(a).cmp(&render_text(b))),
+        (Int(x), Int(y)) => Some(x.cmp(y)),
+        _ if (is_numeric(a) || matches!(a, Text(_))) && (is_numeric(b) || matches!(b, Text(_))) => {
+            let exact = |v: &Value| matches!(v, Int(_) | Num(_) | Bool(_));
+            if exact(a) && exact(b) {
+                let (x, y) = (value_to_numeric(a)?, value_to_numeric(b)?);
+                Some(crate::sql::numeric::cmp_num(&x, &y))
+            } else {
+                value_to_f64(a).partial_cmp(&value_to_f64(b))
+            }
+        }
+        _ => Some(render_text(a).cmp(&render_text(b))),
+    }
+}
+
+/// A value's MySQL text form -- exactly what the text protocol sends for
+/// it, and what a value is compared/concatenated as when it has to be
+/// treated as a string.
+pub(crate) fn render_text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::Text(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => (*b as i64).to_string(),
+        Value::Float(f) => format_double(*f),
+        Value::Num(n) => n.to_string(),
+        Value::Date(d) => crate::sql::datetime::format_date(*d),
+        Value::Ts(t) => crate::sql::datetime::format_timestamp(*t),
+        Value::Time(t) => crate::sql::datetime::format_time(*t),
+        Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
+        Value::Json(j) => j.to_jsonb_string(),
+    }
+}
+
+/// MySQL prints a DOUBLE in its shortest round-trip form, with no
+/// trailing `.0` on an integral value (`2`, not `2.0`).
+pub(crate) fn format_double(f: f64) -> String {
+    if f.is_finite() && f == f.trunc() && f.abs() < 1e15 {
+        format!("{}", f as i64)
+    } else {
+        format!("{f}")
+    }
+}
+
+/// Converts a value to the type of the column it's being written to, the
+/// way real MySQL does on INSERT/UPDATE: a DECIMAL column stores an exact
+/// value rounded to its scale (`12.5` into DECIMAL(10,2) reads back as
+/// `12.50`), FLOAT/DOUBLE store a double, integer columns an integer, DATE
+/// and DATETIME a real date/time. Found via testing before a public
+/// release: values used to be stored in whatever shape the literal arrived
+/// in, so a DECIMAL column filled from `12.50` held *text*, and SUM/AVG/
+/// MAX/ORDER BY/`>` on it were all silently wrong.
+pub(crate) fn coerce_to_column(v: Value, ty: &ColumnType, col: &str) -> Result<Value, MySqlError> {
+    use Value::*;
+    if v.is_null() {
+        return Ok(Null);
+    }
+    let bad = |what: &str, v: &Value| {
+        MySqlError::new(
+            1366,
+            "HY000",
+            format!("Incorrect {what} value: '{}' for column '{col}' at row 1", render_text(v)),
+        )
+    };
+    Ok(match ty {
+        ColumnType::Int | ColumnType::BigInt | ColumnType::Boolean => match v {
+            Int(_) => v,
+            Bool(b) => Int(b as i64),
+            Float(f) => Int(f.round() as i64),
+            Num(ref n) => Int(n.to_f64().round() as i64),
+            Text(ref s) => {
+                let t = s.trim();
+                if let Ok(i) = t.parse::<i64>() {
+                    Int(i)
+                } else if let Ok(f) = t.parse::<f64>() {
+                    Int(f.round() as i64)
+                } else {
+                    return Err(bad("integer", &v));
+                }
+            }
+            _ => return Err(bad("integer", &v)),
+        },
+        ColumnType::Float | ColumnType::Double => match v {
+            Float(_) => v,
+            Int(_) | Num(_) | Bool(_) => Float(value_to_f64(&v)),
+            Text(ref s) => match s.trim().parse::<f64>() {
+                Ok(f) => Float(f),
+                Err(_) => return Err(bad("double", &v)),
+            },
+            _ => return Err(bad("double", &v)),
+        },
+        ColumnType::Decimal(_, scale) => {
+            let n = match v {
+                Text(ref s) => match Numeric::parse(s.trim()) {
+                    Ok(n) => n,
+                    Err(_) => return Err(bad("decimal", &v)),
+                },
+                Int(_) | Num(_) | Float(_) | Bool(_) => {
+                    value_to_numeric(&v).unwrap_or_else(Numeric::zero)
+                }
+                _ => return Err(bad("decimal", &v)),
+            };
+            Num(n.round(*scale as i64))
+        }
+        ColumnType::Date => match v {
+            Date(_) => v,
+            Ts(t) => Date(t.div_euclid(crate::sql::datetime::USECS_PER_DAY) as i32),
+            Text(ref s) => parse_mysql_date(s).map(Date).unwrap_or(v),
+            _ => Text(render_text(&v)),
+        },
+        ColumnType::Datetime => match v {
+            Ts(_) => v,
+            Date(d) => Ts(d as i64 * crate::sql::datetime::USECS_PER_DAY),
+            Text(ref s) => parse_mysql_datetime(s).map(Ts).unwrap_or(v),
+            _ => Text(render_text(&v)),
+        },
+        ColumnType::Varchar(n) => {
+            let t = match v {
+                Text(t) => t,
+                other => render_text(&other),
+            };
+            // Strict mode (the 8.0 default) rejects an over-long string
+            // rather than storing it.
+            if t.chars().count() > *n {
+                return Err(MySqlError::new(
+                    1406,
+                    "22001",
+                    format!("Data too long for column '{col}' at row 1"),
+                ));
+            }
+            Text(t)
+        }
+        ColumnType::Text => match v {
+            Text(_) => v,
+            other => Text(render_text(&other)),
+        },
+        ColumnType::Blob => match v {
+            Bytes(_) | Text(_) => v,
+            other => Text(render_text(&other)),
+        },
+        ColumnType::Enum(members) => {
+            let t = render_text(&v);
+            // Enum values match case-insensitively and are stored as the
+            // member's own spelling; a number picks the member by position.
+            let found =
+                members.iter().find(|m| m.eq_ignore_ascii_case(t.trim_end())).or_else(|| match v {
+                    Int(i) if i >= 1 => members.get(i as usize - 1),
+                    _ => None,
+                });
+            match found {
+                Some(m) => Text(m.clone()),
+                None => {
+                    return Err(MySqlError::new(
+                        1265,
+                        "01000",
+                        format!("Data truncated for column '{col}' at row 1"),
+                    ));
+                }
+            }
+        }
+        ColumnType::Json => match v {
+            Json(_) => v,
+            Text(ref s) => match crate::sql::json::parse_jsonb(s) {
+                Ok(j) => Json(Box::new(j)),
+                Err(_) => {
+                    return Err(MySqlError::new(
+                        3140,
+                        "22032",
+                        format!(
+                            "Invalid JSON text: \"Invalid value.\" at position 0 in value for column '{col}'."
+                        ),
+                    ));
+                }
+            },
+            Int(i) => Json(Box::new(crate::sql::json::parse_jsonb(&i.to_string()).unwrap())),
+            other => Text(render_text(&other)),
+        },
+    })
+}
+
+/// Row equality for `DISTINCT`: column by column with MySQL's comparison
+/// rules, except that two NULLs count as the same value (SQL's DISTINCT
+/// treats NULLs as equal to each other, unlike `=`).
+fn rows_distinct_equal(a: &[Value], b: &[Value]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| match (x.is_null(), y.is_null()) {
+            (true, true) => true,
+            (false, false) => mysql_cmp(x, y) == Some(Ordering::Equal),
+            _ => false,
+        })
+}
+
+/// The first existing row (other than `skip`) that `row` collides with on
+/// some key, as `(row index, index into keys)`. A key with a NULL in any of
+/// its columns never collides -- MySQL's UNIQUE allows any number of NULLs.
+/// Values compare the way the column's collation does (`mysql_cmp`), so
+/// 'Bob' and 'bob' are the same key, as in real MySQL.
+fn find_key_conflict(
+    t: &Table,
+    keys: &[(String, Vec<usize>)],
+    row: &[Value],
+    skip: Option<usize>,
+) -> Option<(usize, usize)> {
+    for (k, (_, cols)) in keys.iter().enumerate() {
+        if cols.iter().any(|&c| row[c].is_null()) {
+            continue;
+        }
+        for (i, other) in t.rows.iter().enumerate() {
+            if Some(i) == skip {
+                continue;
+            }
+            if cols.iter().all(|&c| mysql_cmp(&row[c], &other[c]) == Some(Ordering::Equal)) {
+                return Some((i, k));
+            }
+        }
+    }
+    None
+}
+
+/// MySQL 8's `ER_DUP_ENTRY`: `Duplicate entry 'a-b' for key 't.k'`.
+fn duplicate_key_error(t: &Table, key: &(String, Vec<usize>), row: &[Value]) -> MySqlError {
+    let entry: Vec<String> = key.1.iter().map(|&c| render_text(&row[c])).collect();
+    MySqlError::new(
+        1062,
+        "23000",
+        format!("Duplicate entry '{}' for key '{}.{}'", entry.join("-"), t.name, key.0),
+    )
+}
+
+/// MySQL's `ER_BAD_NULL_ERROR` (strict mode, the 8.0 default).
+fn column_cannot_be_null(col: &str) -> MySqlError {
+    MySqlError::new(1048, "23000", format!("Column '{col}' cannot be null"))
+}
+
+/// A column type as MySQL itself spells it (`DESCRIBE`, `SHOW CREATE TABLE`,
+/// `information_schema`), not the Rust enum's debug name.
+pub(crate) fn mysql_type_name(ty: &ColumnType) -> String {
+    match ty {
+        ColumnType::Int => "int".into(),
+        ColumnType::BigInt => "bigint".into(),
+        ColumnType::Varchar(n) => format!("varchar({n})"),
+        ColumnType::Text => "text".into(),
+        ColumnType::Float => "float".into(),
+        ColumnType::Double => "double".into(),
+        ColumnType::Decimal(p, s) => format!("decimal({p},{s})"),
+        ColumnType::Date => "date".into(),
+        ColumnType::Datetime => "datetime".into(),
+        ColumnType::Boolean => "tinyint(1)".into(),
+        ColumnType::Enum(m) => format!(
+            "enum({})",
+            m.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(",")
+        ),
+        ColumnType::Json => "json".into(),
+        ColumnType::Blob => "blob".into(),
+    }
+}
+
+fn column_default_text(col: &Column) -> Option<String> {
+    if col.default_now {
+        return Some("CURRENT_TIMESTAMP".into());
+    }
+    match &col.default {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(render_text(v)),
+    }
 }

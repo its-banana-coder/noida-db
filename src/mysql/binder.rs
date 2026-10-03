@@ -1,6 +1,8 @@
-use crate::mysql::catalog::{Column, ColumnType};
+use crate::mysql::catalog::{Column, ColumnType, UniqueKey};
 use crate::mysql::error::MySqlError;
-use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, JoinOp, Plan, contains_agg};
+use crate::mysql::plan::{
+    AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SortKey, contains_agg,
+};
 use crate::mysql::types::Value;
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
@@ -30,9 +32,30 @@ impl Binder {
         match stmt {
             Statement::Query(query) => self.bind_query(*query),
             Statement::ShowDatabases { .. } => Ok(Plan::ShowDatabases),
-            Statement::ShowTables { .. } => {
-                let db = self.current_db.clone().unwrap_or_default();
-                Ok(Plan::ShowTables(db))
+            Statement::ShowTables { full, show_options, .. } => {
+                let db = match &show_options.show_in {
+                    Some(sqlparser::ast::ShowStatementIn { parent_name: Some(name), .. }) => {
+                        name.to_string().trim_matches('`').to_string()
+                    }
+                    _ => self
+                        .current_db
+                        .clone()
+                        .ok_or_else(|| MySqlError::new(1046, "3D000", "No database selected"))?,
+                };
+                // Found via testing before a public release: the LIKE
+                // pattern used to be ignored, listing every table.
+                let like = match &show_options.filter_position {
+                    Some(
+                        sqlparser::ast::ShowStatementFilterPosition::Suffix(f)
+                        | sqlparser::ast::ShowStatementFilterPosition::Infix(f),
+                    ) => match f {
+                        sqlparser::ast::ShowStatementFilter::Like(p)
+                        | sqlparser::ast::ShowStatementFilter::ILike(p) => Some(p.clone()),
+                        _ => return Err(MySqlError::unsupported("SHOW TABLES WHERE")),
+                    },
+                    None => None,
+                };
+                Ok(Plan::ShowTables { db, like, full })
             }
             Statement::ShowColumns { show_options, .. } => {
                 let table_name_str = match show_options.show_in {
@@ -80,11 +103,44 @@ impl Binder {
                 }
                 _ => Err(MySqlError::unsupported("USE statement format")),
             },
-            Statement::CreateTable(create_table) => self.bind_create_table(
-                create_table.name,
-                create_table.columns,
-                create_table.constraints,
-            ),
+            Statement::CreateTable(create_table) => {
+                if create_table.query.is_some() || create_table.like.is_some() {
+                    return Err(MySqlError::unsupported("CREATE TABLE ... SELECT/LIKE"));
+                }
+                let if_not_exists = create_table.if_not_exists;
+                let mut plan = self.bind_create_table(
+                    create_table.name,
+                    create_table.columns,
+                    create_table.constraints,
+                )?;
+                if let Plan::CreateTable { if_not_exists: f, .. } = &mut plan {
+                    *f = if_not_exists;
+                }
+                Ok(plan)
+            }
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::Table,
+                if_exists,
+                names,
+                ..
+            } => {
+                let tables =
+                    names.iter().map(|n| self.resolve_table_name(n)).collect::<Result<_, _>>()?;
+                Ok(Plan::DropTable { tables, if_exists })
+            }
+            Statement::Truncate(t) => {
+                let target = t
+                    .table_names
+                    .first()
+                    .ok_or_else(|| MySqlError::syntax_error("TRUNCATE needs a table"))?;
+                let (db, table) = self.resolve_table_name(&target.name)?;
+                Ok(Plan::Truncate { db, table })
+            }
+            // `DESCRIBE t` / `DESC t` / `EXPLAIN t` are SHOW COLUMNS.
+            Statement::ExplainTable { table_name, .. } => {
+                let (db, table) = self.resolve_table_name(&table_name)?;
+                Ok(Plan::ShowColumns { db, table })
+            }
             Statement::CreateDatabase { db_name, if_not_exists, .. } => {
                 let name = db_name
                     .0
@@ -110,15 +166,19 @@ impl Binder {
                 Ok(Plan::CreateIndex { db, table, columns, if_not_exists: ci.if_not_exists })
             }
             Statement::Insert(insert) => self.bind_insert(insert),
-            Statement::Update(update) => {
-                self.bind_update(update.table, update.assignments, update.selection)
-            }
+            Statement::Update(update) => self.bind_update(
+                update.table,
+                update.assignments,
+                update.selection,
+                update.order_by,
+                update.limit,
+            ),
             Statement::Delete(delete) => {
                 let from = match delete.from {
                     sqlparser::ast::FromTable::WithFromKeyword(f) => f,
                     sqlparser::ast::FromTable::WithoutKeyword(f) => f,
                 };
-                self.bind_delete(from, delete.selection)
+                self.bind_delete(from, delete.selection, delete.order_by, delete.limit)
             }
             _ => Err(MySqlError::unsupported("statement")),
         }
@@ -132,6 +192,7 @@ impl Binder {
     ) -> Result<Plan, MySqlError> {
         let (db, table) = self.resolve_table_name(&name)?;
         let mut cols = Vec::new();
+        let mut unique_keys: Vec<UniqueKey> = Vec::new();
 
         for col_def in columns {
             let col_name = col_def.name.value.clone();
@@ -165,12 +226,39 @@ impl Binder {
                         .unwrap_or(255);
                     ColumnType::Varchar(l)
                 }
+                DataType::Char(len) | DataType::Character(len) | DataType::Nvarchar(len) => {
+                    ColumnType::Varchar(match len {
+                        Some(sqlparser::ast::CharacterLength::IntegerLength { length, .. }) => {
+                            *length as usize
+                        }
+                        _ => 1,
+                    })
+                }
                 DataType::Text | DataType::TinyText | DataType::MediumText | DataType::LongText => {
                     ColumnType::Text
                 }
-                DataType::Float(_) => ColumnType::Float,
-                DataType::Double(_) => ColumnType::Double,
-                DataType::Decimal(exact) => {
+                DataType::Float(_) | DataType::Float4 | DataType::Real => ColumnType::Float,
+                DataType::Double(_) | DataType::DoublePrecision | DataType::Float8 => {
+                    ColumnType::Double
+                }
+                DataType::Bool => ColumnType::Boolean,
+                DataType::JSON => ColumnType::Json,
+                DataType::Enum(members, _) => ColumnType::Enum(
+                    members
+                        .iter()
+                        .map(|m| match m {
+                            sqlparser::ast::EnumMember::Name(n)
+                            | sqlparser::ast::EnumMember::NamedValue(n, _) => n.clone(),
+                        })
+                        .collect(),
+                ),
+                DataType::Blob(_)
+                | DataType::TinyBlob
+                | DataType::MediumBlob
+                | DataType::LongBlob
+                | DataType::Binary(_)
+                | DataType::Varbinary(_) => ColumnType::Blob,
+                DataType::Decimal(exact) | DataType::Numeric(exact) | DataType::Dec(exact) => {
                     let (p, s) = match exact {
                         sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
                             (*p as u8, *s as u8)
@@ -181,7 +269,10 @@ impl Binder {
                     ColumnType::Decimal(p, s)
                 }
                 DataType::Date => ColumnType::Date,
-                DataType::Datetime(_) => ColumnType::Datetime,
+                // `TIMESTAMP` is stored and returned like `DATETIME` -- this
+                // engine has no session time zone for its UTC-conversion
+                // semantics to differ by.
+                DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::Datetime,
                 DataType::Boolean => ColumnType::Boolean,
                 _ => {
                     return Err(MySqlError::unsupported(&format!(
@@ -195,14 +286,17 @@ impl Binder {
             let mut auto_increment = false;
             let mut primary_key = false;
             let mut default = None;
+            let mut default_now = false;
+            let mut on_update_now = false;
 
             for opt in &col_def.options {
                 match &opt.option {
                     sqlparser::ast::ColumnOption::NotNull => not_null = true,
-                    sqlparser::ast::ColumnOption::Unique(u) => {
-                        if u.index_name.is_none() && u.index_type.is_none() {
-                            // Unique
-                        }
+                    sqlparser::ast::ColumnOption::Unique(_) => {
+                        unique_keys.push(UniqueKey {
+                            name: col_name.clone(),
+                            columns: vec![col_name.clone()],
+                        });
                     }
                     sqlparser::ast::ColumnOption::PrimaryKey(_) => {
                         primary_key = true;
@@ -224,9 +318,23 @@ impl Binder {
                     // isn't evaluated here -- falls back to no default,
                     // same as before this existed at all.
                     sqlparser::ast::ColumnOption::Default(expr) => {
-                        if let Ok(Expr::Const(v)) = self.bind_expr(expr.clone()) {
+                        if is_current_time(expr) {
+                            default_now = true;
+                        } else if let Ok(Expr::Const(v)) = self.bind_expr(expr.clone()) {
                             default = Some(v);
+                        } else {
+                            // Found via testing before a public release: a
+                            // non-constant default used to be dropped
+                            // silently, so a `NOT NULL DEFAULT <expr>`
+                            // column then rejected every insert that relied
+                            // on it. Refuse it at CREATE time instead.
+                            return Err(MySqlError::unsupported(&format!(
+                                "DEFAULT expression {expr}"
+                            )));
                         }
+                    }
+                    sqlparser::ast::ColumnOption::OnUpdate(expr) if is_current_time(expr) => {
+                        on_update_now = true;
                     }
                     _ => {}
                 }
@@ -239,6 +347,8 @@ impl Binder {
                 default,
                 auto_increment,
                 primary_key,
+                default_now,
+                on_update_now,
             });
         }
 
@@ -252,6 +362,25 @@ impl Binder {
         // `FOREIGN KEY`, `KEY`/`INDEX`, `FULLTEXT`/`SPATIAL`) are accepted
         // but not tracked, for the same reason.
         for constraint in &constraints {
+            if let TableConstraint::Unique(u) = constraint {
+                let columns: Vec<String> = u
+                    .columns
+                    .iter()
+                    .filter_map(|c| match &c.column.expr {
+                        AstExpr::Identifier(i) => Some(i.value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !columns.is_empty() {
+                    let name = u
+                        .name
+                        .as_ref()
+                        .or(u.index_name.as_ref())
+                        .map(|i| i.value.clone())
+                        .unwrap_or_else(|| columns[0].clone());
+                    unique_keys.push(UniqueKey { name, columns });
+                }
+            }
             if let TableConstraint::PrimaryKey(pk) = constraint {
                 for idx_col in &pk.columns {
                     if let AstExpr::Identifier(ident) = &idx_col.column.expr {
@@ -266,7 +395,7 @@ impl Binder {
             }
         }
 
-        Ok(Plan::CreateTable { db, table, columns: cols })
+        Ok(Plan::CreateTable { db, table, columns: cols, unique_keys, if_not_exists: false })
     }
 
     fn bind_insert(&mut self, insert: sqlparser::ast::Insert) -> Result<Plan, MySqlError> {
@@ -275,18 +404,12 @@ impl Binder {
             _ => return Err(MySqlError::unsupported("insert table target")),
         };
         let (db, table) = self.resolve_table_name(table_name)?;
-        let columns = insert
+        let mut columns: Vec<String> = insert
             .columns
             .iter()
-            .filter_map(|name| {
-                if name.0.len() != 1 {
-                    None
-                } else {
-                    match &name.0[0] {
-                        sqlparser::ast::ObjectNamePart::Identifier(id) => Some(id.value.clone()),
-                        _ => None,
-                    }
-                }
+            .filter_map(|name| match name.0.last() {
+                Some(sqlparser::ast::ObjectNamePart::Identifier(id)) => Some(id.value.clone()),
+                _ => None,
             })
             .collect();
         let mut rows = Vec::new();
@@ -301,11 +424,48 @@ impl Binder {
                     rows.push(r);
                 }
             } else {
-                return Err(MySqlError::unsupported("insert source"));
+                return Err(MySqlError::unsupported("INSERT ... SELECT"));
             }
+        } else if !insert.assignments.is_empty() {
+            // `INSERT INTO t SET a = 1, b = 2` -- found via testing before a
+            // public release: this form used to insert nothing at all (no
+            // rows, no error).
+            let mut row = Vec::new();
+            for a in insert.assignments {
+                columns.push(assignment_column(&a.target)?);
+                row.push(self.bind_expr(a.value)?);
+            }
+            rows.push(row);
         }
 
-        Ok(Plan::Insert { db, table, columns, rows })
+        // Found via testing before a public release: IGNORE / REPLACE /
+        // ON DUPLICATE KEY UPDATE used to be dropped silently, so an upsert
+        // (WordPress's own `add_option()` is one) inserted a duplicate row.
+        let mode = if insert.replace_into {
+            InsertMode::Replace
+        } else if let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) = insert.on {
+            // MySQL 8.0.19+ `INSERT ... AS new ON DUPLICATE KEY UPDATE c = new.c`:
+            // `new.c` means the same as `VALUES(c)`.
+            let row_alias = insert.insert_alias.as_ref().map(|a| a.row_alias.to_string());
+            let mut out = Vec::new();
+            for a in assignments {
+                let col = assignment_column(&a.target)?;
+                let mut e = self.bind_expr(a.value)?;
+                if let Some(alias) = &row_alias {
+                    e = row_alias_to_values(e, alias);
+                }
+                out.push((col, e));
+            }
+            InsertMode::Upsert(out)
+        } else if insert.ignore {
+            InsertMode::Ignore
+        } else if insert.on.is_some() {
+            return Err(MySqlError::unsupported("INSERT ... ON CONFLICT"));
+        } else {
+            InsertMode::Error
+        };
+
+        Ok(Plan::Insert { db, table, columns, rows, mode })
     }
 
     fn bind_update(
@@ -313,7 +473,12 @@ impl Binder {
         table: TableWithJoins,
         assignments: Vec<Assignment>,
         selection: Option<AstExpr>,
+        order_by: Vec<sqlparser::ast::OrderByExpr>,
+        limit: Option<AstExpr>,
     ) -> Result<Plan, MySqlError> {
+        if !table.joins.is_empty() {
+            return Err(MySqlError::unsupported("multi-table UPDATE"));
+        }
         let (db, table_name) = match &table.relation {
             TableFactor::Table { name, .. } => self.resolve_table_name(name)?,
             _ => return Err(MySqlError::unsupported("update target")),
@@ -321,18 +486,7 @@ impl Binder {
 
         let mut out_assignments = Vec::new();
         for a in assignments {
-            let col_name = match &a.target {
-                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                    if name.0.len() != 1 {
-                        return Err(MySqlError::unsupported("update column name length"));
-                    }
-                    match &name.0[0] {
-                        sqlparser::ast::ObjectNamePart::Identifier(id) => id.value.clone(),
-                        _ => return Err(MySqlError::unsupported("update column name format")),
-                    }
-                }
-                _ => return Err(MySqlError::unsupported("update assignment target")),
-            };
+            let col_name = assignment_column(&a.target)?;
             let expr = self.bind_expr(a.value)?;
             out_assignments.push((col_name, expr));
         }
@@ -341,17 +495,27 @@ impl Binder {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
+        let (order, limit) = self.bind_dml_order_limit(order_by, limit)?;
 
-        Ok(Plan::Update { db, table: table_name, assignments: out_assignments, selection: sel })
+        Ok(Plan::Update {
+            db,
+            table: table_name,
+            assignments: out_assignments,
+            selection: sel,
+            order,
+            limit,
+        })
     }
 
     fn bind_delete(
         &mut self,
         from: Vec<TableWithJoins>,
         selection: Option<AstExpr>,
+        order_by: Vec<sqlparser::ast::OrderByExpr>,
+        limit: Option<AstExpr>,
     ) -> Result<Plan, MySqlError> {
-        if from.len() != 1 {
-            return Err(MySqlError::unsupported("delete multiple tables"));
+        if from.len() != 1 || !from[0].joins.is_empty() {
+            return Err(MySqlError::unsupported("multi-table DELETE"));
         }
         let (db, table_name) = match &from[0].relation {
             TableFactor::Table { name, .. } => self.resolve_table_name(name)?,
@@ -362,8 +526,26 @@ impl Binder {
             Some(expr) => Some(self.bind_expr(expr)?),
             None => None,
         };
+        let (order, limit) = self.bind_dml_order_limit(order_by, limit)?;
 
-        Ok(Plan::Delete { db, table: table_name, selection: sel })
+        Ok(Plan::Delete { db, table: table_name, selection: sel, order, limit })
+    }
+
+    /// `UPDATE`/`DELETE ... ORDER BY ... LIMIT n`. Found via testing before a
+    /// public release: both used to be ignored silently, so `DELETE FROM t
+    /// WHERE ... ORDER BY id LIMIT 1` deleted every matching row.
+    fn bind_dml_order_limit(
+        &mut self,
+        order_by: Vec<sqlparser::ast::OrderByExpr>,
+        limit: Option<AstExpr>,
+    ) -> Result<(OrderKeys, Option<u64>), MySqlError> {
+        let mut order = Vec::new();
+        for item in order_by {
+            let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
+            order.push((self.bind_expr(item.expr)?, asc));
+        }
+        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
+        Ok((order, limit))
     }
 
     fn bind_query(&mut self, query: Query) -> Result<Plan, MySqlError> {
@@ -379,62 +561,21 @@ impl Binder {
                     source = Plan::Filter { source: Box::new(source), predicate: pred };
                 }
 
-                // `ORDER BY`/`LIMIT`/`OFFSET` sit between the row source and
-                // the projection (see `Plan::Sort`'s own doc comment for
-                // why), so this has to happen here, before `exprs`/`names`
-                // are built below.
-                let keys = match order_by {
-                    Some(sqlparser::ast::OrderBy {
-                        kind: OrderByKind::Expressions(exprs), ..
-                    }) => exprs
-                        .into_iter()
-                        .map(|e| {
-                            let asc = !matches!(e.options.sort, Some(OrderBySort::Desc));
-                            Ok((self.bind_expr(e.expr)?, asc))
-                        })
-                        .collect::<Result<Vec<_>, MySqlError>>()?,
-                    Some(sqlparser::ast::OrderBy { kind: OrderByKind::All(_), .. }) => {
-                        return Err(MySqlError::unsupported("ORDER BY ALL"));
-                    }
-                    None => Vec::new(),
-                };
-                let (limit, offset) = match limit_clause {
-                    Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
-                        if !limit_by.is_empty() {
-                            return Err(MySqlError::unsupported("LIMIT BY"));
-                        }
-                        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
-                        let offset = offset.as_ref().map(|o| expr_to_u64(&o.value)).transpose()?;
-                        (limit, offset)
-                    }
-                    Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                        (Some(expr_to_u64(&limit)?), Some(expr_to_u64(&offset)?))
-                    }
-                    None => (None, None),
-                };
-                let calc_found_rows =
-                    select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
-                if !keys.is_empty() || limit.is_some() || offset.is_some() || calc_found_rows {
-                    source = Plan::Sort {
-                        source: Box::new(source),
-                        keys,
-                        limit,
-                        offset,
-                        calc_found_rows,
-                    };
-                }
-
-                let group_exprs: Vec<Expr> = match select.group_by {
-                    GroupByExpr::Expressions(exprs, _) => {
-                        exprs.into_iter().map(|e| self.bind_expr(e)).collect::<Result<_, _>>()?
-                    }
-                    GroupByExpr::All(_) => {
-                        return Err(MySqlError::unsupported("GROUP BY ALL"));
-                    }
+                let distinct = match &select.distinct {
+                    None => false,
+                    Some(sqlparser::ast::Distinct::Distinct) => true,
+                    Some(_) => return Err(MySqlError::unsupported("DISTINCT ON")),
                 };
 
+                // The projection is bound first: GROUP BY, HAVING and ORDER
+                // BY may all refer to its aliases (`... AS total ORDER BY
+                // total`) and positions (`ORDER BY 2`).
                 let mut exprs = Vec::new();
                 let mut names = Vec::new();
+                // (alias, expr) for every `expr AS alias` item -- only real
+                // aliases, not plain column names.
+                let mut aliases: Vec<(String, Expr)> = Vec::new();
+                let mut has_wildcard = false;
                 for item in select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
@@ -459,37 +600,151 @@ impl Binder {
                             names.push(name);
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
-                            exprs.push(self.bind_expr(expr)?);
+                            let bound = self.bind_expr(expr)?;
+                            aliases.push((alias.value.clone(), bound.clone()));
+                            exprs.push(bound);
                             names.push(alias.value);
                         }
-                        // `SELECT *` and `SELECT table.*` -- the qualifier
-                        // (if any) is dropped the same way a qualified
-                        // column reference already is: this engine only
-                        // ever binds one table into scope per query.
-                        // Expanded to the real per-column values (and, in
+                        // `SELECT *` and `SELECT table.*` -- expanded to the
+                        // real per-column values (and, in
                         // `plan::column_names`, the real per-column names)
                         // at execution time, not here -- the binder has no
                         // catalog access to look the table's columns up.
                         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                             exprs.push(Expr::Wildcard);
                             names.push("*".to_string());
+                            has_wildcard = true;
                         }
                         _ => return Err(MySqlError::unsupported("select item")),
                     }
                 }
+                let alias_of = |e: &AstExpr| -> Option<Expr> {
+                    match e {
+                        AstExpr::Identifier(i) => aliases
+                            .iter()
+                            .find(|(a, _)| a.eq_ignore_ascii_case(&i.value))
+                            .map(|(_, x)| x.clone()),
+                        _ => None,
+                    }
+                };
+                let position_of = |e: &AstExpr| -> Option<usize> {
+                    match e {
+                        AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                            value: AstValue::Number(n, _),
+                            ..
+                        }) => n.parse::<usize>().ok(),
+                        _ => None,
+                    }
+                };
 
-                let having = select.having.map(|h| self.bind_expr(h)).transpose()?;
+                // GROUP BY accepts a column, an alias, or a position.
+                let mut group_exprs: Vec<Expr> = Vec::new();
+                match select.group_by {
+                    GroupByExpr::Expressions(gexprs, _) => {
+                        for g in gexprs {
+                            if let Some(n) = position_of(&g) {
+                                if n == 0 || n > exprs.len() || has_wildcard {
+                                    return Err(MySqlError::new(
+                                        1054,
+                                        "42S22",
+                                        format!("Unknown column '{n}' in 'group statement'"),
+                                    ));
+                                }
+                                group_exprs.push(exprs[n - 1].clone());
+                            } else if let Some(x) = alias_of(&g) {
+                                group_exprs.push(x);
+                            } else {
+                                group_exprs.push(self.bind_expr(g)?);
+                            }
+                        }
+                    }
+                    GroupByExpr::All(_) => {
+                        return Err(MySqlError::unsupported("GROUP BY ALL"));
+                    }
+                }
 
-                if !group_exprs.is_empty() || exprs.iter().any(contains_agg) || having.is_some() {
-                    Ok(Plan::Aggregate {
-                        source: Box::new(source),
-                        group_exprs,
-                        exprs,
-                        names,
-                        having,
+                // HAVING may name a SELECT-list alias (`HAVING cnt > 2`).
+                let having = match select.having {
+                    Some(h) => Some(substitute_aliases(self.bind_expr(h)?, &aliases)),
+                    None => None,
+                };
+
+                // ORDER BY: a position addresses an output column directly;
+                // an alias or any other expression is evaluated as a hidden
+                // trailing column (see `Plan::Finish`).
+                let mut order: Vec<(SortKey, bool)> = Vec::new();
+                let mut hidden_exprs: Vec<Expr> = Vec::new();
+                if let Some(ob) = order_by {
+                    let items = match ob.kind {
+                        OrderByKind::Expressions(items) => items,
+                        OrderByKind::All(_) => return Err(MySqlError::unsupported("ORDER BY ALL")),
+                    };
+                    for item in items {
+                        let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
+                        if let Some(n) = position_of(&item.expr) {
+                            if n == 0 || (!has_wildcard && n > exprs.len()) {
+                                return Err(MySqlError::new(
+                                    1054,
+                                    "42S22",
+                                    format!("Unknown column '{n}' in 'order clause'"),
+                                ));
+                            }
+                            order.push((SortKey::Output(n - 1), asc));
+                            continue;
+                        }
+                        let bound = match alias_of(&item.expr) {
+                            Some(x) => x,
+                            None => self.bind_expr(item.expr)?,
+                        };
+                        hidden_exprs.push(bound);
+                        order.push((SortKey::Hidden(hidden_exprs.len() - 1), asc));
+                    }
+                }
+                let (limit, offset) = match limit_clause {
+                    Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+                        if !limit_by.is_empty() {
+                            return Err(MySqlError::unsupported("LIMIT BY"));
+                        }
+                        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
+                        let offset = offset.as_ref().map(|o| expr_to_u64(&o.value)).transpose()?;
+                        (limit, offset)
+                    }
+                    Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                        (Some(expr_to_u64(&limit)?), Some(expr_to_u64(&offset)?))
+                    }
+                    None => (None, None),
+                };
+                let calc_found_rows =
+                    select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
+
+                let is_aggregate = !group_exprs.is_empty()
+                    || exprs.iter().any(contains_agg)
+                    || hidden_exprs.iter().any(contains_agg)
+                    || having.is_some();
+                let hidden = hidden_exprs.len();
+                exprs.extend(hidden_exprs);
+                let plan = if is_aggregate {
+                    Plan::Aggregate { source: Box::new(source), group_exprs, exprs, names, having }
+                } else {
+                    Plan::Project { source: Box::new(source), exprs, names }
+                };
+                if !order.is_empty()
+                    || limit.is_some()
+                    || offset.is_some()
+                    || distinct
+                    || calc_found_rows
+                {
+                    Ok(Plan::Finish {
+                        source: Box::new(plan),
+                        order,
+                        hidden,
+                        distinct,
+                        limit,
+                        offset,
+                        calc_found_rows,
                     })
                 } else {
-                    Ok(Plan::Project { source: Box::new(source), exprs, names })
+                    Ok(plan)
                 }
             }
             _ => Err(MySqlError::unsupported("query body")),
@@ -548,6 +803,15 @@ impl Binder {
 
     fn bind_table_factor(&mut self, tf: &TableFactor) -> Result<Plan, MySqlError> {
         match tf {
+            // `FROM DUAL` -- MySQL's one-row dummy table, needs no database
+            // selected (connection pools ping with `SELECT 1 FROM DUAL`).
+            TableFactor::Table { name, .. }
+                if name.0.len() == 1
+                    && matches!(&name.0[0], sqlparser::ast::ObjectNamePart::Identifier(id)
+                        if id.value.eq_ignore_ascii_case("dual")) =>
+            {
+                Ok(Plan::Dummy)
+            }
             TableFactor::Table { name, .. } => {
                 let (db, table) = self.resolve_table_name(name)?;
                 Ok(Plan::Scan { db, table })
@@ -568,16 +832,34 @@ impl Binder {
             AstExpr::Value(sqlparser::ast::ValueWithSpan {
                 value: AstValue::Number(s, _), ..
             }) => {
+                // Found via testing before a public release: a non-integer
+                // literal (`12.50`) used to bind as *text*, so a DECIMAL/
+                // DOUBLE column filled from one stored strings -- SUM/AVG/
+                // MAX of a money column came back NULL, ORDER BY sorted it
+                // alphabetically, `price > 9.6` matched nothing. MySQL treats
+                // `12.50` as an exact DECIMAL and `1.5e3` as a DOUBLE.
                 if let Ok(i) = s.parse::<i64>() {
                     Ok(Expr::Const(Value::Int(i)))
+                } else if s.contains(['e', 'E']) {
+                    s.parse::<f64>()
+                        .map(|f| Expr::Const(Value::Float(f)))
+                        .map_err(|_| MySqlError::syntax_error(&format!("bad number {s}")))
                 } else {
-                    Ok(Expr::Const(Value::Text(s)))
+                    crate::sql::numeric::Numeric::parse(&s)
+                        .map(|n| Expr::Const(Value::Num(n)))
+                        .map_err(|_| MySqlError::syntax_error(&format!("bad number {s}")))
                 }
             }
+            // MySQL's default (no ANSI_QUOTES) treats "..." as a string, not
+            // an identifier -- common in PHP code.
             AstExpr::Value(sqlparser::ast::ValueWithSpan {
-                value: AstValue::SingleQuotedString(s),
+                value: AstValue::SingleQuotedString(s) | AstValue::DoubleQuotedString(s),
                 ..
             }) => Ok(Expr::Const(Value::Text(s))),
+            // MySQL booleans are just 1/0.
+            AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                value: AstValue::Boolean(b), ..
+            }) => Ok(Expr::Const(Value::Int(b as i64))),
             AstExpr::Value(sqlparser::ast::ValueWithSpan { value: AstValue::Null, .. }) => {
                 Ok(Expr::Const(Value::Null))
             }
@@ -590,6 +872,19 @@ impl Binder {
                 Ok(Expr::Param(idx))
             }
             AstExpr::Function(func) => self.bind_function(func),
+            // `CURRENT_TIMESTAMP`/`CURRENT_DATE` written without parentheses
+            // (the usual form) arrive as a bare identifier, not a function
+            // call -- previously bound as a column name, which silently
+            // resolved to NULL.
+            AstExpr::Identifier(ident)
+                if ident.quote_style.is_none()
+                    && matches!(
+                        ident.value.to_ascii_uppercase().as_str(),
+                        "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "LOCALTIMESTAMP" | "LOCALTIME"
+                    ) =>
+            {
+                Ok(Expr::Call { name: ident.value.to_ascii_uppercase(), args: vec![] })
+            }
             AstExpr::Identifier(ident) => {
                 if ident.value.starts_with("@@") {
                     Ok(Expr::SysVar(ident.value[2..].to_string()))
@@ -628,6 +923,30 @@ impl Binder {
             AstExpr::BinaryOp { left, op, right } => {
                 let l = self.bind_expr(*left)?;
                 let r = self.bind_expr(*right)?;
+                // `d + INTERVAL 1 DAY` / `d - INTERVAL 1 DAY`.
+                if let Expr::Call { name, args } = &r
+                    && name == "INTERVAL"
+                    && matches!(op, BinaryOperator::Plus | BinaryOperator::Minus)
+                {
+                    let f =
+                        if matches!(op, BinaryOperator::Plus) { "DATE_ADD" } else { "DATE_SUB" };
+                    let mut a = vec![l];
+                    a.extend(args.iter().cloned());
+                    return Ok(Expr::Call { name: f.into(), args: a });
+                }
+                let call = |n: &str, args: Vec<Expr>| Ok(Expr::Call { name: n.into(), args });
+                match op {
+                    // `col->'$.a'` is JSON_EXTRACT, `col->>'$.a'` also unquotes.
+                    BinaryOperator::Arrow => return call("JSON_EXTRACT", vec![l, r]),
+                    BinaryOperator::LongArrow => {
+                        return call(
+                            "JSON_UNQUOTE",
+                            vec![Expr::Call { name: "JSON_EXTRACT".into(), args: vec![l, r] }],
+                        );
+                    }
+                    BinaryOperator::MyIntegerDivide => return call("DIV", vec![l, r]),
+                    _ => {}
+                }
                 match op {
                     BinaryOperator::Eq => {
                         Ok(Expr::Compare { op: CmpOp::Eq, left: Box::new(l), right: Box::new(r) })
@@ -674,6 +993,54 @@ impl Binder {
                 Ok(Expr::InList { expr: bound_expr, list: bound_list, negated })
             }
             AstExpr::Nested(inner) => self.bind_expr(*inner),
+            AstExpr::Interval(iv) => {
+                let unit = iv
+                    .leading_field
+                    .as_ref()
+                    .map(|f| f.to_string().to_uppercase())
+                    .ok_or_else(|| MySqlError::unsupported("INTERVAL without a unit"))?;
+                let v = self.bind_expr(*iv.value)?;
+                Ok(Expr::Call {
+                    name: "INTERVAL".into(),
+                    args: vec![v, Expr::Const(Value::Text(unit))],
+                })
+            }
+            AstExpr::Trim { trim_where, trim_what, expr, .. } => {
+                let side = match trim_where {
+                    Some(sqlparser::ast::TrimWhereField::Leading) => "LTRIM",
+                    Some(sqlparser::ast::TrimWhereField::Trailing) => "RTRIM",
+                    _ => "TRIM",
+                };
+                let mut args = vec![self.bind_expr(*expr)?];
+                if let Some(w) = trim_what {
+                    args.push(self.bind_expr(*w)?);
+                }
+                Ok(Expr::Call { name: side.into(), args })
+            }
+            AstExpr::Cast { expr, data_type, .. } => {
+                // The target type travels as its SQL spelling (`SIGNED`,
+                // `CHAR(10)`, `DECIMAL(10,2)`); see `cast_value`.
+                let ty = data_type.to_string().to_uppercase();
+                let e = self.bind_expr(*expr)?;
+                Ok(Expr::Call { name: "CAST".into(), args: vec![e, Expr::Const(Value::Text(ty))] })
+            }
+            AstExpr::Ceil { expr, .. } => {
+                Ok(Expr::Call { name: "CEIL".into(), args: vec![self.bind_expr(*expr)?] })
+            }
+            AstExpr::Floor { expr, .. } => {
+                Ok(Expr::Call { name: "FLOOR".into(), args: vec![self.bind_expr(*expr)?] })
+            }
+            AstExpr::Position { expr, r#in } => Ok(Expr::Call {
+                name: "LOCATE".into(),
+                args: vec![self.bind_expr(*expr)?, self.bind_expr(*r#in)?],
+            }),
+            AstExpr::Extract { field, expr, .. } => Ok(Expr::Call {
+                name: "EXTRACT".into(),
+                args: vec![
+                    Expr::Const(Value::Text(field.to_string().to_uppercase())),
+                    self.bind_expr(*expr)?,
+                ],
+            }),
             AstExpr::UnaryOp { op: UnaryOperator::Not, expr } => {
                 Ok(Expr::Not(Box::new(self.bind_expr(*expr)?)))
             }
@@ -782,8 +1149,17 @@ impl Binder {
             .join(".");
         let upper = name.to_uppercase();
 
+        let mut agg_distinct = false;
+        let mut clauses = Vec::new();
         let args = match func.args {
-            FunctionArguments::List(list) => list.args,
+            FunctionArguments::List(list) => {
+                agg_distinct = matches!(
+                    list.duplicate_treatment,
+                    Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                );
+                clauses = list.clauses;
+                list.args
+            }
             FunctionArguments::None => vec![],
             FunctionArguments::Subquery(_) => {
                 return Err(MySqlError::unsupported("function with subquery argument"));
@@ -795,10 +1171,14 @@ impl Binder {
                 if args.len() == 1
                     && matches!(&args[0], FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
                 {
-                    Ok(Expr::Agg { func: AggFunc::CountStar, arg: None })
+                    Ok(Expr::Agg { func: AggFunc::CountStar, arg: None, distinct: false })
                 } else if args.len() == 1 {
                     let arg = self.bind_function_arg(&args[0])?;
-                    Ok(Expr::Agg { func: AggFunc::Count, arg: Some(Box::new(arg)) })
+                    Ok(Expr::Agg {
+                        func: AggFunc::Count,
+                        arg: Some(Box::new(arg)),
+                        distinct: agg_distinct,
+                    })
                 } else {
                     Err(MySqlError::unsupported("COUNT argument list"))
                 }
@@ -815,7 +1195,7 @@ impl Binder {
                     "MAX" => AggFunc::Max,
                     _ => unreachable!(),
                 };
-                Ok(Expr::Agg { func: agg_func, arg: Some(Box::new(arg)) })
+                Ok(Expr::Agg { func: agg_func, arg: Some(Box::new(arg)), distinct: agg_distinct })
             }
             "FOUND_ROWS" => {
                 if !args.is_empty() {
@@ -827,8 +1207,115 @@ impl Binder {
             // -- see `Executor::eval_call` for what each one actually
             // computes. Argument-count validation happens there too, not
             // here, so it stays next to the logic it's validating.
+            // `VALUES(col)` inside ON DUPLICATE KEY UPDATE: the value this
+            // row would have been inserted with (see `InsertMode::Upsert`).
+            "VALUES" => {
+                if args.len() != 1 {
+                    return Err(MySqlError::unsupported("VALUES argument list"));
+                }
+                let arg = self.bind_function_arg(&args[0])?;
+                Ok(Expr::Call { name: "VALUES".to_string(), args: vec![arg] })
+            }
+            "LAST_INSERT_ID" if args.is_empty() => Ok(Expr::Call { name: upper, args: vec![] }),
+            // `GROUP_CONCAT([DISTINCT] a, b ... [ORDER BY x [DESC]] [SEPARATOR s])`.
+            // The aggregate's argument is a `GROUP_CONCAT` call carrying the
+            // concatenated value, the separator, then (key, asc) order pairs;
+            // `Executor::fold_aggs` evaluates it per row.
+            "GROUP_CONCAT" => {
+                let mut parts = Vec::new();
+                for a in &args {
+                    parts.push(self.bind_function_arg(a)?);
+                }
+                if parts.is_empty() {
+                    return Err(MySqlError::unsupported("GROUP_CONCAT argument list"));
+                }
+                let value = if parts.len() == 1 {
+                    parts.remove(0)
+                } else {
+                    Expr::Call { name: "CONCAT".into(), args: parts }
+                };
+                let mut sep = ",".to_string();
+                let mut order = Vec::new();
+                for clause in &clauses {
+                    match clause {
+                        sqlparser::ast::FunctionArgumentClause::Separator(v) => {
+                            sep = match &v.value {
+                                AstValue::SingleQuotedString(s)
+                                | AstValue::DoubleQuotedString(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                        }
+                        sqlparser::ast::FunctionArgumentClause::OrderBy(items) => {
+                            for item in items {
+                                let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
+                                order.push(self.bind_expr(item.expr.clone())?);
+                                order.push(Expr::Const(Value::Int(asc as i64)));
+                            }
+                        }
+                        _ => return Err(MySqlError::unsupported("GROUP_CONCAT clause")),
+                    }
+                }
+                let mut call_args = vec![value, Expr::Const(Value::Text(sep))];
+                call_args.extend(order);
+                Ok(Expr::Agg {
+                    func: AggFunc::GroupConcat,
+                    arg: Some(Box::new(Expr::Call {
+                        name: "GROUP_CONCAT".into(),
+                        args: call_args,
+                    })),
+                    distinct: agg_distinct,
+                })
+            }
+            // `DATE_ADD(d, INTERVAL n unit)` -> DATE_ADD(d, n, unit).
+            "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE" => {
+                if args.len() != 2 {
+                    return Err(MySqlError::unsupported(&format!("{upper} argument list")));
+                }
+                let d = self.bind_function_arg(&args[0])?;
+                let f =
+                    if upper == "DATE_ADD" || upper == "ADDDATE" { "DATE_ADD" } else { "DATE_SUB" };
+                match self.bind_function_arg(&args[1])? {
+                    Expr::Call { name, args: iv } if name == "INTERVAL" => {
+                        let mut a = vec![d];
+                        a.extend(iv);
+                        Ok(Expr::Call { name: f.into(), args: a })
+                    }
+                    // `ADDDATE(d, 3)`: days.
+                    n => Ok(Expr::Call {
+                        name: f.into(),
+                        args: vec![d, n, Expr::Const(Value::Text("DAY".into()))],
+                    }),
+                }
+            }
+            // `TIMESTAMPDIFF(unit, a, b)`: the unit is a bare keyword.
+            "TIMESTAMPDIFF" | "TIMESTAMPADD" => {
+                if args.len() != 3 {
+                    return Err(MySqlError::unsupported(&format!("{upper} argument list")));
+                }
+                let unit = match &args[0] {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(AstExpr::Identifier(i))) => {
+                        i.value.to_uppercase()
+                    }
+                    _ => return Err(MySqlError::unsupported(&format!("{upper} unit"))),
+                };
+                let a = self.bind_function_arg(&args[1])?;
+                let b = self.bind_function_arg(&args[2])?;
+                Ok(Expr::Call { name: upper, args: vec![Expr::Const(Value::Text(unit)), a, b] })
+            }
             "CONCAT" | "UPPER" | "LOWER" | "LENGTH" | "SUBSTRING" | "SUBSTR" | "COALESCE"
-            | "IFNULL" => {
+            | "IFNULL" | "DATABASE" | "SCHEMA" | "USER" | "CURRENT_USER" | "SESSION_USER"
+            | "SYSTEM_USER" | "CONNECTION_ID" | "VERSION" | "NOW" | "CURRENT_TIMESTAMP"
+            | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" | "CURDATE" | "CURRENT_DATE" | "IF"
+            | "NULLIF" | "GREATEST" | "LEAST" | "ROUND" | "TRUNCATE" | "ABS" | "CEIL"
+            | "CEILING" | "FLOOR" | "MOD" | "POW" | "POWER" | "SQRT" | "SIGN" | "CHAR_LENGTH"
+            | "CHARACTER_LENGTH" | "CONCAT_WS" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
+            | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "LOCATE" | "INSTR"
+            | "UCASE" | "LCASE" | "MID" | "DATE" | "TIME" | "YEAR" | "MONTH" | "DAY"
+            | "DAYOFMONTH" | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK" | "DAYOFYEAR"
+            | "WEEKDAY" | "DATE_FORMAT" | "DATEDIFF" | "UNIX_TIMESTAMP" | "FROM_UNIXTIME"
+            | "UTC_TIMESTAMP" | "UTC_DATE" | "LAST_DAY" | "JSON_EXTRACT" | "JSON_UNQUOTE"
+            | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_VALID" | "JSON_TYPE" | "JSON_LENGTH" | "HEX"
+            | "FIELD" | "ELT" | "STRCMP" => {
                 let bound_args =
                     args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<_, _>>()?;
                 Ok(Expr::Call { name: upper, args: bound_args })
@@ -886,3 +1373,101 @@ fn expr_to_u64(expr: &AstExpr) -> Result<u64, MySqlError> {
     }
     Err(MySqlError::unsupported("LIMIT/OFFSET value"))
 }
+
+/// `CURRENT_TIMESTAMP`, `CURRENT_TIMESTAMP()`, `NOW()`, `LOCALTIMESTAMP`,
+/// `CURRENT_DATE` -- the column default / `ON UPDATE` values meaning "the
+/// time of the write", which can't be stored as a constant.
+fn is_current_time(e: &AstExpr) -> bool {
+    let name = match e {
+        AstExpr::Identifier(i) => i.value.clone(),
+        AstExpr::Function(f) => f.name.to_string(),
+        _ => return false,
+    };
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CURRENT_TIMESTAMP" | "NOW" | "LOCALTIMESTAMP" | "LOCALTIME" | "CURRENT_DATE" | "CURDATE"
+    )
+}
+
+/// Replaces a bare `ColName` that names a SELECT-list alias with the
+/// aliased expression itself (`HAVING cnt > 2` where `COUNT(*) AS cnt`).
+fn substitute_aliases(e: Expr, aliases: &[(String, Expr)]) -> Expr {
+    let sub = |x: Expr| substitute_aliases(x, aliases);
+    let sub_box = |x: Box<Expr>| Box::new(substitute_aliases(*x, aliases));
+    match e {
+        Expr::ColName(ref n) if !n.contains('.') => aliases
+            .iter()
+            .find(|(a, _)| a.eq_ignore_ascii_case(n))
+            .map(|(_, x)| x.clone())
+            .unwrap_or(e),
+        Expr::And(v) => Expr::And(v.into_iter().map(sub).collect()),
+        Expr::Or(v) => Expr::Or(v.into_iter().map(sub).collect()),
+        Expr::Compare { op, left, right } => {
+            Expr::Compare { op, left: sub_box(left), right: sub_box(right) }
+        }
+        Expr::Arith { op, left, right } => {
+            Expr::Arith { op, left: sub_box(left), right: sub_box(right) }
+        }
+        Expr::Call { name, args } => Expr::Call { name, args: args.into_iter().map(sub).collect() },
+        Expr::InList { expr, list, negated } => {
+            Expr::InList { expr: sub_box(expr), list: list.into_iter().map(sub).collect(), negated }
+        }
+        Expr::Not(x) => Expr::Not(sub_box(x)),
+        Expr::IsNull(x, neg) => Expr::IsNull(sub_box(x), neg),
+        Expr::Like { expr, pattern, escape, negated } => Expr::Like {
+            expr: sub_box(expr),
+            pattern: sub_box(pattern),
+            escape: sub_box(escape),
+            negated,
+        },
+        Expr::Case { conditions, else_result } => Expr::Case {
+            conditions: conditions.into_iter().map(|(c, r)| (sub(c), sub(r))).collect(),
+            else_result: else_result.map(sub_box),
+        },
+        other => other,
+    }
+}
+
+/// The column an `UPDATE`/`INSERT ... SET`/`ON DUPLICATE KEY UPDATE`
+/// assignment targets: `col`, or a table-qualified `t.col`.
+fn assignment_column(target: &sqlparser::ast::AssignmentTarget) -> Result<String, MySqlError> {
+    match target {
+        sqlparser::ast::AssignmentTarget::ColumnName(name) if name.0.len() <= 2 => {
+            match name.0.last() {
+                Some(sqlparser::ast::ObjectNamePart::Identifier(id)) => Ok(id.value.clone()),
+                _ => Err(MySqlError::unsupported("assignment column name format")),
+            }
+        }
+        _ => Err(MySqlError::unsupported("assignment target")),
+    }
+}
+
+/// `new.col` (an `INSERT ... AS new` row alias) -> `VALUES(col)`.
+fn row_alias_to_values(e: Expr, alias: &str) -> Expr {
+    let f = |x: Expr| row_alias_to_values(x, alias);
+    let fb = |x: Box<Expr>| Box::new(row_alias_to_values(*x, alias));
+    match e {
+        Expr::ColName(ref n) => match n.split_once('.') {
+            Some((a, col)) if a.eq_ignore_ascii_case(alias) => Expr::Call {
+                name: "VALUES".to_string(),
+                args: vec![Expr::ColName(col.to_string())],
+            },
+            _ => e,
+        },
+        Expr::And(v) => Expr::And(v.into_iter().map(f).collect()),
+        Expr::Or(v) => Expr::Or(v.into_iter().map(f).collect()),
+        Expr::Compare { op, left, right } => Expr::Compare { op, left: fb(left), right: fb(right) },
+        Expr::Arith { op, left, right } => Expr::Arith { op, left: fb(left), right: fb(right) },
+        Expr::Call { name, args } => Expr::Call { name, args: args.into_iter().map(f).collect() },
+        Expr::Not(x) => Expr::Not(fb(x)),
+        Expr::IsNull(x, neg) => Expr::IsNull(fb(x), neg),
+        Expr::Case { conditions, else_result } => Expr::Case {
+            conditions: conditions.into_iter().map(|(c, r)| (f(c), f(r))).collect(),
+            else_result: else_result.map(fb),
+        },
+        other => other,
+    }
+}
+
+/// `ORDER BY` keys as (expression, ascending).
+type OrderKeys = Vec<(Expr, bool)>;

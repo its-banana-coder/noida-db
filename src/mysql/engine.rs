@@ -4,7 +4,7 @@ use crate::mysql::error::MySqlError;
 use crate::mysql::exec::Executor;
 use crate::mysql::plan;
 use crate::mysql::types::Value;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ShowStatementFilter, Statement};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
 use std::sync::{Arc, Mutex};
@@ -33,9 +33,12 @@ pub struct Engine {
     /// truncation) for the most recent query that used it, so a later
     /// `FOUND_ROWS()` call can read it. Unlike `last_insert_id`'s wire
     /// field, this *does* persist across intervening statements, matching
-    /// real MySQL and how the `LAST_INSERT_ID()` SQL function (not yet
-    /// implemented) would too -- see `Executor::last_found_rows`.
+    /// real MySQL and `LAST_INSERT_ID()` (`session_insert_id`) -- see
+    /// `Executor::last_found_rows`.
     pub last_found_rows: u64,
+    /// What `LAST_INSERT_ID()` returns: the most recent id an INSERT on this
+    /// connection generated, kept across later statements.
+    pub session_insert_id: u64,
     /// A whole-`DbState` snapshot taken at `BEGIN`/`START TRANSACTION`,
     /// restored verbatim on `ROLLBACK` and discarded on `COMMIT`. This is
     /// deliberately the simplest thing that gives real commit/rollback
@@ -55,6 +58,7 @@ impl Default for Engine {
             last_insert_id: 0,
             last_column_names: Vec::new(),
             last_found_rows: 0,
+            session_insert_id: 0,
             tx_snapshot: None,
         }
     }
@@ -127,6 +131,109 @@ impl Engine {
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
+            // Connection-setup statements every real driver/framework sends
+            // before its first query (pymysql/mysqlclient: `SET NAMES`;
+            // Laravel/Rails/Django: `SET NAMES ... COLLATE`, `SET SESSION
+            // sql_mode`, `SET SESSION TRANSACTION ISOLATION LEVEL`; JDBC:
+            // `SHOW VARIABLES`, `SET character_set_results`). Found via
+            // testing before a public release: every one of these used to
+            // fail as "unsupported statement", so pymysql (and anything on
+            // top of it: SQLAlchemy, Django) couldn't even connect. `SET` is
+            // an accepted no-op: the connection is already utf8mb4 and this
+            // engine has no per-session mode/charset/isolation state for it
+            // to change.
+            Statement::Set(_) => {
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
+            Statement::ShowVariables { filter, .. } => {
+                self.last_affected_rows = 0;
+                self.last_column_names = vec!["Variable_name".into(), "Value".into()];
+                return Ok(show_filtered(SESSION_VARIABLES, filter.as_ref()));
+            }
+            Statement::ShowStatus { filter, .. } => {
+                self.last_affected_rows = 0;
+                self.last_column_names = vec!["Variable_name".into(), "Value".into()];
+                return Ok(show_filtered(STATUS_VARIABLES, filter.as_ref()));
+            }
+            Statement::ShowCollation { filter } => {
+                self.last_affected_rows = 0;
+                self.last_column_names =
+                    ["Collation", "Charset", "Id", "Default", "Compiled", "Sortlen"]
+                        .map(String::from)
+                        .to_vec();
+                let all = show_filtered(COLLATIONS, filter.as_ref());
+                // `show_filtered` yields (name, charset) pairs; widen to the
+                // real six-column SHOW COLLATION shape.
+                return Ok(all
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut r)| {
+                        r.push(Value::Int(255 - i as i64));
+                        r.push(Value::Text(if i == 0 { "Yes" } else { "" }.into()));
+                        r.push(Value::Text("Yes".into()));
+                        r.push(Value::Int(0));
+                        r
+                    })
+                    .collect());
+            }
+            // `SHOW {INDEX|INDEXES|KEYS} {FROM|IN} t [{FROM|IN} db]`, which
+            // sqlparser's MySQL dialect leaves as a bare word list.
+            Statement::ShowVariable { variable }
+                if variable.len() >= 3
+                    && ["INDEX", "INDEXES", "KEYS"]
+                        .iter()
+                        .any(|w| variable[0].value.eq_ignore_ascii_case(w)) =>
+            {
+                let words: Vec<&str> = variable.iter().map(|i| i.value.as_str()).collect();
+                let table = words[2];
+                let db = match words.get(4) {
+                    Some(d) => d.to_string(),
+                    None => self
+                        .current_db
+                        .clone()
+                        .ok_or_else(|| MySqlError::new(1046, "3D000", "No database selected"))?,
+                };
+                let t = {
+                    let state = self.db.lock().unwrap();
+                    crate::mysql::infoschema::lookup_table(&state, &db, table)
+                }
+                .ok_or_else(|| {
+                    MySqlError::new(1146, "42S02", format!("Table '{db}.{table}' doesn't exist"))
+                })?;
+                self.last_affected_rows = 0;
+                self.last_column_names =
+                    crate::mysql::infoschema::SHOW_INDEX_COLUMNS.map(String::from).to_vec();
+                return Ok(crate::mysql::infoschema::show_index(&t));
+            }
+            // `SHOW <word>` forms sqlparser has no dedicated node for.
+            // Only the ones real clients actually send get an answer; any
+            // other one still falls through to "unsupported" rather than a
+            // made-up empty result.
+            Statement::ShowVariable { variable }
+                if variable.len() == 1
+                    && ["WARNINGS", "ERRORS", "ENGINES"]
+                        .iter()
+                        .any(|w| variable[0].value.eq_ignore_ascii_case(w)) =>
+            {
+                self.last_affected_rows = 0;
+                let word = variable[0].value.to_ascii_uppercase();
+                if word == "ENGINES" {
+                    self.last_column_names =
+                        ["Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"]
+                            .map(String::from)
+                            .to_vec();
+                    return Ok(vec![
+                        ["InnoDB", "DEFAULT", "noida-db in-memory engine", "YES", "NO", "NO"]
+                            .map(|s| Value::Text(s.into()))
+                            .to_vec(),
+                    ]);
+                }
+                // No warnings channel exists, so there are never any to show.
+                self.last_column_names = ["Level", "Code", "Message"].map(String::from).to_vec();
+                return Ok(vec![]);
+            }
             Statement::Rollback { .. } => {
                 let mut state = self.db.lock().unwrap();
                 if let Some(snapshot) = self.tx_snapshot.take() {
@@ -151,9 +258,13 @@ impl Engine {
 
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
         executor.last_found_rows = self.last_found_rows;
+        executor.session_insert_id = self.session_insert_id;
         let res = executor.execute_plan(plan)?;
         self.last_affected_rows = executor.last_affected_rows;
         self.last_insert_id = executor.last_insert_id;
+        if executor.last_insert_id != 0 {
+            self.session_insert_id = executor.last_insert_id;
+        }
         self.last_found_rows = executor.last_found_rows;
 
         // Update current DB if USE was called
@@ -167,4 +278,75 @@ impl Engine {
     pub fn use_db(&mut self, db: &str) {
         self.current_db = Some(db.to_string());
     }
+}
+
+/// What `SHOW [SESSION|GLOBAL] VARIABLES` reports. Values agree with what
+/// `SELECT @@var` already returns for the names `Executor` knows (version
+/// `8.0.33`, `max_allowed_packet`, `wait_timeout`, ...), so a driver that
+/// reads the same setting both ways sees one consistent answer.
+const SESSION_VARIABLES: &[(&str, &str)] = &[
+    ("auto_increment_increment", "1"),
+    ("auto_increment_offset", "1"),
+    ("autocommit", "ON"),
+    ("character_set_client", "utf8mb4"),
+    ("character_set_connection", "utf8mb4"),
+    ("character_set_database", "utf8mb4"),
+    ("character_set_results", "utf8mb4"),
+    ("character_set_server", "utf8mb4"),
+    ("collation_connection", "utf8mb4_0900_ai_ci"),
+    ("collation_database", "utf8mb4_0900_ai_ci"),
+    ("collation_server", "utf8mb4_0900_ai_ci"),
+    ("have_ssl", "DISABLED"),
+    ("init_connect", ""),
+    ("interactive_timeout", "28800"),
+    ("license", "GPL"),
+    ("lower_case_table_names", "0"),
+    ("max_allowed_packet", "67108864"),
+    ("net_buffer_length", "16384"),
+    ("net_write_timeout", "60"),
+    ("performance_schema", "OFF"),
+    ("port", "3306"),
+    ("socket", "/tmp/mysql.sock"),
+    (
+        "sql_mode",
+        "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+    ),
+    ("system_time_zone", "UTC"),
+    ("time_zone", "SYSTEM"),
+    ("transaction_isolation", "REPEATABLE-READ"),
+    ("tx_isolation", "REPEATABLE-READ"),
+    ("version", "8.0.33"),
+    ("version_comment", "noida-db MySQL 8.0"),
+    ("wait_timeout", "28800"),
+];
+
+const STATUS_VARIABLES: &[(&str, &str)] = &[("Threads_connected", "1"), ("Uptime", "1")];
+
+/// `(collation, charset)` pairs for `SHOW COLLATION`; the first is the default.
+const COLLATIONS: &[(&str, &str)] = &[
+    ("utf8mb4_0900_ai_ci", "utf8mb4"),
+    ("utf8mb4_general_ci", "utf8mb4"),
+    ("utf8mb4_unicode_ci", "utf8mb4"),
+    ("utf8mb4_bin", "utf8mb4"),
+];
+
+/// Applies a `SHOW ... LIKE 'pattern'` filter to a two-column name/value
+/// table (MySQL's `LIKE` here matches the first column, case-insensitively).
+/// A `WHERE` filter isn't evaluated -- every row is returned, which only
+/// ever over-reports to clients that look values up by name (JDBC's old
+/// `SHOW VARIABLES WHERE Variable_name = ...` probe), never drops one.
+fn show_filtered(table: &[(&str, &str)], filter: Option<&ShowStatementFilter>) -> Vec<Vec<Value>> {
+    let pattern = match filter {
+        Some(ShowStatementFilter::Like(p)) | Some(ShowStatementFilter::NoKeyword(p)) => {
+            Some(p.as_str())
+        }
+        _ => None,
+    };
+    table
+        .iter()
+        .filter(|(name, _)| {
+            pattern.is_none_or(|p| crate::mysql::exec::mysql_like(name, p, Some('\\')))
+        })
+        .map(|(n, v)| vec![Value::Text((*n).into()), Value::Text((*v).into())])
+        .collect()
 }

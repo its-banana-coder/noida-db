@@ -543,9 +543,9 @@ inserted/matched/deleted) and a real `last_insert_id` for an
 `mysqli_insert_id()`, which WordPress's `$wpdb->insert_id` reads directly
 — reflects the id generated for the *first* row of a multi-row `INSERT`,
 matching real MySQL; like real MySQL, it's per-statement, reported as
-0/`None` on any statement that didn't itself generate one, not a value
-persisted across intervening statements — the `LAST_INSERT_ID()` SQL
-function, which *does* persist, is not yet implemented).
+0/`None` on any statement that didn't itself generate one; the
+`LAST_INSERT_ID()` SQL function returns the connection's most recent
+generated id and persists across later statements, as in MySQL).
 
 Verified against `mysql_async` (`tests/mysql_client.rs`, including the
 prepared-statement, `GROUP BY`, transaction, `affected_rows` and
@@ -562,42 +562,82 @@ a server reachable on the default port that uses either of those auth
 plugins will cause the same SKIPPED/connection-error behavior — point
 `NOIDA_MYSQL_REF` at a `mysql_native_password`-configured server instead.
 
-`HAVING` filters groups by a directly-written aggregate or grouped-column
-expression (`HAVING COUNT(*) > 2`, `HAVING SUM(amount) >= 10`), the
-overwhelmingly common real-world shape, evaluated the same per-group way
-the projection's own aggregate expressions are. Referencing a
-`SELECT`-list alias instead (`SELECT COUNT(*) AS cnt ... HAVING cnt > 2`)
-isn't resolved yet — repeat the aggregate expression itself. Works with
-or without an explicit `GROUP BY` (no `GROUP BY` means the whole result
-is one implicit group, same as an aggregate in the `SELECT` list alone).
+`HAVING`, `GROUP BY` and `ORDER BY` accept `SELECT`-list aliases and
+positions (`GROUP BY 1`, `HAVING total > 5`, `ORDER BY 2 DESC`), and
+`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT` apply after aggregation
+(`SELECT COUNT(*) FROM t LIMIT 1` counts the whole table). Aggregates take
+`DISTINCT` (`COUNT(DISTINCT x)`), and `GROUP_CONCAT` supports `DISTINCT`,
+`ORDER BY` and `SEPARATOR`.
+
+Keys: the `PRIMARY KEY` (including a composite one) and every `UNIQUE`
+key (column-level or `UNIQUE KEY name (a, b)`) are enforced, comparing
+values the way the default `_ci` collation does, with MySQL's own
+`1062 Duplicate entry 'x' for key 't.k'` error. A failing `INSERT`,
+`UPDATE` or `DELETE` leaves the table exactly as it was. `INSERT IGNORE`,
+`REPLACE`, `INSERT ... ON DUPLICATE KEY UPDATE` (with `VALUES(col)` and
+the 8.0 `AS new` row alias) and `INSERT ... SET` work, with MySQL's
+affected-row counts (1 per insert, 2 per updated duplicate).
+`AUTO_INCREMENT` moves past an explicitly inserted id. `UPDATE`/`DELETE`
+honor `ORDER BY ... LIMIT`.
+
+Strict mode, the 8.0 default, applies: `NULL` into a `NOT NULL` column
+is error 1048 (an explicit `NULL` is never replaced by the column's
+`DEFAULT`, which only fills omitted columns), an over-long `VARCHAR` is
+1406, an unknown `ENUM` value is 1265, invalid `JSON` is 3140, and an
+unknown column is 1054. Column names are case-insensitive. Values are
+stored as their column's type: `DECIMAL` is exact, rounded to the
+column's scale, and arithmetic and `SUM`/`AVG` on exact values stay
+exact (`AVG` adds 4 decimal places, like MySQL).
+
+Column types: integers (stored as `i64`; `UNSIGNED` and display widths
+are accepted but not distinguished), `DECIMAL`/`NUMERIC`, `FLOAT`/
+`DOUBLE`/`REAL`, `CHAR`/`VARCHAR`/`TEXT` (all sizes), `BOOLEAN`, `DATE`,
+`DATETIME`/`TIMESTAMP` (no time zone conversion; everything is UTC),
+`ENUM`, `JSON`, and the `BLOB`/`BINARY` family. `DEFAULT CURRENT_TIMESTAMP`
+and `ON UPDATE CURRENT_TIMESTAMP` work.
+
+Functions: `IF`, `IFNULL`, `NULLIF`, `COALESCE`, `GREATEST`/`LEAST`,
+`CASE`; `ROUND`, `TRUNCATE`, `ABS`, `SIGN`, `CEIL`, `FLOOR`, `MOD`, `DIV`,
+`POW`, `SQRT`; `CONCAT`, `CONCAT_WS`, `UPPER`/`LOWER`, `LENGTH`,
+`CHAR_LENGTH`, `SUBSTRING`/`MID`, `LEFT`/`RIGHT`, `LPAD`/`RPAD`, `TRIM`
+(all forms), `REPLACE`, `REPEAT`, `REVERSE`, `LOCATE`/`INSTR`/`POSITION`,
+`FIELD`, `ELT`, `STRCMP`, `HEX`; `CAST(x AS SIGNED|UNSIGNED|CHAR|DECIMAL|
+DOUBLE|DATE|DATETIME|TIME|JSON)`; `NOW()` and its synonyms, `CURDATE()`,
+`UTC_TIMESTAMP()`, `DATE`, `TIME`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/
+`SECOND`, `DAYOFWEEK`, `WEEKDAY`, `DAYOFYEAR`, `QUARTER`, `LAST_DAY`,
+`EXTRACT`, `DATE_FORMAT`, `DATE_ADD`/`DATE_SUB`/`ADDDATE`/`SUBDATE`,
+`d + INTERVAL n unit`, `DATEDIFF`, `TIMESTAMPDIFF`/`TIMESTAMPADD`,
+`UNIX_TIMESTAMP`, `FROM_UNIXTIME`; `JSON_EXTRACT`, `->`, `->>`,
+`JSON_UNQUOTE`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALID`, `JSON_TYPE`,
+`JSON_LENGTH`; `DATABASE()`, `USER()`, `VERSION()`, `CONNECTION_ID()`,
+`LAST_INSERT_ID()`, `FOUND_ROWS()`. An unknown function is an error,
+never a silent NULL.
+
+DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF
+EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
+[LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
+DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
+`SET` (accepted, no effect), and `information_schema.SCHEMATA`/`TABLES`/
+`COLUMNS`/`STATISTICS`/`KEY_COLUMN_USAGE`, which is what ORMs and
+migration tools query.
 
 **Not yet**
 - Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
   above).
-- `HAVING` referencing a `SELECT`-list alias (see above); subqueries;
-  window functions.
-- `ORDER BY`/`LIMIT`/`OFFSET` combined with `GROUP BY`/aggregates when
-  the sort key references the aggregated result rather than a grouped
-  column (plain, non-aggregated `ORDER BY`/`LIMIT` is supported — see
-  above).
+- Subqueries (`IN (SELECT ...)`, `EXISTS`, scalar subqueries, derived
+  tables), `UNION`, window functions, and `REGEXP`.
+- `ALTER TABLE`, and multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
+- `FOREIGN KEY` constraints are accepted but not enforced (no
+  referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
+  `FULLTEXT` declarations are accepted and ignored; nothing is indexed.
 - Isolation levels, nested/savepoint transactions, and any cross-
   connection isolation (a transaction only protects against its own
   connection's later `ROLLBACK`, not against seeing concurrent writes
   from other connections).
-- `LAST_INSERT_ID()` as a callable SQL function (the OK packet's own
-  `last_insert_id` field is real — see above — but a session-persisted
-  value queryable via SQL isn't implemented).
-- `UNIQUE`/`FOREIGN KEY`/`KEY`/`INDEX`/`FULLTEXT`/`SPATIAL` constraints,
-  column-level or table-level, are accepted (not a parse error) but
-  never enforced — no duplicate-key rejection, no referential integrity,
-  no real indexing. A table-level `PRIMARY KEY` is the one exception
-  that's tracked (see above), though still not enforced as unique.
-- `ALTER TABLE`, `DROP TABLE` (found via `benchmarks/noidadb_bench.py`'s
-  own reset-between-runs logic hitting it).
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the
   first is executed).
-- `SHOW TABLES LIKE '...'` ignores the `LIKE` filter and returns every
-  table.
+- JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions
+  (`JSON_SET`, `JSON_INSERT`, ...).
 - Authentication (every password is currently accepted).
 
 ## Memcached
