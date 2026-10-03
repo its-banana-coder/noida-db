@@ -188,7 +188,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           declare -A TARGETS=(
             [linux-x64]=x86_64-unknown-linux-gnu
             [linux-arm64]=aarch64-unknown-linux-gnu
@@ -196,6 +196,19 @@ jobs:
             [darwin-arm64]=aarch64-apple-darwin
             [win32-x64]=x86_64-pc-windows-msvc
           )
+          # A brand-new scoped package's first-ever publish can sit behind
+          # npm's own automated security review for a while (observed:
+          # anywhere from under a minute to tens of minutes) -- during that
+          # window a PUT for it 404s as if the scope/package didn't exist at
+          # all. `set -e` here would mean one still-under-review platform
+          # blocks every platform after it in iteration order (bash doesn't
+          # guarantee associative-array key order), so a single stuck
+          # package could silently prevent every other one from ever being
+          # attempted. Try every platform regardless, retry each a few
+          # times with a short backoff (the review usually isn't that
+          # fast, but it costs nothing to try), and only fail the job at
+          # the end if something is still missing after all of them ran.
+          failed=()
           for plat in "${!TARGETS[@]}"; do
             target="${TARGETS[$plat]}"
             dir="npm/platforms/$plat"
@@ -210,8 +223,23 @@ jobs:
               p.version = '${VERSION}';
               fs.writeFileSync('$dir/package.json', JSON.stringify(p, null, 2) + '\n');
             "
-            (cd "$dir" && npm publish --access public)
+            ok=false
+            for attempt in 1 2 3; do
+              if (cd "$dir" && npm publish --access public); then
+                ok=true
+                break
+              fi
+              echo "::warning::$plat publish attempt $attempt failed, retrying in 30s"
+              sleep 30
+            done
+            if [ "$ok" = false ]; then
+              failed+=("$plat")
+            fi
           done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::Still unpublished after retries: ${failed[*]}"
+            exit 1
+          fi
 
       - name: Bump and publish the meta package
         shell: bash
