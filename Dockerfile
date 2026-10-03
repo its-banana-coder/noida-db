@@ -10,6 +10,10 @@ WORKDIR /build
 # targets in Cargo.toml; these placeholders are overwritten below once the
 # real source is copied in.
 COPY Cargo.toml Cargo.lock ./
+# Cargo.toml declares [[test]] targets; cargo refuses to resolve the
+# manifest if their files are missing, so they come along too. (Every
+# Docker publish failed on this before.)
+COPY tests ./tests
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
