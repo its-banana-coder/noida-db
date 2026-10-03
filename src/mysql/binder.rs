@@ -559,6 +559,11 @@ impl Binder {
     }
 
     fn bind_query(&mut self, query: Query) -> Result<Plan, MySqlError> {
+        // Said plainly rather than ignoring the WITH clause and then
+        // failing with "Table 'totals' doesn't exist".
+        if query.with.is_some() {
+            return Err(MySqlError::unsupported("WITH (common table expressions)"));
+        }
         let order_by = query.order_by;
         let limit_clause = query.limit_clause;
         match *query.body {

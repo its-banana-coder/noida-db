@@ -625,7 +625,7 @@ migration tools query.
 - Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
   above).
 - Subqueries (`IN (SELECT ...)`, `EXISTS`, scalar subqueries, derived
-  tables), `UNION`, window functions, and `REGEXP`.
+  tables), CTEs (`WITH`), `UNION`, window functions, and `REGEXP`.
 - `ALTER TABLE`, and multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
 - `FOREIGN KEY` constraints are accepted but not enforced (no
   referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
