@@ -322,3 +322,78 @@ fn regexp_query_matches_on_keyword_fields() {
         call(&engine, "POST", "/books/_search", r#"{"query":{"regexp":{"sku":"AB-1[0-9]{2}"}}}"#);
     assert_eq!(ids(&resp), vec!["1"]);
 }
+
+/// Found via extensive real-client testing before a public release: an
+/// unrecognized query clause (`query_string`, `nested`, `fuzzy`,
+/// `function_score`, ...) used to silently fall through to "0 hits" --
+/// a perfectly well-formed, confidently WRONG successful response rather
+/// than an error. Violates this project's own stated principle (see
+/// docs/specs/README.md: "never silently wrong"). Fixed to return a real
+/// 400 instead.
+#[test]
+fn unsupported_query_type_errors_instead_of_silently_matching_nothing() {
+    let engine = Engine::default();
+    call(&engine, "PUT", "/docs", "");
+    call(&engine, "PUT", "/docs/_doc/1", r#"{"name":"alice"}"#);
+    call(&engine, "POST", "/docs/_refresh", "");
+
+    let (status, resp) =
+        call(&engine, "POST", "/docs/_search", r#"{"query":{"query_string":{"query":"alice"}}}"#);
+    assert_eq!(status, 400);
+    assert_eq!(resp["error"]["type"], "parsing_exception");
+
+    let (status, _) =
+        call(&engine, "POST", "/docs/_count", r#"{"query":{"query_string":{"query":"alice"}}}"#);
+    assert_eq!(status, 400);
+}
+
+/// Real Elasticsearch auto-creates an index on its first write
+/// (`action.auto_create_index`, on by default) -- found missing via
+/// testing before a public release, confirmed to affect both a single
+/// document `PUT` and `_bulk`. `GET`/`DELETE` against a genuinely missing
+/// index must still 404, unaffected by this fix.
+#[test]
+fn put_doc_auto_creates_a_missing_index() {
+    let engine = Engine::default();
+    let (status, resp) = call(&engine, "PUT", "/newindex/_doc/1", r#"{"name":"alice"}"#);
+    assert_eq!(status, 201);
+    assert_eq!(resp["result"], "created");
+
+    let (status, _) = call(&engine, "GET", "/newindex/_doc/1", "");
+    assert_eq!(status, 200);
+
+    // A real miss (GET on a genuinely never-written index) still 404s.
+    let (status, _) = call(&engine, "GET", "/nevercreated/_doc/1", "");
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn bulk_auto_creates_a_missing_index() {
+    let engine = Engine::default();
+    let body = "{\"index\":{\"_index\":\"bulked\",\"_id\":\"1\"}}\n{\"name\":\"a\"}\n";
+    let (status, resp) = call(&engine, "POST", "/bulked/_bulk", body);
+    assert_eq!(status, 200);
+    assert_eq!(resp["errors"], false);
+}
+
+/// The global `/_bulk` endpoint (no index in the URL, `_index` set per
+/// action) wasn't routed at all before this fix -- confirmed missing via
+/// testing before a public release. This is the form most real
+/// bulk-ingestion tooling actually uses.
+#[test]
+fn global_bulk_endpoint_is_routed() {
+    let engine = Engine::default();
+    let body = concat!(
+        "{\"index\":{\"_index\":\"globalbulk\",\"_id\":\"1\"}}\n",
+        "{\"name\":\"a\"}\n",
+        "{\"index\":{\"_index\":\"globalbulk\",\"_id\":\"2\"}}\n",
+        "{\"name\":\"b\"}\n",
+    );
+    let (status, resp) = call(&engine, "POST", "/_bulk", body);
+    assert_eq!(status, 200);
+    assert_eq!(resp["errors"], false);
+    assert_eq!(resp["items"].as_array().unwrap().len(), 2);
+
+    let (status, _) = call(&engine, "GET", "/globalbulk/_doc/1", "");
+    assert_eq!(status, 200);
+}

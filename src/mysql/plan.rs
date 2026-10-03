@@ -17,6 +17,7 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    Mod,
 }
 
 /// The five aggregate functions this engine understands. `CountStar` is
@@ -83,6 +84,29 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `NOT expr` -- three-valued: `NOT NULL` is `NULL`, not `1`.
+    Not(Box<Expr>),
+    /// `expr IS [NOT] NULL`. The `bool` is `true` for `IS NOT NULL`.
+    IsNull(Box<Expr>, bool),
+    /// `expr [NOT] LIKE pattern [ESCAPE esc]`. `%`/`_` are wildcards in
+    /// `pattern`; `esc` (default `\`, matching MySQL's own implicit
+    /// default escape character when no `ESCAPE` clause is given) can
+    /// precede either wildcard to match it literally. Matching is
+    /// case-insensitive, matching MySQL's default `_ci` collations.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Box<Expr>,
+        negated: bool,
+    },
+    /// Searched `CASE WHEN cond1 THEN r1 WHEN cond2 THEN r2 ... [ELSE e] END`.
+    /// A simple `CASE operand WHEN v THEN r ... END` is rewritten by the
+    /// binder into this same shape, with each condition being
+    /// `operand = v`.
+    Case {
+        conditions: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
 }
 
 /// True if `expr` contains an aggregate function call anywhere within it
@@ -97,6 +121,15 @@ pub fn contains_agg(expr: &Expr) -> bool {
         }
         Expr::Call { args, .. } => args.iter().any(contains_agg),
         Expr::InList { expr, list, .. } => contains_agg(expr) || list.iter().any(contains_agg),
+        Expr::Not(e) => contains_agg(e),
+        Expr::IsNull(e, _) => contains_agg(e),
+        Expr::Like { expr, pattern, escape, .. } => {
+            contains_agg(expr) || contains_agg(pattern) || contains_agg(escape)
+        }
+        Expr::Case { conditions, else_result } => {
+            conditions.iter().any(|(c, r)| contains_agg(c) || contains_agg(r))
+                || else_result.as_ref().is_some_and(|e| contains_agg(e))
+        }
         _ => false,
     }
 }
@@ -146,6 +179,23 @@ pub enum Plan {
         db: String,
         table: String,
         columns: Vec<Column>,
+    },
+    CreateDatabase {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `CREATE INDEX` is accepted and validated (the table and every named
+    /// column must exist) but doesn't build a real index -- matching this
+    /// engine's existing "simple over performant" tradeoff for lookups
+    /// (see `docs/BENCHMARKING.md`'s own note that Postgres/MySQL have no
+    /// real indexing yet). What matters for compatibility is that the
+    /// *statement* succeeds instead of hard-failing a migration that
+    /// issues it.
+    CreateIndex {
+        db: String,
+        table: String,
+        columns: Vec<String>,
+        if_not_exists: bool,
     },
     Insert {
         db: String,
@@ -239,6 +289,21 @@ pub fn count_params(plan: &Plan) -> usize {
             Expr::InList { expr, list, .. } => {
                 expr_max(expr, max);
                 for e in list {
+                    expr_max(e, max);
+                }
+            }
+            Expr::Not(e) | Expr::IsNull(e, _) => expr_max(e, max),
+            Expr::Like { expr, pattern, escape, .. } => {
+                expr_max(expr, max);
+                expr_max(pattern, max);
+                expr_max(escape, max);
+            }
+            Expr::Case { conditions, else_result } => {
+                for (c, r) in conditions {
+                    expr_max(c, max);
+                    expr_max(r, max);
+                }
+                if let Some(e) = else_result {
                     expr_max(e, max);
                 }
             }
