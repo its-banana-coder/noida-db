@@ -1,12 +1,13 @@
 use crate::mysql::binder::Binder;
-use crate::mysql::catalog::DbState;
+use crate::mysql::catalog::{DbState, Table, TxUndo};
 use crate::mysql::error::MySqlError;
 use crate::mysql::exec::Executor;
-use crate::mysql::plan;
+use crate::mysql::plan::{self, Plan};
 use crate::mysql::types::Value;
 use sqlparser::ast::{ShowStatementFilter, Statement};
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
@@ -39,15 +40,24 @@ pub struct Engine {
     /// What `LAST_INSERT_ID()` returns: the most recent id an INSERT on this
     /// connection generated, kept across later statements.
     pub session_insert_id: u64,
-    /// A whole-`DbState` snapshot taken at `BEGIN`/`START TRANSACTION`,
-    /// restored verbatim on `ROLLBACK` and discarded on `COMMIT`. This is
-    /// deliberately the simplest thing that gives real commit/rollback
-    /// semantics for a single connection: no MVCC, no isolation levels, no
-    /// nested transactions (a second `BEGIN` while one is active just
-    /// replaces the snapshot, matching MySQL's implicit-commit-of-the-
-    /// previous-transaction behavior in spirit, not in detail).
-    tx_snapshot: Option<DbState>,
+    /// This connection's id, keying its undo log in `DbState::open_txns`.
+    pub conn_id: u64,
+    /// The session's `autocommit` (on by default). With it off, the first
+    /// write implicitly opens a transaction that lasts until COMMIT or
+    /// ROLLBACK -- how pymysql, mysqlclient, SQLAlchemy and Django's
+    /// `atomic()` run transactions (they never send BEGIN).
+    pub autocommit: bool,
+    /// Whether a transaction is open (explicit BEGIN, or implicit).
+    pub in_tx: bool,
+    /// Open savepoints, oldest first: each name with the tables the
+    /// transaction had written by then, as they stood at the savepoint.
+    savepoints: Vec<(String, TableImages)>,
 }
+
+/// Tables as they stood at a savepoint, by (database, table).
+type TableImages = BTreeMap<(String, String), Arc<Table>>;
+
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Default for Engine {
     fn default() -> Self {
@@ -59,7 +69,10 @@ impl Default for Engine {
             last_column_names: Vec::new(),
             last_found_rows: 0,
             session_insert_id: 0,
-            tx_snapshot: None,
+            conn_id: NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            autocommit: true,
+            in_tx: false,
+            savepoints: Vec::new(),
         }
     }
 }
@@ -79,13 +92,12 @@ impl Engine {
     /// never made durable across a restart.
     pub fn snapshot(&self) -> DbState {
         let state = self.db.lock().unwrap();
-        if let Some(base) = &state.tx_base {
-            let mut clean_base = (**base).clone();
-            clean_base.tx_base = None;
-            clean_base
-        } else {
-            state.clone()
+        let mut clean = state.clone();
+        clean.open_txns.clear();
+        for undo in state.open_txns.values() {
+            clean.undo(undo);
         }
+        clean
     }
 
     /// Builds an `Engine` whose shared database state is `db` (loaded from
@@ -94,6 +106,156 @@ impl Engine {
     /// with real data instead of an empty `DbState`.
     pub fn new_persistent(db: DbState) -> Self {
         Self { db: Arc::new(Mutex::new(db)), ..Self::default() }
+    }
+
+    /// The MySQL protocol status flags for this session's next OK/EOF
+    /// packet: `SERVER_STATUS_IN_TRANS` (1) and `SERVER_STATUS_AUTOCOMMIT`
+    /// (2). pymysql decides whether to send `SET autocommit` from these.
+    /// A new connection's session over the same shared database: its own
+    /// id and fresh session state.
+    pub fn new_connection(&self) -> Engine {
+        Engine { db: self.db.clone(), ..Engine::default() }
+    }
+
+    /// Rolls back this connection's open transaction, if any (on
+    /// disconnect, as MySQL does).
+    pub fn rollback(&mut self) {
+        let mut state = self.db.lock().unwrap();
+        if let Some(undo) = state.open_txns.remove(&self.conn_id) {
+            state.undo(&undo);
+        }
+        self.in_tx = false;
+    }
+
+    pub fn status_flags(&self) -> u16 {
+        u16::from(self.in_tx) | if self.autocommit { 2 } else { 0 }
+    }
+
+    /// Ends this connection's transaction, keeping its writes.
+    pub fn commit(&mut self) {
+        if self.in_tx {
+            self.db.lock().unwrap().open_txns.remove(&self.conn_id);
+        }
+        self.in_tx = false;
+        self.savepoints.clear();
+    }
+
+    /// `SAVEPOINT name`: remembers how every table the transaction has
+    /// written so far stands now (a table first written later is undone
+    /// back to its own pre-image). Django's nested `atomic()` uses these.
+    fn savepoint(&mut self, name: &str) {
+        if !self.in_tx && !self.autocommit {
+            self.in_tx = true;
+        }
+        if !self.in_tx {
+            return;
+        }
+        let state = self.db.lock().unwrap();
+        let tables: BTreeMap<_, _> = state
+            .open_txns
+            .get(&self.conn_id)
+            .map(|u| {
+                u.tables
+                    .keys()
+                    .filter_map(|(db, t)| {
+                        let cur = state.schemas.get(db)?.tables.get(t)?.clone();
+                        Some(((db.clone(), t.clone()), cur))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(state);
+        self.savepoints.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self.savepoints.push((name.to_string(), tables));
+    }
+
+    /// `ROLLBACK TO SAVEPOINT name`: undoes the writes made since it.
+    fn rollback_to(&mut self, name: &str) -> Result<(), MySqlError> {
+        let Some(pos) = self.savepoints.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(name))
+        else {
+            return Err(MySqlError::new(1305, "42000", format!("SAVEPOINT {name} does not exist")));
+        };
+        self.savepoints.truncate(pos + 1);
+        let at = self.savepoints[pos].1.clone();
+        let mut state = self.db.lock().unwrap();
+        let Some(undo) = state.open_txns.get(&self.conn_id).cloned() else { return Ok(()) };
+        // Tables written before the savepoint go back to how they stood
+        // then; tables first written after it, to their pre-transaction
+        // image (and leave the undo log).
+        let partial = TxUndo {
+            tables: undo
+                .tables
+                .iter()
+                .map(|(k, (before, ours))| {
+                    (
+                        k.clone(),
+                        (at.get(k).cloned().unwrap_or_else(|| before.clone()), ours.clone()),
+                    )
+                })
+                .collect(),
+        };
+        state.undo(&partial);
+        let mut kept = undo;
+        kept.tables.retain(|k, _| at.contains_key(k));
+        for (k, entry) in kept.tables.iter_mut() {
+            if let Some(now) = state.schemas.get(&k.0).and_then(|s| s.tables.get(&k.1)) {
+                entry.1 = now.clone();
+            }
+        }
+        state.open_txns.insert(self.conn_id, kept);
+        Ok(())
+    }
+
+    /// Transaction bookkeeping before a plan runs (shared with the
+    /// prepared-statement path in `server.rs`): DDL commits an open
+    /// transaction first (MySQL's implicit commit); a write opens one when
+    /// `autocommit` is off and records the table's pre-image. Returns the
+    /// table a write targets, for `after_plan`.
+    pub fn before_plan(&mut self, plan: &Plan) -> Option<(String, String)> {
+        match plan {
+            Plan::CreateTable { .. }
+            | Plan::DropTable { .. }
+            | Plan::Truncate { .. }
+            | Plan::CreateDatabase { .. }
+            | Plan::AlterTable { .. }
+            | Plan::CreateIndex { .. } => {
+                self.commit();
+                None
+            }
+            Plan::Insert { db, table, .. }
+            | Plan::Update { db, table, .. }
+            | Plan::Delete { db, table, .. } => {
+                if !self.in_tx && !self.autocommit {
+                    self.in_tx = true;
+                }
+                if !self.in_tx {
+                    return None;
+                }
+                let key = (db.clone(), table.clone());
+                let mut state = self.db.lock().unwrap();
+                let current = state.schemas.get(db).and_then(|s| s.tables.get(table)).cloned();
+                let undo = state.open_txns.entry(self.conn_id).or_default();
+                if let Some(t) = current {
+                    undo.tables.entry(key.clone()).or_insert_with(|| (t.clone(), t));
+                }
+                Some(key)
+            }
+            _ => None,
+        }
+    }
+
+    /// Records the table a transactional write left behind (see `before_plan`).
+    pub fn after_plan(&mut self, written: Option<(String, String)>) {
+        let Some((db, table)) = written else { return };
+        let mut state = self.db.lock().unwrap();
+        let Some(now) = state.schemas.get(&db).and_then(|s| s.tables.get(&table)).cloned() else {
+            return;
+        };
+        if let Some(entry) =
+            state.open_txns.get_mut(&self.conn_id).and_then(|u| u.tables.get_mut(&(db, table)))
+        {
+            entry.1 = now;
+        }
     }
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
@@ -113,20 +275,15 @@ impl Engine {
         // which `Executor` (built fresh per statement) doesn't have.
         match &stmt {
             Statement::StartTransaction { .. } => {
-                let mut state = self.db.lock().unwrap();
-                let base = state.clone();
-                if state.tx_base.is_none() {
-                    state.tx_base = Some(Box::new(base.clone()));
-                }
-                self.tx_snapshot = Some(base);
+                // BEGIN inside a transaction commits it first, as in MySQL.
+                self.commit();
+                self.in_tx = true;
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
             }
             Statement::Commit { .. } => {
-                let mut state = self.db.lock().unwrap();
-                state.tx_base = None;
-                self.tx_snapshot = None;
+                self.commit();
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
@@ -142,7 +299,15 @@ impl Engine {
             // an accepted no-op: the connection is already utf8mb4 and this
             // engine has no per-session mode/charset/isolation state for it
             // to change.
-            Statement::Set(_) => {
+            Statement::Set(set) => {
+                // `SET autocommit = 0|1` is the one setting with an effect:
+                // turning it back on commits an open transaction.
+                if let Some(on) = autocommit_assignment(set) {
+                    if on && !self.autocommit {
+                        self.commit();
+                    }
+                    self.autocommit = on;
+                }
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
@@ -234,14 +399,42 @@ impl Engine {
                 self.last_column_names = ["Level", "Code", "Message"].map(String::from).to_vec();
                 return Ok(vec![]);
             }
+            Statement::Savepoint { name } => {
+                self.savepoint(&name.value);
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
+            Statement::ReleaseSavepoint { name } => {
+                let Some(pos) =
+                    self.savepoints.iter().rposition(|(n, _)| n.eq_ignore_ascii_case(&name.value))
+                else {
+                    return Err(MySqlError::new(
+                        1305,
+                        "42000",
+                        format!("SAVEPOINT {} does not exist", name.value),
+                    ));
+                };
+                self.savepoints.truncate(pos);
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
+            Statement::Rollback { savepoint: Some(name), .. } => {
+                self.rollback_to(&name.value)?;
+                self.last_affected_rows = 0;
+                self.last_column_names = Vec::new();
+                return Ok(vec![]);
+            }
             Statement::Rollback { .. } => {
-                let mut state = self.db.lock().unwrap();
-                if let Some(snapshot) = self.tx_snapshot.take() {
-                    *state = snapshot;
-                } else if let Some(base) = state.tx_base.take() {
-                    *state = *base;
+                self.savepoints.clear();
+                {
+                    let mut state = self.db.lock().unwrap();
+                    if let Some(undo) = state.open_txns.remove(&self.conn_id) {
+                        state.undo(&undo);
+                    }
                 }
-                state.tx_base = None;
+                self.in_tx = false;
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
@@ -249,7 +442,7 @@ impl Engine {
             _ => {}
         }
 
-        let mut binder = Binder::new(self.current_db.clone());
+        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql);
         let plan = binder.bind_statement(stmt)?;
         self.last_column_names = {
             let state = self.db.lock().unwrap();
@@ -259,7 +452,9 @@ impl Engine {
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
         executor.last_found_rows = self.last_found_rows;
         executor.session_insert_id = self.session_insert_id;
+        let written = self.before_plan(&plan);
         let res = executor.execute_plan(plan)?;
+        self.after_plan(written);
         self.last_affected_rows = executor.last_affected_rows;
         self.last_insert_id = executor.last_insert_id;
         if executor.last_insert_id != 0 {
@@ -284,7 +479,7 @@ impl Engine {
 /// `SELECT @@var` already returns for the names `Executor` knows (version
 /// `8.0.33`, `max_allowed_packet`, `wait_timeout`, ...), so a driver that
 /// reads the same setting both ways sees one consistent answer.
-const SESSION_VARIABLES: &[(&str, &str)] = &[
+pub(crate) const SESSION_VARIABLES: &[(&str, &str)] = &[
     ("auto_increment_increment", "1"),
     ("auto_increment_offset", "1"),
     ("autocommit", "ON"),
@@ -349,4 +544,40 @@ fn show_filtered(table: &[(&str, &str)], filter: Option<&ShowStatementFilter>) -
         })
         .map(|(n, v)| vec![Value::Text((*n).into()), Value::Text((*v).into())])
         .collect()
+}
+
+/// `Some(on)` if `set` assigns `autocommit` (`SET autocommit = 0`,
+/// `SET @@autocommit = 1`, `SET SESSION autocommit = OFF`, ...).
+fn autocommit_assignment(set: &sqlparser::ast::Set) -> Option<bool> {
+    use sqlparser::ast::{Expr as E, Set, Value as V};
+    let pairs: Vec<(String, &E)> = match set {
+        Set::SingleAssignment { variable, values, .. } => {
+            values.first().map(|v| vec![(variable.to_string(), v)]).unwrap_or_default()
+        }
+        Set::MultipleAssignments { assignments } => {
+            assignments.iter().map(|a| (a.name.to_string(), &a.value)).collect()
+        }
+        _ => vec![],
+    };
+    let mut out = None;
+    for (name, value) in pairs {
+        let name = name.trim_start_matches('@').to_ascii_lowercase();
+        if name.rsplit('.').next() != Some("autocommit") {
+            continue;
+        }
+        out = match value {
+            E::Value(v) => match &v.value {
+                V::Number(n, _) => Some(n != "0"),
+                V::Boolean(b) => Some(*b),
+                V::SingleQuotedString(s) => Some(!s.eq_ignore_ascii_case("off") && s != "0"),
+                _ => None,
+            },
+            E::Identifier(i) => {
+                Some(i.value.eq_ignore_ascii_case("on") || i.value.eq_ignore_ascii_case("true"))
+            }
+            _ => None,
+        }
+        .or(out);
+    }
+    out
 }

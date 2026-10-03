@@ -55,7 +55,7 @@ pub fn spawn_persistent_for_test(
 
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let engine = engine.clone();
+            let engine = engine.new_connection();
             let _ = thread::spawn(move || {
                 let _ = serve(stream, engine);
             });
@@ -103,6 +103,16 @@ struct Session {
     stmt_param_types: HashMap<u32, Vec<(u8, u8)>>,
 }
 
+/// A connection that goes away mid-transaction has it rolled back, as
+/// MySQL does -- however the connection ends.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.engine.in_tx {
+            self.engine.rollback();
+        }
+    }
+}
+
 fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     // Every real packet here is sent as two separate writes (a 4-byte
     // length header, then the payload) -- without this, Nagle's
@@ -122,7 +132,11 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
         stmt_param_types: HashMap::new(),
     };
 
-    // Send Handshake. Capability flags (lower 2 bytes `\xdf\xf7` = 0xf7df,
+    // Send Handshake: protocol 10, server version "8.0.33" -- the same
+    // version `SELECT VERSION()`/`@@version` report. Found via testing
+    // before a public release: the greeting used to claim
+    // "5.5.5-10.4.22-MariaDB", so SQLAlchemy, Doctrine and Prisma (which
+    // read it) chose their MariaDB SQL dialects. Capability flags (lower 2 bytes `\xdf\xf7` = 0xf7df,
     // upper 2 bytes `\x0f\x00` = 0x000f) advertise everything this server
     // actually does *except* CLIENT_SSL (0x0800), CLIENT_COMPRESS (0x0020)
     // and CLIENT_SSL_VERIFY_SERVER_CERT / CLIENT_REMEMBER_OPTIONS (upper
@@ -131,7 +145,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     // client whose default is "use SSL if the server offers it" (pymysql,
     // the stock `mysql` CLI's `--ssl-mode=PREFERRED`) started a TLS
     // handshake against a plaintext server and failed to connect at all.
-    let handshake = b"\x0a\x35\x2e\x35\x2e\x35\x2d\x31\x30\x2e\x34\x2e\x32\x32\x2d\x4d\x61\x72\x69\x61\x44\x42\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xdf\xf7\x21\x02\x00\x0f\x00\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
+    let handshake = b"\x0a\x38\x2e\x30\x2e\x33\x33\x00\x01\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x00\xdf\xf7\x21\x02\x00\x0f\x00\x15\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x31\x32\x33\x34\x35\x36\x37\x38\x39\x30\x31\x32\x00\x6d\x79\x73\x71\x6c\x5f\x6e\x61\x74\x69\x76\x65\x5f\x70\x61\x73\x73\x77\x6f\x72\x64\x00";
     let mut header = [0u8; 4];
     header[0..3].copy_from_slice(&(handshake.len() as u32).to_le_bytes()[0..3]);
     header[3] = 0;
@@ -192,7 +206,9 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
             0x03 => {
                 // Query
                 let q = String::from_utf8_lossy(&payload[1..]);
-                match session.engine.execute(&q) {
+                let result = session.engine.execute(&q);
+                STATUS.with(|s| s.set(session.engine.status_flags()));
+                match result {
                     Ok(rows) => {
                         let affected = session.engine.last_affected_rows;
                         let insert_id = session.engine.last_insert_id;
@@ -234,13 +250,16 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             continue;
                         }
                         let stmt = asts.remove(0);
-                        let mut binder = Binder::new(session.engine.current_db.clone());
+                        let mut binder =
+                            Binder::new(session.engine.current_db.clone()).with_sql(&sql);
                         match binder.bind_statement(stmt) {
                             Ok(plan) => {
                                 let stmt_id = session.stmt_id_counter;
                                 session.stmt_id_counter += 1;
 
-                                let num_params = plan::count_params(&plan) as u16;
+                                let num_params = plan::count_params(&plan)
+                                    .max(binder.placeholder_count())
+                                    as u16;
                                 let num_columns: u16 = 0; // Simplified
 
                                 session
@@ -273,8 +292,9 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                                     next_seq = next_seq.wrapping_add(1);
                                 }
                                 if num_params > 0 {
-                                    let eof = b"\xfe\x00\x00\x02\x00";
-                                    let _ = write_packet(&mut stream, next_seq, eof);
+                                    let st = STATUS.with(|s| s.get()).to_le_bytes();
+                                    let eof = [0xfe, 0x00, 0x00, st[0], st[1]];
+                                    let _ = write_packet(&mut stream, next_seq, &eof);
                                 }
                             }
                             Err(e) => {
@@ -350,7 +370,13 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)
                         };
-                        match executor.execute_plan(stmt_plan) {
+                        let written = session.engine.before_plan(&stmt_plan);
+                        let result = executor.execute_plan(stmt_plan);
+                        if result.is_ok() {
+                            session.engine.after_plan(written);
+                        }
+                        STATUS.with(|s| s.set(session.engine.status_flags()));
+                        match result {
                             Ok(rows) => {
                                 let affected = executor.last_affected_rows;
                                 session.engine.last_affected_rows = affected;
@@ -474,6 +500,13 @@ fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> io::Result<(
     Ok(())
 }
 
+thread_local! {
+    /// The status flags (`SERVER_STATUS_IN_TRANS`/`_AUTOCOMMIT`) for this
+    /// connection's next OK/EOF packet. One thread serves one connection,
+    /// so a thread-local is per-session; it's set after every command.
+    static STATUS: std::cell::Cell<u16> = const { std::cell::Cell::new(2) };
+}
+
 fn send_ok(
     stream: &mut TcpStream,
     seq: u8,
@@ -484,7 +517,7 @@ fn send_ok(
     payload.push(0x00);
     write_lenenc_int(&mut payload, affected_rows);
     write_lenenc_int(&mut payload, last_insert_id);
-    payload.extend_from_slice(&0x0002u16.to_le_bytes()); // status flags: SERVER_STATUS_AUTOCOMMIT
+    payload.extend_from_slice(&STATUS.with(|s| s.get()).to_le_bytes()); // status flags
     payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
     write_packet(stream, seq, &payload)
 }
@@ -612,8 +645,9 @@ fn send_resultset(
         seq = seq.wrapping_add(1);
     }
 
-    let eof = b"\xfe\x00\x00\x02\x00";
-    write_packet(stream, seq, eof)?;
+    let st = STATUS.with(|s| s.get()).to_le_bytes();
+    let eof = [0xfe, 0x00, 0x00, st[0], st[1]];
+    write_packet(stream, seq, &eof)?;
     seq = seq.wrapping_add(1);
 
     for row in rows {
@@ -629,7 +663,7 @@ fn send_resultset(
         seq = seq.wrapping_add(1);
     }
 
-    write_packet(stream, seq, eof)?;
+    write_packet(stream, seq, &eof)?;
 
     Ok(())
 }
@@ -678,16 +712,25 @@ fn send_binary_resultset(
     write_packet(stream, seq, &[cols as u8])?;
     seq = seq.wrapping_add(1);
 
+    // Each column is declared with its real type and its values encoded in
+    // that type's binary form. Found via testing before a public release:
+    // every column used to be declared VAR_STRING, so a prepared statement
+    // (mysql2's execute(), Go's database/sql, JDBC server-side prepares)
+    // got every integer, DATETIME and JSON value back as a string.
+    let mut types = Vec::with_capacity(cols);
     for i in 0..cols {
         let fallback = format!("col{i}");
         let name = names.get(i).filter(|n| n.as_str() != "?").unwrap_or(&fallback);
-        let coldef = column_def_packet(name, None); // force VAR_STRING typing
+        let sample = column_sample(&rows, i);
+        types.push(column_type_for(sample).0);
+        let coldef = column_def_packet(name, sample);
         write_packet(stream, seq, &coldef)?;
         seq = seq.wrapping_add(1);
     }
 
-    let eof = b"\xfe\x00\x00\x02\x00";
-    write_packet(stream, seq, eof)?;
+    let st = STATUS.with(|s| s.get()).to_le_bytes();
+    let eof = [0xfe, 0x00, 0x00, st[0], st[1]];
+    write_packet(stream, seq, &eof)?;
     seq = seq.wrapping_add(1);
 
     // Binary Protocol Resultset Row: a 0x00 header byte, then a null
@@ -704,16 +747,16 @@ fn send_binary_resultset(
             }
         }
         row_payload.extend_from_slice(&bitmap);
-        for val in &row {
+        for (i, val) in row.iter().enumerate() {
             if !val.is_null() {
-                encode_lenenc_value(&mut row_payload, val);
+                encode_binary_value(&mut row_payload, types[i], val);
             }
         }
         write_packet(stream, seq, &row_payload)?;
         seq = seq.wrapping_add(1);
     }
 
-    write_packet(stream, seq, eof)?;
+    write_packet(stream, seq, &eof)?;
     Ok(())
 }
 
@@ -778,10 +821,8 @@ fn decode_execute_params(
 
 /// Decodes one value from the MySQL binary protocol's per-parameter
 /// encoding, given its `COM_STMT_EXECUTE` type code. Returns the value and
-/// how many bytes it consumed. Covers the numeric and text/blob types real
-/// client libraries actually send for typical bound parameters; date/time
-/// types use a different (non length-encoded-string) binary layout this
-/// engine doesn't decode yet.
+/// how many bytes it consumed: integers, floats, strings/blobs/decimals,
+/// and the binary DATE/DATETIME/TIMESTAMP/TIME layouts.
 fn decode_binary_value(ty: u8, buf: &[u8]) -> Result<(Value, usize), MySqlError> {
     let need = |n: usize| -> Result<(), MySqlError> {
         if buf.len() < n {
@@ -828,6 +869,63 @@ fn decode_binary_value(ty: u8, buf: &[u8]) -> Result<(Value, usize), MySqlError>
             Ok((Value::Text(s), n))
         }
         0x06 => Ok((Value::Null, 0)), // MYSQL_TYPE_NULL (value should already be in the null-bitmap)
+        0x0d => {
+            need(2)?;
+            Ok((Value::Int(u16::from_le_bytes([buf[0], buf[1]]) as i64), 2)) // YEAR
+        }
+        0xf5 | 0x10 => {
+            let (s, n) = read_lenenc_string(buf)?; // JSON, BIT
+            Ok((Value::Text(s), n))
+        }
+        // DATE / DATETIME / TIMESTAMP: a length byte (0, 4, 7 or 11), then
+        // year (u16), month, day, [hour, minute, second], [microseconds
+        // (u32)]. Found via testing before a public release: JDBC, Go and
+        // mysql2 send every date value this way and it used to be refused.
+        0x0a | 0x0c | 0x07 => {
+            need(1)?;
+            let len = buf[0] as usize;
+            need(1 + len)?;
+            let b = &buf[1..1 + len];
+            if len == 0 {
+                return Ok((Value::Text("0000-00-00 00:00:00".into()), 1));
+            }
+            let (y, mo, d) = (u16::from_le_bytes([b[0], b[1]]) as i64, b[2] as u32, b[3] as u32);
+            let (h, mi, sec) =
+                if len >= 7 { (b[4] as i64, b[5] as i64, b[6] as i64) } else { (0, 0, 0) };
+            let us =
+                if len >= 11 { u32::from_le_bytes([b[7], b[8], b[9], b[10]]) as i64 } else { 0 };
+            if mo == 0 || d == 0 {
+                return Ok((Value::Text(format!("{y:04}-{mo:02}-{d:02}")), 1 + len));
+            }
+            let days = crate::sql::datetime::date_from_ymd(y, mo, d);
+            let v = if ty == 0x0a {
+                Value::Date(days)
+            } else {
+                Value::Ts(
+                    days as i64 * crate::sql::datetime::USECS_PER_DAY
+                        + ((h * 60 + mi) * 60 + sec) * crate::sql::datetime::USECS_PER_SEC
+                        + us,
+                )
+            };
+            Ok((v, 1 + len))
+        }
+        // TIME: a length byte (0, 8 or 12), then negative flag, days (u32),
+        // hour, minute, second, [microseconds (u32)].
+        0x0b => {
+            need(1)?;
+            let len = buf[0] as usize;
+            need(1 + len)?;
+            let b = &buf[1..1 + len];
+            if len == 0 {
+                return Ok((Value::Time(0), 1));
+            }
+            let days = u32::from_le_bytes([b[1], b[2], b[3], b[4]]) as i64;
+            let secs = ((days * 24 + b[5] as i64) * 60 + b[6] as i64) * 60 + b[7] as i64;
+            let us =
+                if len >= 12 { u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as i64 } else { 0 };
+            let total = secs * crate::sql::datetime::USECS_PER_SEC + us;
+            Ok((Value::Time(if b[0] == 1 { -total } else { total }), 1 + len))
+        }
         _ => Err(MySqlError::unsupported("bound parameter type")),
     }
 }
@@ -884,5 +982,54 @@ fn write_lenenc_int(buf: &mut Vec<u8>, val: u64) {
     } else {
         buf.push(0xfe);
         buf.extend_from_slice(&val.to_le_bytes());
+    }
+}
+
+/// One non-NULL value in the binary result-row format for its column's
+/// declared `ty` (see `column_type_for`).
+fn encode_binary_value(out: &mut Vec<u8>, ty: u8, val: &Value) {
+    use crate::sql::datetime::{USECS_PER_DAY, ymd_from_date};
+    match (ty, val) {
+        (0x08, Value::Int(i)) => out.extend_from_slice(&i.to_le_bytes()),
+        (0x01, Value::Bool(b)) => out.push(u8::from(*b)),
+        (0x05, Value::Float(f)) => out.extend_from_slice(&f.to_le_bytes()),
+        (0x0a, Value::Date(d)) => {
+            let (y, m, d) = ymd_from_date(*d);
+            out.push(4);
+            out.extend_from_slice(&(y as u16).to_le_bytes());
+            out.extend_from_slice(&[m as u8, d as u8]);
+        }
+        (0x0c, Value::Ts(t)) => {
+            let (y, mo, d) = ymd_from_date(t.div_euclid(USECS_PER_DAY) as i32);
+            let us = t.rem_euclid(USECS_PER_DAY);
+            let (h, mi, s, frac) =
+                (us / 3_600_000_000, us / 60_000_000 % 60, us / 1_000_000 % 60, us % 1_000_000);
+            out.push(if frac == 0 { 7 } else { 11 });
+            out.extend_from_slice(&(y as u16).to_le_bytes());
+            out.extend_from_slice(&[mo as u8, d as u8, h as u8, mi as u8, s as u8]);
+            if frac != 0 {
+                out.extend_from_slice(&(frac as u32).to_le_bytes());
+            }
+        }
+        (0x0b, Value::Time(us)) => {
+            let neg = *us < 0;
+            let us = us.unsigned_abs();
+            let (days, rest) = (us / 86_400_000_000, us % 86_400_000_000);
+            let (h, mi, s, frac) = (
+                rest / 3_600_000_000,
+                rest / 60_000_000 % 60,
+                rest / 1_000_000 % 60,
+                rest % 1_000_000,
+            );
+            out.push(if frac == 0 { 8 } else { 12 });
+            out.push(u8::from(neg));
+            out.extend_from_slice(&(days as u32).to_le_bytes());
+            out.extend_from_slice(&[h as u8, mi as u8, s as u8]);
+            if frac != 0 {
+                out.extend_from_slice(&(frac as u32).to_le_bytes());
+            }
+        }
+        // DECIMAL, JSON, BLOB and strings: length-encoded bytes.
+        _ => encode_lenenc_value(out, val),
     }
 }

@@ -498,6 +498,81 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
                 _ => 1,
             })
         }
+        // `JSON_CONTAINS(target, candidate[, path])`: MySQL's containment
+        // (objects by key, arrays by element), the same rule as jsonb `@>`.
+        "JSON_CONTAINS" => {
+            need(2)?;
+            if any_null(a.len()) {
+                return Ok(Value::Null);
+            }
+            let mut target = to_json(&a[0], name)?;
+            if let Some(p) = a.get(2) {
+                match walk(&target, &parse_path(&render_text(p))?) {
+                    Some(j) => target = j.clone(),
+                    None => return Ok(Value::Null),
+                }
+            }
+            let candidate = to_json(&a[1], name)?;
+            Value::Int(i64::from(target.contains(&candidate)))
+        }
+        "JSON_CONTAINS_PATH" => {
+            need(3)?;
+            if any_null(a.len()) {
+                return Ok(Value::Null);
+            }
+            let doc = to_json(&a[0], name)?;
+            let all = render_text(&a[1]).eq_ignore_ascii_case("all");
+            let mut found = Vec::new();
+            for p in &a[2..] {
+                found.push(walk(&doc, &parse_path(&render_text(p))?).is_some());
+            }
+            Value::Int(i64::from(if all {
+                found.iter().all(|f| *f)
+            } else {
+                found.iter().any(|f| *f)
+            }))
+        }
+        "JSON_KEYS" => {
+            need(1)?;
+            if any_null(a.len()) {
+                return Ok(Value::Null);
+            }
+            let mut doc = to_json(&a[0], name)?;
+            if let Some(p) = a.get(1) {
+                match walk(&doc, &parse_path(&render_text(p))?) {
+                    Some(j) => doc = j.clone(),
+                    None => return Ok(Value::Null),
+                }
+            }
+            match doc {
+                Json::Object(m) => Value::Json(Box::new(Json::Array(
+                    m.into_iter().map(|(k, _)| Json::Str(k)).collect(),
+                ))),
+                _ => Value::Null,
+            }
+        }
+        // `CONVERT_TZ(dt, from, to)`, with offsets (`'+05:30'`), `UTC`/
+        // `SYSTEM` (this server's time zone is UTC) or IANA names. Django
+        // probes it on connect when USE_TZ is on.
+        "CONVERT_TZ" => {
+            need(3)?;
+            let (Some(t), Some(from), Some(to)) = (to_ts(&a[0]), text(1), text(2)) else {
+                return Ok(Value::Null);
+            };
+            let zone = |n: &str| {
+                if n.eq_ignore_ascii_case("system") {
+                    Some(crate::sql::tz::Zone::utc())
+                } else {
+                    crate::sql::tz::lookup(n)
+                }
+            };
+            let (Some(zf), Some(zt)) = (zone(&from), zone(&to)) else { return Ok(Value::Null) };
+            let local_unix = t.div_euclid(USECS_PER_SEC) + UNIX_EPOCH_SECS;
+            let from_off = zf.offset_for_local(local_unix) as i64;
+            let utc_unix = local_unix - from_off;
+            let shift = (zt.offset_at_utc(utc_unix) as i64 - from_off) * USECS_PER_SEC;
+            Value::Ts(t + shift)
+        }
         "INTERVAL" => {
             return Err(MySqlError::unsupported("INTERVAL outside DATE_ADD/DATE_SUB or +/-"));
         }

@@ -1,4 +1,4 @@
-use crate::mysql::catalog::{Column, ColumnType, DbState, Table};
+use crate::mysql::catalog::{Column, ColumnType, DbState, Table, UniqueKey};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SortKey};
 use crate::mysql::types::Value;
@@ -286,18 +286,14 @@ impl Executor {
                 state.schemas.insert(name, crate::mysql::catalog::Schema::default());
                 Ok(vec![])
             }
-            Plan::CreateIndex { db, table, columns, if_not_exists } => {
-                let state = self.db.lock().unwrap();
-                let schema = state.schemas.get(&db).ok_or_else(|| {
-                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
-                })?;
-                let t = match schema.tables.get(&table) {
-                    Some(t) => t,
-                    None if if_not_exists => return Ok(vec![]),
-                    None => return Err(MySqlError::unknown_table(&table)),
+            Plan::CreateIndex { db, table, columns, if_not_exists, unique } => {
+                let mut t = match self.load_table(&db, &table) {
+                    Ok(t) => t,
+                    Err(_) if if_not_exists => return Ok(vec![]),
+                    Err(e) => return Err(e),
                 };
                 for col in &columns {
-                    if !t.columns.iter().any(|c| c.name == *col) {
+                    if resolve_column_index(&t.columns, col).is_none() {
                         return Err(MySqlError::new(
                             1072,
                             "42000",
@@ -305,12 +301,36 @@ impl Executor {
                         ));
                     }
                 }
+                if let Some(name) = unique {
+                    add_unique_key(&mut t, UniqueKey { name, columns })?;
+                    self.store_table(&db, t)?;
+                }
                 Ok(vec![])
             }
-            // INSERT/UPDATE/DELETE all work on a copy of the table and only
-            // store it back once the whole statement succeeded, so a
-            // statement that fails part-way (a duplicate key on row 3 of a
-            // multi-row INSERT) leaves the table untouched, as InnoDB does.
+            Plan::AlterTable { db, table, ops } => {
+                let mut t = self.load_table(&db, &table)?;
+                let mut rename_to = None;
+                for op in ops {
+                    alter_table(&mut t, op, &mut rename_to)?;
+                }
+                let mut state = self.db.lock().unwrap();
+                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
+                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
+                })?;
+                if let Some(new) = rename_to {
+                    if schema.tables.contains_key(&new) {
+                        return Err(MySqlError::new(
+                            1050,
+                            "42S01",
+                            format!("Table '{new}' already exists"),
+                        ));
+                    }
+                    schema.tables.remove(&table);
+                    t.name = new;
+                }
+                schema.tables.insert(t.name.clone(), Arc::new(t));
+                Ok(vec![])
+            }
             Plan::Insert { db, table, columns, rows, mode } => {
                 let mut work = self.load_table(&db, &table)?;
                 let keys = work.keys();
@@ -441,7 +461,8 @@ impl Executor {
             Plan::Update { db, table, assignments, selection, order, limit } => {
                 let mut work = self.load_table(&db, &table)?;
                 let keys = work.keys();
-                let targets = self.dml_targets(&work, selection.as_ref(), &order, limit)?;
+                let targets =
+                    self.dml_targets(&work, selection.as_ref(), &order, limit.as_ref())?;
                 for &i in &targets {
                     self.apply_assignments(&mut work, i, &assignments)?;
                     if let Some((_, k)) = find_key_conflict(&work, &keys, &work.rows[i], Some(i)) {
@@ -454,7 +475,8 @@ impl Executor {
             }
             Plan::Delete { db, table, selection, order, limit } => {
                 let mut work = self.load_table(&db, &table)?;
-                let targets = self.dml_targets(&work, selection.as_ref(), &order, limit)?;
+                let targets =
+                    self.dml_targets(&work, selection.as_ref(), &order, limit.as_ref())?;
                 let mut keep = vec![true; work.rows.len()];
                 for &i in &targets {
                     keep[i] = false;
@@ -550,6 +572,8 @@ impl Executor {
                 Ok(out_rows)
             }
             Plan::Finish { source, order, hidden, distinct, limit, offset, calc_found_rows } => {
+                let limit = limit.map(|e| self.count(&e)).transpose()?;
+                let offset = offset.map(|e| self.count(&e)).transpose()?;
                 let mut rows = self.execute_plan(*source)?;
                 let key_index = |row: &[Value], key: &SortKey| match key {
                     SortKey::Output(i) => *i,
@@ -675,6 +699,20 @@ impl Executor {
         }
     }
 
+    /// A LIMIT/OFFSET value: a literal, or a bound `?` (drivers send it as
+    /// an integer or a numeric string).
+    fn count(&self, e: &Expr) -> Result<u64, MySqlError> {
+        match self.eval_expr(e, &[], None)? {
+            Value::Int(n) if n >= 0 => Ok(n as u64),
+            Value::Text(t) if t.trim().parse::<u64>().is_ok() => Ok(t.trim().parse().unwrap()),
+            v => Err(MySqlError::new(
+                1210,
+                "HY000",
+                format!("Incorrect arguments to LIMIT: {}", render_text(&v)),
+            )),
+        }
+    }
+
     fn load_table(&self, db: &str, table: &str) -> Result<Table, MySqlError> {
         let state = self.db.lock().unwrap();
         if let Some(t) = crate::mysql::infoschema::lookup_table(&state, db, table) {
@@ -710,8 +748,9 @@ impl Executor {
         t: &Table,
         selection: Option<&Expr>,
         order: &[(Expr, bool)],
-        limit: Option<u64>,
+        limit: Option<&Expr>,
     ) -> Result<Vec<usize>, MySqlError> {
+        let limit = limit.map(|e| self.count(e)).transpose()?;
         let mut targets = Vec::new();
         for (i, row) in t.rows.iter().enumerate() {
             if let Some(sel) = selection {
@@ -867,7 +906,19 @@ impl Executor {
                 } else if name.eq_ignore_ascii_case("socket") {
                     Ok(Value::Text("/tmp/mysql.sock".to_string()))
                 } else {
-                    Ok(Value::Text("".to_string()))
+                    // Everything else `SHOW VARIABLES` knows (`@@sql_mode`,
+                    // `@@character_set_server`, `@@transaction_isolation`,
+                    // ...), numbers as numbers; otherwise empty, never an
+                    // error -- drivers probe many variables on connect.
+                    let bare = name.rsplit('.').next().unwrap_or(name);
+                    Ok(crate::mysql::engine::SESSION_VARIABLES
+                        .iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(bare))
+                        .map(|(_, v)| match v.parse::<i64>() {
+                            Ok(n) => Value::Int(n),
+                            Err(_) => Value::Text(v.to_string()),
+                        })
+                        .unwrap_or_else(|| Value::Text(String::new())))
                 }
             }
             Expr::Not(e) => {
@@ -1711,8 +1762,10 @@ pub(crate) fn render_text(v: &Value) -> String {
         Value::Float(f) => format_double(*f),
         Value::Num(n) => n.to_string(),
         Value::Date(d) => crate::sql::datetime::format_date(*d),
-        Value::Ts(t) => crate::sql::datetime::format_timestamp(*t),
-        Value::Time(t) => crate::sql::datetime::format_time(*t),
+        // MySQL prints fractional seconds as all six digits (`.000600`),
+        // never trimmed the way Postgres does (`.0006`).
+        Value::Ts(t) => mysql_fraction(crate::sql::datetime::format_timestamp(*t), *t),
+        Value::Time(t) => mysql_fraction(crate::sql::datetime::format_time(*t), *t),
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Json(j) => j.to_jsonb_string(),
     }
@@ -1993,5 +2046,224 @@ fn resolve_column(t: &Table, sought: &str) -> Result<Option<usize>, MySqlError> 
                 )),
             }
         }
+    }
+}
+
+/// A UNIQUE (or PRIMARY) key over existing rows: error 1062 if they
+/// already collide, else added.
+fn add_unique_key(t: &mut Table, key: UniqueKey) -> Result<(), MySqlError> {
+    let mut probe = t.clone();
+    probe.unique_keys = vec![key.clone()];
+    for c in probe.columns.iter_mut() {
+        c.primary_key = false;
+    }
+    let keys = probe.keys();
+    let rows = std::mem::take(&mut probe.rows);
+    for row in rows {
+        if let Some((_, k)) = find_key_conflict(&probe, &keys, &row, None) {
+            return Err(duplicate_key_error(&probe, &keys[k], &row));
+        }
+        probe.rows.push(row);
+    }
+    t.unique_keys.retain(|k| !k.name.eq_ignore_ascii_case(&key.name));
+    t.unique_keys.push(key);
+    Ok(())
+}
+
+/// The value an existing row gets for a column `ALTER TABLE ... ADD`s:
+/// its default, else NULL, else (NOT NULL) the type's implicit default.
+fn added_column_value(col: &Column) -> Value {
+    if col.default_now {
+        return Value::Ts(now_ts());
+    }
+    if let Some(d) = &col.default {
+        return d.clone();
+    }
+    if !col.not_null {
+        return Value::Null;
+    }
+    match &col.ty {
+        ColumnType::Int | ColumnType::BigInt | ColumnType::Boolean => Value::Int(0),
+        ColumnType::Decimal(..) => Value::Num(Numeric::zero()),
+        ColumnType::Float | ColumnType::Double => Value::Float(0.0),
+        ColumnType::Enum(m) => Value::Text(m.first().cloned().unwrap_or_default()),
+        ColumnType::Date => Value::Text("0000-00-00".into()),
+        ColumnType::Datetime => Value::Text("0000-00-00 00:00:00".into()),
+        _ => Value::Text(String::new()),
+    }
+}
+
+fn column_index_or_err(t: &Table, name: &str, what: &str) -> Result<usize, MySqlError> {
+    t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)).ok_or_else(|| {
+        MySqlError::new(1054, "42S22", format!("Unknown column '{name}' in '{what}'"))
+    })
+}
+
+fn place_column(
+    t: &mut Table,
+    from: usize,
+    pos: Option<crate::mysql::plan::ColumnPos>,
+) -> Result<(), MySqlError> {
+    use crate::mysql::plan::ColumnPos;
+    let to = match pos {
+        None => return Ok(()),
+        Some(ColumnPos::First) => 0,
+        Some(ColumnPos::After(c)) => {
+            let i = column_index_or_err(t, &c, "field list")?;
+            if i < from { i + 1 } else { i }
+        }
+    };
+    let col = t.columns.remove(from);
+    t.columns.insert(to, col);
+    for row in t.rows.iter_mut() {
+        let v = row.remove(from);
+        row.insert(to, v);
+    }
+    Ok(())
+}
+
+/// Applies one `ALTER TABLE` operation to `t` (a copy: a failing operation
+/// leaves the real table untouched).
+fn alter_table(
+    t: &mut Table,
+    op: crate::mysql::plan::AlterOp,
+    rename_to: &mut Option<String>,
+) -> Result<(), MySqlError> {
+    use crate::mysql::plan::AlterOp;
+    match op {
+        AlterOp::AddColumn { col, unique, pos, if_not_exists } => {
+            if t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col.name)) {
+                if if_not_exists {
+                    return Ok(());
+                }
+                return Err(MySqlError::new(
+                    1060,
+                    "42S21",
+                    format!("Duplicate column name '{}'", col.name),
+                ));
+            }
+            let mut next_id = t.next_auto_increment;
+            for row in t.rows.iter_mut() {
+                let v = if col.auto_increment {
+                    next_id += 1;
+                    Value::Int(next_id - 1)
+                } else {
+                    added_column_value(&col)
+                };
+                row.push(v);
+            }
+            if col.auto_increment {
+                t.next_auto_increment = next_id;
+            }
+            t.columns.push(col);
+            let at = t.columns.len() - 1;
+            place_column(t, at, pos)?;
+            for k in unique {
+                add_unique_key(t, k)?;
+            }
+        }
+        AlterOp::DropColumn { name, if_exists } => {
+            let Some(i) = t.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&name)) else {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(MySqlError::new(
+                    1091,
+                    "42000",
+                    format!("Can't DROP '{name}'; check that column/key exists"),
+                ));
+            };
+            t.columns.remove(i);
+            for row in t.rows.iter_mut() {
+                row.remove(i);
+            }
+            t.unique_keys.retain(|k| !k.columns.iter().any(|c| c.eq_ignore_ascii_case(&name)));
+        }
+        AlterOp::ReplaceColumn { old, mut col, unique, pos } => {
+            let i = column_index_or_err(t, &old, "field list")?;
+            col.primary_key |= t.columns[i].primary_key;
+            for row in t.rows.iter_mut() {
+                let v = std::mem::replace(&mut row[i], Value::Null);
+                if v.is_null() && col.not_null {
+                    return Err(MySqlError::new(1138, "22004", "Invalid use of NULL value"));
+                }
+                row[i] = coerce_to_column(v, &col.ty, &col.name)?;
+            }
+            if !old.eq_ignore_ascii_case(&col.name) {
+                for k in t.unique_keys.iter_mut() {
+                    for c in k.columns.iter_mut() {
+                        if c.eq_ignore_ascii_case(&old) {
+                            *c = col.name.clone();
+                        }
+                    }
+                }
+            }
+            t.columns[i] = col;
+            place_column(t, i, pos)?;
+            for k in unique {
+                add_unique_key(t, k)?;
+            }
+        }
+        AlterOp::RenameColumn { old, new } => {
+            let i = column_index_or_err(t, &old, "field list")?;
+            for k in t.unique_keys.iter_mut() {
+                for c in k.columns.iter_mut() {
+                    if c.eq_ignore_ascii_case(&old) {
+                        *c = new.clone();
+                    }
+                }
+            }
+            t.columns[i].name = new;
+        }
+        AlterOp::RenameTable(new) => *rename_to = Some(new),
+        AlterOp::AddUnique(key) => {
+            for c in &key.columns {
+                column_index_or_err(t, c, "key")?;
+            }
+            add_unique_key(t, key)?;
+        }
+        AlterOp::AddPrimaryKey(cols) => {
+            if t.columns.iter().any(|c| c.primary_key) {
+                return Err(MySqlError::new(1068, "42000", "Multiple primary key defined"));
+            }
+            let mut idx = Vec::new();
+            for c in &cols {
+                idx.push(column_index_or_err(t, c, "key")?);
+            }
+            add_unique_key(t, UniqueKey { name: "PRIMARY".into(), columns: cols })?;
+            t.unique_keys.retain(|k| k.name != "PRIMARY");
+            for i in idx {
+                t.columns[i].primary_key = true;
+                t.columns[i].not_null = true;
+            }
+        }
+        AlterOp::DropKey(name) if name.eq_ignore_ascii_case("PRIMARY") => {
+            t.columns.iter_mut().for_each(|c| c.primary_key = false);
+        }
+        // A plain (non-unique) index isn't tracked, so dropping one that
+        // isn't a UNIQUE key is a no-op rather than an error.
+        AlterOp::DropKey(name) => t.unique_keys.retain(|k| !k.name.eq_ignore_ascii_case(&name)),
+        AlterOp::DropPrimaryKey => t.columns.iter_mut().for_each(|c| c.primary_key = false),
+        AlterOp::SetDefault { col, default, now } => {
+            let i = column_index_or_err(t, &col, "field list")?;
+            t.columns[i].default = default;
+            t.columns[i].default_now = now;
+        }
+        AlterOp::AutoIncrement(n) => t.next_auto_increment = t.next_auto_increment.max(n),
+        AlterOp::Noop => {}
+    }
+    Ok(())
+}
+
+/// Pads a trimmed fractional-seconds part back out to six digits.
+fn mysql_fraction(text: String, micros: i64) -> String {
+    if micros.rem_euclid(1_000_000) == 0 {
+        return text;
+    }
+    match text.rsplit_once('.') {
+        Some((head, frac)) if frac.len() < 6 && frac.chars().all(|c| c.is_ascii_digit()) => {
+            format!("{head}.{frac:0<6}")
+        }
+        _ => text,
     }
 }

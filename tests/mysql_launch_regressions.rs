@@ -349,3 +349,172 @@ async fn table_aliases_in_joins_and_dml() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// pymysql/mysqlclient/SQLAlchemy/Django never send BEGIN: they turn
+/// `autocommit` off and rely on MySQL opening a transaction implicitly.
+/// That used to be ignored (every statement committed, ROLLBACK did
+/// nothing); and a rollback used to restore the *whole* shared database,
+/// wiping other connections' commits.
+#[tokio::test]
+async fn implicit_transactions_and_per_connection_rollback() {
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let pool = Pool::new(format!("mysql://root@127.0.0.1:{}/test", addr.port()).as_str());
+    let mut a = pool.get_conn().await.unwrap();
+    let mut b = pool.get_conn().await.unwrap();
+    a.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10))").await.unwrap();
+    a.query_drop("INSERT INTO t VALUES (1, 'orig')").await.unwrap();
+
+    a.query_drop("SET autocommit = 0").await.unwrap();
+    a.query_drop("INSERT INTO t VALUES (2, 'mine')").await.unwrap();
+    a.query_drop("UPDATE t SET v = 'changed' WHERE id = 1").await.unwrap();
+    // Another connection commits to the same table meanwhile.
+    b.query_drop("INSERT INTO t VALUES (3, 'theirs')").await.unwrap();
+    a.query_drop("ROLLBACK").await.unwrap();
+    assert_eq!(
+        rows(&mut b, "SELECT id, v FROM t ORDER BY id").await,
+        vec![vec![s("1"), s("orig")], vec![s("3"), s("theirs")]]
+    );
+
+    a.query_drop("INSERT INTO t VALUES (4, 'kept')").await.unwrap();
+    a.query_drop("COMMIT").await.unwrap();
+    // DDL implicitly commits.
+    a.query_drop("INSERT INTO t VALUES (5, 'ddl')").await.unwrap();
+    a.query_drop("CREATE TABLE u (x INT)").await.unwrap();
+    a.query_drop("ROLLBACK").await.unwrap();
+    assert_eq!(one(&mut b, "SELECT COUNT(*) FROM t WHERE id IN (4, 5)").await, s("2"));
+
+    // A connection that disconnects mid-transaction is rolled back.
+    let mut c = pool.get_conn().await.unwrap();
+    c.query_drop("SET autocommit = 0").await.unwrap();
+    c.query_drop("INSERT INTO t VALUES (6, 'gone')").await.unwrap();
+    c.disconnect().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(one(&mut b, "SELECT COUNT(*) FROM t WHERE id = 6").await, s("0"));
+
+    drop(a);
+    drop(b);
+    pool.disconnect().await.unwrap();
+}
+
+/// Prepared statements (the binary protocol: mysql2's execute(), Go's
+/// database/sql, JDBC server-side prepares). Found via testing before a
+/// public release: parameters were numbered in binding order rather than
+/// textual order (`SELECT ? ... WHERE id = ?` swapped them), a `?` in
+/// HAVING wasn't counted, `LIMIT ?` was rejected, and every result column
+/// came back as a string.
+#[tokio::test]
+async fn prepared_statement_parameters_and_binary_types() {
+    use mysql_async::Value as V;
+    let (pool, mut c) = connect().await;
+    c.query_drop(
+        "CREATE TABLE p (id INT PRIMARY KEY, name VARCHAR(10), qty INT, at DATETIME, price DECIMAL(6,2))",
+    )
+    .await
+    .unwrap();
+    c.query_drop(
+        "INSERT INTO p VALUES (1, 'apple', 3, '2024-03-05 14:07:09', 9.99), \
+         (2, 'pear', NULL, NULL, 0.10), (3, 'fig', 7, NULL, 1.00)",
+    )
+    .await
+    .unwrap();
+
+    let r: Vec<(String, String)> =
+        c.exec("SELECT ? AS tag, name FROM p WHERE id = ?", ("x", 2)).await.unwrap();
+    assert_eq!(r, vec![("x".to_string(), "pear".to_string())]);
+
+    let r: Vec<String> = c
+        .exec("SELECT name FROM p GROUP BY name HAVING COUNT(*) >= ? ORDER BY name", (1,))
+        .await
+        .unwrap();
+    assert_eq!(r, vec!["apple", "fig", "pear"]);
+
+    let r: Vec<String> =
+        c.exec("SELECT name FROM p ORDER BY id LIMIT ? OFFSET ?", (1, 1)).await.unwrap();
+    assert_eq!(r, vec!["pear"]);
+
+    // Typed binary values, not strings.
+    let row: mysql_async::Row =
+        c.exec_first("SELECT id, qty, at, price FROM p WHERE id = ?", (1,)).await.unwrap().unwrap();
+    assert_eq!(row.as_ref(0), Some(&V::Int(1)));
+    assert_eq!(row.as_ref(1), Some(&V::Int(3)));
+    assert_eq!(row.as_ref(2), Some(&V::Date(2024, 3, 5, 14, 7, 9, 0)));
+    assert_eq!(row.as_ref(3), Some(&V::Bytes(b"9.99".to_vec())));
+
+    // A DATETIME *parameter* in its binary layout (JDBC, Go, mysql2).
+    c.exec_drop(
+        "INSERT INTO p (id, name, at) VALUES (?, ?, ?)",
+        (9, "date", V::Date(2025, 1, 2, 3, 4, 5, 600)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(one(&mut c, "SELECT at FROM p WHERE id = 9").await, s("2025-01-02 03:04:05.000600"));
+
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
+
+/// Migration tools (Django, Rails, Laravel, Alembic) all ALTER tables;
+/// every ALTER used to be rejected. Also savepoints (Django's nested
+/// `atomic()`) and the functions Django probes.
+#[tokio::test]
+async fn alter_table_savepoints_and_django_probes() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE a (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(10))")
+        .await
+        .unwrap();
+    c.query_drop("INSERT INTO a (name) VALUES ('x'), ('y')").await.unwrap();
+    c.query_drop("ALTER TABLE a ADD COLUMN qty INT NOT NULL DEFAULT 5 AFTER id").await.unwrap();
+    assert_eq!(
+        rows(&mut c, "SELECT * FROM a WHERE id = 1").await,
+        vec![vec![s("1"), s("5"), s("x")]]
+    );
+    c.query_drop("ALTER TABLE a MODIFY name VARCHAR(50) NOT NULL").await.unwrap();
+    c.query_drop("ALTER TABLE a CHANGE qty quantity BIGINT NOT NULL").await.unwrap();
+    c.query_drop("ALTER TABLE a RENAME COLUMN name TO title").await.unwrap();
+    c.query_drop("ALTER TABLE a ADD UNIQUE KEY uq_title (title)").await.unwrap();
+    assert_eq!(err_code(&mut c, "INSERT INTO a (quantity, title) VALUES (1, 'x')").await, 1062);
+    // A UNIQUE key over existing duplicates is refused and changes nothing.
+    c.query_drop("INSERT INTO a (quantity, title) VALUES (5, 'z')").await.unwrap();
+    assert_eq!(err_code(&mut c, "ALTER TABLE a ADD UNIQUE (quantity)").await, 1062);
+    c.query_drop("ALTER TABLE a DROP INDEX uq_title").await.unwrap();
+    c.query_drop("INSERT INTO a (quantity, title) VALUES (1, 'x')").await.unwrap();
+    c.query_drop("ALTER TABLE a ALTER COLUMN quantity SET DEFAULT 9").await.unwrap();
+    c.query_drop("ALTER TABLE a ADD CONSTRAINT fk FOREIGN KEY (quantity) REFERENCES b (id)")
+        .await
+        .unwrap();
+    c.query_drop("ALTER TABLE a DROP COLUMN quantity").await.unwrap();
+    c.query_drop("ALTER TABLE a RENAME TO items").await.unwrap();
+    assert_eq!(
+        rows(
+            &mut c,
+            "SELECT COLUMN_NAME FROM information_schema.columns WHERE table_name = 'items'"
+        )
+        .await,
+        vec![vec![s("id")], vec![s("title")]]
+    );
+    c.query_drop("CREATE UNIQUE INDEX one_title ON items (title, id)").await.unwrap();
+
+    c.query_drop("SET autocommit = 0").await.unwrap();
+    c.query_drop("INSERT INTO items (title) VALUES ('keep')").await.unwrap();
+    c.query_drop("SAVEPOINT s1").await.unwrap();
+    c.query_drop("INSERT INTO items (title) VALUES ('drop')").await.unwrap();
+    c.query_drop("ROLLBACK TO SAVEPOINT s1").await.unwrap();
+    c.query_drop("RELEASE SAVEPOINT s1").await.unwrap();
+    c.query_drop("COMMIT").await.unwrap();
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT GROUP_CONCAT(title ORDER BY title) FROM items WHERE title IN ('keep', 'drop')"
+        )
+        .await,
+        s("keep")
+    );
+    assert_eq!(
+        one(&mut c, "SELECT CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL").await,
+        s("1")
+    );
+    assert_eq!(one(&mut c, "SELECT JSON_CONTAINS('[1, 2, 3]', '2')").await, s("1"));
+
+    drop(c);
+    pool.disconnect().await.unwrap();
+}

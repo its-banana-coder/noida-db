@@ -491,13 +491,13 @@ A real unsupported statement now gets a real MySQL `ERR` packet
 (previously a silent `OK`, indistinguishable from "0 rows, no error").
 
 Result sets report real column names in the wire column-definition
-packets (a bare column reference is labeled with the column's own name,
-an alias with the alias) — what lets a real client fetch a row by column
-name (PHP's `mysqli`/`$wpdb`, PDO's associative fetch mode, any ORM's
-row hydration) rather than only by position. A genuinely unaliased
-non-column expression (a literal, a function call, arithmetic — real
-MySQL labels these with their own source SQL text) still falls back to
-a synthesized name, not yet reconstructed from the original SQL.
+packets, labeled the way MySQL labels them: a column by its name, an
+alias by the alias, and any other expression by its source text exactly
+as written (`count(*)`, `price * 2`; a string literal by its value). That
+is what lets a client fetch a row by column name (PHP's `$row['COUNT(*)']`,
+PDO's associative fetch mode, any ORM's row hydration). Prepared-statement
+(binary protocol) results carry real column types too: integers, doubles,
+DATE/DATETIME/TIME in their binary forms, DECIMAL and JSON as text.
 
 Prepared statements (`COM_STMT_PREPARE`/`EXECUTE`/`CLOSE`/`RESET`) support
 real parameter binding: `EXECUTE`'s null-bitmap and (when sent —
@@ -507,11 +507,12 @@ parameter values are decoded from the wire per the MySQL binary protocol
 and substituted for the `?` placeholders the statement was prepared
 with, so re-executing the same prepared plan with different bound values
 actually runs against those values. Supported bound-parameter wire types:
-`TINY`/`SHORT`/`LONG`/`INT24`/`LONGLONG` (integers), `FLOAT`/`DOUBLE`,
-and `DECIMAL`/`VARCHAR`/`VAR_STRING`/`STRING`/`BLOB` (as text) — bound
-`DATE`/`DATETIME`/`TIME` parameters are not decoded yet (their binary
-layout isn't length-encoded text) and are rejected with a real error
-rather than silently misread.
+`TINY`/`SHORT`/`LONG`/`INT24`/`LONGLONG`/`YEAR` (integers),
+`FLOAT`/`DOUBLE`, `DECIMAL`/`VARCHAR`/`VAR_STRING`/`STRING`/`BLOB`/`JSON`/
+`BIT` (as text), and `DATE`/`DATETIME`/`TIMESTAMP`/`TIME` in their binary
+layouts. Verified with mysql_async, Node's mysql2, Go's database/sql and
+JDBC Connector/J (`useServerPrepStmts=true`). Placeholders are numbered by
+their position in the SQL text, and `LIMIT ?`/`OFFSET ?` work.
 
 `GROUP BY` and the five aggregate functions `COUNT`/`COUNT(*)`/`SUM`/
 `AVG`/`MIN`/`MAX` work, including with no `GROUP BY` clause at all (the
@@ -524,16 +525,21 @@ and mixing aggregates with non-aggregated, non-grouped columns in the
 same projection (undefined in standard SQL, and MySQL's own behavior
 there depends on `ONLY_FULL_GROUP_BY`) are not handled specially.
 
-`BEGIN`/`START TRANSACTION`, `COMMIT`, and `ROLLBACK` give a single
-connection real commit/rollback semantics: `BEGIN` snapshot-clones the
-entire in-memory database state, `ROLLBACK` restores that snapshot
-verbatim, and `COMMIT` discards it and keeps whatever's current. This is
-deliberately the simplest thing that's still correct for one connection,
-not a real transaction engine — there's no MVCC, no isolation levels
-(every statement always sees the latest state, even from other
-connections, whether or not a transaction is open), and no nested
-transactions (a `BEGIN` while a transaction is already open just replaces
-the snapshot rather than erroring or stacking).
+Transactions: `BEGIN`/`START TRANSACTION`, `COMMIT` and `ROLLBACK`, and
+the implicit transactions drivers actually use: with `SET autocommit = 0`
+(what pymysql, mysqlclient, SQLAlchemy and Django's `atomic()` send), the
+first write opens a transaction that lasts until `COMMIT`/`ROLLBACK`, and
+`SET autocommit = 1` commits it. DDL and a second `BEGIN` commit an open
+transaction, and a connection that disconnects mid-transaction is rolled
+back, all as in MySQL. OK/EOF packets report `SERVER_STATUS_IN_TRANS` and
+`SERVER_STATUS_AUTOCOMMIT` truthfully. A rollback undoes only its own
+connection's writes: tables nobody else touched get their pre-transaction
+contents back, and in a table another connection also wrote meanwhile,
+only this transaction's own row changes are reversed. `AUTO_INCREMENT` is
+not rolled back (as in MySQL). `SAVEPOINT`, `ROLLBACK TO SAVEPOINT` and
+`RELEASE SAVEPOINT` work (Django's nested `atomic()`). There is no
+isolation: uncommitted writes are visible to other connections
+immediately.
 
 `OK` packets now report a real `affected_rows` count for
 `INSERT`/`UPDATE`/`DELETE` (a client's `.affected_rows()` — e.g.
@@ -609,12 +615,16 @@ DOUBLE|DATE|DATETIME|TIME|JSON)`; `NOW()` and its synonyms, `CURDATE()`,
 `d + INTERVAL n unit`, `DATEDIFF`, `TIMESTAMPDIFF`/`TIMESTAMPADD`,
 `UNIX_TIMESTAMP`, `FROM_UNIXTIME`; `JSON_EXTRACT`, `->`, `->>`,
 `JSON_UNQUOTE`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_VALID`, `JSON_TYPE`,
-`JSON_LENGTH`; `DATABASE()`, `USER()`, `VERSION()`, `CONNECTION_ID()`,
+`JSON_LENGTH`, `JSON_CONTAINS`, `JSON_CONTAINS_PATH`, `JSON_KEYS`;
+`CONVERT_TZ`; `DATABASE()`, `USER()`, `VERSION()`, `CONNECTION_ID()`,
 `LAST_INSERT_ID()`, `FOUND_ROWS()`. An unknown function is an error,
 never a silent NULL.
 
-DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `DROP TABLE [IF
-EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
+DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `ALTER TABLE`
+(`ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME COLUMN`, `RENAME TO`, `ADD`/`DROP`
+`UNIQUE`/`PRIMARY KEY`/`INDEX`, `ALTER COLUMN SET`/`DROP DEFAULT`,
+`AUTO_INCREMENT =`; foreign keys accepted, not enforced), `CREATE [UNIQUE]
+INDEX`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
 [LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
 DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
 `SET` (accepted, no effect), and `information_schema.SCHEMATA`/`TABLES`/
@@ -622,18 +632,14 @@ DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
 migration tools query.
 
 **Not yet**
-- Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
-  above).
 - Subqueries (`IN (SELECT ...)`, `EXISTS`, scalar subqueries, derived
-  tables), `UNION`, window functions, and `REGEXP`.
-- `ALTER TABLE`, and multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
+  tables), CTEs (`WITH`), `UNION`, window functions, and `REGEXP`.
+- Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
 - `FOREIGN KEY` constraints are accepted but not enforced (no
   referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
   `FULLTEXT` declarations are accepted and ignored; nothing is indexed.
-- Isolation levels, nested/savepoint transactions, and any cross-
-  connection isolation (a transaction only protects against its own
-  connection's later `ROLLBACK`, not against seeing concurrent writes
-  from other connections).
+- Isolation levels: other connections see a transaction's uncommitted
+  writes immediately (a rollback still undoes them).
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the
   first is executed).
 - JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions

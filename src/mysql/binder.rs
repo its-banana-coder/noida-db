@@ -1,7 +1,8 @@
 use crate::mysql::catalog::{Column, ColumnType, UniqueKey};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{
-    AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SortKey, contains_agg,
+    AggFunc, AlterOp, ArithOp, CmpOp, ColumnPos, Expr, InsertMode, JoinOp, Plan, SortKey,
+    contains_agg,
 };
 use crate::mysql::types::Value;
 use sqlparser::ast::{
@@ -21,11 +22,125 @@ pub struct Binder {
     /// order — matching how `COM_STMT_EXECUTE` lays out bound parameter
     /// values on the wire.
     param_counter: usize,
+    /// Every `?`'s (line, column) in the statement's text, in textual
+    /// order. A placeholder's parameter index is its rank here, not the
+    /// order the binder happens to visit it in -- found via testing before
+    /// a public release: the SELECT list is bound before WHERE but HAVING
+    /// after GROUP BY, so `SELECT ? ... WHERE id = ?` swapped its
+    /// parameters and silently matched the wrong rows.
+    placeholder_at: Vec<(u64, u64)>,
+    /// The statement's text (see `with_sql`), for labeling result columns.
+    sql: String,
 }
 
 impl Binder {
     pub fn new(current_db: Option<String>) -> Self {
-        Self { current_db, prepared_types: HashMap::new(), param_counter: 0 }
+        Self {
+            current_db,
+            prepared_types: HashMap::new(),
+            param_counter: 0,
+            placeholder_at: Vec::new(),
+            sql: String::new(),
+        }
+    }
+
+    /// How many `?` placeholders the statement's text has (0 without
+    /// `with_sql`) -- the parameter count a prepared statement reports.
+    pub fn placeholder_count(&self) -> usize {
+        self.placeholder_at.len()
+    }
+
+    /// Numbers placeholders by their position in `sql` (see
+    /// `placeholder_at`). Without it, they're numbered in binding order.
+    pub fn with_sql(mut self, sql: &str) -> Self {
+        use sqlparser::tokenizer::{Token, Tokenizer};
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        if let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize_with_location() {
+            self.placeholder_at = tokens
+                .iter()
+                .filter(|t| matches!(t.token, Token::Placeholder(_)))
+                .map(|t| (t.span.start.line, t.span.start.column))
+                .collect();
+        }
+        self.sql = sql.to_string();
+        self
+    }
+
+    /// An expression's text exactly as written in the statement: from its
+    /// parse span's start (1-based line/column, in characters) to the end
+    /// of the select item -- the next top-level `,` or clause keyword,
+    /// skipping over parentheses and quoted strings. (The span's own end
+    /// stops short of a function call's closing parenthesis.)
+    fn source_text(&self, e: &AstExpr) -> Option<String> {
+        use sqlparser::ast::Spanned;
+        if let AstExpr::Value(sqlparser::ast::ValueWithSpan {
+            value: AstValue::SingleQuotedString(s) | AstValue::DoubleQuotedString(s),
+            ..
+        }) = e
+        {
+            return Some(s.clone()); // MySQL labels a string literal by its value
+        }
+        if let AstExpr::UnaryOp { op: UnaryOperator::Minus, expr } = e {
+            return self.source_text(expr).map(|t| format!("-{t}"));
+        }
+        let span = e.span();
+        if self.sql.is_empty() || span.start.line == 0 {
+            return None;
+        }
+        let mut start = 0usize;
+        for (i, l) in self.sql.split('\n').enumerate() {
+            if i + 1 == span.start.line as usize {
+                start += (span.start.column as usize).saturating_sub(1);
+                break;
+            }
+            start += l.chars().count() + 1;
+        }
+        let chars: Vec<char> = self.sql.chars().collect();
+        let (mut depth, mut quote, mut end) = (0i32, None::<char>, chars.len());
+        let mut k = start;
+        while k < chars.len() {
+            let c = chars[k];
+            match quote {
+                Some(q) if c == q => quote = None,
+                Some(_) => {}
+                None => match c {
+                    '\'' | '"' | '`' => quote = Some(c),
+                    '(' => depth += 1,
+                    ')' if depth == 0 => {
+                        end = k;
+                        break;
+                    }
+                    ')' => depth -= 1,
+                    ',' | ';' if depth == 0 => {
+                        end = k;
+                        break;
+                    }
+                    c if depth == 0 && c.is_whitespace() => {
+                        let rest: String =
+                            chars[k..].iter().take(12).collect::<String>().to_ascii_uppercase();
+                        let rest = rest.trim_start();
+                        if [
+                            "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTO",
+                            "FOR", "WINDOW",
+                        ]
+                        .iter()
+                        .any(|kw| {
+                            rest.starts_with(kw)
+                                && !rest[kw.len()..]
+                                    .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                        }) {
+                            end = k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            k += 1;
+        }
+        let text: String = chars.get(start..end)?.iter().collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
     }
 
     pub fn bind_statement(&mut self, stmt: Statement) -> Result<Plan, MySqlError> {
@@ -118,6 +233,7 @@ impl Binder {
                 }
                 Ok(plan)
             }
+            Statement::AlterTable(alter) => self.bind_alter_table(alter),
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Table,
                 if_exists,
@@ -163,7 +279,19 @@ impl Binder {
                         _ => None,
                     })
                     .collect();
-                Ok(Plan::CreateIndex { db, table, columns, if_not_exists: ci.if_not_exists })
+                let unique = ci.unique.then(|| {
+                    ci.name
+                        .as_ref()
+                        .map(|n| n.to_string().trim_matches('`').to_string())
+                        .unwrap_or_default()
+                });
+                Ok(Plan::CreateIndex {
+                    db,
+                    table,
+                    columns,
+                    if_not_exists: ci.if_not_exists,
+                    unique,
+                })
             }
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => self.bind_update(
@@ -184,6 +312,309 @@ impl Binder {
         }
     }
 
+    /// One column definition (CREATE TABLE, ALTER TABLE ADD/MODIFY/CHANGE).
+    /// A column-level `UNIQUE` is pushed onto `unique_keys`.
+    fn bind_column_def(
+        &mut self,
+        col_def: ColumnDef,
+        unique_keys: &mut Vec<UniqueKey>,
+    ) -> Result<Column, MySqlError> {
+        let col_name = col_def.name.value.clone();
+        let col_type = match &col_def.data_type {
+            DataType::Int(_)
+            | DataType::Integer(_)
+            | DataType::IntUnsigned(_)
+            | DataType::IntegerUnsigned(_)
+            | DataType::TinyInt(_)
+            | DataType::TinyIntUnsigned(_)
+            | DataType::UTinyInt
+            | DataType::SmallInt(_)
+            | DataType::SmallIntUnsigned(_)
+            | DataType::MediumInt(_)
+            | DataType::MediumIntUnsigned(_) => ColumnType::Int,
+            // No dedicated unsigned/width-limited storage type -- values
+            // are stored as a plain i64 either way (see "simple over
+            // performant" in the project's own philosophy), so UNSIGNED
+            // and the various display-width variants are accepted but
+            // not distinguished from their signed/plain counterparts.
+            DataType::BigInt(_) | DataType::BigIntUnsigned(_) => ColumnType::BigInt,
+            DataType::Varchar(len) => {
+                let l = len
+                    .as_ref()
+                    .and_then(|e| match &e {
+                        sqlparser::ast::CharacterLength::IntegerLength { length, .. } => {
+                            Some(*length as usize)
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(255);
+                ColumnType::Varchar(l)
+            }
+            DataType::Char(len) | DataType::Character(len) | DataType::Nvarchar(len) => {
+                ColumnType::Varchar(match len {
+                    Some(sqlparser::ast::CharacterLength::IntegerLength { length, .. }) => {
+                        *length as usize
+                    }
+                    _ => 1,
+                })
+            }
+            DataType::Text | DataType::TinyText | DataType::MediumText | DataType::LongText => {
+                ColumnType::Text
+            }
+            DataType::Float(_) | DataType::Float4 | DataType::Real => ColumnType::Float,
+            DataType::Double(_) | DataType::DoublePrecision | DataType::Float8 => {
+                ColumnType::Double
+            }
+            DataType::Bool => ColumnType::Boolean,
+            DataType::JSON => ColumnType::Json,
+            DataType::Enum(members, _) => ColumnType::Enum(
+                members
+                    .iter()
+                    .map(|m| match m {
+                        sqlparser::ast::EnumMember::Name(n)
+                        | sqlparser::ast::EnumMember::NamedValue(n, _) => n.clone(),
+                    })
+                    .collect(),
+            ),
+            DataType::Blob(_)
+            | DataType::TinyBlob
+            | DataType::MediumBlob
+            | DataType::LongBlob
+            | DataType::Binary(_)
+            | DataType::Varbinary(_) => ColumnType::Blob,
+            DataType::Decimal(exact) | DataType::Numeric(exact) | DataType::Dec(exact) => {
+                let (p, s) = match exact {
+                    sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                        (*p as u8, *s as u8)
+                    }
+                    sqlparser::ast::ExactNumberInfo::Precision(p) => (*p as u8, 0),
+                    sqlparser::ast::ExactNumberInfo::None => (10, 0),
+                };
+                ColumnType::Decimal(p, s)
+            }
+            DataType::Date => ColumnType::Date,
+            // `TIMESTAMP` is stored and returned like `DATETIME` -- this
+            // engine has no session time zone for its UTC-conversion
+            // semantics to differ by.
+            DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::Datetime,
+            DataType::Boolean => ColumnType::Boolean,
+            _ => {
+                return Err(MySqlError::unsupported(&format!("data type {:?}", col_def.data_type)));
+            }
+        };
+
+        let mut not_null = false;
+        let mut auto_increment = false;
+        let mut primary_key = false;
+        let mut default = None;
+        let mut default_now = false;
+        let mut on_update_now = false;
+
+        for opt in &col_def.options {
+            match &opt.option {
+                sqlparser::ast::ColumnOption::NotNull => not_null = true,
+                sqlparser::ast::ColumnOption::Unique(_) => {
+                    unique_keys.push(UniqueKey {
+                        name: col_name.clone(),
+                        columns: vec![col_name.clone()],
+                    });
+                }
+                sqlparser::ast::ColumnOption::PrimaryKey(_) => {
+                    primary_key = true;
+                    not_null = true;
+                }
+                sqlparser::ast::ColumnOption::DialectSpecific(tokens) => {
+                    let text = tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
+                    if text.eq_ignore_ascii_case("auto_increment") {
+                        auto_increment = true;
+                    }
+                }
+                // A default that's a literal (the overwhelmingly common
+                // case: `DEFAULT 0`, `DEFAULT ''`, `DEFAULT NULL`,
+                // including WordPress's own schema's `DEFAULT '0'` on
+                // NOT NULL columns like comment_count) binds to a
+                // `Const`, which is stored directly. A non-constant
+                // default (`DEFAULT CURRENT_TIMESTAMP`, an expression)
+                // isn't evaluated here -- falls back to no default,
+                // same as before this existed at all.
+                sqlparser::ast::ColumnOption::Default(expr) => {
+                    // MySQL 8's expression-default syntax wraps it in
+                    // parentheses: `DEFAULT (now())`, what SQLAlchemy
+                    // emits for `server_default=func.now()`.
+                    let mut expr = expr;
+                    while let AstExpr::Nested(inner) = expr {
+                        expr = inner;
+                    }
+                    if is_current_time(expr) {
+                        default_now = true;
+                    } else if let Ok(Expr::Const(v)) = self.bind_expr(expr.clone()) {
+                        default = Some(v);
+                    } else {
+                        // Found via testing before a public release: a
+                        // non-constant default used to be dropped
+                        // silently, so a `NOT NULL DEFAULT <expr>`
+                        // column then rejected every insert that relied
+                        // on it. Refuse it at CREATE time instead.
+                        return Err(MySqlError::unsupported(&format!("DEFAULT expression {expr}")));
+                    }
+                }
+                sqlparser::ast::ColumnOption::OnUpdate(expr)
+                    if is_current_time(match expr {
+                        AstExpr::Nested(inner) => inner,
+                        e => e,
+                    }) =>
+                {
+                    on_update_now = true;
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Column {
+            name: col_name,
+            ty: col_type,
+            not_null,
+            default,
+            auto_increment,
+            primary_key,
+            default_now,
+            on_update_now,
+        })
+    }
+
+    /// `ALTER TABLE`, the forms migration tools emit (Django, Rails,
+    /// Laravel, Alembic). Found via testing before a public release: any
+    /// ALTER failed, so no ORM's migrations could run.
+    fn bind_alter_table(&mut self, alter: sqlparser::ast::AlterTable) -> Result<Plan, MySqlError> {
+        use sqlparser::ast::{AlterColumnOperation as Acol, AlterTableOperation as A};
+        let (db, table) = self.resolve_table_name(&alter.name)?;
+        let pos = |p: Option<sqlparser::ast::MySQLColumnPosition>| {
+            p.map(|p| match p {
+                sqlparser::ast::MySQLColumnPosition::First => ColumnPos::First,
+                sqlparser::ast::MySQLColumnPosition::After(i) => ColumnPos::After(i.value),
+            })
+        };
+        let idents = |cols: &[sqlparser::ast::IndexColumn]| -> Vec<String> {
+            cols.iter()
+                .filter_map(|c| match &c.column.expr {
+                    AstExpr::Identifier(i) => Some(i.value.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut ops = Vec::new();
+        for op in alter.operations {
+            let next = match op {
+                A::AddColumn { column_def, column_position, if_not_exists, .. } => {
+                    let mut unique = Vec::new();
+                    let col = self.bind_column_def(column_def, &mut unique)?;
+                    AlterOp::AddColumn { col, unique, pos: pos(column_position), if_not_exists }
+                }
+                A::DropColumn { column_names, if_exists, .. } => {
+                    for c in column_names {
+                        ops.push(AlterOp::DropColumn { name: c.value, if_exists });
+                    }
+                    continue;
+                }
+                A::ModifyColumn { col_name, data_type, options, column_position } => {
+                    let mut unique = Vec::new();
+                    let def = ColumnDef {
+                        name: col_name.clone(),
+                        data_type,
+                        options: options_with_names(options),
+                    };
+                    let col = self.bind_column_def(def, &mut unique)?;
+                    AlterOp::ReplaceColumn {
+                        old: col_name.value,
+                        col,
+                        unique,
+                        pos: pos(column_position),
+                    }
+                }
+                A::ChangeColumn { old_name, new_name, data_type, options, column_position } => {
+                    let mut unique = Vec::new();
+                    let def = ColumnDef {
+                        name: new_name,
+                        data_type,
+                        options: options_with_names(options),
+                    };
+                    let col = self.bind_column_def(def, &mut unique)?;
+                    AlterOp::ReplaceColumn {
+                        old: old_name.value,
+                        col,
+                        unique,
+                        pos: pos(column_position),
+                    }
+                }
+                A::RenameColumn { old_column_name, new_column_name } => {
+                    AlterOp::RenameColumn { old: old_column_name.value, new: new_column_name.value }
+                }
+                A::RenameTable { table_name } => {
+                    let name = match table_name {
+                        sqlparser::ast::RenameTableNameKind::As(n)
+                        | sqlparser::ast::RenameTableNameKind::To(n) => n,
+                    };
+                    AlterOp::RenameTable(self.resolve_table_name(&name)?.1)
+                }
+                A::AddConstraint { constraint, .. } => match constraint {
+                    TableConstraint::Unique(u) => {
+                        let columns = idents(&u.columns);
+                        let name = u
+                            .name
+                            .as_ref()
+                            .or(u.index_name.as_ref())
+                            .map(|i| i.value.clone())
+                            .unwrap_or_else(|| columns.first().cloned().unwrap_or_default());
+                        AlterOp::AddUnique(UniqueKey { name, columns })
+                    }
+                    TableConstraint::PrimaryKey(pk) => AlterOp::AddPrimaryKey(idents(&pk.columns)),
+                    // FOREIGN KEY, INDEX, CHECK: accepted, not enforced.
+                    _ => AlterOp::Noop,
+                },
+                A::DropIndex { name } | A::DropConstraint { name, .. } => {
+                    AlterOp::DropKey(name.value)
+                }
+                A::DropForeignKey { .. } => AlterOp::Noop,
+                A::DropPrimaryKey { .. } => AlterOp::DropPrimaryKey,
+                A::AlterColumn { column_name, op } => match op {
+                    Acol::SetDefault { value } => {
+                        let mut v = &value;
+                        while let AstExpr::Nested(inner) = v {
+                            v = inner;
+                        }
+                        if is_current_time(v) {
+                            AlterOp::SetDefault { col: column_name.value, default: None, now: true }
+                        } else if let Ok(Expr::Const(c)) = self.bind_expr(v.clone()) {
+                            AlterOp::SetDefault {
+                                col: column_name.value,
+                                default: Some(c),
+                                now: false,
+                            }
+                        } else {
+                            return Err(MySqlError::unsupported(&format!(
+                                "DEFAULT expression {value}"
+                            )));
+                        }
+                    }
+                    Acol::DropDefault => {
+                        AlterOp::SetDefault { col: column_name.value, default: None, now: false }
+                    }
+                    other => {
+                        return Err(MySqlError::unsupported(&format!("ALTER COLUMN {other}")));
+                    }
+                },
+                A::AutoIncrement { value, .. } => match &value.value {
+                    AstValue::Number(n, _) => AlterOp::AutoIncrement(n.parse().unwrap_or(1)),
+                    _ => AlterOp::Noop,
+                },
+                A::Algorithm { .. } | A::Lock { .. } => AlterOp::Noop,
+                other => return Err(MySqlError::unsupported(&format!("ALTER TABLE {other}"))),
+            };
+            ops.push(next);
+        }
+        Ok(Plan::AlterTable { db, table, ops })
+    }
+
     fn bind_create_table(
         &mut self,
         name: ObjectName,
@@ -195,161 +626,8 @@ impl Binder {
         let mut unique_keys: Vec<UniqueKey> = Vec::new();
 
         for col_def in columns {
-            let col_name = col_def.name.value.clone();
-            let col_type = match &col_def.data_type {
-                DataType::Int(_)
-                | DataType::Integer(_)
-                | DataType::IntUnsigned(_)
-                | DataType::IntegerUnsigned(_)
-                | DataType::TinyInt(_)
-                | DataType::TinyIntUnsigned(_)
-                | DataType::UTinyInt
-                | DataType::SmallInt(_)
-                | DataType::SmallIntUnsigned(_)
-                | DataType::MediumInt(_)
-                | DataType::MediumIntUnsigned(_) => ColumnType::Int,
-                // No dedicated unsigned/width-limited storage type -- values
-                // are stored as a plain i64 either way (see "simple over
-                // performant" in the project's own philosophy), so UNSIGNED
-                // and the various display-width variants are accepted but
-                // not distinguished from their signed/plain counterparts.
-                DataType::BigInt(_) | DataType::BigIntUnsigned(_) => ColumnType::BigInt,
-                DataType::Varchar(len) => {
-                    let l = len
-                        .as_ref()
-                        .and_then(|e| match &e {
-                            sqlparser::ast::CharacterLength::IntegerLength { length, .. } => {
-                                Some(*length as usize)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(255);
-                    ColumnType::Varchar(l)
-                }
-                DataType::Char(len) | DataType::Character(len) | DataType::Nvarchar(len) => {
-                    ColumnType::Varchar(match len {
-                        Some(sqlparser::ast::CharacterLength::IntegerLength { length, .. }) => {
-                            *length as usize
-                        }
-                        _ => 1,
-                    })
-                }
-                DataType::Text | DataType::TinyText | DataType::MediumText | DataType::LongText => {
-                    ColumnType::Text
-                }
-                DataType::Float(_) | DataType::Float4 | DataType::Real => ColumnType::Float,
-                DataType::Double(_) | DataType::DoublePrecision | DataType::Float8 => {
-                    ColumnType::Double
-                }
-                DataType::Bool => ColumnType::Boolean,
-                DataType::JSON => ColumnType::Json,
-                DataType::Enum(members, _) => ColumnType::Enum(
-                    members
-                        .iter()
-                        .map(|m| match m {
-                            sqlparser::ast::EnumMember::Name(n)
-                            | sqlparser::ast::EnumMember::NamedValue(n, _) => n.clone(),
-                        })
-                        .collect(),
-                ),
-                DataType::Blob(_)
-                | DataType::TinyBlob
-                | DataType::MediumBlob
-                | DataType::LongBlob
-                | DataType::Binary(_)
-                | DataType::Varbinary(_) => ColumnType::Blob,
-                DataType::Decimal(exact) | DataType::Numeric(exact) | DataType::Dec(exact) => {
-                    let (p, s) = match exact {
-                        sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                            (*p as u8, *s as u8)
-                        }
-                        sqlparser::ast::ExactNumberInfo::Precision(p) => (*p as u8, 0),
-                        sqlparser::ast::ExactNumberInfo::None => (10, 0),
-                    };
-                    ColumnType::Decimal(p, s)
-                }
-                DataType::Date => ColumnType::Date,
-                // `TIMESTAMP` is stored and returned like `DATETIME` -- this
-                // engine has no session time zone for its UTC-conversion
-                // semantics to differ by.
-                DataType::Datetime(_) | DataType::Timestamp(_, _) => ColumnType::Datetime,
-                DataType::Boolean => ColumnType::Boolean,
-                _ => {
-                    return Err(MySqlError::unsupported(&format!(
-                        "data type {:?}",
-                        col_def.data_type
-                    )));
-                }
-            };
-
-            let mut not_null = false;
-            let mut auto_increment = false;
-            let mut primary_key = false;
-            let mut default = None;
-            let mut default_now = false;
-            let mut on_update_now = false;
-
-            for opt in &col_def.options {
-                match &opt.option {
-                    sqlparser::ast::ColumnOption::NotNull => not_null = true,
-                    sqlparser::ast::ColumnOption::Unique(_) => {
-                        unique_keys.push(UniqueKey {
-                            name: col_name.clone(),
-                            columns: vec![col_name.clone()],
-                        });
-                    }
-                    sqlparser::ast::ColumnOption::PrimaryKey(_) => {
-                        primary_key = true;
-                        not_null = true;
-                    }
-                    sqlparser::ast::ColumnOption::DialectSpecific(tokens) => {
-                        let text =
-                            tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(" ");
-                        if text.eq_ignore_ascii_case("auto_increment") {
-                            auto_increment = true;
-                        }
-                    }
-                    // A default that's a literal (the overwhelmingly common
-                    // case: `DEFAULT 0`, `DEFAULT ''`, `DEFAULT NULL`,
-                    // including WordPress's own schema's `DEFAULT '0'` on
-                    // NOT NULL columns like comment_count) binds to a
-                    // `Const`, which is stored directly. A non-constant
-                    // default (`DEFAULT CURRENT_TIMESTAMP`, an expression)
-                    // isn't evaluated here -- falls back to no default,
-                    // same as before this existed at all.
-                    sqlparser::ast::ColumnOption::Default(expr) => {
-                        if is_current_time(expr) {
-                            default_now = true;
-                        } else if let Ok(Expr::Const(v)) = self.bind_expr(expr.clone()) {
-                            default = Some(v);
-                        } else {
-                            // Found via testing before a public release: a
-                            // non-constant default used to be dropped
-                            // silently, so a `NOT NULL DEFAULT <expr>`
-                            // column then rejected every insert that relied
-                            // on it. Refuse it at CREATE time instead.
-                            return Err(MySqlError::unsupported(&format!(
-                                "DEFAULT expression {expr}"
-                            )));
-                        }
-                    }
-                    sqlparser::ast::ColumnOption::OnUpdate(expr) if is_current_time(expr) => {
-                        on_update_now = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            cols.push(Column {
-                name: col_name,
-                ty: col_type,
-                not_null,
-                default,
-                auto_increment,
-                primary_key,
-                default_now,
-                on_update_now,
-            });
+            let col = self.bind_column_def(col_def, &mut unique_keys)?;
+            cols.push(col);
         }
 
         // A table-level `PRIMARY KEY (...)` clause (WordPress-style schemas
@@ -548,17 +826,22 @@ impl Binder {
         &mut self,
         order_by: Vec<sqlparser::ast::OrderByExpr>,
         limit: Option<AstExpr>,
-    ) -> Result<(OrderKeys, Option<u64>), MySqlError> {
+    ) -> Result<(OrderKeys, Option<Expr>), MySqlError> {
         let mut order = Vec::new();
         for item in order_by {
             let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
             order.push((self.bind_expr(item.expr)?, asc));
         }
-        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
+        let limit = limit.map(|e| self.bind_count(e)).transpose()?;
         Ok((order, limit))
     }
 
     fn bind_query(&mut self, query: Query) -> Result<Plan, MySqlError> {
+        // Said plainly rather than ignoring the WITH clause and then
+        // failing with "Table 'totals' doesn't exist".
+        if query.with.is_some() {
+            return Err(MySqlError::unsupported("WITH (common table expressions)"));
+        }
         let order_by = query.order_by;
         let limit_clause = query.limit_clause;
         match *query.body {
@@ -590,21 +873,19 @@ impl Binder {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
                             // Real MySQL labels an unaliased plain column
-                            // reference with the column's own name (this is
-                            // the overwhelmingly common case real apps hit:
-                            // `SELECT option_name, option_value FROM
-                            // wp_options`), and labels anything else with
-                            // the expression's own source text -- not
-                            // replicated here (`"?"` stays as a placeholder
-                            // for those), since it needs the original SQL
-                            // slice, not just the parsed AST.
+                            // reference with the column's own name, and
+                            // anything else with the expression's source
+                            // text exactly as written (`count(*)`, `1`,
+                            // `price * 2`) -- what `row['COUNT(*)']`-style
+                            // code reads. Found via testing before a public
+                            // release: those used to be labeled `col0`.
                             let name = match &expr {
                                 AstExpr::Identifier(ident) => ident.value.clone(),
                                 AstExpr::CompoundIdentifier(idents) => idents
                                     .last()
                                     .map(|i| i.value.clone())
                                     .unwrap_or_else(|| "?".to_string()),
-                                _ => "?".to_string(),
+                                other => self.source_text(other).unwrap_or_else(|| "?".to_string()),
                             };
                             exprs.push(self.bind_expr(expr)?);
                             names.push(name);
@@ -715,12 +996,14 @@ impl Binder {
                         if !limit_by.is_empty() {
                             return Err(MySqlError::unsupported("LIMIT BY"));
                         }
-                        let limit = limit.as_ref().map(expr_to_u64).transpose()?;
-                        let offset = offset.as_ref().map(|o| expr_to_u64(&o.value)).transpose()?;
+                        let limit = limit.map(|e| self.bind_count(e)).transpose()?;
+                        let offset = offset.map(|o| self.bind_count(o.value)).transpose()?;
                         (limit, offset)
                     }
                     Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                        (Some(expr_to_u64(&limit)?), Some(expr_to_u64(&offset)?))
+                        // `LIMIT offset, count`: bind in textual order.
+                        let offset = self.bind_count(offset)?;
+                        (Some(self.bind_count(limit)?), Some(offset))
                     }
                     None => (None, None),
                 };
@@ -876,8 +1159,12 @@ impl Binder {
             }
             AstExpr::Value(sqlparser::ast::ValueWithSpan {
                 value: AstValue::Placeholder(_),
-                ..
+                span,
             }) => {
+                let at = (span.start.line, span.start.column);
+                if let Ok(rank) = self.placeholder_at.binary_search(&at) {
+                    return Ok(Expr::Param(rank));
+                }
                 let idx = self.param_counter;
                 self.param_counter += 1;
                 Ok(Expr::Param(idx))
@@ -1326,7 +1613,8 @@ impl Binder {
             | "WEEKDAY" | "DATE_FORMAT" | "DATEDIFF" | "UNIX_TIMESTAMP" | "FROM_UNIXTIME"
             | "UTC_TIMESTAMP" | "UTC_DATE" | "LAST_DAY" | "JSON_EXTRACT" | "JSON_UNQUOTE"
             | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_VALID" | "JSON_TYPE" | "JSON_LENGTH" | "HEX"
-            | "FIELD" | "ELT" | "STRCMP" => {
+            | "FIELD" | "ELT" | "STRCMP" | "CONVERT_TZ" | "JSON_CONTAINS"
+            | "JSON_CONTAINS_PATH" | "JSON_KEYS" => {
                 let bound_args =
                     args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<_, _>>()?;
                 Ok(Expr::Call { name: upper, args: bound_args })
@@ -1375,14 +1663,24 @@ impl Binder {
 /// Extracts a `LIMIT`/`OFFSET` value: real MySQL only accepts a plain
 /// non-negative integer literal there (no expressions, no placeholders),
 /// so this rejects anything else rather than trying to evaluate it.
-fn expr_to_u64(expr: &AstExpr) -> Result<u64, MySqlError> {
-    if let AstExpr::Value(sqlparser::ast::ValueWithSpan { value: AstValue::Number(s, _), .. }) =
-        expr
-        && let Ok(n) = s.parse::<u64>()
-    {
-        return Ok(n);
+impl Binder {
+    /// A LIMIT/OFFSET: a non-negative integer literal or a `?`. Found via
+    /// testing before a public release: `LIMIT ?` (how every Node/Go/JDBC
+    /// app paginates with a prepared statement) was rejected.
+    fn bind_count(&mut self, expr: AstExpr) -> Result<Expr, MySqlError> {
+        match &expr {
+            AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                value: AstValue::Number(s, _), ..
+            }) if s.parse::<u64>().is_ok() => {
+                Ok(Expr::Const(Value::Int(s.parse::<i64>().unwrap_or(i64::MAX))))
+            }
+            AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                value: AstValue::Placeholder(_),
+                ..
+            }) => self.bind_expr(expr),
+            _ => Err(MySqlError::syntax_error("LIMIT/OFFSET must be an integer or ?")),
+        }
     }
-    Err(MySqlError::unsupported("LIMIT/OFFSET value"))
 }
 
 /// `CURRENT_TIMESTAMP`, `CURRENT_TIMESTAMP()`, `NOW()`, `LOCALTIMESTAMP`,
@@ -1475,3 +1773,14 @@ fn strip_alias(e: Expr, alias: Option<&str>) -> Expr {
 
 /// `ORDER BY` keys as (expression, ascending).
 type OrderKeys = Vec<(Expr, bool)>;
+
+/// sqlparser's MODIFY/CHANGE carry bare `ColumnOption`s; `ColumnDef` wants
+/// them wrapped with (no) constraint names.
+fn options_with_names(
+    options: Vec<sqlparser::ast::ColumnOption>,
+) -> Vec<sqlparser::ast::ColumnOptionDef> {
+    options
+        .into_iter()
+        .map(|option| sqlparser::ast::ColumnOptionDef { name: None, option })
+        .collect()
+}

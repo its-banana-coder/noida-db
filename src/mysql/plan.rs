@@ -221,6 +221,12 @@ pub enum Plan {
         if_not_exists: bool,
     },
     /// `DROP TABLE [IF EXISTS] a, b`.
+    /// `ALTER TABLE t op, op, ...`.
+    AlterTable {
+        db: String,
+        table: String,
+        ops: Vec<AlterOp>,
+    },
     DropTable {
         tables: Vec<(String, String)>,
         if_exists: bool,
@@ -246,6 +252,8 @@ pub enum Plan {
         table: String,
         columns: Vec<String>,
         if_not_exists: bool,
+        /// `CREATE UNIQUE INDEX name ...` (enforced, like a UNIQUE key).
+        unique: Option<String>,
     },
     Insert {
         db: String,
@@ -261,7 +269,8 @@ pub enum Plan {
         assignments: Vec<(String, Expr)>,
         selection: Option<Expr>,
         order: Vec<(Expr, bool)>,
-        limit: Option<u64>,
+        /// A literal or a `?` (`LIMIT ?`); see `Executor::count`.
+        limit: Option<Expr>,
     },
     /// Single-table `DELETE`, including MySQL's `ORDER BY ... LIMIT n`.
     Delete {
@@ -269,7 +278,7 @@ pub enum Plan {
         table: String,
         selection: Option<Expr>,
         order: Vec<(Expr, bool)>,
-        limit: Option<u64>,
+        limit: Option<Expr>,
     },
     /// `GROUP BY` (possibly implicit, i.e. an empty `group_exprs` with at
     /// least one aggregate in `exprs` — the whole input is then one
@@ -284,10 +293,8 @@ pub enum Plan {
         /// (so it can reference an aggregate function or a grouped column
         /// directly, e.g. `HAVING COUNT(*) > 2`), filtering out groups
         /// where it's false/NULL -- same truthiness rule as `Filter`'s own
-        /// `WHERE` predicate. Referencing a `SELECT`-list alias instead of
-        /// repeating the aggregate expression (`HAVING cnt > 2` where
-        /// `cnt` is the projection's own alias) isn't resolved yet; only
-        /// a direct expression works.
+        /// `WHERE` predicate. A `SELECT`-list alias (`HAVING cnt > 2`) is
+        /// substituted by the binder.
         having: Option<Expr>,
     },
     /// `ORDER BY` / `DISTINCT` / `LIMIT` / `OFFSET` / `SQL_CALC_FOUND_ROWS`,
@@ -309,8 +316,9 @@ pub enum Plan {
         order: Vec<(SortKey, bool)>, // (key, ascending)
         hidden: usize,
         distinct: bool,
-        limit: Option<u64>,
-        offset: Option<u64>,
+        /// Literals or `?` placeholders (`LIMIT ? OFFSET ?`).
+        limit: Option<Expr>,
+        offset: Option<Expr>,
         /// Real MySQL's `SQL_CALC_FOUND_ROWS` select modifier: when set,
         /// the row count *before* `limit`/`offset` truncation is recorded
         /// for a later `FOUND_ROWS()` call to read.
@@ -383,7 +391,7 @@ pub fn count_params(plan: &Plan) -> usize {
                     expr_max(e, max);
                 }
             }
-            Plan::Aggregate { source, group_exprs, exprs, .. } => {
+            Plan::Aggregate { source, group_exprs, exprs, having, .. } => {
                 plan_max(source, max);
                 for e in group_exprs {
                     expr_max(e, max);
@@ -391,6 +399,10 @@ pub fn count_params(plan: &Plan) -> usize {
                 for e in exprs {
                     expr_max(e, max);
                 }
+                // Found via testing before a public release: a `?` in
+                // HAVING wasn't counted, so the client was told to bind
+                // fewer parameters and it evaluated as NULL (no groups).
+                having.iter().for_each(|e| expr_max(e, max));
             }
             Plan::Join { left, right, op } => {
                 plan_max(left, max);
@@ -412,7 +424,8 @@ pub fn count_params(plan: &Plan) -> usize {
                     }
                 }
             }
-            Plan::Update { assignments, selection, order, .. } => {
+            Plan::Update { assignments, selection, order, limit, .. } => {
+                limit.iter().for_each(|e| expr_max(e, max));
                 for (_, e) in assignments {
                     expr_max(e, max);
                 }
@@ -423,7 +436,8 @@ pub fn count_params(plan: &Plan) -> usize {
                     expr_max(e, max);
                 }
             }
-            Plan::Delete { selection, order, .. } => {
+            Plan::Delete { selection, order, limit, .. } => {
+                limit.iter().for_each(|e| expr_max(e, max));
                 if let Some(s) = selection {
                     expr_max(s, max);
                 }
@@ -431,7 +445,10 @@ pub fn count_params(plan: &Plan) -> usize {
                     expr_max(e, max);
                 }
             }
-            Plan::Finish { source, .. } => plan_max(source, max),
+            Plan::Finish { source, limit, offset, .. } => {
+                plan_max(source, max);
+                limit.iter().chain(offset.iter()).for_each(|e| expr_max(e, max));
+            }
             _ => {}
         }
     }
@@ -528,4 +545,50 @@ pub fn map_colnames(e: Expr, f: &dyn Fn(String) -> Expr) -> Expr {
         },
         other => other,
     }
+}
+
+/// Where `ADD`/`MODIFY`/`CHANGE` put a column: `FIRST` or `AFTER col`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColumnPos {
+    First,
+    After(String),
+}
+
+/// One `ALTER TABLE` operation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AlterOp {
+    AddColumn {
+        col: Column,
+        unique: Vec<UniqueKey>,
+        pos: Option<ColumnPos>,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    /// `MODIFY col def` (same name) or `CHANGE old new def`.
+    ReplaceColumn {
+        old: String,
+        col: Column,
+        unique: Vec<UniqueKey>,
+        pos: Option<ColumnPos>,
+    },
+    RenameColumn {
+        old: String,
+        new: String,
+    },
+    RenameTable(String),
+    AddUnique(UniqueKey),
+    AddPrimaryKey(Vec<String>),
+    DropKey(String),
+    DropPrimaryKey,
+    SetDefault {
+        col: String,
+        default: Option<Value>,
+        now: bool,
+    },
+    AutoIncrement(i64),
+    /// Accepted and ignored: foreign keys, plain indexes, ALGORITHM/LOCK.
+    Noop,
 }
