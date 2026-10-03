@@ -123,6 +123,30 @@ def main():
     check("offsets_for_times", got, [0, 1, 2, -1])
     c3.close()
 
+    # Two consumers joining a group at the same moment must split the
+    # partitions. Used to leave one with all of them and the other with
+    # none, indefinitely, about half the time (a join racing the round
+    # already completing).
+    split_ok = 0
+    for _ in range(5):
+        rb_topic = f"rb-{uuid.uuid4().hex[:8]}"
+        admin.create_topics([NewTopic(rb_topic, num_partitions=4, replication_factor=1)])[rb_topic].result(10)
+        gconf = {**conf, "group.id": f"rb-{uuid.uuid4().hex[:8]}", "session.timeout.ms": 6000,
+                 "heartbeat.interval.ms": 500}
+        a, b = Consumer(gconf), Consumer(gconf)
+        a.subscribe([rb_topic])
+        b.subscribe([rb_topic])
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            a.poll(0.1)
+            b.poll(0.1)
+            if len(a.assignment()) == 2 and len(b.assignment()) == 2:
+                split_ok += 1
+                break
+        a.close()
+        b.close()
+    check("simultaneous joiners split partitions 2/2 (5 runs)", split_ok, 5)
+
     print(f"confluent-kafka: {checks} checks, {len(failures)} failed")
     for f in failures:
         print("  FAIL", f)

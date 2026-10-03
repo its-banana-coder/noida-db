@@ -121,9 +121,55 @@ pub struct GroupState {
     pub awaiting_members: HashMap<String, Vec<(String, Vec<u8>)>>,
     pub assignments: HashMap<String, Vec<u8>>,
     pub rebalance_start_ms: i64,
+    /// A freshly formed group's first round waits until this (wall-clock)
+    /// instant for more members, like Kafka's
+    /// `group.initial.rebalance.delay.ms` -- so consumers started together
+    /// land in one round instead of racing.
+    pub initial_until: Option<std::time::Instant>,
 }
 
+/// noida-db's `group.initial.rebalance.delay.ms` (Kafka's default is 3s).
+const INITIAL_REBALANCE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
 impl GroupState {
+    /// Completes a rebalance once every member has (re)joined: the round
+    /// moves to CompletingRebalance and a protocol all members support is
+    /// chosen (the leader's first such). Called on join *and* on leave --
+    /// found via testing before a public release: a member leaving while
+    /// everyone else had already rejoined never completed the round, so
+    /// the rest sat in JoinGroup until the rebalance timeout (5 minutes).
+    pub fn try_complete_join(&mut self) {
+        if self.initial_until.is_some_and(|t| std::time::Instant::now() < t) {
+            return;
+        }
+        self.initial_until = None;
+        if self.state != GroupLifecycleState::PreparingRebalance
+            || self.members.is_empty()
+            || !self.members.keys().all(|m| self.awaiting_members.contains_key(m))
+        {
+            return;
+        }
+        self.awaiting_members.retain(|m, _| self.members.contains_key(m));
+        self.state = GroupLifecycleState::CompletingRebalance;
+        if self.leader_id.as_ref().is_none_or(|l| !self.members.contains_key(l)) {
+            self.leader_id = self.awaiting_members.keys().next().cloned();
+        }
+        if let Some(leader_id) = &self.leader_id
+            && let Some(leader_protos) = self.awaiting_members.get(leader_id)
+        {
+            for (proto_name, _) in leader_protos {
+                let supported_by_all = self
+                    .awaiting_members
+                    .values()
+                    .all(|protos| protos.iter().any(|(p, _)| p == proto_name));
+                if supported_by_all {
+                    self.protocol_name = Some(proto_name.clone());
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn new(group_id: String) -> Self {
         Self {
             group_id,
@@ -137,6 +183,7 @@ impl GroupState {
             awaiting_members: HashMap::new(),
             assignments: HashMap::new(),
             rebalance_start_ms: 0,
+            initial_until: None,
         }
     }
 }
@@ -1003,11 +1050,30 @@ impl EngineState {
             assignment: Vec::new(),
         };
 
+        // A member that's new to the group (or whose subscription changed)
+        // arriving while a round is completing must start a new round, as
+        // Kafka's coordinator does. Found via testing before a public
+        // release: it used to be folded into the round already completing,
+        // whose leader had computed assignments without it -- so two
+        // consumers starting together often left one with every partition
+        // and the other with none, indefinitely.
+        let changed = group.members.get(&m_id).is_none_or(|m| m.protocols != protocols_vec);
+        if group.state == GroupLifecycleState::CompletingRebalance && changed {
+            group.state = GroupLifecycleState::PreparingRebalance;
+            group.generation_id += 1;
+            group.rebalance_start_ms = now;
+            group.assignments.clear();
+            group.awaiting_members.clear();
+        }
+
         group.members.insert(m_id.clone(), member);
         group.awaiting_members.insert(m_id.clone(), protocols_vec);
 
         // State transition: trigger rebalance if Empty or Stable
         if group.state == GroupLifecycleState::Empty || group.state == GroupLifecycleState::Stable {
+            if group.state == GroupLifecycleState::Empty {
+                group.initial_until = Some(std::time::Instant::now() + INITIAL_REBALANCE_DELAY);
+            }
             group.state = GroupLifecycleState::PreparingRebalance;
             group.generation_id += 1;
             group.rebalance_start_ms = now;
@@ -1021,27 +1087,10 @@ impl EngineState {
         }
 
         // Complete rebalance when all known members have joined
-        if group.awaiting_members.len() >= group.members.len() {
-            group.state = GroupLifecycleState::CompletingRebalance;
-
-            // Protocol selection: pick first protocol of leader that all members support
-            if let Some(leader_id) = &group.leader_id
-                && let Some(leader_protos) = group.awaiting_members.get(leader_id)
-            {
-                for (proto_name, _) in leader_protos {
-                    let supported_by_all = group
-                        .awaiting_members
-                        .values()
-                        .all(|protos| protos.iter().any(|(p, _)| p == proto_name));
-                    if supported_by_all {
-                        group.protocol_name = Some(proto_name.clone());
-                        break;
-                    }
-                }
-            }
-            if group.protocol_name.is_none() {
-                group.protocol_name = req.protocols.first().map(|p| p.name.as_str().to_string());
-            }
+        group.try_complete_join();
+        if group.protocol_name.is_none() && group.state == GroupLifecycleState::CompletingRebalance
+        {
+            group.protocol_name = req.protocols.first().map(|p| p.name.as_str().to_string());
         }
 
         res.error_code = 0;
@@ -1233,8 +1282,14 @@ impl EngineState {
             if group.leader_id.as_ref().is_none_or(|l| !group.members.contains_key(l)) {
                 group.leader_id = group.members.keys().next().cloned();
             }
+            if group.state != GroupLifecycleState::PreparingRebalance {
+                // A new round: everyone rejoins.
+                group.awaiting_members.clear();
+                group.assignments.clear();
+            }
             group.state = GroupLifecycleState::PreparingRebalance;
             group.generation_id += 1;
+            group.try_complete_join();
         }
 
         res
@@ -2245,7 +2300,10 @@ impl Engine {
             }
 
             drop(state);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(g) = self.state.lock().unwrap().groups.get_mut(&group_id) {
+                g.try_complete_join();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
@@ -2254,33 +2312,44 @@ impl Engine {
         req: &kafka_protocol::messages::SyncGroupRequest,
         version: i16,
     ) -> kafka_protocol::messages::SyncGroupResponse {
-        let mut resp = self.state.lock().unwrap().handle_sync_group(req, version);
-
+        // A follower's SyncGroup waits for the leader's: answered before the
+        // leader has sent the round's assignments, it used to get an empty
+        // assignment and no error, leaving that consumer with no partitions
+        // until the next rebalance (found via testing before a public
+        // release). The leader's own SyncGroup (carrying assignments) is
+        // answered at once; so is everyone once the group is Stable, and a
+        // restarted round answers REBALANCE_IN_PROGRESS so members rejoin.
         let group_id = req.group_id.as_str().to_string();
+        let member_id = req.member_id.as_str();
+        let started = std::time::Instant::now();
         loop {
             let state = self.state.lock().unwrap();
-            let group = match state.groups.get(&group_id) {
-                Some(g) => g,
-                None => {
-                    resp.error_code = 25; // UNKNOWN_MEMBER_ID
-                    return resp;
-                }
+            let Some(group) = state.groups.get(&group_id) else {
+                drop(state);
+                return self.state.lock().unwrap().handle_sync_group(req, version);
             };
-
-            if group.state == GroupLifecycleState::PreparingRebalance {
-                return resp; // Return the 27 REBALANCE_IN_PROGRESS
-            }
-
-            if group.state == GroupLifecycleState::Stable
-                || group.state == GroupLifecycleState::Dead
-                || group.state == GroupLifecycleState::CompletingRebalance
-            {
+            let waiting_for_leader = group.state == GroupLifecycleState::CompletingRebalance
+                && group.members.contains_key(member_id)
+                && req.assignments.is_empty()
+                && group.leader_id.as_deref() != Some(member_id)
+                && req.generation_id == group.generation_id;
+            // A leader that died without leaving is only noticed when its
+            // session expires, so don't wait longer than that.
+            let timeout_ms = group
+                .members
+                .get(member_id)
+                .map_or(30_000, |m| m.rebalance_timeout_ms.min(m.session_timeout_ms).max(1));
+            if !waiting_for_leader {
                 drop(state);
                 return self.state.lock().unwrap().handle_sync_group(req, version);
             }
-
+            if started.elapsed().as_millis() as i64 >= timeout_ms as i64 {
+                let mut resp = kafka_protocol::messages::SyncGroupResponse::default();
+                resp.error_code = 27; // REBALANCE_IN_PROGRESS: rejoin
+                return resp;
+            }
             drop(state);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
 
