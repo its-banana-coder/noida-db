@@ -2234,9 +2234,13 @@ impl Engine {
     ) -> kafka_protocol::messages::JoinGroupResponse {
         let mut resp = self.state.lock().unwrap().handle_join_group(req, version);
 
-        if resp.error_code != 0 || req.member_id.is_empty() {
+        // An old-version JoinGroup (kafka-go) arrives with an empty member
+        // id and is assigned one in this same request; it waits for the
+        // round to complete like any other join.
+        if resp.error_code != 0 {
             return resp;
         }
+        let member_id = resp.member_id.clone();
 
         let group_id = req.group_id.as_str().to_string();
         loop {
@@ -2264,8 +2268,8 @@ impl Engine {
                 final_resp.leader = kafka_protocol::protocol::StrBytes::from_string(
                     group.leader_id.clone().unwrap_or_default(),
                 );
-                final_resp.member_id = req.member_id.clone();
-                if final_resp.leader == req.member_id {
+                final_resp.member_id = member_id.clone();
+                if final_resp.leader == member_id {
                     let mut mems = Vec::new();
                     for (m_id, protos) in &group.awaiting_members {
                         let mut mem = kafka_protocol::messages::join_group_response::JoinGroupResponseMember::default();
