@@ -106,7 +106,7 @@ impl Engine {
             return self.get_alias(&segments);
         }
         if segments.first() == Some(&"_search") || segments.first() == Some(&"_count") {
-            return self.search_or_count(method, segments[0], "*", body);
+            return self.search_or_count(method, segments[0], "*", &q, body);
         }
         if segments.first() == Some(&"_analyze") {
             return self.analyze(body);
@@ -163,7 +163,11 @@ impl Engine {
             "_refresh" | "_flush" | "_open" | "_close" => {
                 self.index_action(method, index_name, segments[1])
             }
-            "_search" | "_count" => self.search_or_count(method, segments[1], index_name, body),
+            "_search" | "_count" => self.search_or_count(method, segments[1], index_name, &q, body),
+            "_delete_by_query" | "_update_by_query" => {
+                self.by_query(method, segments[1], index_name, &q, body)
+            }
+            "_alias" | "_aliases" => self.index_alias(method, index_name, segments.get(2).copied()),
             "_analyze" => self.analyze(body),
             "_doc" | "_create" | "_source" if segments.len() >= 3 => {
                 self.document_api(method, index_name, segments[2], segments[1], &q, body)
@@ -173,7 +177,7 @@ impl Engine {
             }
             "_bulk" => self.bulk(method, index_name, &q, body),
             "_update" if segments.len() >= 3 => self.update(method, index_name, segments[2], body),
-            "_mget" => self.mget(method, index_name, body),
+            "_mget" => self.mget(method, index_name, &q, body),
             _ => (404, error("not_found", "no handler found for uri", 404)),
         }
     }
@@ -225,12 +229,24 @@ impl Engine {
         method: &str,
         action: &str,
         index_pattern: &str,
+        q: &HashMap<String, String>,
         body: &[u8],
     ) -> (u16, Value) {
         if method != "GET" && method != "POST" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
-        let req = parse_json(body).unwrap_or_else(|| json!({}));
+        let mut req = parse_json(body).unwrap_or_else(|| json!({}));
+        // URL parameters the clients send instead of body fields. Found via
+        // testing before a public release: `_source_includes` etc. were
+        // ignored, returning whole documents.
+        if let Some(f) = source_filter_from_params(q) {
+            req["_source"] = f;
+        }
+        for (param, key) in [("size", "size"), ("from", "from")] {
+            if let Some(n) = q.get(param).and_then(|v| v.parse::<u64>().ok()) {
+                req[key] = json!(n);
+            }
+        }
         let s = self.0.lock().unwrap();
         let is_wildcard = index_pattern == "_all" || index_pattern == "*";
         let names = Self::resolve_indices(&s, index_pattern);
@@ -326,22 +342,17 @@ impl Engine {
                     );
                 }
                 let req: Value = parse_json(body).unwrap_or_else(|| json!({}));
-                let mappings = req.get("mappings").cloned().unwrap_or(json!({"properties":{}}));
-                let settings = req
-                    .get("settings")
-                    .cloned()
-                    .unwrap_or(json!({"index":{"number_of_shards":"1","number_of_replicas":"1"}}));
-                let aliases = req
-                    .get("aliases")
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                s.indices.insert(
-                    name.to_string(),
-                    Index { settings, mappings, aliases, opened: true, ..Index::default() },
-                );
+                let mut index = new_index_from_templates(&s.templates, name);
+                if let Some(m) = req.get("mappings") {
+                    merge(&mut index.mappings, m.clone());
+                }
+                if let Some(st) = req.get("settings") {
+                    merge(&mut index.settings, st.clone());
+                }
+                if let Some(a) = req.get("aliases").and_then(Value::as_object) {
+                    index.aliases.extend(a.clone());
+                }
+                s.indices.insert(name.to_string(), index);
                 (200, json!({"acknowledged":true,"shards_acknowledged":true,"index":name}))
             }
             "GET" => {
@@ -377,7 +388,8 @@ impl Engine {
             return missing_index(name);
         };
         match method {
-            "GET" => (200, json!({(name):i.mappings})),
+            // `{"<index>": {"mappings": {...}}}`, as Elasticsearch shapes it.
+            "GET" => (200, json!({(name): {"mappings": i.mappings}})),
             "PUT" | "POST" => {
                 let next = parse_json(body).unwrap_or_else(|| json!({}));
                 merge(&mut i.mappings, next);
@@ -443,10 +455,8 @@ impl Engine {
         // instead. GET/HEAD/DELETE on a genuinely missing index still
         // correctly 404 below -- only the write path auto-creates.
         if !s.indices.contains_key(index) && matches!(method, "PUT" | "POST") {
-            s.indices.insert(
-                index.to_string(),
-                Index { mappings: json!({"properties": {}}), opened: true, ..Index::default() },
-            );
+            let created = new_index_from_templates(&s.templates, index);
+            s.indices.insert(index.to_string(), created);
         }
         let Some(i) = s.indices.get_mut(index) else {
             return missing_index(index);
@@ -464,7 +474,13 @@ impl Engine {
         let id = if id.is_empty() { auto_id() } else { id.to_string() };
         match method {
             "GET" | "HEAD" => match i.docs.get(&id) {
-                Some(d) => (200, doc_response(index, &id, d, "")),
+                Some(d) => {
+                    let mut r = doc_response(index, &id, d, "");
+                    if let Some(f) = source_filter_from_params(q) {
+                        r["_source"] = search::filter_source(&d.source, Some(&f));
+                    }
+                    (200, r)
+                }
                 None => {
                     if method == "HEAD" {
                         (404, json!({}))
@@ -599,7 +615,19 @@ impl Engine {
             let id =
                 opts.get("_id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(auto_id);
             touched.push(ix.to_string());
-            if action == "delete" {
+            if action == "update" {
+                // A partial update (`{"doc": ...}` / upsert), not a
+                // replace. Found via testing before a public release: bulk
+                // `update` used to store the `{"doc": ...}` wrapper itself as
+                // the new document.
+                let data = lines.next().unwrap_or("").as_bytes();
+                let (status, mut res) = self.update("POST", ix, &id, data);
+                errors |= status >= 300;
+                res["status"] = json!(status);
+                let mut item = Map::new();
+                item.insert(action.to_string(), res);
+                items.push(Value::Object(item));
+            } else if action == "delete" {
                 let (status, mut res) =
                     self.document_api("DELETE", ix, &id, "_doc", &no_refresh, b"");
                 errors |= status >= 300;
@@ -632,14 +660,120 @@ impl Engine {
         (200, json!({"took":0,"errors":errors,"items":items}))
     }
 
-    fn mget(&self, method: &str, index: &str, body: &[u8]) -> (u16, Value) {
+    fn mget(
+        &self,
+        method: &str,
+        index: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
+        if method != "POST" && method != "GET" {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        let req = parse_json(body).unwrap_or_else(|| json!({}));
+        // `{"docs": [{"_id": ...}]}` or the `{"ids": [...]}` shorthand.
+        let mut docs = req.get("docs").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(ids) = req.get("ids").and_then(Value::as_array) {
+            docs.extend(ids.iter().map(|id| json!({"_id": id})));
+        }
+        let filter = source_filter_from_params(q);
+        let items=docs.iter().map(|d|{let ix=d.get("_index").and_then(Value::as_str).unwrap_or(index); let id=d.get("_id").and_then(Value::as_str).unwrap_or("");let s=self.0.lock().unwrap(); let doc=s.indices.get(ix).and_then(|i|i.docs.get(id)); match doc {Some(doc)=>json!({"_index":ix,"_id":id,"_version":doc.version,"_seq_no":doc.seq,"_primary_term":1,"found":true,"_source":search::filter_source(&doc.source, filter.as_ref())}),None=>json!({"_index":ix,"_id":id,"found":false,"_source":null})}}).collect::<Vec<_>>();
+        (200, json!({"docs":items}))
+    }
+
+    /// `_delete_by_query` / `_update_by_query` (no script: a reindex in
+    /// place, which bumps each matching document's version). Like
+    /// Elasticsearch, they act on the refreshed (searchable) view.
+    fn by_query(
+        &self,
+        method: &str,
+        action: &str,
+        index: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
         if method != "POST" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
         let req = parse_json(body).unwrap_or_else(|| json!({}));
-        let docs = req.get("docs").and_then(Value::as_array).cloned().unwrap_or_default();
-        let items=docs.iter().map(|d|{let ix=d.get("_index").and_then(Value::as_str).unwrap_or(index); let id=d.get("_id").and_then(Value::as_str).unwrap_or("");let s=self.0.lock().unwrap(); let doc=s.indices.get(ix).and_then(|i|i.docs.get(id)); match doc {Some(doc)=>json!({"_index":ix,"_id":id,"_version":doc.version,"found":true,"_source":doc.source}),None=>json!({"_index":ix,"_id":id,"found":false,"_source":null})}}).collect::<Vec<_>>();
-        (200, json!({"docs":items}))
+        if action == "_update_by_query" && req.get("script").is_some() {
+            return (
+                400,
+                error("illegal_argument_exception", "scripts are not supported by noida-db", 400),
+            );
+        }
+        let query = req.get("query").cloned().unwrap_or_else(|| json!({"match_all": {}}));
+        let mut s = self.0.lock().unwrap();
+        let names = Self::resolve_indices(&s, index);
+        if names.is_empty() {
+            return missing_index(index);
+        }
+        let mut total = 0;
+        for name in &names {
+            let i = s.indices.get_mut(name).unwrap();
+            let matched = match search::eval(&query, &i.mappings, &i.committed) {
+                Ok(m) => m,
+                Err(reason) => return (400, error("parsing_exception", &reason, 400)),
+            };
+            let ids: Vec<String> = matched.keys().map(|&k| i.committed[k].id.clone()).collect();
+            for id in ids {
+                if action == "_delete_by_query" {
+                    if i.docs.remove(&id).is_some() {
+                        i.order.retain(|x| x != &id);
+                        i.seq += 1;
+                        total += 1;
+                    }
+                } else if let Some(d) = i.docs.get_mut(&id) {
+                    i.seq += 1;
+                    d.seq = i.seq;
+                    d.version += 1;
+                    total += 1;
+                }
+            }
+            maybe_refresh(i, name, q);
+        }
+        let mut out = json!({"took": 0, "timed_out": false, "total": total, "batches": 1,
+            "version_conflicts": 0, "noops": 0, "failures": [],
+            "retries": {"bulk": 0, "search": 0}, "throttled_millis": 0,
+            "requests_per_second": -1.0, "throttled_until_millis": 0});
+        out[if action == "_delete_by_query" { "deleted" } else { "updated" }] = json!(total);
+        (200, out)
+    }
+
+    /// `PUT|DELETE /<index>/_alias/<name>` and `GET /<index>/_alias`.
+    fn index_alias(&self, method: &str, index: &str, alias: Option<&str>) -> (u16, Value) {
+        let mut s = self.0.lock().unwrap();
+        let Some(i) = s.indices.get_mut(index) else { return missing_index(index) };
+        match (method, alias) {
+            ("PUT" | "POST", Some(a)) => {
+                i.aliases.insert(a.to_string(), json!({}));
+                (200, json!({"acknowledged": true}))
+            }
+            ("DELETE", Some(a)) => {
+                if i.aliases.remove(a).is_some() {
+                    (200, json!({"acknowledged": true}))
+                } else {
+                    (
+                        404,
+                        error(
+                            "aliases_not_found_exception",
+                            &format!("aliases [{a}] missing"),
+                            404,
+                        ),
+                    )
+                }
+            }
+            ("GET", _) => {
+                let a: Map<String, Value> = i
+                    .aliases
+                    .iter()
+                    .filter(|(k, _)| alias.is_none_or(|x| x == k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                (200, json!({(index): {"aliases": a}}))
+            }
+            _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
+        }
     }
 
     fn aliases(&self, method: &str, body: &[u8]) -> (u16, Value) {
@@ -736,9 +870,11 @@ fn version_conflict(_index: &str, id: &str) -> Value {
     )
 }
 fn doc_response(index: &str, id: &str, d: &Document, result: &str) -> Value {
-    let mut v = json!({"_index":index,"_id":id,"_version":d.version,"_seq_no":d.seq,"_primary_term":1,"_shards":{"total":2,"successful":1,"failed":0}});
+    let mut v =
+        json!({"_index":index,"_id":id,"_version":d.version,"_seq_no":d.seq,"_primary_term":1});
     if !result.is_empty() {
         v["result"] = json!(result);
+        v["_shards"] = json!({"total":2,"successful":1,"failed":0});
     } else {
         v["found"] = json!(true);
         v["_source"] = d.source.clone();
@@ -763,7 +899,7 @@ fn auto_id() -> String {
             .as_nanos()) as u64);
     (0..20)
         .map(|i| {
-            A[((n.rotate_left((i % 63) as u32).wrapping_add(i as u64 * 0x9e3779b97f4a7c15)
+            A[((n.rotate_left((i % 63) as u32).wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15))
                 >> (i % 8 * 8)) as usize)
                 % A.len()] as char
         })
@@ -809,6 +945,9 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
                 continue;
             }
             let ty = match v {
+                // `date_detection` (on by default): an ISO date string maps
+                // as a date, not text.
+                Value::String(s) if looks_like_date(s) => "date",
                 Value::String(_) => "text",
                 Value::Bool(_) => "boolean",
                 Value::Number(n) => {
@@ -839,4 +978,84 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
             props.insert(k.clone(),if ty=="text"{json!({"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}})}else{json!({"type":ty})});
         }
     }
+}
+
+/// A new index's starting state: every composable index template whose
+/// `index_patterns` match `name`, lowest `priority` first so the highest
+/// wins. Applies to explicit creation and to auto-creation on first write.
+/// Found via testing before a public release: templates were stored but
+/// never applied.
+fn new_index_from_templates(templates: &HashMap<String, Value>, name: &str) -> Index {
+    let mut index = Index {
+        mappings: json!({"properties": {}}),
+        settings: json!({"index": {"number_of_shards": "1", "number_of_replicas": "1"}}),
+        opened: true,
+        ..Index::default()
+    };
+    let mut matching: Vec<&Value> = templates
+        .values()
+        .filter(|t| {
+            let pats: Vec<&str> = match t.get("index_patterns") {
+                Some(Value::String(p)) => vec![p.as_str()],
+                Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+                _ => vec![],
+            };
+            pats.iter().any(|p| match p.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => *p == name,
+            })
+        })
+        .collect();
+    matching.sort_by_key(|t| t.get("priority").and_then(Value::as_i64).unwrap_or(0));
+    for t in matching {
+        let Some(tpl) = t.get("template") else { continue };
+        if let Some(m) = tpl.get("mappings") {
+            merge(&mut index.mappings, m.clone());
+        }
+        if let Some(st) = tpl.get("settings") {
+            merge(&mut index.settings, st.clone());
+        }
+        if let Some(a) = tpl.get("aliases").and_then(Value::as_object) {
+            index.aliases.extend(a.clone());
+        }
+    }
+    index
+}
+
+/// `_source`, `_source_includes` and `_source_excludes` URL parameters as
+/// a body-style `_source` filter.
+fn source_filter_from_params(q: &HashMap<String, String>) -> Option<Value> {
+    let list =
+        |k: &str| q.get(k).map(|v| v.split(',').map(|s| json!(s.trim())).collect::<Vec<_>>());
+    let includes = list("_source_includes");
+    let excludes = list("_source_excludes");
+    if includes.is_some() || excludes.is_some() {
+        return Some(
+            json!({"includes": includes.unwrap_or_default(), "excludes": excludes.unwrap_or_default()}),
+        );
+    }
+    match q.get("_source").map(String::as_str) {
+        Some("false") => Some(json!(false)),
+        Some("true") | None => None,
+        Some(fields) => Some(json!({"includes": fields.split(',').collect::<Vec<_>>()})),
+    }
+}
+
+/// `strict_date_optional_time`: `yyyy-MM-dd` optionally followed by
+/// `THH:mm[:ss[.fff]]` and a zone.
+fn looks_like_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    let digits =
+        |r: std::ops::Range<usize>| r.clone().all(|i| b.get(i).is_some_and(u8::is_ascii_digit));
+    if b.len() < 10
+        || !digits(0..4)
+        || b[4] != b'-'
+        || !digits(5..7)
+        || b[7] != b'-'
+        || !digits(8..10)
+    {
+        return false;
+    }
+    b.len() == 10
+        || (b[10] == b'T' && b.len() >= 16 && digits(11..13) && b[13] == b':' && digits(14..16))
 }

@@ -711,9 +711,20 @@ not just `_search`) are all verified against a real Elasticsearch node in
 write against a stale `seq_no` gets a real 409 version conflict, also
 verified against a real node.
 
+Array fields match per element (`"tags": ["a", "b"]` for `term`,
+`terms`, aggregations, `exists`), and multi-field sub-fields
+(`"fields": {"raw": {"type": "keyword"}}`, or dynamic `.keyword`) are
+queryable, sortable and aggregatable. Dynamic mapping detects ISO dates.
+Composable index templates apply to new indices, including ones
+auto-created on first write. `_delete_by_query` and `_update_by_query`
+(without a script) work on the refreshed view. `_source`,
+`_source_includes` and `_source_excludes` are honored as URL parameters
+on `_search`, GET and `_mget`, and `_mget` takes the `ids` shorthand.
+
 Not yet built: `query_string`, `simple_query_string`, `search_after`,
 scroll/PIT, nested field mappings and nested queries, highlighting,
-date-math ranges (`now-1d/d`), gzip, `_cat`/`_cluster` endpoints, and exact
+date-math ranges (`now-1d/d`), `date_histogram`, painless scripts
+(`_update` / `_update_by_query` with a `script`), gzip, `_cat`/`_cluster` endpoints, and exact
 Elasticsearch error/response parity for every path. This is not ready to
 replace Elasticsearch for application workflows that search with more
 than the query types above (aggregating is well covered).

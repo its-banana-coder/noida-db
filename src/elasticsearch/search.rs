@@ -27,15 +27,50 @@ pub struct CommittedDoc {
     pub version: i64,
 }
 
-fn mapped_type<'a>(mappings: &'a Value, field: &str) -> Option<&'a str> {
-    mappings.get("properties")?.get(field)?.get("type")?.as_str()
+/// Where a (possibly dotted) field name's values come from in `_source`,
+/// and its mapped type: a plain field (`brand`), an object path
+/// (`meta.source`), or a multi-field (`name.raw` / `name.keyword`: the
+/// values of `name`, indexed with the sub-field's type). Found via testing
+/// before a public release: multi-fields weren't resolved at all, so
+/// `term: {"name.raw": ...}` and sorting/aggregating on a `.raw` sub-field
+/// silently matched nothing.
+fn resolve_field(mappings: &Value, field: &str) -> (String, Option<String>) {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut props = mappings.get("properties");
+    for (i, seg) in segs.iter().enumerate() {
+        let Some(node) = props.and_then(|p| p.get(*seg)) else { break };
+        if i + 1 == segs.len() {
+            let ty = node.get("type").and_then(Value::as_str).unwrap_or("object");
+            return (field.to_string(), Some(ty.to_string()));
+        }
+        if i + 2 == segs.len()
+            && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        {
+            let ty = sub.get("type").and_then(Value::as_str).unwrap_or("keyword");
+            return (segs[..=i].join("."), Some(ty.to_string()));
+        }
+        props = node.get("properties");
+    }
+    // Unmapped (e.g. a search across indices): `x.keyword` is the dynamic
+    // keyword sub-field of `x`.
+    if let Some(base) = field.strip_suffix(".keyword") {
+        return (base.to_string(), Some("keyword".to_string()));
+    }
+    (field.to_string(), None)
 }
 
 /// Walks a dotted field path through nested objects, flattening arrays
 /// along the way, the way Elasticsearch resolves e.g. `"meta.source"`.
 fn navigate<'a>(v: &'a Value, path: &[&str]) -> Vec<&'a Value> {
     if path.is_empty() {
-        return vec![v];
+        // A leaf array is that many values (`"tags": ["a", "b"]`). Found
+        // via testing before a public release: it used to be one opaque
+        // value, so term/terms queries and aggregations never matched any
+        // array field.
+        return match v {
+            Value::Array(arr) => arr.iter().flat_map(|e| navigate(e, path)).collect(),
+            _ => vec![v],
+        };
     }
     match v {
         Value::Object(m) => m.get(path[0]).map(|nv| navigate(nv, &path[1..])).unwrap_or_default(),
@@ -62,17 +97,18 @@ fn value_to_term(v: &Value) -> String {
 /// the implicit `<field>.keyword` sub-field, `standard`-analyzed otherwise
 /// (Elasticsearch's dynamic-mapping default for strings).
 pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> {
-    if let Some(base) = field.strip_suffix(".keyword") {
-        return raw_values(source, base)
+    let (path, ty) = resolve_field(mappings, field);
+    let ty = ty.as_deref();
+    if ty == Some("keyword") && path != field && field.ends_with(".keyword") {
+        return raw_values(source, &path)
             .into_iter()
             .filter_map(Value::as_str)
             .filter(|s| s.chars().count() <= 256)
             .map(str::to_string)
             .collect();
     }
-    let ty = mapped_type(mappings, field);
     let mut out = Vec::new();
-    for v in raw_values(source, field) {
+    for v in raw_values(source, &path) {
         match v {
             Value::String(s) => {
                 if ty == Some("keyword") {
@@ -490,8 +526,10 @@ fn eval_bool(
         }
     }
     scores.retain(|i, _| candidates.contains(i));
+    // Filter and must_not clauses don't score: a bool with nothing else
+    // scores 0, as in Elasticsearch.
     for i in &candidates {
-        scores.entry(*i).or_insert(1.0);
+        scores.entry(*i).or_insert(0.0);
     }
     Ok(scores)
 }
@@ -600,11 +638,12 @@ fn compare_field(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     }
 }
 
-fn sort_ranked(ranked: &mut [(usize, f32)], spec: &Value, docs: &[CommittedDoc]) {
+fn sort_ranked(ranked: &mut [(usize, f32)], spec: &Value, mappings: &Value, docs: &[CommittedDoc]) {
     let sorts: Vec<Value> = spec.as_array().cloned().unwrap_or_else(|| vec![spec.clone()]);
     ranked.sort_by(|a, b| {
         for s in &sorts {
             let (field, order) = parse_sort(s);
+            let field = resolve_field(mappings, &field).0;
             let ord = if field == "_score" {
                 b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
             } else if field == "_doc" {
@@ -626,13 +665,27 @@ fn sort_ranked(ranked: &mut [(usize, f32)], spec: &Value, docs: &[CommittedDoc])
 fn pick_fields(source: &Value, fields: &[String]) -> Value {
     let mut m = Map::new();
     if let Value::Object(src) = source {
-        for f in fields {
-            if let Some(v) = src.get(f) {
-                m.insert(f.clone(), v.clone());
+        for (k, v) in src {
+            if fields.iter().any(|f| field_pattern_matches(f, k)) {
+                m.insert(k.clone(), v.clone());
             }
         }
     }
     Value::Object(m)
+}
+
+/// A `_source` include/exclude pattern: an exact field, a `prefix*`
+/// wildcard, or a dotted path naming a field inside an object (matched at
+/// its top-level key).
+fn field_pattern_matches(pattern: &str, key: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => key.starts_with(prefix),
+        None => pattern == key || pattern.split('.').next() == Some(key),
+    }
+}
+
+pub fn filter_source(source: &Value, filter: Option<&Value>) -> Value {
+    apply_source_filter(source, filter)
 }
 
 fn apply_source_filter(source: &Value, filter: Option<&Value>) -> Value {
@@ -660,9 +713,9 @@ fn apply_source_filter(source: &Value, filter: Option<&Value>) -> Value {
             let mut result =
                 if includes.is_empty() { source.clone() } else { pick_fields(source, &includes) };
             if let Value::Object(m) = &mut result {
-                for e in &excludes {
-                    m.remove(e);
-                }
+                m.retain(|k, _| {
+                    !excludes.iter().any(|e| field_pattern_matches(e, k) && !e.contains('.'))
+                });
             }
             result
         }
@@ -681,12 +734,10 @@ fn apply_source_filter(source: &Value, filter: Option<&Value>) -> Value {
 /// sub-field, analyzed terms (as strings) for `text` fields — so a `terms`
 /// aggregation bucket key comes back as the right JSON type.
 fn agg_values(mappings: &Value, source: &Value, field: &str) -> Vec<Value> {
-    if let Some(base) = field.strip_suffix(".keyword") {
-        return raw_values(source, base).into_iter().filter(|v| v.is_string()).cloned().collect();
-    }
-    let ty = mapped_type(mappings, field);
+    let (path, ty) = resolve_field(mappings, field);
+    let ty = ty.as_deref();
     let mut out = Vec::new();
-    for v in raw_values(source, field) {
+    for v in raw_values(source, &path) {
         match v {
             Value::String(s) => {
                 if ty == Some("keyword") {
@@ -792,7 +843,15 @@ fn range_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
             })
             .collect();
         let mut b = Map::new();
-        let key = r.get("key").and_then(Value::as_str).map(str::to_string);
+        // Elasticsearch always keys a range bucket: its own `key`, else
+        // `from-to` with `*` for an open end (`*-100.0`, `100.0-200.0`).
+        let fmt = |x: Option<f64>| x.map_or("*".to_string(), |v| format!("{v:?}"));
+        let key = Some(
+            r.get("key")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}-{}", fmt(from), fmt(to))),
+        );
         if let Some(k) = &key {
             b.insert("key".to_string(), json!(k));
         }
@@ -964,14 +1023,19 @@ fn cardinality_agg(
     json!({"value": seen.len()})
 }
 
-fn top_hits_agg(spec: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
+fn top_hits_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
     let size = spec.get("size").and_then(Value::as_u64).unwrap_or(3) as usize;
-    let hits: Vec<Value> = bucket
+    let mut ranked: Vec<(usize, f32)> = bucket.iter().map(|&i| (i, 0.0)).collect();
+    if let Some(sort) = spec.get("sort") {
+        sort_ranked(&mut ranked, sort, mappings, docs);
+    }
+    let hits: Vec<Value> = ranked
         .iter()
         .take(size)
-        .map(|&i| {
+        .map(|&(i, _)| {
             let d = &docs[i];
-            json!({"_index": d.index, "_id": d.id, "_score": Value::Null, "_source": d.source})
+            let src = apply_source_filter(&d.source, spec.get("_source"));
+            json!({"_index": d.index, "_id": d.id, "_score": Value::Null, "_source": src})
         })
         .collect();
     json!({"hits": {"total": {"value": bucket.len(), "relation": "eq"}, "max_score": Value::Null, "hits": hits}})
@@ -1027,7 +1091,7 @@ fn eval_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usi
         return cardinality_agg(v, mappings, docs, bucket);
     }
     if let Some(v) = spec.get("top_hits") {
-        return top_hits_agg(v, docs, bucket);
+        return top_hits_agg(v, mappings, docs, bucket);
     }
     json!({})
 }
@@ -1060,7 +1124,7 @@ pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<V
 
     let mut ranked: Vec<(usize, f32)> = scores.into_iter().collect();
     match body.get("sort") {
-        Some(spec) => sort_ranked(&mut ranked, spec, docs),
+        Some(spec) => sort_ranked(&mut ranked, spec, mappings, docs),
         None => ranked
             .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))),
     }
@@ -1073,12 +1137,12 @@ pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<V
         .take(size)
         .map(|(idx, score)| {
             let d = &docs[*idx];
-            json!({
-                "_index": d.index,
-                "_id": d.id,
-                "_score": score,
-                "_source": apply_source_filter(&d.source, source_filter),
-            })
+            let mut hit = json!({"_index": d.index, "_id": d.id, "_score": score});
+            // `"_source": false` omits the key, as Elasticsearch does.
+            if !matches!(source_filter, Some(Value::Bool(false))) {
+                hit["_source"] = apply_source_filter(&d.source, source_filter);
+            }
+            hit
         })
         .collect();
 

@@ -73,7 +73,7 @@ fn bulk_and_dynamic_mapping_match_the_milestone_contract() {
 
     let (status, mapping) = call(&engine, "GET", "/events/_mapping", "");
     assert_eq!(status, 200);
-    let properties = &mapping["events"]["properties"];
+    let properties = &mapping["events"]["mappings"]["properties"];
     assert_eq!(properties["message"]["type"], "text");
     assert_eq!(
         properties["message"]["fields"]["keyword"],
@@ -99,8 +99,8 @@ fn explicit_mapping_and_settings_round_trip() {
     );
 
     let (_, mapping) = call(&engine, "GET", "/catalog/_mapping", "");
-    assert_eq!(mapping["catalog"]["properties"]["isbn"]["type"], "keyword");
-    assert_eq!(mapping["catalog"]["properties"]["title"]["type"], "text");
+    assert_eq!(mapping["catalog"]["mappings"]["properties"]["isbn"]["type"], "keyword");
+    assert_eq!(mapping["catalog"]["mappings"]["properties"]["title"]["type"], "text");
     let (_, settings) = call(&engine, "GET", "/catalog/_settings", "");
     assert_eq!(settings["catalog"]["settings"]["index"]["refresh_interval"], "5s");
 }
@@ -396,4 +396,79 @@ fn global_bulk_endpoint_is_routed() {
 
     let (status, _) = call(&engine, "GET", "/globalbulk/_doc/1", "");
     assert_eq!(status, 200);
+}
+
+/// Silently-wrong behavior found by testing the official Python client
+/// before a public release.
+#[test]
+fn arrays_multi_fields_and_document_apis_behave_like_elasticsearch() {
+    let engine = Engine::default();
+    let q = |method: &str, path: &str, query: &str, body: &str| {
+        engine.dispatch(method, path, query, body.as_bytes())
+    };
+    q(
+        "PUT",
+        "/p",
+        "",
+        r#"{"mappings":{"properties":{"name":{"type":"text","fields":{"raw":{"type":"keyword"}}},"tags":{"type":"keyword"},"price":{"type":"float"}}}}"#,
+    );
+    let bulk = "{\"index\":{\"_index\":\"p\",\"_id\":\"1\"}}\n{\"name\":\"Dell XPS\",\"tags\":[\"laptop\",\"win\"],\"price\":1200}\n\
+                {\"index\":{\"_index\":\"p\",\"_id\":\"2\"}}\n{\"name\":\"Mac Pro\",\"tags\":[\"laptop\"],\"price\":2500}\n\
+                {\"update\":{\"_index\":\"p\",\"_id\":\"2\"}}\n{\"doc\":{\"price\":2400}}\n";
+    let (_, r) = q("POST", "/_bulk", "refresh=true", bulk);
+    assert_eq!(r["errors"], false);
+    // Bulk `update` merges; it used to store `{"doc": ...}` as the document.
+    let (_, d) = q("GET", "/p/_doc/2", "", "");
+    assert_eq!(d["_source"], json!({"name":"Mac Pro","tags":["laptop"],"price":2400}));
+
+    // Array fields match per element (used to never match).
+    let (_, r) = q("POST", "/p/_count", "", r#"{"query":{"term":{"tags":"win"}}}"#);
+    assert_eq!(r["count"], 1);
+    let (_, r) =
+        q("POST", "/p/_search", "", r#"{"size":0,"aggs":{"t":{"terms":{"field":"tags"}}}}"#);
+    assert_eq!(r["aggregations"]["t"]["buckets"][0], json!({"key":"laptop","doc_count":2}));
+
+    // Multi-field sub-fields resolve to their parent's values.
+    let (_, r) = q("POST", "/p/_count", "", r#"{"query":{"term":{"name.raw":"Dell XPS"}}}"#);
+    assert_eq!(r["count"], 1);
+
+    // Range buckets are always keyed; filter-only bool scores 0.
+    let (_, r) = q(
+        "POST",
+        "/p/_search",
+        "",
+        r#"{"size":0,"aggs":{"r":{"range":{"field":"price","ranges":[{"to":2000}]}}}}"#,
+    );
+    assert_eq!(r["aggregations"]["r"]["buckets"][0]["key"], "*-2000.0");
+    let (_, r) =
+        q("POST", "/p/_search", "", r#"{"query":{"bool":{"filter":{"term":{"tags":"win"}}}}}"#);
+    assert_eq!(r["hits"]["hits"][0]["_score"], 0.0);
+
+    // `_source_includes` URL parameter, `_mget` ids shorthand, mapping shape.
+    let (_, r) =
+        q("POST", "/p/_search", "_source_includes=price", r#"{"query":{"ids":{"values":["1"]}}}"#);
+    assert_eq!(r["hits"]["hits"][0]["_source"], json!({"price":1200}));
+    let (_, r) = q("POST", "/p/_mget", "", r#"{"ids":["1","nope"]}"#);
+    assert_eq!(r["docs"][0]["found"], true);
+    assert_eq!(r["docs"][1]["found"], false);
+    let (_, r) = q("GET", "/p/_mapping", "", "");
+    assert_eq!(r["p"]["mappings"]["properties"]["tags"]["type"], "keyword");
+
+    // _delete_by_query, per-index alias routes, templates on auto-create.
+    let (_, r) =
+        q("POST", "/p/_delete_by_query", "refresh=true", r#"{"query":{"term":{"tags":"win"}}}"#);
+    assert_eq!(r["deleted"], 1);
+    assert_eq!(q("PUT", "/p/_alias/shop", "", "").0, 200);
+    let (_, r) = q("POST", "/shop/_count", "", "");
+    assert_eq!(r["count"], 1);
+    q(
+        "PUT",
+        "/_index_template/logs",
+        "",
+        r#"{"index_patterns":["logs-*"],"template":{"mappings":{"properties":{"level":{"type":"keyword"}}}}}"#,
+    );
+    q("POST", "/logs-1/_doc", "", r#"{"level":"WARN","at":"2024-01-01T10:00:00Z"}"#);
+    let (_, r) = q("GET", "/logs-1/_mapping", "", "");
+    assert_eq!(r["logs-1"]["mappings"]["properties"]["level"]["type"], "keyword");
+    assert_eq!(r["logs-1"]["mappings"]["properties"]["at"]["type"], "date");
 }
