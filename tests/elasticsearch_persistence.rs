@@ -117,7 +117,7 @@ fn elasticsearch_persistence_save_and_load() {
     // Verify mappings
     let res = request(addr2, "GET", "/my_index/_mapping", b"");
     assert_eq!(res.status, 200);
-    assert!(res.body["my_index"]["properties"]["title"].is_object());
+    assert!(res.body["my_index"]["mappings"]["properties"]["title"].is_object());
 
     // Verify documents via search
     let search = br#"{"query":{"match_all":{}}}"#;
