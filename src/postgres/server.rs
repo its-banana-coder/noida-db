@@ -157,6 +157,9 @@ struct Conn {
     buf: BytesMut,
     out: BytesMut,
     ctx: DecodeContext,
+    /// The socket's current read timeout (see `recv_or_idle`), cached so
+    /// the common no-LISTEN path never pays a syscall per message.
+    read_timeout: Option<std::time::Duration>,
 }
 
 impl Conn {
@@ -176,6 +179,21 @@ impl Conn {
 
     /// Reads the next frontend message, blocking as needed.
     fn recv(&mut self) -> io::Result<Option<PgWireFrontendMessage>> {
+        self.recv_or_idle(None, &mut || Ok(vec![]))
+    }
+
+    /// Like `recv`, but while waiting, wakes every `tick` to run `on_idle`
+    /// (which may queue messages; they're flushed). A message split across
+    /// a tick is kept in `buf`, so nothing is lost.
+    fn recv_or_idle(
+        &mut self,
+        tick: Option<std::time::Duration>,
+        on_idle: &mut dyn FnMut() -> io::Result<Vec<PgWireBackendMessage>>,
+    ) -> io::Result<Option<PgWireFrontendMessage>> {
+        if self.read_timeout != tick {
+            self.stream.set_read_timeout(tick)?;
+            self.read_timeout = tick;
+        }
         loop {
             match PgWireFrontendMessage::decode(&mut self.buf, &self.ctx) {
                 Ok(Some(msg)) => return Ok(Some(msg)),
@@ -184,7 +202,22 @@ impl Conn {
             }
             self.flush()?;
             let mut chunk = [0u8; 8192];
-            let n = self.reader.read(&mut chunk)?;
+            let n = match self.reader.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e)
+                    if tick.is_some()
+                        && matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    for m in on_idle()? {
+                        self.send(m)?;
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             if n == 0 {
                 return Ok(None);
             }
@@ -201,6 +234,7 @@ fn serve(stream: TcpStream, engine: Engine, cfg: Arc<Config>) -> io::Result<()> 
         buf: BytesMut::with_capacity(8192),
         out: BytesMut::with_capacity(8192),
         ctx: DecodeContext::new(ProtocolVersion::PROTOCOL3_0),
+        read_timeout: None,
     };
     // Startup: SSL/GSS negotiation, then the startup packet.
     let startup = loop {
@@ -396,7 +430,29 @@ fn scram_err(e: ScramError) -> PgError {
 fn main_loop(conn: &mut Conn, engine: &Engine, session: &mut Session) -> io::Result<()> {
     let mut skip_until_sync = false;
     loop {
-        let Some(msg) = conn.recv()? else { return Ok(()) };
+        // A LISTENing session gets its notifications while idle, as from
+        // a real server (psycopg's `notifies()`, asyncpg's listeners and
+        // pg-listen all wait on an idle connection). Found via testing
+        // before a public release: they used to arrive only with the
+        // response to the listener's *next* query. Like Postgres, nothing
+        // is delivered mid-transaction.
+        let tick = (!session.rt.listening.is_empty() && session.status == TxStatus::Idle)
+            .then(|| std::time::Duration::from_millis(50));
+        let notifications = session.notifications.clone();
+        let Some(msg) = conn.recv_or_idle(tick, &mut || {
+            let pending = std::mem::take(&mut *notifications.lock().unwrap());
+            Ok(pending
+                .into_iter()
+                .map(|(pid, channel, payload)| {
+                    PgWireBackendMessage::NotificationResponse(NotificationResponse::new(
+                        pid, channel, payload,
+                    ))
+                })
+                .collect())
+        })?
+        else {
+            return Ok(());
+        };
         if skip_until_sync
             && !matches!(msg, PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Terminate(_))
         {
@@ -1010,6 +1066,20 @@ fn describe_portal(
     session: &mut Session,
     name: &str,
 ) -> PgResult<()> {
+    // A `DECLARE`d cursor is a portal too: psycopg's named (server-side)
+    // cursors DECLARE one, then Describe it by name. Found via testing
+    // before a public release.
+    if !session.portals.contains_key(name)
+        && let Some(cursor) = session.cursors.get(name)
+    {
+        let cols = cursor.cols.clone();
+        let msg = if cols.is_empty() {
+            PgWireBackendMessage::NoData(pgwire::messages::data::NoData::new())
+        } else {
+            PgWireBackendMessage::RowDescription(row_description(&cols, &[]))
+        };
+        return conn.send(msg).map_err(io_to_pg);
+    }
     let portal = session.portals.get(name).ok_or_else(|| {
         PgError::new(code::INVALID_CURSOR_NAME, format!("portal \"{name}\" does not exist"))
     })?;

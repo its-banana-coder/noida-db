@@ -213,6 +213,27 @@ def main():
         conn.execute("DROP TABLE items")
         conn.execute("DROP TABLE people")
 
+    # A named (server-side) cursor DECLAREs a cursor, then Describes it as a
+    # protocol-level portal. Used to fail: 'portal "big" does not exist'.
+    with psycopg.connect(DSN) as conn:
+        with conn.cursor(name="big") as cur:
+            cur.itersize = 100
+            cur.execute("SELECT g FROM generate_series(1, 1000) g")
+            check("named cursor streams every row", sum(r[0] for r in cur), 500500)
+
+    # NOTIFY reaches a listener that is idle, waiting on its socket -- not
+    # only with the response to its next query, as it used to.
+    with psycopg.connect(DSN, autocommit=True) as listener, psycopg.connect(
+        DSN, autocommit=True
+    ) as sender:
+        listener.execute("LISTEN jobs")
+        sender.execute("NOTIFY jobs, 'job-1'")
+        got = None
+        for n in listener.notifies(timeout=5):
+            got = (n.channel, n.payload)
+            break
+        check("NOTIFY delivered to an idle listener", got, ("jobs", "job-1"))
+
     print(f"psycopg: {checks} checks passed")
 
 

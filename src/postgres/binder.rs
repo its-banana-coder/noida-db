@@ -242,6 +242,18 @@ impl<'a> Binder<'a> {
                 let (order, limit, offset) = self.bind_tail(q, &cols, None)?;
                 Ok((attach_tail(sq, order, limit, offset), cols))
             }
+            // A data-modifying statement inside WITH (`WITH d AS (DELETE ...
+            // RETURNING *) SELECT ...`). Found via testing before a public
+            // release.
+            a::SetExpr::Insert(stmt) | a::SetExpr::Update(stmt) | a::SetExpr::Delete(stmt) => {
+                let planned = match stmt {
+                    a::Statement::Insert(ins) => self.bind_insert(ins)?,
+                    a::Statement::Update(up) => self.bind_update(up)?,
+                    a::Statement::Delete(del) => self.bind_delete(del)?,
+                    other => return Err(unsupported(&first_words(&other.to_string()))),
+                };
+                Ok((planned.query, planned.cols))
+            }
             other => Err(unsupported(&first_words(&other.to_string()))),
         }
     }
@@ -752,7 +764,10 @@ impl<'a> Binder<'a> {
             let col = match existing {
                 Some(i) => i,
                 None => {
-                    if distinct != Distinct::None {
+                    // Plain DISTINCT only: DISTINCT ON may sort by anything
+                    // (`DISTINCT ON (region) ... ORDER BY region, amt DESC`
+                    // picks each region's largest row).
+                    if distinct == Distinct::All {
                         return Err(PgError::new(
                             code::INVALID_COLUMN_REFERENCE,
                             "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
@@ -3733,6 +3748,17 @@ impl<'a> Binder<'a> {
             }
             seen
         };
+        // Without a column list, the targets are the table's *first* N
+        // columns, N being the source's width (`INSERT INTO t VALUES ('a', 1)`
+        // into a three-column table defaults the third). Found via testing
+        // before a public release: this used to be rejected.
+        let mut cols = cols;
+        if ins.columns.is_empty()
+            && let Some(width) = ins.source.as_deref().and_then(source_width)
+            && width < cols.len()
+        {
+            cols.truncate(width);
+        }
         let target_types: Vec<(Type, i32)> =
             cols.iter().map(|&i| (table.columns[i].ty, table.columns[i].typmod)).collect();
         // Source rows.
@@ -4863,4 +4889,21 @@ fn query_references(q: &a::Query, name: &str) -> bool {
 
 fn first_words(s: &str) -> String {
     s.split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+}
+
+/// How many columns an INSERT source produces, when that's knowable from
+/// the syntax alone: a VALUES list's row width, or a SELECT list without
+/// wildcards.
+fn source_width(q: &a::Query) -> Option<usize> {
+    match q.body.as_ref() {
+        a::SetExpr::Values(v) => v.rows.first().map(|r| r.len()),
+        a::SetExpr::Select(sel)
+            if sel.projection.iter().all(|p| {
+                matches!(p, a::SelectItem::UnnamedExpr(_) | a::SelectItem::ExprWithAlias { .. })
+            }) =>
+        {
+            Some(sel.projection.len())
+        }
+        _ => None,
+    }
 }

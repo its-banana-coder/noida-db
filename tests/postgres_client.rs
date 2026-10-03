@@ -514,3 +514,63 @@ fn persistent_server_starts_empty_when_no_data_dir() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Silently-wrong DML found by client testing before a public release.
+#[test]
+fn derived_tables_in_dml_and_writable_ctes() {
+    let mut c = client();
+    c.batch_execute(
+        "CREATE TABLE d (id int PRIMARY KEY, v int, n int DEFAULT 7);
+         INSERT INTO d VALUES (1, 0), (2, 0), (3, 0);",
+    )
+    .unwrap();
+    // No column list: VALUES fills the leading columns, the rest default.
+    let n: i32 = c.query_one("SELECT n FROM d WHERE id = 1", &[]).unwrap().get(0);
+    assert_eq!(n, 7);
+
+    // UPDATE ... FROM / DELETE ... USING a derived table used to match no
+    // rows at all (the derived table was read as zero columns wide).
+    let updated = c
+        .execute(
+            "UPDATE d SET v = s.n FROM (VALUES (1, 10), (2, 20)) s(id, n) WHERE d.id = s.id",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(updated, 2);
+    let deleted = c.execute("DELETE FROM d USING (SELECT 1 AS x) v WHERE d.id = v.x", &[]).unwrap();
+    assert_eq!(deleted, 1);
+    let rows: Vec<(i32, i32)> = c
+        .query("SELECT id, v FROM d ORDER BY id", &[])
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(rows, vec![(2, 20), (3, 0)]);
+
+    // Writable CTEs.
+    let moved: i64 = c
+        .query_one(
+            "WITH m AS (DELETE FROM d WHERE id = 3 RETURNING id) \
+             SELECT count(*) FROM m",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(moved, 1);
+    let left: i64 = c.query_one("SELECT count(*) FROM d", &[]).unwrap().get(0);
+    assert_eq!(left, 1);
+
+    // DISTINCT ON may sort by a column it doesn't select.
+    c.batch_execute(
+        "CREATE TABLE s (region text, rep text, amt int);
+         INSERT INTO s VALUES ('e', 'ann', 1), ('e', 'bob', 9), ('w', 'cat', 5);",
+    )
+    .unwrap();
+    let top: Vec<(String, String)> = c
+        .query("SELECT DISTINCT ON (region) region, rep FROM s ORDER BY region, amt DESC", &[])
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(top, vec![("e".into(), "bob".into()), ("w".into(), "cat".into())]);
+}
