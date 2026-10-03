@@ -899,7 +899,9 @@ fn auto_id() -> String {
             .as_nanos()) as u64);
     (0..20)
         .map(|i| {
-            A[((n.rotate_left((i % 63) as u32).wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            A[((n
+                .rotate_left((i % 63) as u32)
+                .wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15))
                 >> (i % 8 * 8)) as usize)
                 % A.len()] as char
         })
