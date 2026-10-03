@@ -847,12 +847,32 @@ impl EngineState {
                     if let Some(part_state) = topic_state.partitions.get(&partition.partition_index)
                     {
                         part_res.error_code = 0;
-                        if partition.timestamp == -2 {
-                            // Earliest
-                            part_res.offset = 0;
-                        } else {
-                            // Latest (-1) or timestamp
-                            part_res.offset = part_state.high_watermark;
+                        part_res.timestamp = -1;
+                        // A read_committed client's "latest" is the last
+                        // stable offset, never past an open transaction.
+                        let lso = part_state
+                            .active_txns
+                            .values()
+                            .copied()
+                            .min()
+                            .map_or(part_state.high_watermark, |m| {
+                                m.min(part_state.high_watermark)
+                            });
+                        let end =
+                            if req.isolation_level == 1 { lso } else { part_state.high_watermark };
+                        match partition.timestamp {
+                            -2 => part_res.offset = 0,
+                            -1 => part_res.offset = end,
+                            // A timestamp (or -3, the record with the largest
+                            // timestamp). Found via testing before a public
+                            // release: every timestamp lookup used to answer
+                            // with the end offset, so `offsetsForTimes` and
+                            // "replay from 10 minutes ago" skipped everything.
+                            ts => {
+                                let (offset, found_ts) = offset_for_timestamp(part_state, ts, end);
+                                part_res.offset = offset;
+                                part_res.timestamp = found_ts;
+                            }
                         }
                     } else {
                         part_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
@@ -2675,4 +2695,40 @@ impl EngineState {
             txn_partitions: HashMap::new(),
         }
     }
+}
+
+/// Kafka's ListOffsets-by-timestamp: the earliest offset (below `end`)
+/// whose record timestamp is >= `target`, with that timestamp; for -3
+/// (`MAX_TIMESTAMP`), the record with the largest timestamp. `(-1, -1)` when
+/// there's no such record. Control records (transaction markers) never
+/// match.
+fn offset_for_timestamp(part: &PartitionState, target: i64, end: i64) -> (i64, i64) {
+    use kafka_protocol::records::RecordBatchDecoder;
+    let mut best: Option<(i64, i64)> = None;
+    for (base, batch) in &part.record_batches {
+        if *base >= end {
+            break;
+        }
+        // The batch's own header carries the offset its records count from.
+        let Some(header_base) = batch.get(..8).map(|b| i64::from_be_bytes(b.try_into().unwrap()))
+        else {
+            continue;
+        };
+        let mut buf = bytes::Bytes::copy_from_slice(batch);
+        let Ok(set) = RecordBatchDecoder::decode(&mut buf) else { continue };
+        for r in set.records {
+            let offset = base + (r.offset - header_base);
+            if r.control || offset >= end {
+                continue;
+            }
+            if target == -3 {
+                if best.is_none_or(|(_, t)| r.timestamp > t) {
+                    best = Some((offset, r.timestamp));
+                }
+            } else if r.timestamp >= target {
+                return (offset, r.timestamp);
+            }
+        }
+    }
+    best.unwrap_or((-1, -1))
 }

@@ -4,7 +4,8 @@
 import os
 import sys
 import time
-from confluent_kafka import Consumer, KafkaError, Producer
+import uuid
+from confluent_kafka import Consumer, KafkaError, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
 PORT = os.environ.get("NOIDA_KAFKA_PORT")
@@ -106,6 +107,21 @@ def main():
 
     check("resumes past committed offset", resumed_msgs, ["v4"])
     c2.close()
+
+    # offsetsForTimes: the earliest offset whose timestamp is >= the target.
+    # Used to answer with the end offset for every timestamp.
+    ts_topic = f"ts-{uuid.uuid4().hex[:8]}"
+    p3 = Producer({**conf, "compression.type": "lz4", "linger.ms": 50})
+    for ts in (1000, 2000, 3000):
+        p3.produce(ts_topic, value=b"m", timestamp=ts)
+    p3.flush(10)
+    c3 = Consumer({**conf, "group.id": "ts-lookup"})
+    got = [
+        c3.offsets_for_times([TopicPartition(ts_topic, 0, t)], timeout=10)[0].offset
+        for t in (0, 1500, 3000, 3001)
+    ]
+    check("offsets_for_times", got, [0, 1, 2, -1])
+    c3.close()
 
     print(f"confluent-kafka: {checks} checks, {len(failures)} failed")
     for f in failures:
