@@ -55,7 +55,7 @@ pub fn spawn_persistent_for_test(
 
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let engine = engine.clone();
+            let engine = engine.new_connection();
             let _ = thread::spawn(move || {
                 let _ = serve(stream, engine);
             });
@@ -101,6 +101,16 @@ struct Session {
     // real client is free to omit resending types on a later `EXECUTE` of
     // the same statement, reusing what it sent before.
     stmt_param_types: HashMap<u32, Vec<(u8, u8)>>,
+}
+
+/// A connection that goes away mid-transaction has it rolled back, as
+/// MySQL does -- however the connection ends.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.engine.in_tx {
+            self.engine.rollback();
+        }
+    }
 }
 
 fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
@@ -192,7 +202,9 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
             0x03 => {
                 // Query
                 let q = String::from_utf8_lossy(&payload[1..]);
-                match session.engine.execute(&q) {
+                let result = session.engine.execute(&q);
+                STATUS.with(|s| s.set(session.engine.status_flags()));
+                match result {
                     Ok(rows) => {
                         let affected = session.engine.last_affected_rows;
                         let insert_id = session.engine.last_insert_id;
@@ -273,8 +285,9 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                                     next_seq = next_seq.wrapping_add(1);
                                 }
                                 if num_params > 0 {
-                                    let eof = b"\xfe\x00\x00\x02\x00";
-                                    let _ = write_packet(&mut stream, next_seq, eof);
+                                    let st = STATUS.with(|s| s.get()).to_le_bytes();
+                                    let eof = [0xfe, 0x00, 0x00, st[0], st[1]];
+                                    let _ = write_packet(&mut stream, next_seq, &eof);
                                 }
                             }
                             Err(e) => {
@@ -350,7 +363,13 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)
                         };
-                        match executor.execute_plan(stmt_plan) {
+                        let written = session.engine.before_plan(&stmt_plan);
+                        let result = executor.execute_plan(stmt_plan);
+                        if result.is_ok() {
+                            session.engine.after_plan(written);
+                        }
+                        STATUS.with(|s| s.set(session.engine.status_flags()));
+                        match result {
                             Ok(rows) => {
                                 let affected = executor.last_affected_rows;
                                 session.engine.last_affected_rows = affected;
@@ -474,6 +493,13 @@ fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> io::Result<(
     Ok(())
 }
 
+thread_local! {
+    /// The status flags (`SERVER_STATUS_IN_TRANS`/`_AUTOCOMMIT`) for this
+    /// connection's next OK/EOF packet. One thread serves one connection,
+    /// so a thread-local is per-session; it's set after every command.
+    static STATUS: std::cell::Cell<u16> = const { std::cell::Cell::new(2) };
+}
+
 fn send_ok(
     stream: &mut TcpStream,
     seq: u8,
@@ -484,7 +510,7 @@ fn send_ok(
     payload.push(0x00);
     write_lenenc_int(&mut payload, affected_rows);
     write_lenenc_int(&mut payload, last_insert_id);
-    payload.extend_from_slice(&0x0002u16.to_le_bytes()); // status flags: SERVER_STATUS_AUTOCOMMIT
+    payload.extend_from_slice(&STATUS.with(|s| s.get()).to_le_bytes()); // status flags
     payload.extend_from_slice(&0u16.to_le_bytes()); // warnings
     write_packet(stream, seq, &payload)
 }
@@ -612,8 +638,9 @@ fn send_resultset(
         seq = seq.wrapping_add(1);
     }
 
-    let eof = b"\xfe\x00\x00\x02\x00";
-    write_packet(stream, seq, eof)?;
+    let st = STATUS.with(|s| s.get()).to_le_bytes();
+    let eof = [0xfe, 0x00, 0x00, st[0], st[1]];
+    write_packet(stream, seq, &eof)?;
     seq = seq.wrapping_add(1);
 
     for row in rows {
@@ -629,7 +656,7 @@ fn send_resultset(
         seq = seq.wrapping_add(1);
     }
 
-    write_packet(stream, seq, eof)?;
+    write_packet(stream, seq, &eof)?;
 
     Ok(())
 }
@@ -686,8 +713,9 @@ fn send_binary_resultset(
         seq = seq.wrapping_add(1);
     }
 
-    let eof = b"\xfe\x00\x00\x02\x00";
-    write_packet(stream, seq, eof)?;
+    let st = STATUS.with(|s| s.get()).to_le_bytes();
+    let eof = [0xfe, 0x00, 0x00, st[0], st[1]];
+    write_packet(stream, seq, &eof)?;
     seq = seq.wrapping_add(1);
 
     // Binary Protocol Resultset Row: a 0x00 header byte, then a null
@@ -713,7 +741,7 @@ fn send_binary_resultset(
         seq = seq.wrapping_add(1);
     }
 
-    write_packet(stream, seq, eof)?;
+    write_packet(stream, seq, &eof)?;
     Ok(())
 }
 

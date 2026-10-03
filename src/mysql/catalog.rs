@@ -1,6 +1,6 @@
 use crate::mysql::types::Value;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 pub type Row = Vec<Value>;
@@ -110,11 +110,55 @@ pub struct Schema {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DbState {
     pub schemas: BTreeMap<String, Schema>,
-    /// Pre-transaction database state if a transaction is currently open.
-    /// Excluded from on-disk serialization so a snapshot never stores
-    /// this internal recovery field.
+    /// Every open transaction's undo log, by connection id: for each table
+    /// the transaction wrote, the table as it was before its first write
+    /// and as the transaction last left it. Shared (not per-connection) so
+    /// a clean-shutdown snapshot can leave out every open transaction's
+    /// uncommitted writes. Never serialized.
     #[serde(skip)]
-    pub tx_base: Option<Box<DbState>>,
+    pub open_txns: HashMap<u64, TxUndo>,
+}
+
+/// One open transaction's undo log; see `DbState::open_txns`.
+#[derive(Clone, Debug, Default)]
+pub struct TxUndo {
+    pub tables: BTreeMap<(String, String), (Arc<Table>, Arc<Table>)>,
+}
+
+impl DbState {
+    /// Undoes one transaction's writes. A table nobody else has written
+    /// since gets its pre-transaction image back exactly; one that another
+    /// connection has also changed meanwhile gets only this transaction's
+    /// own row changes reversed, so the other connection's committed rows
+    /// survive. `AUTO_INCREMENT` counters are never rolled back (as in
+    /// MySQL).
+    pub fn undo(&mut self, undo: &TxUndo) {
+        for ((db, name), (before, ours)) in &undo.tables {
+            let Some(current) = self.schemas.get(db).and_then(|s| s.tables.get(name)).cloned()
+            else {
+                continue;
+            };
+            let mut restored = if Arc::ptr_eq(&current, ours) {
+                (**before).clone()
+            } else {
+                let mut rows = current.rows.clone();
+                let mut removed = before.rows.clone();
+                for r in &ours.rows {
+                    if let Some(i) = removed.iter().position(|x| x == r) {
+                        removed.swap_remove(i);
+                    } else if let Some(i) = rows.iter().position(|x| x == r) {
+                        rows.remove(i);
+                    }
+                }
+                rows.extend(removed);
+                Table { rows, ..(*current).clone() }
+            };
+            restored.next_auto_increment = current.next_auto_increment;
+            if let Some(schema) = self.schemas.get_mut(db) {
+                schema.tables.insert(name.clone(), Arc::new(restored));
+            }
+        }
+    }
 }
 
 impl Default for DbState {
@@ -127,6 +171,6 @@ impl Default for DbState {
                 Schema { name: name.to_string(), tables: BTreeMap::new() },
             );
         }
-        Self { schemas, tx_base: None }
+        Self { schemas, open_txns: HashMap::new() }
     }
 }

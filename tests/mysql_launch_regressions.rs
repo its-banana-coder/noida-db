@@ -349,3 +349,49 @@ async fn table_aliases_in_joins_and_dml() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// pymysql/mysqlclient/SQLAlchemy/Django never send BEGIN: they turn
+/// `autocommit` off and rely on MySQL opening a transaction implicitly.
+/// That used to be ignored (every statement committed, ROLLBACK did
+/// nothing); and a rollback used to restore the *whole* shared database,
+/// wiping other connections' commits.
+#[tokio::test]
+async fn implicit_transactions_and_per_connection_rollback() {
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let pool = Pool::new(format!("mysql://root@127.0.0.1:{}/test", addr.port()).as_str());
+    let mut a = pool.get_conn().await.unwrap();
+    let mut b = pool.get_conn().await.unwrap();
+    a.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10))").await.unwrap();
+    a.query_drop("INSERT INTO t VALUES (1, 'orig')").await.unwrap();
+
+    a.query_drop("SET autocommit = 0").await.unwrap();
+    a.query_drop("INSERT INTO t VALUES (2, 'mine')").await.unwrap();
+    a.query_drop("UPDATE t SET v = 'changed' WHERE id = 1").await.unwrap();
+    // Another connection commits to the same table meanwhile.
+    b.query_drop("INSERT INTO t VALUES (3, 'theirs')").await.unwrap();
+    a.query_drop("ROLLBACK").await.unwrap();
+    assert_eq!(
+        rows(&mut b, "SELECT id, v FROM t ORDER BY id").await,
+        vec![vec![s("1"), s("orig")], vec![s("3"), s("theirs")]]
+    );
+
+    a.query_drop("INSERT INTO t VALUES (4, 'kept')").await.unwrap();
+    a.query_drop("COMMIT").await.unwrap();
+    // DDL implicitly commits.
+    a.query_drop("INSERT INTO t VALUES (5, 'ddl')").await.unwrap();
+    a.query_drop("CREATE TABLE u (x INT)").await.unwrap();
+    a.query_drop("ROLLBACK").await.unwrap();
+    assert_eq!(one(&mut b, "SELECT COUNT(*) FROM t WHERE id IN (4, 5)").await, s("2"));
+
+    // A connection that disconnects mid-transaction is rolled back.
+    let mut c = pool.get_conn().await.unwrap();
+    c.query_drop("SET autocommit = 0").await.unwrap();
+    c.query_drop("INSERT INTO t VALUES (6, 'gone')").await.unwrap();
+    c.disconnect().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(one(&mut b, "SELECT COUNT(*) FROM t WHERE id = 6").await, s("0"));
+
+    drop(a);
+    drop(b);
+    pool.disconnect().await.unwrap();
+}

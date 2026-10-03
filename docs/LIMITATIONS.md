@@ -524,16 +524,19 @@ and mixing aggregates with non-aggregated, non-grouped columns in the
 same projection (undefined in standard SQL, and MySQL's own behavior
 there depends on `ONLY_FULL_GROUP_BY`) are not handled specially.
 
-`BEGIN`/`START TRANSACTION`, `COMMIT`, and `ROLLBACK` give a single
-connection real commit/rollback semantics: `BEGIN` snapshot-clones the
-entire in-memory database state, `ROLLBACK` restores that snapshot
-verbatim, and `COMMIT` discards it and keeps whatever's current. This is
-deliberately the simplest thing that's still correct for one connection,
-not a real transaction engine — there's no MVCC, no isolation levels
-(every statement always sees the latest state, even from other
-connections, whether or not a transaction is open), and no nested
-transactions (a `BEGIN` while a transaction is already open just replaces
-the snapshot rather than erroring or stacking).
+Transactions: `BEGIN`/`START TRANSACTION`, `COMMIT` and `ROLLBACK`, and
+the implicit transactions drivers actually use: with `SET autocommit = 0`
+(what pymysql, mysqlclient, SQLAlchemy and Django's `atomic()` send), the
+first write opens a transaction that lasts until `COMMIT`/`ROLLBACK`, and
+`SET autocommit = 1` commits it. DDL and a second `BEGIN` commit an open
+transaction, and a connection that disconnects mid-transaction is rolled
+back, all as in MySQL. OK/EOF packets report `SERVER_STATUS_IN_TRANS` and
+`SERVER_STATUS_AUTOCOMMIT` truthfully. A rollback undoes only its own
+connection's writes: tables nobody else touched get their pre-transaction
+contents back, and in a table another connection also wrote meanwhile,
+only this transaction's own row changes are reversed. `AUTO_INCREMENT` is
+not rolled back (as in MySQL). There is no isolation: uncommitted writes
+are visible to other connections immediately, and there are no savepoints.
 
 `OK` packets now report a real `affected_rows` count for
 `INSERT`/`UPDATE`/`DELETE` (a client's `.affected_rows()` — e.g.
@@ -630,10 +633,8 @@ migration tools query.
 - `FOREIGN KEY` constraints are accepted but not enforced (no
   referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
   `FULLTEXT` declarations are accepted and ignored; nothing is indexed.
-- Isolation levels, nested/savepoint transactions, and any cross-
-  connection isolation (a transaction only protects against its own
-  connection's later `ROLLBACK`, not against seeing concurrent writes
-  from other connections).
+- Isolation levels and savepoints: other connections see a transaction's
+  uncommitted writes immediately (a rollback still undoes them).
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the
   first is executed).
 - JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions

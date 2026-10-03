@@ -318,6 +318,13 @@ impl Binder {
                     // isn't evaluated here -- falls back to no default,
                     // same as before this existed at all.
                     sqlparser::ast::ColumnOption::Default(expr) => {
+                        // MySQL 8's expression-default syntax wraps it in
+                        // parentheses: `DEFAULT (now())`, what SQLAlchemy
+                        // emits for `server_default=func.now()`.
+                        let mut expr = expr;
+                        while let AstExpr::Nested(inner) = expr {
+                            expr = inner;
+                        }
                         if is_current_time(expr) {
                             default_now = true;
                         } else if let Ok(Expr::Const(v)) = self.bind_expr(expr.clone()) {
@@ -333,7 +340,12 @@ impl Binder {
                             )));
                         }
                     }
-                    sqlparser::ast::ColumnOption::OnUpdate(expr) if is_current_time(expr) => {
+                    sqlparser::ast::ColumnOption::OnUpdate(expr)
+                        if is_current_time(match expr {
+                            AstExpr::Nested(inner) => inner,
+                            e => e,
+                        }) =>
+                    {
                         on_update_now = true;
                     }
                     _ => {}
