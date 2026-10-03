@@ -178,6 +178,42 @@ impl Executor {
                 schema.tables.insert(table.clone(), Arc::new(Table::new(table, columns)));
                 Ok(vec![])
             }
+            Plan::CreateDatabase { name, if_not_exists } => {
+                let mut state = self.db.lock().unwrap();
+                if state.schemas.contains_key(&name) {
+                    if if_not_exists {
+                        return Ok(vec![]);
+                    }
+                    return Err(MySqlError::new(
+                        1007,
+                        "HY000",
+                        format!("Can't create database '{name}'; database exists"),
+                    ));
+                }
+                state.schemas.insert(name, crate::mysql::catalog::Schema::default());
+                Ok(vec![])
+            }
+            Plan::CreateIndex { db, table, columns, if_not_exists } => {
+                let state = self.db.lock().unwrap();
+                let schema = state.schemas.get(&db).ok_or_else(|| {
+                    MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
+                })?;
+                let t = match schema.tables.get(&table) {
+                    Some(t) => t,
+                    None if if_not_exists => return Ok(vec![]),
+                    None => return Err(MySqlError::unknown_table(&table)),
+                };
+                for col in &columns {
+                    if !t.columns.iter().any(|c| c.name == *col) {
+                        return Err(MySqlError::new(
+                            1072,
+                            "42000",
+                            format!("Key column '{col}' doesn't exist in table"),
+                        ));
+                    }
+                }
+                Ok(vec![])
+            }
             Plan::Insert { db, table, columns, rows } => {
                 let mut state = self.db.lock().unwrap();
                 let schema = state.schemas.get_mut(&db).ok_or_else(|| {
@@ -584,6 +620,52 @@ impl Executor {
                     Ok(Value::Text("".to_string()))
                 }
             }
+            Expr::Not(e) => {
+                let v = self.eval_expr(e, row, table)?;
+                if v.is_null() {
+                    Ok(Value::Null)
+                } else if v == Value::Int(0) {
+                    Ok(Value::Int(1))
+                } else {
+                    Ok(Value::Int(0))
+                }
+            }
+            Expr::IsNull(e, negated) => {
+                let v = self.eval_expr(e, row, table)?;
+                let is_null = v.is_null();
+                Ok(Value::Int((is_null != *negated) as i64))
+            }
+            Expr::Like { expr, pattern, escape, negated } => {
+                let v = self.eval_expr(expr, row, table)?;
+                let p = self.eval_expr(pattern, row, table)?;
+                let esc = self.eval_expr(escape, row, table)?;
+                if v.is_null() || p.is_null() {
+                    return Ok(Value::Null);
+                }
+                let (Some(s), Some(pat)) = (value_as_text(&v), value_as_text(&p)) else {
+                    return Ok(Value::Null);
+                };
+                let esc_char = value_as_text(&esc).and_then(|e| e.chars().next());
+                let m = mysql_like(&s, &pat, esc_char);
+                Ok(Value::Int((m != *negated) as i64))
+            }
+            Expr::Case { conditions, else_result } => {
+                for (cond, result) in conditions {
+                    let c = self.eval_expr(cond, row, table)?;
+                    if !c.is_null() && c != Value::Int(0) {
+                        return self.eval_expr(result, row, table);
+                    }
+                }
+                match else_result {
+                    Some(e) => self.eval_expr(e, row, table),
+                    None => Ok(Value::Null),
+                }
+            }
+            Expr::Call { name, args } => {
+                let vals: Vec<Value> =
+                    args.iter().map(|a| self.eval_expr(a, row, table)).collect::<Result<_, _>>()?;
+                eval_call(name, &vals)
+            }
             _ => Err(MySqlError::unsupported("expr in execution")),
         }
     }
@@ -775,6 +857,170 @@ fn mysql_text_to_f64(s: &str) -> f64 {
     s[..end].parse::<f64>().unwrap_or(0.0)
 }
 
+/// Coerces a `Value` to a plain string the way `CONCAT`/`UPPER`/`LOWER`/
+/// `SUBSTRING`/`LIKE` need it, mirroring the leniency `mysql_text_to_f64`
+/// already applies on the numeric side: `NULL` has no text form (the
+/// caller decides how to propagate that), and the handful of variants this
+/// scalar-function library doesn't have a defined textual form for yet
+/// (`Bytes`/`Date`/`Time`/`Ts`/`Json`) return `None` rather than guessing.
+fn value_as_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Text(s) => Some(s.clone()),
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        Value::Bool(b) => Some(if *b { "1".to_string() } else { "0".to_string() }),
+        Value::Num(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// `pattern [ESCAPE esc]` matching for `LIKE`: `%` matches any run of
+/// characters (including none), `_` matches exactly one, and `esc`
+/// (when given) makes the character right after it literal instead of a
+/// wildcard. Case-insensitive, matching MySQL's default `_ci` collations.
+/// Same tokenize-then-backtrack algorithm as `postgres::funcs::like`
+/// (not shared code -- `mysql` and `postgres` are independent Cargo
+/// features, so mysql's own executor can't depend on postgres's module).
+fn mysql_like(s: &str, pattern: &str, esc: Option<char>) -> bool {
+    enum Tok {
+        Lit(char),
+        One,
+        Any,
+    }
+    let s: Vec<char> = s.to_lowercase().chars().collect();
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let esc = esc.map(|c| c.to_ascii_lowercase());
+
+    let mut toks = Vec::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < pattern.len() {
+        let c = pattern[i];
+        if Some(c) == esc && i + 1 < pattern.len() {
+            toks.push(Tok::Lit(pattern[i + 1]));
+            i += 2;
+            continue;
+        }
+        toks.push(match c {
+            '%' => Tok::Any,
+            '_' => Tok::One,
+            c => Tok::Lit(c),
+        });
+        i += 1;
+    }
+
+    let (mut si, mut ti) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if ti < toks.len() {
+            match toks[ti] {
+                Tok::Any => {
+                    star = Some((ti, si));
+                    ti += 1;
+                    continue;
+                }
+                Tok::One => {
+                    si += 1;
+                    ti += 1;
+                    continue;
+                }
+                Tok::Lit(c) if c == s[si] => {
+                    si += 1;
+                    ti += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match star {
+            Some((st, ss)) => {
+                ti = st + 1;
+                si = ss + 1;
+                star = Some((st, ss + 1));
+            }
+            None => return false,
+        }
+    }
+    while ti < toks.len() && matches!(toks[ti], Tok::Any) {
+        ti += 1;
+    }
+    ti == toks.len()
+}
+
+/// The fixed scalar-function library `Expr::Call` dispatches to -- see the
+/// comment on that variant. Any argument that can't be coerced to text
+/// (`value_as_text` returning `None`, which includes `NULL`) makes the
+/// whole call `NULL`, matching real MySQL's own NULL-propagation for
+/// these functions.
+fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
+    match name {
+        "CONCAT" => {
+            let mut out = String::new();
+            for a in args {
+                match value_as_text(a) {
+                    Some(s) => out.push_str(&s),
+                    None => return Ok(Value::Null),
+                }
+            }
+            Ok(Value::Text(out))
+        }
+        "UPPER" => match args.first().and_then(value_as_text) {
+            Some(s) => Ok(Value::Text(s.to_uppercase())),
+            None => Ok(Value::Null),
+        },
+        "LOWER" => match args.first().and_then(value_as_text) {
+            Some(s) => Ok(Value::Text(s.to_lowercase())),
+            None => Ok(Value::Null),
+        },
+        "LENGTH" => match args.first().and_then(value_as_text) {
+            Some(s) => Ok(Value::Int(s.len() as i64)),
+            None => Ok(Value::Null),
+        },
+        "SUBSTRING" | "SUBSTR" => {
+            let Some(s) = args.first().and_then(value_as_text) else {
+                return Ok(Value::Null);
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            // MySQL's `SUBSTRING` is 1-indexed, and a negative start
+            // counts from the end of the string (`SUBSTRING('hello', -3)`
+            // is `"llo"`).
+            let Some(Value::Int(start)) = args.get(1) else { return Ok(Value::Null) };
+            let start0 = if *start > 0 {
+                start - 1
+            } else if *start < 0 {
+                (len + start).max(0)
+            } else {
+                0
+            };
+            let count = match args.get(2) {
+                Some(Value::Int(n)) => (*n).max(0),
+                Some(_) => return Ok(Value::Null),
+                None => len,
+            };
+            let begin = start0.clamp(0, len) as usize;
+            let end = (start0 + count).clamp(0, len) as usize;
+            Ok(Value::Text(chars[begin..end.max(begin)].iter().collect()))
+        }
+        "COALESCE" => {
+            for a in args {
+                if !a.is_null() {
+                    return Ok(a.clone());
+                }
+            }
+            Ok(Value::Null)
+        }
+        "IFNULL" => {
+            let Some(a) = args.first() else { return Ok(Value::Null) };
+            if !a.is_null() {
+                Ok(a.clone())
+            } else {
+                Ok(args.get(1).cloned().unwrap_or(Value::Null))
+            }
+        }
+        _ => Err(MySqlError::unsupported(&format!("function {name}"))),
+    }
+}
+
 /// Basic integer/float arithmetic. Only defined for the two numeric
 /// `Value` variants this engine's literal parser actually produces
 /// (`Int`/`Float`) — mixing in a float promotes the result to float,
@@ -803,6 +1049,16 @@ fn eval_arith(op: ArithOp, l: Value, r: Value) -> Result<Value, MySqlError> {
                     Ok(Value::Text(format!("{:.4}", *a as f64 / *b as f64)))
                 }
             }
+            // Unlike `/`, MySQL's `%`/`MOD` on two integers stays an
+            // integer (no DECIMAL promotion) and, like real MySQL,
+            // `x % 0` is NULL rather than a division-by-zero error.
+            ArithOp::Mod => {
+                if *b == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Int(a % b))
+                }
+            }
         },
         _ => {
             let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) else {
@@ -821,6 +1077,13 @@ fn eval_arith(op: ArithOp, l: Value, r: Value) -> Result<Value, MySqlError> {
                         Ok(Value::Null)
                     } else {
                         Ok(Value::Float(a / b))
+                    }
+                }
+                ArithOp::Mod => {
+                    if b == 0.0 {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Float(a % b))
                     }
                 }
             }

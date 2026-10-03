@@ -111,6 +111,19 @@ impl Engine {
         if segments.first() == Some(&"_analyze") {
             return self.analyze(body);
         }
+        if segments.first() == Some(&"_bulk") {
+            // The global bulk endpoint -- no index in the URL, each
+            // action line names its own `_index` instead. Found missing
+            // via testing before a public release: only the per-index
+            // `/<index>/_bulk` form (below) was routed at all, so this
+            // -- the form most real bulk-ingestion tooling actually
+            // uses -- 404'd outright rather than running the bulk
+            // request. `bulk()`'s own `index` fallback parameter is
+            // irrelevant here since every real caller of this form sets
+            // `_index` on every line; pass an empty string rather than a
+            // real index name.
+            return self.bulk(method, "", &q, body);
+        }
         if segments.len() == 1 && segments[0].starts_with('_') {
             return (404, error("not_found", "no handler found for uri", 404));
         }
@@ -225,11 +238,15 @@ impl Engine {
             return missing_index(index_pattern);
         }
         if action == "_count" {
-            let total: u64 = names
+            let counts: Result<Vec<u64>, String> = names
                 .iter()
                 .filter_map(|n| s.indices.get(n))
                 .map(|i| search::count(&i.mappings, &i.committed, &req))
-                .sum();
+                .collect();
+            let total: u64 = match counts {
+                Ok(cs) => cs.into_iter().sum(),
+                Err(reason) => return (400, error("parsing_exception", &reason, 400)),
+            };
             let shards = names.len().max(1);
             return (
                 200,
@@ -249,7 +266,10 @@ impl Engine {
             }
             (json!({"properties": {}}), docs)
         };
-        (200, search::search(&mappings, &docs, &req))
+        match search::search(&mappings, &docs, &req) {
+            Ok(resp) => (200, resp),
+            Err(reason) => (400, error("parsing_exception", &reason, 400)),
+        }
     }
 
     fn analyze(&self, body: &[u8]) -> (u16, Value) {
@@ -415,6 +435,19 @@ impl Engine {
         body: &[u8],
     ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
+        // Real Elasticsearch auto-creates an index on its first write
+        // (`action.auto_create_index`, on by default) -- found via
+        // testing before a public release: this engine required the
+        // index to already exist even for PUT/POST, so the ordinary
+        // "just start writing" pattern every real client relies on 404'd
+        // instead. GET/HEAD/DELETE on a genuinely missing index still
+        // correctly 404 below -- only the write path auto-creates.
+        if !s.indices.contains_key(index) && matches!(method, "PUT" | "POST") {
+            s.indices.insert(
+                index.to_string(),
+                Index { mappings: json!({"properties": {}}), opened: true, ..Index::default() },
+            );
+        }
         let Some(i) = s.indices.get_mut(index) else {
             return missing_index(index);
         };

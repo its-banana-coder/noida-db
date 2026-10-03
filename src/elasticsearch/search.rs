@@ -447,7 +447,11 @@ fn clauses(v: &Value, key: &str) -> Vec<Value> {
     }
 }
 
-fn eval_bool(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+fn eval_bool(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, String> {
     let must = clauses(v, "must");
     let should = clauses(v, "should");
     let filter = clauses(v, "filter");
@@ -457,18 +461,18 @@ fn eval_bool(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
     let mut scores: HashMap<usize, f32> = HashMap::new();
 
     for q in &must {
-        let m = eval(q, mappings, docs);
+        let m = eval(q, mappings, docs)?;
         candidates.retain(|i| m.contains_key(i));
         for (i, s) in &m {
             *scores.entry(*i).or_insert(0.0) += s;
         }
     }
     for q in &filter {
-        let m = eval(q, mappings, docs);
+        let m = eval(q, mappings, docs)?;
         candidates.retain(|i| m.contains_key(i));
     }
     for q in &must_not {
-        let m = eval(q, mappings, docs);
+        let m = eval(q, mappings, docs)?;
         candidates.retain(|i| !m.contains_key(i));
     }
     if !should.is_empty() {
@@ -476,7 +480,7 @@ fn eval_bool(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
         let msm = v.get("minimum_should_match").and_then(Value::as_i64).unwrap_or(default_msm);
         let mut should_count: HashMap<usize, i64> = HashMap::new();
         for q in &should {
-            for (i, s) in eval(q, mappings, docs) {
+            for (i, s) in eval(q, mappings, docs)? {
                 *scores.entry(i).or_insert(0.0) += s;
                 *should_count.entry(i).or_insert(0) += 1;
             }
@@ -489,7 +493,7 @@ fn eval_bool(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
     for i in &candidates {
         scores.entry(*i).or_insert(1.0);
     }
-    scores
+    Ok(scores)
 }
 
 /// Evaluates a Query DSL clause, returning matched document indices (into
@@ -498,46 +502,52 @@ fn eval_bool(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
 /// constant (their boost, 1.0 by default) the way Elasticsearch's
 /// `ConstantScoreQuery` does; `match_all`, `match`, `match_phrase` and
 /// `multi_match` produce a graded, BM25-backed score.
-pub fn eval(query: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
-    let Some(obj) = query.as_object() else { return HashMap::new() };
+pub fn eval(
+    query: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, String> {
+    let Some(obj) = query.as_object() else {
+        return Err("query must be an object".to_string());
+    };
     if obj.contains_key("match_all") {
-        return (0..docs.len()).map(|i| (i, 1.0)).collect();
+        return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
     }
     if obj.contains_key("match_none") {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
     if let Some(v) = obj.get("term") {
-        return eval_term(v, mappings, docs);
+        return Ok(eval_term(v, mappings, docs));
     }
     if let Some(v) = obj.get("terms") {
-        return eval_terms(v, mappings, docs);
+        return Ok(eval_terms(v, mappings, docs));
     }
     if let Some(v) = obj.get("match") {
-        return eval_match(v, mappings, docs);
+        return Ok(eval_match(v, mappings, docs));
     }
     if let Some(v) = obj.get("match_phrase") {
-        return eval_match_phrase(v, mappings, docs);
+        return Ok(eval_match_phrase(v, mappings, docs));
     }
     if let Some(v) = obj.get("multi_match") {
-        return eval_multi_match(v, mappings, docs);
+        return Ok(eval_multi_match(v, mappings, docs));
     }
     if let Some(v) = obj.get("wildcard") {
-        return eval_wildcard(v, mappings, docs);
+        return Ok(eval_wildcard(v, mappings, docs));
     }
     if let Some(v) = obj.get("regexp") {
-        return eval_regexp(v, mappings, docs);
+        return Ok(eval_regexp(v, mappings, docs));
     }
     if let Some(v) = obj.get("range") {
-        return eval_range(v, mappings, docs);
+        return Ok(eval_range(v, mappings, docs));
     }
     if let Some(v) = obj.get("exists") {
-        return eval_exists(v, docs);
+        return Ok(eval_exists(v, docs));
     }
     if let Some(v) = obj.get("prefix") {
-        return eval_prefix(v, mappings, docs);
+        return Ok(eval_prefix(v, mappings, docs));
     }
     if let Some(v) = obj.get("ids") {
-        return eval_ids(v, docs);
+        return Ok(eval_ids(v, docs));
     }
     if let Some(v) = obj.get("bool") {
         return eval_bool(v, mappings, docs);
@@ -545,9 +555,17 @@ pub fn eval(query: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<u
     if let Some(v) = obj.get("constant_score") {
         let inner = v.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));
         let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
-        return eval(&inner, mappings, docs).into_keys().map(|k| (k, boost)).collect();
+        return Ok(eval(&inner, mappings, docs)?.into_keys().map(|k| (k, boost)).collect());
     }
-    HashMap::new()
+    // Found via testing before a public release: this used to fall
+    // through to `HashMap::new()` -- a real client sending a query type
+    // this engine doesn't understand (`query_string`, `nested`, `fuzzy`,
+    // `function_score`, ...) got a perfectly well-formed "0 hits"
+    // response instead of an error, silently wrong rather than loudly
+    // unsupported. See `docs/specs/README.md`'s own stated principle:
+    // "never silently wrong."
+    let clause = obj.keys().next().map(String::as_str).unwrap_or("<empty>");
+    Err(format!("no [{clause}] query registered"))
 }
 
 fn parse_sort(s: &Value) -> (String, String) {
@@ -833,7 +851,13 @@ fn histogram_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: 
 
 fn filter_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
     let filter_query = spec.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));
-    let matched = eval(&filter_query, mappings, docs);
+    // The aggregation pipeline doesn't thread a `Result` the way the main
+    // `_search` query does (see `eval`'s own doc comment) -- an
+    // unsupported query type inside a `filter` aggregation's own filter
+    // falls back to "matches nothing" here rather than a real error. A
+    // real gap, smaller in practice than the main-query case this was
+    // found and fixed for.
+    let matched = eval(&filter_query, mappings, docs).unwrap_or_default();
     let idxs: Vec<usize> = bucket.iter().copied().filter(|i| matched.contains_key(i)).collect();
     let mut b = Map::new();
     b.insert("doc_count".to_string(), json!(idxs.len()));
@@ -847,7 +871,7 @@ fn named_filter_bucket(
     docs: &[CommittedDoc],
     bucket: &[usize],
 ) -> Value {
-    let matched = eval(filter_query, mappings, docs);
+    let matched = eval(filter_query, mappings, docs).unwrap_or_default();
     let idxs: Vec<usize> = bucket.iter().copied().filter(|i| matched.contains_key(i)).collect();
     let mut b = Map::new();
     b.insert("doc_count".to_string(), json!(idxs.len()));
@@ -1022,9 +1046,9 @@ pub fn eval_aggs(aggs: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: 
 
 /// `POST/GET _search`: runs the query, ranks and paginates the results,
 /// and computes any `aggs`/`aggregations` over the full matched set.
-pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Value {
+pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<Value, String> {
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
-    let mut scores = eval(&query, mappings, docs);
+    let mut scores = eval(&query, mappings, docs)?;
     if let Some(min_score) = body.get("min_score").and_then(Value::as_f64) {
         let min_score = min_score as f32;
         scores.retain(|_, s| *s >= min_score);
@@ -1071,13 +1095,13 @@ pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Value {
     if let Some(agg_spec) = body.get("aggs").or_else(|| body.get("aggregations")) {
         resp["aggregations"] = eval_aggs(agg_spec, mappings, docs, &matched);
     }
-    resp
+    Ok(resp)
 }
 
 /// `POST/GET _count`: the number of matching documents.
-pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> u64 {
+pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u64, String> {
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
-    eval(&query, mappings, docs).len() as u64
+    Ok(eval(&query, mappings, docs)?.len() as u64)
 }
 
 #[cfg(test)]
@@ -1095,7 +1119,7 @@ mod tests {
     #[test]
     fn match_all_scores_every_doc_one() {
         let docs = vec![doc("i", "1", json!({"a":1})), doc("i", "2", json!({"a":2}))];
-        let m = eval(&json!({"match_all": {}}), &json!({}), &docs);
+        let m = eval(&json!({"match_all": {}}), &json!({}), &docs).unwrap();
         assert_eq!(m.len(), 2);
         assert!(m.values().all(|&s| s == 1.0));
     }
@@ -1107,7 +1131,7 @@ mod tests {
             doc("i", "1", json!({"status":"Active"})),
             doc("i", "2", json!({"status":"active"})),
         ];
-        let m = eval(&json!({"term": {"status": "Active"}}), &mappings, &docs);
+        let m = eval(&json!({"term": {"status": "Active"}}), &mappings, &docs).unwrap();
         assert_eq!(m.len(), 1);
         assert!(m.contains_key(&0));
     }
@@ -1119,7 +1143,7 @@ mod tests {
             doc("i", "1", json!({"body":"the quick fox"})),
             doc("i", "2", json!({"body":"quick quick quick fox fox"})),
         ];
-        let resp = search(&mappings, &docs, &json!({"query":{"match":{"body":"quick"}}}));
+        let resp = search(&mappings, &docs, &json!({"query":{"match":{"body":"quick"}}})).unwrap();
         let hits = resp["hits"]["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["_id"], "2");
@@ -1138,7 +1162,7 @@ mod tests {
             "filter": [{"term": {"tag": "a"}}],
             "must_not": [{"range": {"n": {"gt": 1}}}]
         }});
-        let m = eval(&q, &mappings, &docs);
+        let m = eval(&q, &mappings, &docs).unwrap();
         assert_eq!(m.len(), 1);
         assert!(m.contains_key(&0));
     }
@@ -1146,7 +1170,7 @@ mod tests {
     #[test]
     fn range_query_matches_numeric_bounds() {
         let docs = vec![doc("i", "1", json!({"n":5})), doc("i", "2", json!({"n":15}))];
-        let m = eval(&json!({"range": {"n": {"gte": 10}}}), &json!({}), &docs);
+        let m = eval(&json!({"range": {"n": {"gte": 10}}}), &json!({}), &docs).unwrap();
         assert_eq!(m.len(), 1);
         assert!(m.contains_key(&1));
     }
@@ -1154,7 +1178,7 @@ mod tests {
     #[test]
     fn sort_by_field_overrides_score_order() {
         let docs = vec![doc("i", "1", json!({"n":5})), doc("i", "2", json!({"n":1}))];
-        let resp = search(&json!({}), &docs, &json!({"sort": [{"n": {"order": "asc"}}]}));
+        let resp = search(&json!({}), &docs, &json!({"sort": [{"n": {"order": "asc"}}]})).unwrap();
         let hits = resp["hits"]["hits"].as_array().unwrap();
         assert_eq!(hits[0]["_id"], "2");
         assert_eq!(hits[1]["_id"], "1");
@@ -1163,7 +1187,8 @@ mod tests {
     #[test]
     fn from_and_size_paginate() {
         let docs: Vec<_> = (0..5).map(|i| doc("i", &i.to_string(), json!({"n": i}))).collect();
-        let resp = search(&json!({}), &docs, &json!({"from": 2, "size": 2, "sort": ["n"]}));
+        let resp =
+            search(&json!({}), &docs, &json!({"from": 2, "size": 2, "sort": ["n"]})).unwrap();
         let hits = resp["hits"]["hits"].as_array().unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["_id"], "2");
@@ -1174,7 +1199,7 @@ mod tests {
     #[test]
     fn source_filtering_includes_only_requested_fields() {
         let docs = vec![doc("i", "1", json!({"a":1,"b":2}))];
-        let resp = search(&json!({}), &docs, &json!({"_source": ["a"]}));
+        let resp = search(&json!({}), &docs, &json!({"_source": ["a"]})).unwrap();
         assert_eq!(resp["hits"]["hits"][0]["_source"], json!({"a":1}));
     }
 
@@ -1195,7 +1220,7 @@ mod tests {
             &mappings,
             &docs,
             &json!({"size":0,"aggs":{"by_tag":{"terms":{"field":"tag"},"aggs":{"avg_price":{"avg":{"field":"price"}}}}}}),
-        );
+        ).unwrap();
         assert_eq!(resp["hits"]["hits"].as_array().unwrap().len(), 0);
         let buckets = resp["aggregations"]["by_tag"]["buckets"].as_array().unwrap();
         assert_eq!(buckets[0]["key"], "a");
@@ -1213,7 +1238,7 @@ mod tests {
             &mappings,
             &docs,
             &json!({"aggs":{"price_stats":{"stats":{"field":"price"}},"distinct_tags":{"cardinality":{"field":"tag"}}}}),
-        );
+        ).unwrap();
         assert_eq!(resp["aggregations"]["price_stats"]["count"], 4);
         assert_eq!(resp["aggregations"]["price_stats"]["min"], 10.0);
         assert_eq!(resp["aggregations"]["price_stats"]["max"], 40.0);
@@ -1231,7 +1256,8 @@ mod tests {
                 "by_price":{"range":{"field":"price","ranges":[{"to":25},{"from":25}]}},
                 "no_tag":{"missing":{"field":"tag"}}
             }}),
-        );
+        )
+        .unwrap();
         let buckets = resp["aggregations"]["by_price"]["buckets"].as_array().unwrap();
         assert_eq!(buckets[0]["doc_count"], 2);
         assert_eq!(buckets[1]["doc_count"], 2);
@@ -1257,7 +1283,8 @@ mod tests {
                     "aggs":{"avg_price":{"avg":{"field":"price"}}}
                 }
             }}),
-        );
+        )
+        .unwrap();
         let buckets = resp["aggregations"]["by_price"]["buckets"].as_array().unwrap();
         assert_eq!(buckets[0]["avg_price"]["value"], 15.0);
         assert_eq!(buckets[1]["avg_price"]["value"], 35.0);
@@ -1275,7 +1302,8 @@ mod tests {
                 "tag_a":{"filter":{"term":{"tag":"a"}}},
                 "by_tag":{"filters":{"filters":{"a":{"term":{"tag":"a"}},"b":{"term":{"tag":"b"}}}}}
             }}),
-        );
+        )
+        .unwrap();
         assert_eq!(resp["aggregations"]["tag_a"]["doc_count"], 2);
         assert_eq!(resp["aggregations"]["by_tag"]["buckets"]["a"]["doc_count"], 2);
         assert_eq!(resp["aggregations"]["by_tag"]["buckets"]["b"]["doc_count"], 1);

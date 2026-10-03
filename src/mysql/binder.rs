@@ -6,7 +6,7 @@ use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
     ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, Statement, TableConstraint,
-    TableFactor, TableWithJoins, Value as AstValue,
+    TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::collections::HashMap;
 
@@ -85,6 +85,30 @@ impl Binder {
                 create_table.columns,
                 create_table.constraints,
             ),
+            Statement::CreateDatabase { db_name, if_not_exists, .. } => {
+                let name = db_name
+                    .0
+                    .iter()
+                    .filter_map(|p| match p {
+                        sqlparser::ast::ObjectNamePart::Identifier(id) => Some(id.value.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Ok(Plan::CreateDatabase { name, if_not_exists })
+            }
+            Statement::CreateIndex(ci) => {
+                let (db, table) = self.resolve_table_name(&ci.table_name)?;
+                let columns = ci
+                    .columns
+                    .into_iter()
+                    .filter_map(|c| match c.column.expr {
+                        AstExpr::Identifier(id) => Some(id.value),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(Plan::CreateIndex { db, table, columns, if_not_exists: ci.if_not_exists })
+            }
             Statement::Insert(insert) => self.bind_insert(insert),
             Statement::Update(update) => {
                 self.bind_update(update.table, update.assignments, update.selection)
@@ -601,6 +625,9 @@ impl Binder {
                     BinaryOperator::Divide => {
                         Ok(Expr::Arith { op: ArithOp::Div, left: Box::new(l), right: Box::new(r) })
                     }
+                    BinaryOperator::Modulo => {
+                        Ok(Expr::Arith { op: ArithOp::Mod, left: Box::new(l), right: Box::new(r) })
+                    }
                     _ => Err(MySqlError::unsupported("binary operator")),
                 }
             }
@@ -611,6 +638,94 @@ impl Binder {
                 Ok(Expr::InList { expr: bound_expr, list: bound_list, negated })
             }
             AstExpr::Nested(inner) => self.bind_expr(*inner),
+            AstExpr::UnaryOp { op: UnaryOperator::Not, expr } => {
+                Ok(Expr::Not(Box::new(self.bind_expr(*expr)?)))
+            }
+            AstExpr::UnaryOp { op: UnaryOperator::Minus, expr } => {
+                // No literal negative-number AST node in sqlparser for this
+                // dialect's integer literals -- `-5` arrives as a unary
+                // minus over `5`. Expressed as `0 - expr` rather than a new
+                // `Expr` variant, since every numeric `Expr` already
+                // supports `Arith`.
+                let e = self.bind_expr(*expr)?;
+                Ok(Expr::Arith {
+                    op: ArithOp::Sub,
+                    left: Box::new(Expr::Const(Value::Int(0))),
+                    right: Box::new(e),
+                })
+            }
+            AstExpr::UnaryOp { op: UnaryOperator::Plus, expr } => self.bind_expr(*expr),
+            AstExpr::IsNull(e) => Ok(Expr::IsNull(Box::new(self.bind_expr(*e)?), false)),
+            AstExpr::IsNotNull(e) => Ok(Expr::IsNull(Box::new(self.bind_expr(*e)?), true)),
+            AstExpr::Between { expr, negated, low, high } => {
+                let x = self.bind_expr(*expr)?;
+                let lo = self.bind_expr(*low)?;
+                let hi = self.bind_expr(*high)?;
+                let ge =
+                    Expr::Compare { op: CmpOp::Ge, left: Box::new(x.clone()), right: Box::new(lo) };
+                let le = Expr::Compare { op: CmpOp::Le, left: Box::new(x), right: Box::new(hi) };
+                let both = Expr::And(vec![ge, le]);
+                Ok(if negated { Expr::Not(Box::new(both)) } else { both })
+            }
+            AstExpr::Like { negated, expr, pattern, escape_char, any } => {
+                if any {
+                    return Err(MySqlError::unsupported("LIKE ANY"));
+                }
+                let e = self.bind_expr(*expr)?;
+                let p = self.bind_expr(*pattern)?;
+                let esc = match escape_char {
+                    Some(c) => self.bind_expr(*c)?,
+                    // MySQL's own default when no `ESCAPE` clause is given.
+                    None => Expr::Const(Value::Text("\\".to_string())),
+                };
+                Ok(Expr::Like {
+                    expr: Box::new(e),
+                    pattern: Box::new(p),
+                    escape: Box::new(esc),
+                    negated,
+                })
+            }
+            AstExpr::Substring { expr, substring_from, substring_for, .. } => {
+                // sqlparser parses any `SUBSTRING(...)` call -- both the
+                // comma form this engine's executor expects and the
+                // `FROM ... FOR ...` SQL-standard form -- into this
+                // dedicated AST node, never a plain `AstExpr::Function`.
+                let mut args = vec![self.bind_expr(*expr)?];
+                if let Some(f) = substring_from {
+                    args.push(self.bind_expr(*f)?);
+                }
+                if let Some(l) = substring_for {
+                    args.push(self.bind_expr(*l)?);
+                }
+                Ok(Expr::Call { name: "SUBSTRING".to_string(), args })
+            }
+            AstExpr::Case { operand, conditions, else_result, .. } => {
+                let bound_operand = match operand {
+                    Some(o) => Some(self.bind_expr(*o)?),
+                    None => None,
+                };
+                let mut bound_conditions = Vec::with_capacity(conditions.len());
+                for w in conditions {
+                    let cond = self.bind_expr(w.condition)?;
+                    let result = self.bind_expr(w.result)?;
+                    // A simple `CASE x WHEN v THEN r` compares `x = v`; a
+                    // searched `CASE WHEN cond THEN r` uses `cond` as-is.
+                    let cond = match &bound_operand {
+                        Some(op) => Expr::Compare {
+                            op: CmpOp::Eq,
+                            left: Box::new(op.clone()),
+                            right: Box::new(cond),
+                        },
+                        None => cond,
+                    };
+                    bound_conditions.push((cond, result));
+                }
+                let bound_else = match else_result {
+                    Some(e) => Some(Box::new(self.bind_expr(*e)?)),
+                    None => None,
+                };
+                Ok(Expr::Case { conditions: bound_conditions, else_result: bound_else })
+            }
             _ => Err(MySqlError::unsupported("expr")),
         }
     }
@@ -671,6 +786,16 @@ impl Binder {
                     return Err(MySqlError::unsupported("FOUND_ROWS argument list"));
                 }
                 Ok(Expr::FoundRows)
+            }
+            // A small, fixed scalar-function library (no general catalog)
+            // -- see `Executor::eval_call` for what each one actually
+            // computes. Argument-count validation happens there too, not
+            // here, so it stays next to the logic it's validating.
+            "CONCAT" | "UPPER" | "LOWER" | "LENGTH" | "SUBSTRING" | "SUBSTR" | "COALESCE"
+            | "IFNULL" => {
+                let bound_args =
+                    args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<_, _>>()?;
+                Ok(Expr::Call { name: upper, args: bound_args })
             }
             _ => Err(MySqlError::unsupported(&format!("function {name}"))),
         }

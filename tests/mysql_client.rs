@@ -779,3 +779,126 @@ async fn test_mysql_having() {
     drop(conn);
     pool.disconnect().await.unwrap();
 }
+
+/// Found via extensive real-client testing before a public release: the
+/// MySQL expression binder only handled literals, the 5 aggregate
+/// functions, basic comparisons/AND/OR, +-*/, and IN-list -- LIKE, IS
+/// NULL, BETWEEN, CASE WHEN, unary NOT, modulo, and every scalar function
+/// (including CONCAT) all failed with a generic "unsupported" error. This
+/// covers the fix for each one.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_expression_coverage() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("CREATE TABLE expr_test (id INT, name VARCHAR(50), age INT)").await.unwrap();
+    conn.query_drop(
+        "INSERT INTO expr_test VALUES (1, 'alice', 30), (2, NULL, 25), (3, 'carol', NULL)",
+    )
+    .await
+    .unwrap();
+
+    // LIKE, case-insensitive, matching MySQL's default collation.
+    let names: Vec<String> =
+        conn.query("SELECT name FROM expr_test WHERE name LIKE 'A%'").await.unwrap();
+    assert_eq!(names, vec!["alice".to_string()]);
+
+    // IS NULL / IS NOT NULL.
+    let ids: Vec<i64> = conn.query("SELECT id FROM expr_test WHERE name IS NULL").await.unwrap();
+    assert_eq!(ids, vec![2]);
+    let ids: Vec<i64> = conn.query("SELECT id FROM expr_test WHERE age IS NOT NULL").await.unwrap();
+    assert_eq!(ids, vec![1, 2]);
+
+    // BETWEEN.
+    let ids: Vec<i64> =
+        conn.query("SELECT id FROM expr_test WHERE age BETWEEN 20 AND 28").await.unwrap();
+    assert_eq!(ids, vec![2]);
+
+    // CASE WHEN (searched) and simple CASE (operand form).
+    let labels: Vec<String> = conn
+        .query(
+            "SELECT CASE WHEN age > 28 THEN 'old' WHEN age IS NULL THEN 'unknown' ELSE 'young' END FROM expr_test ORDER BY id",
+        )
+        .await
+        .unwrap();
+    assert_eq!(labels, vec!["old".to_string(), "young".to_string(), "unknown".to_string()]);
+    let labels: Vec<String> = conn
+        .query("SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM expr_test ORDER BY id")
+        .await
+        .unwrap();
+    assert_eq!(labels, vec!["one".to_string(), "two".to_string(), "other".to_string()]);
+
+    // Unary NOT.
+    let ids: Vec<i64> = conn.query("SELECT id FROM expr_test WHERE NOT id = 1").await.unwrap();
+    assert_eq!(ids, vec![2, 3]);
+
+    // Modulo.
+    let rems: Vec<i64> = conn.query("SELECT id % 2 FROM expr_test ORDER BY id").await.unwrap();
+    assert_eq!(rems, vec![1, 0, 1]);
+
+    // Scalar functions.
+    let concatenated: Vec<String> =
+        conn.query("SELECT CONCAT(name, '!') FROM expr_test WHERE id = 1").await.unwrap();
+    assert_eq!(concatenated, vec!["alice!".to_string()]);
+    let upper: Vec<String> =
+        conn.query("SELECT UPPER(name) FROM expr_test WHERE id = 1").await.unwrap();
+    assert_eq!(upper, vec!["ALICE".to_string()]);
+    let lower: Vec<String> =
+        conn.query("SELECT LOWER(name) FROM expr_test WHERE id = 3").await.unwrap();
+    assert_eq!(lower, vec!["carol".to_string()]);
+    let len: Vec<i64> =
+        conn.query("SELECT LENGTH(name) FROM expr_test WHERE id = 1").await.unwrap();
+    assert_eq!(len, vec![5]);
+    let sub: Vec<String> =
+        conn.query("SELECT SUBSTRING(name, 1, 3) FROM expr_test WHERE id = 1").await.unwrap();
+    assert_eq!(sub, vec!["ali".to_string()]);
+    let coalesced: Vec<String> =
+        conn.query("SELECT COALESCE(name, 'default') FROM expr_test WHERE id = 2").await.unwrap();
+    assert_eq!(coalesced, vec!["default".to_string()]);
+    let ifnulled: Vec<i64> =
+        conn.query("SELECT IFNULL(age, -1) FROM expr_test WHERE id = 3").await.unwrap();
+    assert_eq!(ifnulled, vec![-1]);
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
+
+/// `CREATE DATABASE` and standalone `CREATE INDEX` both fell through to
+/// the same generic "unsupported statement" error before this fix --
+/// found via fresh-install testing, significant because almost any real
+/// migration tool issues both before touching anything else.
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn test_mysql_create_database_and_index() {
+    use mysql_async::Pool;
+    use mysql_async::prelude::*;
+
+    let addr = noida::services::start("mysql", "127.0.0.1:0").unwrap().unwrap();
+    let url = format!("mysql://root@127.0.0.1:{}/test", addr.port());
+    let pool = Pool::new(url.as_str());
+    let mut conn = pool.get_conn().await.unwrap();
+
+    conn.query_drop("CREATE DATABASE newdb").await.unwrap();
+    conn.query_drop("CREATE DATABASE IF NOT EXISTS newdb").await.unwrap(); // no error on repeat
+    conn.query_drop("CREATE TABLE newdb.t (id INT)").await.unwrap();
+
+    conn.query_drop("CREATE TABLE idx_test (id INT, name VARCHAR(50))").await.unwrap();
+    conn.query_drop("CREATE INDEX idx_name ON idx_test (name)").await.unwrap();
+
+    // A real duplicate-database error when IF NOT EXISTS isn't given.
+    let err = conn.query_drop("CREATE DATABASE newdb").await;
+    assert!(err.is_err());
+
+    // A real error for an index on a nonexistent column.
+    let err = conn.query_drop("CREATE INDEX bad ON idx_test (nope)").await;
+    assert!(err.is_err());
+
+    drop(conn);
+    pool.disconnect().await.unwrap();
+}
