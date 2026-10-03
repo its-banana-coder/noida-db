@@ -506,17 +506,41 @@ impl Binder {
 
         for join in &twj.joins {
             let right = self.bind_table_factor(&join.relation)?;
-            let op = match &join.join_operator {
-                JoinOperator::Inner(constraint) => {
-                    JoinOp::Inner(self.bind_join_constraint(constraint)?)
+            // Found via testing before a public release: a bare `JOIN`
+            // (no `INNER`/`LEFT`/... keyword -- sqlparser's own generic
+            // `JoinOperator::Join`, not `::Inner`) wasn't matched at all,
+            // nor was a bare `LEFT JOIN` without the optional `OUTER`
+            // keyword (`::Left`, a variant distinct from `::LeftOuter`) --
+            // both are at least as common as the forms that were already
+            // handled, if not more so.
+            let (op, swap_sides) = match &join.join_operator {
+                JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+                    (JoinOp::Inner(self.bind_join_constraint(constraint)?), false)
                 }
-                JoinOperator::LeftOuter(constraint) => {
-                    JoinOp::Left(self.bind_join_constraint(constraint)?)
+                JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
+                    (JoinOp::Left(self.bind_join_constraint(constraint)?), false)
                 }
-                JoinOperator::CrossJoin(_) => JoinOp::Cross,
+                // `A RIGHT JOIN B ON cond` has no direct equivalent in
+                // this engine's `JoinOp` (`Inner`/`Left`/`Cross` only) --
+                // expressed instead as `B LEFT JOIN A ON cond`, same
+                // condition, sides swapped. Values stay correct either
+                // way since every column reference resolves by name, not
+                // position; the one real difference is `SELECT *`'s
+                // column order, which comes out as the right table's
+                // columns before the left's rather than matching real
+                // MySQL's left-then-right order -- a cosmetic gap, not a
+                // correctness one.
+                JoinOperator::Right(constraint) | JoinOperator::RightOuter(constraint) => {
+                    (JoinOp::Left(self.bind_join_constraint(constraint)?), true)
+                }
+                JoinOperator::CrossJoin(_) => (JoinOp::Cross, false),
                 _ => return Err(MySqlError::unsupported("join operator")),
             };
-            plan = Plan::Join { left: Box::new(plan), right: Box::new(right), op };
+            plan = if swap_sides {
+                Plan::Join { left: Box::new(right), right: Box::new(plan), op }
+            } else {
+                Plan::Join { left: Box::new(plan), right: Box::new(right), op }
+            };
         }
 
         Ok(plan)
@@ -574,20 +598,32 @@ impl Binder {
                 }
             }
             // A qualified column reference (`table.col`, or even
-            // `db.table.col`) -- this engine resolves a plain `Expr::ColName`
-            // by name against whichever single table is in scope for the
-            // row being evaluated (see `Executor::eval_expr`'s `ColName`
-            // arm), so the table/db qualifier itself is dropped and only
-            // the final part (the actual column name) is kept. That's
-            // exactly right for the single-table queries this engine
-            // supports today; it would be ambiguous for a real join between
-            // two tables sharing a column name, but joins aren't bound
-            // through this path.
+            // `db.table.col`). Found via testing before a public release:
+            // this used to drop every qualifier and keep only the final
+            // part, on the claim that "joins aren't bound through this
+            // path" -- false, a join's own ON condition (and any SELECT
+            // list/WHERE referencing both sides) binds through exactly
+            // this arm. Dropping the qualifier meant `cust.id` and
+            // `orders.id` (any two joined tables sharing a column name --
+            // extremely common, e.g. every table having its own `id`)
+            // silently resolved to the *same* physical column, whichever
+            // table's happened to come first, regardless of which one was
+            // actually named: joining on `cust.id = orders.customer_id`
+            // and then selecting `orders.id` would silently return
+            // `cust.id`'s value instead. Now the full dotted path is kept,
+            // and `Executor::eval_expr`'s `ColName` lookup (see its own
+            // comment) tries an exact qualified match first before
+            // falling back to a bare-name match -- so a qualified
+            // reference against a join's merged, qualified column list
+            // resolves to the real table it names, and a plain unqualified
+            // reference still works exactly as before for the ordinary
+            // single-table case.
             AstExpr::CompoundIdentifier(idents) => {
-                let last = idents
-                    .last()
-                    .ok_or_else(|| MySqlError::unsupported("empty compound identifier"))?;
-                Ok(Expr::ColName(last.value.clone()))
+                if idents.is_empty() {
+                    return Err(MySqlError::unsupported("empty compound identifier"));
+                }
+                let dotted = idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
+                Ok(Expr::ColName(dotted))
             }
             AstExpr::BinaryOp { left, op, right } => {
                 let l = self.bind_expr(*left)?;
