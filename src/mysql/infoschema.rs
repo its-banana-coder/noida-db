@@ -47,6 +47,8 @@ fn user_tables(state: &DbState) -> impl Iterator<Item = (&String, &Arc<Table>)> 
 }
 
 fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
+    // Column lists are MySQL 8's own, in its order: introspection code
+    // (JDBC's DatabaseMetaData, Hibernate, Prisma) selects columns by name.
     Some(match name {
         "SCHEMATA" => table_of(
             name,
@@ -55,11 +57,22 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 "SCHEMA_NAME",
                 "DEFAULT_CHARACTER_SET_NAME",
                 "DEFAULT_COLLATION_NAME",
+                "SQL_PATH",
+                "DEFAULT_ENCRYPTION",
             ],
             state
                 .schemas
                 .keys()
-                .map(|s| vec![text("def"), text(s), text("utf8mb4"), text("utf8mb4_0900_ai_ci")])
+                .map(|s| {
+                    vec![
+                        text("def"),
+                        text(s),
+                        text("utf8mb4"),
+                        text("utf8mb4_0900_ai_ci"),
+                        Value::Null,
+                        text("NO"),
+                    ]
+                })
                 .collect(),
         ),
         "TABLES" => table_of(
@@ -75,11 +88,16 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 "TABLE_ROWS",
                 "AVG_ROW_LENGTH",
                 "DATA_LENGTH",
+                "MAX_DATA_LENGTH",
                 "INDEX_LENGTH",
+                "DATA_FREE",
                 "AUTO_INCREMENT",
                 "CREATE_TIME",
                 "UPDATE_TIME",
+                "CHECK_TIME",
                 "TABLE_COLLATION",
+                "CHECKSUM",
+                "CREATE_OPTIONS",
                 "TABLE_COMMENT",
             ],
             user_tables(state)
@@ -97,10 +115,15 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         Value::Int(0),
                         Value::Int(0),
                         Value::Int(0),
+                        Value::Int(0),
+                        Value::Int(0),
                         if has_ai { Value::Int(t.next_auto_increment) } else { Value::Null },
                         Value::Null,
                         Value::Null,
+                        Value::Null,
                         text("utf8mb4_0900_ai_ci"),
+                        Value::Null,
+                        text(""),
                         text(""),
                     ]
                 })
@@ -116,6 +139,13 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                     let (char_len, num_prec, num_scale) = match &c.ty {
                         ColumnType::Varchar(n) => (Value::Int(*n as i64), Value::Null, Value::Null),
                         ColumnType::Text => (Value::Int(65535), Value::Null, Value::Null),
+                        ColumnType::Enum(m) => (
+                            Value::Int(
+                                m.iter().map(|v| v.chars().count()).max().unwrap_or(0) as i64
+                            ),
+                            Value::Null,
+                            Value::Null,
+                        ),
                         ColumnType::Int => (Value::Null, Value::Int(10), Value::Int(0)),
                         ColumnType::BigInt => (Value::Null, Value::Int(19), Value::Int(0)),
                         ColumnType::Boolean => (Value::Null, Value::Int(3), Value::Int(0)),
@@ -125,6 +155,10 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         ColumnType::Double => (Value::Null, Value::Int(22), Value::Null),
                         ColumnType::Float => (Value::Null, Value::Int(12), Value::Null),
                         _ => (Value::Null, Value::Null, Value::Null),
+                    };
+                    let octets = match &char_len {
+                        Value::Int(n) => Value::Int(n * 4),
+                        _ => Value::Null,
                     };
                     let is_text = matches!(
                         c.ty,
@@ -164,6 +198,7 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         text(if c.not_null { "NO" } else { "YES" }),
                         text(&data_type),
                         char_len,
+                        octets,
                         num_prec,
                         num_scale,
                         if matches!(c.ty, ColumnType::Datetime) {
@@ -176,8 +211,10 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         text(&full),
                         text(key),
                         text(extra),
+                        text("select,insert,update,references"),
                         text(""),
                         text(""),
+                        Value::Null,
                     ]);
                 }
             }
@@ -193,6 +230,7 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                     "IS_NULLABLE",
                     "DATA_TYPE",
                     "CHARACTER_MAXIMUM_LENGTH",
+                    "CHARACTER_OCTET_LENGTH",
                     "NUMERIC_PRECISION",
                     "NUMERIC_SCALE",
                     "DATETIME_PRECISION",
@@ -201,84 +239,201 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                     "COLUMN_TYPE",
                     "COLUMN_KEY",
                     "EXTRA",
+                    "PRIVILEGES",
                     "COLUMN_COMMENT",
                     "GENERATION_EXPRESSION",
+                    "SRS_ID",
                 ],
                 rows,
             )
         }
-        // One row per (key, column), PRIMARY and UNIQUE keys only -- plain
+        // One row per (key, column) of each PRIMARY/UNIQUE key; plain
         // `KEY`/`INDEX` declarations aren't tracked.
-        "STATISTICS" | "KEY_COLUMN_USAGE" => {
+        "STATISTICS" => {
             let mut rows = Vec::new();
             for (db, t) in user_tables(state) {
                 for (key, cols) in t.keys() {
                     for (seq, &c) in cols.iter().enumerate() {
-                        let col = &t.columns[c].name;
-                        rows.push(if name == "STATISTICS" {
-                            vec![
-                                text("def"),
-                                text(db),
-                                text(&t.name),
-                                Value::Int(0),
-                                text(&key),
-                                Value::Int(seq as i64 + 1),
-                                text(col),
-                                text("BTREE"),
-                            ]
-                        } else {
-                            vec![
-                                text("def"),
-                                text(db),
-                                text(&key),
-                                text("def"),
-                                text(db),
-                                text(&t.name),
-                                text(col),
-                                Value::Int(seq as i64 + 1),
-                                Value::Null,
-                                Value::Null,
-                                Value::Null,
-                            ]
-                        });
+                        let col = &t.columns[c];
+                        rows.push(vec![
+                            text("def"),
+                            text(db),
+                            text(&t.name),
+                            Value::Int(0),
+                            text(db),
+                            text(&key),
+                            Value::Int(seq as i64 + 1),
+                            text(&col.name),
+                            text("A"),
+                            Value::Int(t.rows.len() as i64),
+                            Value::Null,
+                            Value::Null,
+                            text(if col.not_null { "" } else { "YES" }),
+                            text("BTREE"),
+                            text(""),
+                            text(""),
+                            text("YES"),
+                            Value::Null,
+                        ]);
                     }
                 }
             }
-            if name == "STATISTICS" {
-                table_of(
-                    name,
-                    &[
-                        "TABLE_CATALOG",
-                        "TABLE_SCHEMA",
-                        "TABLE_NAME",
-                        "NON_UNIQUE",
-                        "INDEX_NAME",
-                        "SEQ_IN_INDEX",
-                        "COLUMN_NAME",
-                        "INDEX_TYPE",
-                    ],
-                    rows,
-                )
-            } else {
-                table_of(
-                    name,
-                    &[
-                        "CONSTRAINT_CATALOG",
-                        "CONSTRAINT_SCHEMA",
-                        "CONSTRAINT_NAME",
-                        "TABLE_CATALOG",
-                        "TABLE_SCHEMA",
-                        "TABLE_NAME",
-                        "COLUMN_NAME",
-                        "ORDINAL_POSITION",
-                        "REFERENCED_TABLE_SCHEMA",
-                        "REFERENCED_TABLE_NAME",
-                        "REFERENCED_COLUMN_NAME",
-                    ],
-                    rows,
-                )
-            }
+            table_of(
+                name,
+                &[
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "NON_UNIQUE",
+                    "INDEX_SCHEMA",
+                    "INDEX_NAME",
+                    "SEQ_IN_INDEX",
+                    "COLUMN_NAME",
+                    "COLLATION",
+                    "CARDINALITY",
+                    "SUB_PART",
+                    "PACKED",
+                    "NULLABLE",
+                    "INDEX_TYPE",
+                    "COMMENT",
+                    "INDEX_COMMENT",
+                    "IS_VISIBLE",
+                    "EXPRESSION",
+                ],
+                rows,
+            )
         }
+        "KEY_COLUMN_USAGE" => {
+            let mut rows = Vec::new();
+            for (db, t) in user_tables(state) {
+                for (key, cols) in t.keys() {
+                    for (seq, &c) in cols.iter().enumerate() {
+                        rows.push(vec![
+                            text("def"),
+                            text(db),
+                            text(&key),
+                            text("def"),
+                            text(db),
+                            text(&t.name),
+                            text(&t.columns[c].name),
+                            Value::Int(seq as i64 + 1),
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                            Value::Null,
+                        ]);
+                    }
+                }
+            }
+            table_of(
+                name,
+                &[
+                    "CONSTRAINT_CATALOG",
+                    "CONSTRAINT_SCHEMA",
+                    "CONSTRAINT_NAME",
+                    "TABLE_CATALOG",
+                    "TABLE_SCHEMA",
+                    "TABLE_NAME",
+                    "COLUMN_NAME",
+                    "ORDINAL_POSITION",
+                    "POSITION_IN_UNIQUE_CONSTRAINT",
+                    "REFERENCED_TABLE_SCHEMA",
+                    "REFERENCED_TABLE_NAME",
+                    "REFERENCED_COLUMN_NAME",
+                ],
+                rows,
+            )
+        }
+        "TABLE_CONSTRAINTS" => table_of(
+            name,
+            &[
+                "CONSTRAINT_CATALOG",
+                "CONSTRAINT_SCHEMA",
+                "CONSTRAINT_NAME",
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "CONSTRAINT_TYPE",
+                "ENFORCED",
+            ],
+            user_tables(state)
+                .flat_map(|(db, t)| {
+                    t.keys().into_iter().map(move |(key, _)| {
+                        let ty = if key == "PRIMARY" { "PRIMARY KEY" } else { "UNIQUE" };
+                        vec![
+                            text("def"),
+                            text(db),
+                            text(&key),
+                            text(db),
+                            text(&t.name),
+                            text(ty),
+                            text("YES"),
+                        ]
+                    })
+                })
+                .collect(),
+        ),
+        // Foreign keys, views, routines and triggers don't exist here.
+        "REFERENTIAL_CONSTRAINTS" => table_of(
+            name,
+            &[
+                "CONSTRAINT_CATALOG",
+                "CONSTRAINT_SCHEMA",
+                "CONSTRAINT_NAME",
+                "UNIQUE_CONSTRAINT_CATALOG",
+                "UNIQUE_CONSTRAINT_SCHEMA",
+                "UNIQUE_CONSTRAINT_NAME",
+                "MATCH_OPTION",
+                "UPDATE_RULE",
+                "DELETE_RULE",
+                "TABLE_NAME",
+                "REFERENCED_TABLE_NAME",
+            ],
+            vec![],
+        ),
+        "VIEWS" => table_of(
+            name,
+            &[
+                "TABLE_CATALOG",
+                "TABLE_SCHEMA",
+                "TABLE_NAME",
+                "VIEW_DEFINITION",
+                "CHECK_OPTION",
+                "IS_UPDATABLE",
+                "DEFINER",
+                "SECURITY_TYPE",
+                "CHARACTER_SET_CLIENT",
+                "COLLATION_CONNECTION",
+            ],
+            vec![],
+        ),
+        "ROUTINES" => table_of(
+            name,
+            &[
+                "SPECIFIC_NAME",
+                "ROUTINE_CATALOG",
+                "ROUTINE_SCHEMA",
+                "ROUTINE_NAME",
+                "ROUTINE_TYPE",
+                "DATA_TYPE",
+                "ROUTINE_DEFINITION",
+                "DEFINER",
+            ],
+            vec![],
+        ),
+        "TRIGGERS" => table_of(
+            name,
+            &[
+                "TRIGGER_CATALOG",
+                "TRIGGER_SCHEMA",
+                "TRIGGER_NAME",
+                "EVENT_MANIPULATION",
+                "EVENT_OBJECT_SCHEMA",
+                "EVENT_OBJECT_TABLE",
+                "ACTION_STATEMENT",
+                "ACTION_TIMING",
+            ],
+            vec![],
+        ),
         _ => return None,
     })
 }

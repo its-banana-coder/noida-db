@@ -1762,8 +1762,10 @@ pub(crate) fn render_text(v: &Value) -> String {
         Value::Float(f) => format_double(*f),
         Value::Num(n) => n.to_string(),
         Value::Date(d) => crate::sql::datetime::format_date(*d),
-        Value::Ts(t) => crate::sql::datetime::format_timestamp(*t),
-        Value::Time(t) => crate::sql::datetime::format_time(*t),
+        // MySQL prints fractional seconds as all six digits (`.000600`),
+        // never trimmed the way Postgres does (`.0006`).
+        Value::Ts(t) => mysql_fraction(crate::sql::datetime::format_timestamp(*t), *t),
+        Value::Time(t) => mysql_fraction(crate::sql::datetime::format_time(*t), *t),
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Json(j) => j.to_jsonb_string(),
     }
@@ -2251,4 +2253,17 @@ fn alter_table(
         AlterOp::Noop => {}
     }
     Ok(())
+}
+
+/// Pads a trimmed fractional-seconds part back out to six digits.
+fn mysql_fraction(text: String, micros: i64) -> String {
+    if micros.rem_euclid(1_000_000) == 0 {
+        return text;
+    }
+    match text.rsplit_once('.') {
+        Some((head, frac)) if frac.len() < 6 && frac.chars().all(|c| c.is_ascii_digit()) => {
+            format!("{head}.{frac:0<6}")
+        }
+        _ => text,
+    }
 }

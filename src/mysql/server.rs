@@ -821,10 +821,8 @@ fn decode_execute_params(
 
 /// Decodes one value from the MySQL binary protocol's per-parameter
 /// encoding, given its `COM_STMT_EXECUTE` type code. Returns the value and
-/// how many bytes it consumed. Covers the numeric and text/blob types real
-/// client libraries actually send for typical bound parameters; date/time
-/// types use a different (non length-encoded-string) binary layout this
-/// engine doesn't decode yet.
+/// how many bytes it consumed: integers, floats, strings/blobs/decimals,
+/// and the binary DATE/DATETIME/TIMESTAMP/TIME layouts.
 fn decode_binary_value(ty: u8, buf: &[u8]) -> Result<(Value, usize), MySqlError> {
     let need = |n: usize| -> Result<(), MySqlError> {
         if buf.len() < n {
@@ -871,6 +869,63 @@ fn decode_binary_value(ty: u8, buf: &[u8]) -> Result<(Value, usize), MySqlError>
             Ok((Value::Text(s), n))
         }
         0x06 => Ok((Value::Null, 0)), // MYSQL_TYPE_NULL (value should already be in the null-bitmap)
+        0x0d => {
+            need(2)?;
+            Ok((Value::Int(u16::from_le_bytes([buf[0], buf[1]]) as i64), 2)) // YEAR
+        }
+        0xf5 | 0x10 => {
+            let (s, n) = read_lenenc_string(buf)?; // JSON, BIT
+            Ok((Value::Text(s), n))
+        }
+        // DATE / DATETIME / TIMESTAMP: a length byte (0, 4, 7 or 11), then
+        // year (u16), month, day, [hour, minute, second], [microseconds
+        // (u32)]. Found via testing before a public release: JDBC, Go and
+        // mysql2 send every date value this way and it used to be refused.
+        0x0a | 0x0c | 0x07 => {
+            need(1)?;
+            let len = buf[0] as usize;
+            need(1 + len)?;
+            let b = &buf[1..1 + len];
+            if len == 0 {
+                return Ok((Value::Text("0000-00-00 00:00:00".into()), 1));
+            }
+            let (y, mo, d) = (u16::from_le_bytes([b[0], b[1]]) as i64, b[2] as u32, b[3] as u32);
+            let (h, mi, sec) =
+                if len >= 7 { (b[4] as i64, b[5] as i64, b[6] as i64) } else { (0, 0, 0) };
+            let us =
+                if len >= 11 { u32::from_le_bytes([b[7], b[8], b[9], b[10]]) as i64 } else { 0 };
+            if mo == 0 || d == 0 {
+                return Ok((Value::Text(format!("{y:04}-{mo:02}-{d:02}")), 1 + len));
+            }
+            let days = crate::sql::datetime::date_from_ymd(y, mo, d);
+            let v = if ty == 0x0a {
+                Value::Date(days)
+            } else {
+                Value::Ts(
+                    days as i64 * crate::sql::datetime::USECS_PER_DAY
+                        + ((h * 60 + mi) * 60 + sec) * crate::sql::datetime::USECS_PER_SEC
+                        + us,
+                )
+            };
+            Ok((v, 1 + len))
+        }
+        // TIME: a length byte (0, 8 or 12), then negative flag, days (u32),
+        // hour, minute, second, [microseconds (u32)].
+        0x0b => {
+            need(1)?;
+            let len = buf[0] as usize;
+            need(1 + len)?;
+            let b = &buf[1..1 + len];
+            if len == 0 {
+                return Ok((Value::Time(0), 1));
+            }
+            let days = u32::from_le_bytes([b[1], b[2], b[3], b[4]]) as i64;
+            let secs = ((days * 24 + b[5] as i64) * 60 + b[6] as i64) * 60 + b[7] as i64;
+            let us =
+                if len >= 12 { u32::from_le_bytes([b[8], b[9], b[10], b[11]]) as i64 } else { 0 };
+            let total = secs * crate::sql::datetime::USECS_PER_SEC + us;
+            Ok((Value::Time(if b[0] == 1 { -total } else { total }), 1 + len))
+        }
         _ => Err(MySqlError::unsupported("bound parameter type")),
     }
 }

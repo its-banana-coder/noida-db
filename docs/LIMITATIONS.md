@@ -507,11 +507,12 @@ parameter values are decoded from the wire per the MySQL binary protocol
 and substituted for the `?` placeholders the statement was prepared
 with, so re-executing the same prepared plan with different bound values
 actually runs against those values. Supported bound-parameter wire types:
-`TINY`/`SHORT`/`LONG`/`INT24`/`LONGLONG` (integers), `FLOAT`/`DOUBLE`,
-and `DECIMAL`/`VARCHAR`/`VAR_STRING`/`STRING`/`BLOB` (as text) — bound
-`DATE`/`DATETIME`/`TIME` parameters are not decoded yet (their binary
-layout isn't length-encoded text) and are rejected with a real error
-rather than silently misread.
+`TINY`/`SHORT`/`LONG`/`INT24`/`LONGLONG`/`YEAR` (integers),
+`FLOAT`/`DOUBLE`, `DECIMAL`/`VARCHAR`/`VAR_STRING`/`STRING`/`BLOB`/`JSON`/
+`BIT` (as text), and `DATE`/`DATETIME`/`TIMESTAMP`/`TIME` in their binary
+layouts. Verified with mysql_async, Node's mysql2, Go's database/sql and
+JDBC Connector/J (`useServerPrepStmts=true`). Placeholders are numbered by
+their position in the SQL text, and `LIMIT ?`/`OFFSET ?` work.
 
 `GROUP BY` and the five aggregate functions `COUNT`/`COUNT(*)`/`SUM`/
 `AVG`/`MIN`/`MAX` work, including with no `GROUP BY` clause at all (the
@@ -631,8 +632,6 @@ DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
 migration tools query.
 
 **Not yet**
-- Bound `DATE`/`DATETIME`/`TIME` prepared-statement parameters (see
-  above).
 - Subqueries (`IN (SELECT ...)`, `EXISTS`, scalar subqueries, derived
   tables), CTEs (`WITH`), `UNION`, window functions, and `REGEXP`.
 - Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).

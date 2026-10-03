@@ -440,6 +440,15 @@ async fn prepared_statement_parameters_and_binary_types() {
     assert_eq!(row.as_ref(2), Some(&V::Date(2024, 3, 5, 14, 7, 9, 0)));
     assert_eq!(row.as_ref(3), Some(&V::Bytes(b"9.99".to_vec())));
 
+    // A DATETIME *parameter* in its binary layout (JDBC, Go, mysql2).
+    c.exec_drop(
+        "INSERT INTO p (id, name, at) VALUES (?, ?, ?)",
+        (9, "date", V::Date(2025, 1, 2, 3, 4, 5, 600)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(one(&mut c, "SELECT at FROM p WHERE id = 9").await, s("2025-01-02 03:04:05.000600"));
+
     drop(c);
     pool.disconnect().await.unwrap();
 }
