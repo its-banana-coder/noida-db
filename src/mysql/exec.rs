@@ -2864,8 +2864,10 @@ fn compute_agg(func: AggFunc, vals: &[Value]) -> Value {
                         }
                     }
                 }
+                // SUM of integers is a DECIMAL in MySQL (drivers return
+                // Decimal('120'), not 120).
                 if !overflow {
-                    return Value::Int(acc);
+                    return Value::Num(Numeric::from_i64(acc));
                 }
             }
             let mut sum = Numeric::zero();
