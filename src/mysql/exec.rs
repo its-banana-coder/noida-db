@@ -40,6 +40,13 @@ pub struct Executor {
     /// generated id, which -- unlike `last_insert_id` (this statement's
     /// own) -- persists across later statements. Seeded by the caller.
     pub session_insert_id: u64,
+    /// The session's `sql_mode` (how strictly writes are checked).
+    pub sql_mode: crate::mysql::sqlmode::SqlMode,
+    /// The session's `autocommit`, for `@@autocommit`.
+    pub autocommit: bool,
+    /// Set while evaluating the values an INSERT/UPDATE writes, where
+    /// division by zero is an error in strict mode (not just NULL).
+    writing: std::cell::Cell<bool>,
 }
 
 impl Executor {
@@ -53,6 +60,9 @@ impl Executor {
             last_found_rows: 0,
             insert_row: None,
             session_insert_id: 0,
+            sql_mode: Default::default(),
+            autocommit: true,
+            writing: std::cell::Cell::new(false),
         }
     }
 
@@ -271,6 +281,27 @@ impl Executor {
                 t_mut.next_auto_increment = 1;
                 Ok(vec![])
             }
+            Plan::DropDatabase { name, if_exists } => {
+                let mut state = self.db.lock().unwrap();
+                if name.eq_ignore_ascii_case("information_schema") {
+                    return Err(MySqlError::new(
+                        1044,
+                        "42000",
+                        "Access denied for user 'root'@'localhost' to database 'information_schema'",
+                    ));
+                }
+                if state.schemas.remove(&name).is_none() && !if_exists {
+                    return Err(MySqlError::new(
+                        1008,
+                        "HY000",
+                        format!("Can't drop database '{name}'; database doesn't exist"),
+                    ));
+                }
+                if self.current_db.as_deref() == Some(name.as_str()) {
+                    self.current_db = None;
+                }
+                Ok(vec![])
+            }
             Plan::CreateDatabase { name, if_not_exists } => {
                 let mut state = self.db.lock().unwrap();
                 if state.schemas.contains_key(&name) {
@@ -311,7 +342,7 @@ impl Executor {
                 let mut t = self.load_table(&db, &table)?;
                 let mut rename_to = None;
                 for op in ops {
-                    alter_table(&mut t, op, &mut rename_to)?;
+                    alter_table(&mut t, op, &mut rename_to, &self.sql_mode)?;
                 }
                 let mut state = self.db.lock().unwrap();
                 let schema = state.schemas.get_mut(&db).ok_or_else(|| {
@@ -333,130 +364,164 @@ impl Executor {
             }
             Plan::Insert { db, table, columns, rows, mode } => {
                 let mut work = self.load_table(&db, &table)?;
-                let keys = work.keys();
-                let mut affected = 0u64;
-                let mut first_generated_id: Option<i64> = None;
+                let counter_before = work.next_auto_increment;
+                let result = (|| -> Result<Vec<Vec<Value>>, MySqlError> {
+                    let keys = work.keys();
+                    let mut affected = 0u64;
+                    let mut first_generated_id: Option<i64> = None;
 
-                let mut col_indices = Vec::new();
-                if columns.is_empty() {
-                    col_indices.extend(0..work.columns.len());
-                } else {
-                    for col_name in &columns {
-                        let idx = resolve_column_index(&work.columns, col_name)
-                            .ok_or_else(|| MySqlError::unknown_column(col_name))?;
-                        col_indices.push(idx);
-                    }
-                }
-
-                for (row_no, row_exprs) in rows.iter().enumerate() {
-                    if row_exprs.len() != col_indices.len() {
-                        return Err(MySqlError::new(
-                            1136,
-                            "21S01",
-                            format!("Column count doesn't match value count at row {}", row_no + 1),
-                        ));
-                    }
-                    let mut new_row = vec![Value::Null; work.columns.len()];
-                    let mut provided = vec![false; work.columns.len()];
-                    for (i, expr) in row_exprs.iter().enumerate() {
-                        new_row[col_indices[i]] = self.eval_expr(expr, &[], None)?;
-                        provided[col_indices[i]] = true;
-                    }
-
-                    let now = now_ts();
-                    for (i, col) in work.columns.iter().enumerate() {
-                        // MySQL generates an id for NULL *and* for 0 in an
-                        // AUTO_INCREMENT column (default sql_mode).
-                        if col.auto_increment
-                            && (new_row[i].is_null() || new_row[i] == Value::Int(0))
-                        {
-                            new_row[i] = Value::Int(work.next_auto_increment);
-                            first_generated_id.get_or_insert(work.next_auto_increment);
-                            work.next_auto_increment += 1;
-                        } else if provided[i] {
-                            // Found via testing before a public release: an
-                            // explicit NULL used to be replaced by the
-                            // column's DEFAULT. MySQL only uses the default
-                            // for an omitted column; an explicit NULL stays
-                            // NULL, or is an error in a NOT NULL column.
-                            if new_row[i].is_null() && col.not_null {
-                                return Err(column_cannot_be_null(&col.name));
-                            }
-                        } else if new_row[i].is_null() {
-                            if col.default_now {
-                                new_row[i] = Value::Ts(now);
-                            } else if let Some(def) = &col.default {
-                                new_row[i] = def.clone();
-                            } else if col.not_null {
-                                return Err(MySqlError::new(
-                                    1364,
-                                    "HY000",
-                                    format!("Field '{}' doesn't have a default value", col.name),
-                                ));
-                            }
+                    let mut col_indices = Vec::new();
+                    if columns.is_empty() {
+                        col_indices.extend(0..work.columns.len());
+                    } else {
+                        for col_name in &columns {
+                            let idx = resolve_column_index(&work.columns, col_name)
+                                .ok_or_else(|| MySqlError::unknown_column(col_name))?;
+                            col_indices.push(idx);
                         }
                     }
 
-                    // Store every value as its column's declared type (see
-                    // `coerce_to_column`), the way real MySQL converts on
-                    // write -- not as whatever shape the literal happened to
-                    // arrive in.
-                    for (i, col) in work.columns.iter().enumerate() {
-                        let v = std::mem::replace(&mut new_row[i], Value::Null);
-                        new_row[i] = coerce_to_column(v, &col.ty, &col.name)?;
-                        if col.auto_increment
-                            && let Value::Int(n) = new_row[i]
-                            && n >= work.next_auto_increment
-                        {
-                            // An explicit id moves the counter past it, so the
-                            // next generated id can't collide with it.
-                            work.next_auto_increment = n + 1;
+                    for (row_no, row_exprs) in rows.iter().enumerate() {
+                        if row_exprs.len() != col_indices.len() {
+                            return Err(MySqlError::new(
+                                1136,
+                                "21S01",
+                                format!(
+                                    "Column count doesn't match value count at row {}",
+                                    row_no + 1
+                                ),
+                            ));
                         }
-                    }
+                        let mut new_row = vec![Value::Null; work.columns.len()];
+                        let mut provided = vec![false; work.columns.len()];
+                        for (i, expr) in row_exprs.iter().enumerate() {
+                            self.writing.set(true);
+                            let v = self.eval_expr(expr, &[], None);
+                            self.writing.set(false);
+                            new_row[col_indices[i]] = v?;
+                            provided[col_indices[i]] = true;
+                        }
 
-                    let conflict = find_key_conflict(&work, &keys, &new_row, None);
-                    match (&mode, conflict) {
-                        (_, None) => {
-                            work.rows.push(new_row);
-                            affected += 1;
-                        }
-                        (InsertMode::Error, Some((_, k))) => {
-                            return Err(duplicate_key_error(&work, &keys[k], &new_row));
-                        }
-                        (InsertMode::Ignore, Some(_)) => {}
-                        (InsertMode::Replace, Some(_)) => {
-                            while let Some((i, _)) = find_key_conflict(&work, &keys, &new_row, None)
+                        let now = now_ts();
+                        for (i, col) in work.columns.iter().enumerate() {
+                            // MySQL generates an id for NULL *and* for 0 in an
+                            // AUTO_INCREMENT column (default sql_mode).
+                            if col.auto_increment
+                                && (new_row[i].is_null() || new_row[i] == Value::Int(0))
                             {
-                                work.rows.remove(i);
+                                new_row[i] = Value::Int(work.next_auto_increment);
+                                first_generated_id.get_or_insert(work.next_auto_increment);
+                                work.next_auto_increment += 1;
+                            } else if provided[i] {
+                                // Found via testing before a public release: an
+                                // explicit NULL used to be replaced by the
+                                // column's DEFAULT. MySQL only uses the default
+                                // for an omitted column; an explicit NULL stays
+                                // NULL, or is an error in a NOT NULL column.
+                                if new_row[i].is_null() && col.not_null {
+                                    return Err(column_cannot_be_null(&col.name));
+                                }
+                            } else if new_row[i].is_null() {
+                                if col.default_now {
+                                    new_row[i] = Value::Ts(now);
+                                } else if let Some(def) = &col.default {
+                                    new_row[i] = def.clone();
+                                } else if col.not_null {
+                                    // Strict mode: an error. Otherwise MySQL
+                                    // uses the type's implicit default (0, '',
+                                    // the zero date).
+                                    if self.sql_mode.strict() {
+                                        return Err(MySqlError::new(
+                                            1364,
+                                            "HY000",
+                                            format!(
+                                                "Field '{}' doesn't have a default value",
+                                                col.name
+                                            ),
+                                        ));
+                                    }
+                                    new_row[i] = added_column_value(col);
+                                }
+                            }
+                        }
+
+                        // Store every value as its column's declared type (see
+                        // `coerce_to_column`), the way real MySQL converts on
+                        // write -- not as whatever shape the literal happened to
+                        // arrive in.
+                        for (i, col) in work.columns.iter().enumerate() {
+                            let v = std::mem::replace(&mut new_row[i], Value::Null);
+                            new_row[i] = coerce_to_column(v, col, &self.sql_mode)?;
+                            if col.auto_increment
+                                && let Value::Int(n) = new_row[i]
+                                && n >= work.next_auto_increment
+                            {
+                                // An explicit id moves the counter past it, so the
+                                // next generated id can't collide with it.
+                                work.next_auto_increment = n + 1;
+                            }
+                        }
+
+                        let conflict = find_key_conflict(&work, &keys, &new_row, None);
+                        match (&mode, conflict) {
+                            (_, None) => {
+                                work.rows.push(new_row);
                                 affected += 1;
                             }
-                            work.rows.push(new_row);
-                            affected += 1;
-                        }
-                        (InsertMode::Upsert(assignments), Some((i, _))) => {
-                            let before = work.rows[i].clone();
-                            self.insert_row = Some(new_row);
-                            let res = self.apply_assignments(&mut work, i, assignments);
-                            self.insert_row = None;
-                            res?;
-                            if let Some((_, k)) =
-                                find_key_conflict(&work, &keys, &work.rows[i], Some(i))
-                            {
-                                return Err(duplicate_key_error(&work, &keys[k], &work.rows[i]));
+                            (InsertMode::Error, Some((_, k))) => {
+                                return Err(duplicate_key_error(&work, &keys[k], &new_row));
                             }
-                            // MySQL: 2 for an updated row, 0 if the update
-                            // left it as it was.
-                            if work.rows[i] != before {
-                                affected += 2;
+                            (InsertMode::Ignore, Some(_)) => {}
+                            (InsertMode::Replace, Some(_)) => {
+                                while let Some((i, _)) =
+                                    find_key_conflict(&work, &keys, &new_row, None)
+                                {
+                                    work.rows.remove(i);
+                                    affected += 1;
+                                }
+                                work.rows.push(new_row);
+                                affected += 1;
+                            }
+                            (InsertMode::Upsert(assignments), Some((i, _))) => {
+                                let before = work.rows[i].clone();
+                                self.insert_row = Some(new_row);
+                                let res = self.apply_assignments(&mut work, i, assignments);
+                                self.insert_row = None;
+                                res?;
+                                if let Some((_, k)) =
+                                    find_key_conflict(&work, &keys, &work.rows[i], Some(i))
+                                {
+                                    return Err(duplicate_key_error(
+                                        &work,
+                                        &keys[k],
+                                        &work.rows[i],
+                                    ));
+                                }
+                                // MySQL: 2 for an updated row, 0 if the update
+                                // left it as it was.
+                                if work.rows[i] != before {
+                                    affected += 2;
+                                }
                             }
                         }
                     }
-                }
 
-                self.store_table(&db, work)?;
-                self.last_affected_rows = affected;
-                self.last_insert_id = first_generated_id.map(|v| v as u64).unwrap_or(0);
-                Ok(vec![])
+                    self.store_table(&db, work.clone())?;
+                    self.last_affected_rows = affected;
+                    self.last_insert_id = first_generated_id.map(|v| v as u64).unwrap_or(0);
+                    Ok(vec![])
+                })();
+                // A failed INSERT still consumes the AUTO_INCREMENT ids it
+                // generated, as in InnoDB (the next row doesn't reuse them).
+                if result.is_err() && work.next_auto_increment > counter_before {
+                    let mut state = self.db.lock().unwrap();
+                    if let Some(t) =
+                        state.schemas.get_mut(&db).and_then(|s| s.tables.get_mut(&table))
+                    {
+                        Arc::make_mut(t).next_auto_increment = work.next_auto_increment;
+                    }
+                }
+                result
             }
             Plan::Update { db, table, assignments, selection, order, limit } => {
                 let mut work = self.load_table(&db, &table)?;
@@ -492,6 +557,9 @@ impl Executor {
                 let table_context = self.resolve_table_context(&source)?;
 
                 let rows = self.execute_plan(*source)?;
+                if rows.is_empty() {
+                    check_columns(std::iter::once(&predicate), table_context.as_ref())?;
+                }
                 let mut out_rows = Vec::new();
                 for row in rows {
                     let val = self.eval_expr(&predicate, &row, table_context.as_ref())?;
@@ -505,6 +573,9 @@ impl Executor {
                 let table_context = self.resolve_table_context(&source)?;
 
                 let rows = self.execute_plan(*source)?;
+                if rows.is_empty() {
+                    check_columns(exprs.iter(), table_context.as_ref())?;
+                }
                 let mut out_rows = Vec::new();
                 for row in rows {
                     let mut out_row = Vec::new();
@@ -525,6 +596,9 @@ impl Executor {
             Plan::Aggregate { source, group_exprs, exprs, having, .. } => {
                 let table_context = self.resolve_table_context(&source)?;
                 let rows = self.execute_plan(*source)?;
+                if rows.is_empty() {
+                    check_columns(exprs.iter(), table_context.as_ref())?;
+                }
 
                 // Group rows by the evaluated GROUP BY key. `Value`'s
                 // `PartialEq` (via `Vec<Value>`) is enough to compare keys
@@ -803,12 +877,15 @@ impl Executor {
         for (col_name, expr) in assignments {
             let idx = resolve_column_index(&t.columns, col_name)
                 .ok_or_else(|| MySqlError::unknown_column(col_name))?;
-            let val = self.eval_expr(expr, &t.rows[i], Some(&*t))?;
+            self.writing.set(true);
+            let val = self.eval_expr(expr, &t.rows[i], Some(&*t));
+            self.writing.set(false);
+            let val = val?;
             let col = &t.columns[idx];
             if val.is_null() && col.not_null {
                 return Err(column_cannot_be_null(&col.name));
             }
-            t.rows[i][idx] = coerce_to_column(val, &col.ty, &col.name)?;
+            t.rows[i][idx] = coerce_to_column(val, col, &self.sql_mode)?;
             assigned.push(idx);
         }
         let now = now_ts();
@@ -872,6 +949,18 @@ impl Executor {
             Expr::Arith { op, left, right } => {
                 let l = self.eval_expr(left, row, table)?;
                 let r = self.eval_expr(right, row, table)?;
+                // Division by zero is NULL, except in the values an INSERT/
+                // UPDATE writes under strict ERROR_FOR_DIVISION_BY_ZERO.
+                if matches!(op, ArithOp::Div | ArithOp::Mod)
+                    && self.writing.get()
+                    && self.sql_mode.strict()
+                    && self.sql_mode.error_for_division_by_zero()
+                    && !l.is_null()
+                    && !r.is_null()
+                    && value_to_f64(&r) == 0.0
+                {
+                    return Err(MySqlError::new(1365, "22012", "Division by 0"));
+                }
                 eval_arith(*op, l, r)
             }
             Expr::Compare { op, left, right } => {
@@ -888,6 +977,13 @@ impl Executor {
                 eval_in_list(l, &items, *negated)
             }
             Expr::SysVar(name) => {
+                let bare = name.rsplit('.').next().unwrap_or(name);
+                if bare.eq_ignore_ascii_case("sql_mode") {
+                    return Ok(Value::Text(self.sql_mode.as_str()));
+                }
+                if bare.eq_ignore_ascii_case("autocommit") {
+                    return Ok(Value::Int(i64::from(self.autocommit)));
+                }
                 if name.eq_ignore_ascii_case("version") {
                     Ok(Value::Text("8.0.33".to_string()))
                 } else if name.eq_ignore_ascii_case("version_comment") {
@@ -1789,85 +1885,195 @@ pub(crate) fn format_double(f: f64) -> String {
 /// release: values used to be stored in whatever shape the literal arrived
 /// in, so a DECIMAL column filled from `12.50` held *text*, and SUM/AVG/
 /// MAX/ORDER BY/`>` on it were all silently wrong.
-pub(crate) fn coerce_to_column(v: Value, ty: &ColumnType, col: &str) -> Result<Value, MySqlError> {
+/// `[min, max]` for an integer column type.
+fn int_range(ty: &ColumnType, unsigned: bool) -> Option<(i128, i128)> {
+    let bits = match ty {
+        ColumnType::TinyInt | ColumnType::Boolean => 8,
+        ColumnType::SmallInt => 16,
+        ColumnType::MediumInt => 24,
+        ColumnType::Int => 32,
+        ColumnType::BigInt => 64,
+        _ => return None,
+    };
+    Some(if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    })
+}
+
+/// Stores `v` as column `col`'s type, the way MySQL converts on write. In
+/// strict mode (MySQL 8's default) a value that doesn't fit is an error;
+/// otherwise it's adjusted the way MySQL adjusts it -- clamped,
+/// truncated, or zeroed. Found via a differential test against real MySQL:
+/// out-of-range integers and invalid dates used to be stored as given.
+pub(crate) fn coerce_to_column(
+    v: Value,
+    col: &Column,
+    mode: &crate::mysql::sqlmode::SqlMode,
+) -> Result<Value, MySqlError> {
     use Value::*;
     if v.is_null() {
         return Ok(Null);
     }
-    let bad = |what: &str, v: &Value| {
-        MySqlError::new(
+    let name = col.name.as_str();
+    let strict = mode.strict();
+    let err = |code: u16, state: &'static str, msg: String| Err(MySqlError::new(code, state, msg));
+    let incorrect = |what: &str, v: &Value| {
+        err(
             1366,
             "HY000",
-            format!("Incorrect {what} value: '{}' for column '{col}' at row 1", render_text(v)),
+            format!("Incorrect {what} value: '{}' for column '{name}' at row 1", render_text(v)),
         )
     };
-    Ok(match ty {
-        ColumnType::Int | ColumnType::BigInt | ColumnType::Boolean => match v {
-            Int(_) => v,
-            Bool(b) => Int(b as i64),
-            Float(f) => Int(f.round() as i64),
-            Num(ref n) => Int(n.to_f64().round() as i64),
-            Text(ref s) => {
-                let t = s.trim();
-                if let Ok(i) = t.parse::<i64>() {
-                    Int(i)
-                } else if let Ok(f) = t.parse::<f64>() {
-                    Int(f.round() as i64)
-                } else {
-                    return Err(bad("integer", &v));
+    let out_of_range =
+        || err(1264, "22003", format!("Out of range value for column '{name}' at row 1"));
+    Ok(match &col.ty {
+        ty @ (ColumnType::Int
+        | ColumnType::BigInt
+        | ColumnType::Boolean
+        | ColumnType::TinyInt
+        | ColumnType::SmallInt
+        | ColumnType::MediumInt) => {
+            let n: i128 = match &v {
+                Int(i) => *i as i128,
+                Bool(b) => *b as i128,
+                Float(f) => f.round() as i128,
+                Num(n) => n.to_f64().round() as i128,
+                Text(s) => {
+                    let t = s.trim();
+                    match t.parse::<i128>() {
+                        Ok(i) => i,
+                        Err(_) => match t.parse::<f64>() {
+                            Ok(f) => f.round() as i128,
+                            Err(_) if strict => return incorrect("integer", &v),
+                            Err(_) => crate::mysql::funcs::leading_f64(t).round() as i128,
+                        },
+                    }
                 }
+                _ if strict => return incorrect("integer", &v),
+                _ => 0,
+            };
+            let (lo, hi) = int_range(ty, col.unsigned).unwrap();
+            if n < lo || n > hi {
+                if strict {
+                    return out_of_range();
+                }
+                Int(n.clamp(lo, hi).min(i64::MAX as i128) as i64)
+            } else {
+                Int(n as i64)
             }
-            _ => return Err(bad("integer", &v)),
-        },
-        ColumnType::Float | ColumnType::Double => match v {
+        }
+        ColumnType::Float | ColumnType::Double => match &v {
             Float(_) => v,
             Int(_) | Num(_) | Bool(_) => Float(value_to_f64(&v)),
-            Text(ref s) => match s.trim().parse::<f64>() {
+            Text(s) => match s.trim().parse::<f64>() {
                 Ok(f) => Float(f),
-                Err(_) => return Err(bad("double", &v)),
+                Err(_) if strict => return incorrect("double", &v),
+                Err(_) => Float(crate::mysql::funcs::leading_f64(s)),
             },
-            _ => return Err(bad("double", &v)),
+            _ if strict => return incorrect("double", &v),
+            _ => Float(0.0),
         },
-        ColumnType::Decimal(_, scale) => {
-            let n = match v {
-                Text(ref s) => match Numeric::parse(s.trim()) {
+        ColumnType::Decimal(precision, scale) => {
+            let n = match &v {
+                Text(s) => match Numeric::parse(s.trim()) {
                     Ok(n) => n,
-                    Err(_) => return Err(bad("decimal", &v)),
+                    Err(_) if strict => return incorrect("decimal", &v),
+                    Err(_) => Numeric::from_f64(crate::mysql::funcs::leading_f64(s)),
                 },
                 Int(_) | Num(_) | Float(_) | Bool(_) => {
                     value_to_numeric(&v).unwrap_or_else(Numeric::zero)
                 }
-                _ => return Err(bad("decimal", &v)),
+                _ if strict => return incorrect("decimal", &v),
+                _ => Numeric::zero(),
             };
-            Num(n.round(*scale as i64))
+            let n = n.round(*scale as i64);
+            // DECIMAL(p, s) holds at most p - s digits before the point.
+            let int_digits = (*precision as i64 - *scale as i64).max(0);
+            let limit = Numeric::parse(&format!("1{}", "0".repeat(int_digits as usize)))
+                .unwrap_or_else(|_| Numeric::zero());
+            if crate::sql::numeric::cmp_num(&n.abs(), &limit) != Ordering::Less {
+                if strict {
+                    return out_of_range();
+                }
+                let max = format!(
+                    "{}{}{}",
+                    "9".repeat(int_digits as usize),
+                    if *scale > 0 { "." } else { "" },
+                    "9".repeat(*scale as usize)
+                );
+                let max = Numeric::parse(&max).unwrap_or_else(|_| Numeric::zero());
+                Num(if n.is_negative() { max.neg() } else { max })
+            } else {
+                Num(n)
+            }
         }
-        ColumnType::Date => match v {
-            Date(_) => v,
-            Ts(t) => Date(t.div_euclid(crate::sql::datetime::USECS_PER_DAY) as i32),
-            Text(ref s) => parse_mysql_date(s).map(Date).unwrap_or(v),
-            _ => Text(render_text(&v)),
-        },
-        ColumnType::Datetime => match v {
-            Ts(_) => v,
-            Date(d) => Ts(d as i64 * crate::sql::datetime::USECS_PER_DAY),
-            Text(ref s) => parse_mysql_datetime(s).map(Ts).unwrap_or(v),
-            _ => Text(render_text(&v)),
-        },
+        ColumnType::Date | ColumnType::Datetime => {
+            let is_date = col.ty == ColumnType::Date;
+            let parsed = match &v {
+                Date(d) => Some(if is_date {
+                    Date(*d)
+                } else {
+                    Ts(*d as i64 * crate::sql::datetime::USECS_PER_DAY)
+                }),
+                Ts(t) => Some(if is_date {
+                    Date(t.div_euclid(crate::sql::datetime::USECS_PER_DAY) as i32)
+                } else {
+                    Ts(*t)
+                }),
+                other => {
+                    let s = render_text(other);
+                    if is_date {
+                        parse_mysql_date(&s).map(Date)
+                    } else {
+                        parse_mysql_datetime(&s).map(Ts)
+                    }
+                }
+            };
+            let zero = if is_date { "0000-00-00" } else { "0000-00-00 00:00:00" };
+            match parsed {
+                Some(x) => x,
+                None => {
+                    let s = render_text(&v);
+                    let is_zero = s
+                        .trim()
+                        .trim_start_matches('0')
+                        .trim_start_matches(['-', ' ', ':', '0'])
+                        .is_empty()
+                        && s.trim().starts_with("0000-00-00");
+                    // A zero date is fine unless strict mode forbids it;
+                    // anything else unparseable is an error in strict mode
+                    // and becomes the zero date otherwise.
+                    if strict && (!is_zero || mode.no_zero_date()) {
+                        let what = if is_date { "date" } else { "datetime" };
+                        return err(
+                            1292,
+                            "22007",
+                            format!("Incorrect {what} value: '{s}' for column '{name}' at row 1"),
+                        );
+                    }
+                    Text(zero.to_string())
+                }
+            }
+        }
         ColumnType::Varchar(n) => {
             let t = match v {
                 Text(t) => t,
                 other => render_text(&other),
             };
-            // Strict mode (the 8.0 default) rejects an over-long string
-            // rather than storing it.
             if t.chars().count() > *n {
-                return Err(MySqlError::new(
-                    1406,
-                    "22001",
-                    format!("Data too long for column '{col}' at row 1"),
-                ));
+                if strict {
+                    return err(
+                        1406,
+                        "22001",
+                        format!("Data too long for column '{name}' at row 1"),
+                    );
+                }
+                Text(t.chars().take(*n).collect())
+            } else {
+                Text(t)
             }
-            Text(t)
         }
         ColumnType::Text => match v {
             Text(_) => v,
@@ -1888,13 +2094,14 @@ pub(crate) fn coerce_to_column(v: Value, ty: &ColumnType, col: &str) -> Result<V
                 });
             match found {
                 Some(m) => Text(m.clone()),
-                None => {
-                    return Err(MySqlError::new(
+                None if strict => {
+                    return err(
                         1265,
                         "01000",
-                        format!("Data truncated for column '{col}' at row 1"),
-                    ));
+                        format!("Data truncated for column '{name}' at row 1"),
+                    );
                 }
+                None => Text(String::new()),
             }
         }
         ColumnType::Json => match v {
@@ -1902,13 +2109,13 @@ pub(crate) fn coerce_to_column(v: Value, ty: &ColumnType, col: &str) -> Result<V
             Text(ref s) => match crate::sql::json::parse_jsonb(s) {
                 Ok(j) => Json(Box::new(j)),
                 Err(_) => {
-                    return Err(MySqlError::new(
+                    return err(
                         3140,
                         "22032",
                         format!(
-                            "Invalid JSON text: \"Invalid value.\" at position 0 in value for column '{col}'."
+                            "Invalid JSON text: \"Invalid value.\" at position 0 in value for column '{name}'."
                         ),
-                    ));
+                    );
                 }
             },
             Int(i) => Json(Box::new(crate::sql::json::parse_jsonb(&i.to_string()).unwrap())),
@@ -1977,6 +2184,9 @@ pub(crate) fn mysql_type_name(ty: &ColumnType) -> String {
     match ty {
         ColumnType::Int => "int".into(),
         ColumnType::BigInt => "bigint".into(),
+        ColumnType::TinyInt => "tinyint".into(),
+        ColumnType::SmallInt => "smallint".into(),
+        ColumnType::MediumInt => "mediumint".into(),
         ColumnType::Varchar(n) => format!("varchar({n})"),
         ColumnType::Text => "text".into(),
         ColumnType::Float => "float".into(),
@@ -2002,6 +2212,32 @@ fn column_default_text(col: &Column) -> Option<String> {
         None | Some(Value::Null) => None,
         Some(v) => Some(render_text(v)),
     }
+}
+
+/// With no rows to evaluate against, an unknown column would go unnoticed;
+/// MySQL rejects it (1054) whether or not the table has rows.
+fn check_columns<'a>(
+    exprs: impl Iterator<Item = &'a Expr>,
+    table: Option<&Table>,
+) -> Result<(), MySqlError> {
+    let Some(t) = table else { return Ok(()) };
+    let mut res = Ok(());
+    for e in exprs {
+        crate::mysql::plan::for_each_colname(e, &mut |name| {
+            if res.is_ok() {
+                res = match resolve_column(t, name) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(MySqlError::new(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{name}' in 'field list'"),
+                    )),
+                    Err(e) => Err(e),
+                };
+            }
+        });
+    }
+    res
 }
 
 /// Resolves a column reference in an expression the way MySQL does:
@@ -2083,7 +2319,12 @@ fn added_column_value(col: &Column) -> Value {
         return Value::Null;
     }
     match &col.ty {
-        ColumnType::Int | ColumnType::BigInt | ColumnType::Boolean => Value::Int(0),
+        ColumnType::Int
+        | ColumnType::BigInt
+        | ColumnType::Boolean
+        | ColumnType::TinyInt
+        | ColumnType::SmallInt
+        | ColumnType::MediumInt => Value::Int(0),
         ColumnType::Decimal(..) => Value::Num(Numeric::zero()),
         ColumnType::Float | ColumnType::Double => Value::Float(0.0),
         ColumnType::Enum(m) => Value::Text(m.first().cloned().unwrap_or_default()),
@@ -2128,6 +2369,7 @@ fn alter_table(
     t: &mut Table,
     op: crate::mysql::plan::AlterOp,
     rename_to: &mut Option<String>,
+    mode: &crate::mysql::sqlmode::SqlMode,
 ) -> Result<(), MySqlError> {
     use crate::mysql::plan::AlterOp;
     match op {
@@ -2187,7 +2429,7 @@ fn alter_table(
                 if v.is_null() && col.not_null {
                     return Err(MySqlError::new(1138, "22004", "Invalid use of NULL value"));
                 }
-                row[i] = coerce_to_column(v, &col.ty, &col.name)?;
+                row[i] = coerce_to_column(v, &col, mode)?;
             }
             if !old.eq_ignore_ascii_case(&col.name) {
                 for k in t.unique_keys.iter_mut() {

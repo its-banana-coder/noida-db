@@ -42,6 +42,16 @@ jobs:
           MYSQL_ROOT_HOST: "%"
         options: >-
           --health-cmd "mysqladmin ping -h 127.0.0.1 --silent" --health-interval 5s --health-timeout 5s --health-retries 20
+      # MySQL 8 for the failure-path differential (pymysql handles its
+      # auth plugin): strict sql_mode is 8's default.
+      mysql8:
+        image: mysql:8.0
+        ports: ["3307:3306"]
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: yes
+          MYSQL_ROOT_HOST: "%"
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 --silent" --health-interval 5s --health-timeout 5s --health-retries 30
     env:
       NOIDA_REDIS_REF: 127.0.0.1:6379
       NOIDA_POSTGRES_REF: 127.0.0.1:5432
@@ -64,6 +74,15 @@ jobs:
       - run: cargo test --features elasticsearch --test elasticsearch_diff -- --nocapture
       - run: cargo test --features mysql --test mysql_diff -- --nocapture
       - run: cargo test --features mysql --test ecommerce_mysql_diff -- --nocapture
+      # Failure paths (duplicate keys, strict-mode errors, rollbacks,
+      # savepoints) compared step by step against real MySQL 8 and Postgres.
+      - run: tests/failure-diff/run.sh
+        env:
+          MYSQL_REF_PORT: 3307
+          POSTGRES_REF_PORT: 5432
+      # Real MySQL drivers and ORMs: pymysql, SQLAlchemy, Django, mysql2,
+      # Go database/sql + GORM, Connector/J.
+      - run: tests/clients/mysql/run.sh
       - run: tests/clients/elasticsearch/run.sh
       # Real drivers and ORMs: psycopg, SQLAlchemy, node-postgres, JDBC.
       - run: tests/clients/postgres/run.sh

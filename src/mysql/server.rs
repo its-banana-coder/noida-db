@@ -366,6 +366,8 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                         executor.params = params;
                         executor.last_found_rows = session.engine.last_found_rows;
                         executor.session_insert_id = session.engine.session_insert_id;
+                        executor.sql_mode = session.engine.sql_mode.clone();
+                        executor.autocommit = session.engine.autocommit;
                         let names = {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)

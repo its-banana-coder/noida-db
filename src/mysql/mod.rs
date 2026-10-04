@@ -7,6 +7,7 @@ pub mod funcs;
 pub mod infoschema;
 pub mod plan;
 pub mod server;
+pub mod sqlmode;
 pub mod types;
 
 #[cfg(test)]

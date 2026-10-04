@@ -472,10 +472,9 @@ nested boolean expressions) and real tables: `CREATE TABLE` (`INT`/`TINYINT`/`SM
 `LONGTEXT`/`FLOAT`/`DOUBLE`/`DECIMAL`/`DATE`/`DATETIME`/`BOOLEAN` columns,
 `NOT NULL`/`DEFAULT`/`PRIMARY KEY`/`AUTO_INCREMENT`, including a
 table-level `PRIMARY KEY (...)` clause — the form WordPress's own core
-schema always uses rather than a column option; `UNSIGNED` and the
-various display-width integer variants are accepted but not
-distinguished from their plain/signed counterparts, since every integer
-is stored as a plain `i64` regardless), `INSERT INTO ...
+schema always uses rather than a column option; each integer type and
+its `UNSIGNED` form has MySQL's range, though all are stored as `i64`),
+`INSERT INTO ...
 VALUES (...), ...`, `SELECT` with `WHERE`, qualified column references
 (`table.col`, anywhere an expression is allowed, not just `WHERE`) and
 basic `INNER`/`LEFT`/cross `JOIN`, `ORDER BY`/`LIMIT`/`OFFSET` on a
@@ -586,17 +585,32 @@ affected-row counts (1 per insert, 2 per updated duplicate).
 `AUTO_INCREMENT` moves past an explicitly inserted id. `UPDATE`/`DELETE`
 honor `ORDER BY ... LIMIT`.
 
-Strict mode, the 8.0 default, applies: `NULL` into a `NOT NULL` column
-is error 1048 (an explicit `NULL` is never replaced by the column's
-`DEFAULT`, which only fills omitted columns), an over-long `VARCHAR` is
-1406, an unknown `ENUM` value is 1265, invalid `JSON` is 3140, and an
-unknown column is 1054. Column names are case-insensitive. Values are
+`sql_mode` is per session and starts at the 8.0 default (strict).
+`SET [SESSION] sql_mode = '...'` (WordPress sends one) changes how writes
+are checked, and `@@sql_mode`/`SHOW VARIABLES` report it. Strict mode:
+`NULL` into a `NOT NULL` column is error 1048 (an explicit `NULL` is never
+replaced by the column's `DEFAULT`, which only fills omitted columns), an
+omitted `NOT NULL` column with no default is 1364, an out-of-range number
+is 1264, a non-numeric string into a number is 1366, an invalid date is
+1292, an over-long `VARCHAR` is 1406, an unknown `ENUM` value is 1265,
+and dividing by zero in a written value is 1365. Without strict mode
+these become MySQL's adjusted values instead: clamped to the type's
+range, the numeric prefix of a string, the zero date, truncated text,
+`''`, the type's implicit default, and `NULL`. Invalid `JSON` is always
+3140, and an unknown column is always 1054, even on an empty table.
+`ONLY_FULL_GROUP_BY` is not enforced, and the other modes (`ANSI_QUOTES`,
+`PIPES_AS_CONCAT`, `NO_BACKSLASH_ESCAPES`, ...) are reported but have no
+effect. A failed `INSERT` still uses up the `AUTO_INCREMENT` ids it took,
+as in InnoDB. `DROP DATABASE [IF EXISTS]` works. Every failure path above is
+compared step by step against real MySQL 8 in CI (`tests/failure-diff/`).
+Column names are case-insensitive. Values are
 stored as their column's type: `DECIMAL` is exact, rounded to the
 column's scale, and arithmetic and `SUM`/`AVG` on exact values stay
 exact (`AVG` adds 4 decimal places, like MySQL).
 
-Column types: integers (stored as `i64`; `UNSIGNED` and display widths
-are accepted but not distinguished), `DECIMAL`/`NUMERIC`, `FLOAT`/
+Column types: integers (`TINYINT` to `BIGINT`, signed and `UNSIGNED`,
+with their real ranges; stored as `i64`, so `BIGINT UNSIGNED` above
+2^63-1 isn't representable; display widths are ignored), `DECIMAL`/`NUMERIC`, `FLOAT`/
 `DOUBLE`/`REAL`, `CHAR`/`VARCHAR`/`TEXT` (all sizes), `BOOLEAN`, `DATE`,
 `DATETIME`/`TIMESTAMP` (no time zone conversion; everything is UTC),
 `ENUM`, `JSON`, and the `BLOB`/`BINARY` family. `DEFAULT CURRENT_TIMESTAMP`

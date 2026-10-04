@@ -47,6 +47,9 @@ pub struct Engine {
     /// ROLLBACK -- how pymysql, mysqlclient, SQLAlchemy and Django's
     /// `atomic()` run transactions (they never send BEGIN).
     pub autocommit: bool,
+    /// The session's `sql_mode` (MySQL 8's strict default until a
+    /// `SET sql_mode = '...'`, which WordPress sends on every connection).
+    pub sql_mode: crate::mysql::sqlmode::SqlMode,
     /// Whether a transaction is open (explicit BEGIN, or implicit).
     pub in_tx: bool,
     /// Open savepoints, oldest first: each name with the tables the
@@ -71,6 +74,7 @@ impl Default for Engine {
             session_insert_id: 0,
             conn_id: NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             autocommit: true,
+            sql_mode: crate::mysql::sqlmode::SqlMode::default(),
             in_tx: false,
             savepoints: Vec::new(),
         }
@@ -218,6 +222,7 @@ impl Engine {
             | Plan::Truncate { .. }
             | Plan::CreateDatabase { .. }
             | Plan::AlterTable { .. }
+            | Plan::DropDatabase { .. }
             | Plan::CreateIndex { .. } => {
                 self.commit();
                 None
@@ -308,6 +313,9 @@ impl Engine {
                     }
                     self.autocommit = on;
                 }
+                if let Some(mode) = sql_mode_assignment(set) {
+                    self.sql_mode = mode;
+                }
                 self.last_affected_rows = 0;
                 self.last_column_names = Vec::new();
                 return Ok(vec![]);
@@ -315,7 +323,19 @@ impl Engine {
             Statement::ShowVariables { filter, .. } => {
                 self.last_affected_rows = 0;
                 self.last_column_names = vec!["Variable_name".into(), "Value".into()];
-                return Ok(show_filtered(SESSION_VARIABLES, filter.as_ref()));
+                let mode = self.sql_mode.as_str();
+                let autocommit = if self.autocommit { "ON" } else { "OFF" };
+                let mut rows = show_filtered(SESSION_VARIABLES, filter.as_ref());
+                for row in &mut rows {
+                    match &row[0] {
+                        Value::Text(n) if n == "sql_mode" => row[1] = Value::Text(mode.clone()),
+                        Value::Text(n) if n == "autocommit" => {
+                            row[1] = Value::Text(autocommit.into())
+                        }
+                        _ => {}
+                    }
+                }
+                return Ok(rows);
             }
             Statement::ShowStatus { filter, .. } => {
                 self.last_affected_rows = 0;
@@ -452,6 +472,8 @@ impl Engine {
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
         executor.last_found_rows = self.last_found_rows;
         executor.session_insert_id = self.session_insert_id;
+        executor.sql_mode = self.sql_mode.clone();
+        executor.autocommit = self.autocommit;
         let written = self.before_plan(&plan);
         let res = executor.execute_plan(plan)?;
         self.after_plan(written);
@@ -462,10 +484,9 @@ impl Engine {
         }
         self.last_found_rows = executor.last_found_rows;
 
-        // Update current DB if USE was called
-        if let Some(db) = executor.current_db {
-            self.current_db = Some(db);
-        }
+        // USE changes the database; DROP DATABASE of the current one
+        // clears it (DATABASE() is then NULL, as in MySQL).
+        self.current_db = executor.current_db;
 
         Ok(res)
     }
@@ -544,6 +565,40 @@ fn show_filtered(table: &[(&str, &str)], filter: Option<&ShowStatementFilter>) -
         })
         .map(|(n, v)| vec![Value::Text((*n).into()), Value::Text((*v).into())])
         .collect()
+}
+
+/// `Some(mode)` if `set` assigns `sql_mode` (`SET sql_mode = '...'`,
+/// `SET SESSION sql_mode = ...`, `SET @@sql_mode = DEFAULT`, ...).
+fn sql_mode_assignment(set: &sqlparser::ast::Set) -> Option<crate::mysql::sqlmode::SqlMode> {
+    use crate::mysql::sqlmode::SqlMode;
+    use sqlparser::ast::{Expr as E, Set, Value as V};
+    let pairs: Vec<(String, &E)> = match set {
+        Set::SingleAssignment { variable, values, .. } => {
+            values.first().map(|v| vec![(variable.to_string(), v)]).unwrap_or_default()
+        }
+        Set::MultipleAssignments { assignments } => {
+            assignments.iter().map(|a| (a.name.to_string(), &a.value)).collect()
+        }
+        _ => vec![],
+    };
+    let mut out = None;
+    for (name, value) in pairs {
+        let name = name.trim_start_matches('@').to_ascii_lowercase();
+        if name.rsplit('.').next() != Some("sql_mode") {
+            continue;
+        }
+        out = match value {
+            E::Value(v) => match &v.value {
+                V::SingleQuotedString(s) | V::DoubleQuotedString(s) => Some(SqlMode::parse(s)),
+                _ => None,
+            },
+            E::Identifier(i) if i.value.eq_ignore_ascii_case("default") => Some(SqlMode::default()),
+            E::Identifier(i) => Some(SqlMode::parse(&i.value)),
+            _ => None,
+        }
+        .or(out);
+    }
+    out
 }
 
 /// `Some(on)` if `set` assigns `autocommit` (`SET autocommit = 0`,
