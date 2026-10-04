@@ -329,6 +329,9 @@ impl Binder {
                 })
             }
             Statement::Insert(insert) => self.bind_insert(insert),
+            Statement::Update(update) if !update.table.joins.is_empty() => {
+                self.bind_multi_update(update.table, update.assignments, update.selection)
+            }
             Statement::Update(update) => self.bind_update(
                 update.table,
                 update.assignments,
@@ -341,7 +344,27 @@ impl Binder {
                     sqlparser::ast::FromTable::WithFromKeyword(f) => f,
                     sqlparser::ast::FromTable::WithoutKeyword(f) => f,
                 };
-                self.bind_delete(from, delete.selection, delete.order_by, delete.limit)
+                // `DELETE t1, t2 FROM <join>` names its targets before FROM;
+                // `DELETE FROM t1, t2 USING <join>` after it.
+                match (delete.tables.is_empty(), delete.using) {
+                    (true, None) if from.len() == 1 && from[0].joins.is_empty() => {
+                        self.bind_delete(from, delete.selection, delete.order_by, delete.limit)
+                    }
+                    (_, Some(using)) => {
+                        let names = from
+                            .iter()
+                            .filter_map(|t| match &t.relation {
+                                TableFactor::Table { name, .. } => Some(name.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        self.bind_multi_delete(names, using, delete.selection)
+                    }
+                    (false, None) => self.bind_multi_delete(delete.tables, from, delete.selection),
+                    (true, None) => {
+                        Err(MySqlError::unsupported("multi-table DELETE without targets"))
+                    }
+                }
             }
             _ => Err(MySqlError::unsupported("statement")),
         }
@@ -854,6 +877,83 @@ impl Binder {
             order,
             limit,
         })
+    }
+
+    /// Every table a multi-table statement's join reads, as (db, table,
+    /// alias or name).
+    fn join_tables(
+        &self,
+        from: &[TableWithJoins],
+    ) -> Result<Vec<(String, String, String)>, MySqlError> {
+        let mut out = Vec::new();
+        for twj in from {
+            for tf in std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation)) {
+                if let TableFactor::Table { name, alias, .. } = tf {
+                    let (db, t) = self.resolve_table_name(name)?;
+                    let a =
+                        alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| t.clone());
+                    out.push((db, t, a));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn bind_multi_update(
+        &mut self,
+        table: TableWithJoins,
+        assignments: Vec<Assignment>,
+        selection: Option<AstExpr>,
+    ) -> Result<Plan, MySqlError> {
+        let targets = self.join_tables(std::slice::from_ref(&table))?;
+        let join = self.bind_from(vec![table])?;
+        let mut out = Vec::new();
+        for a in assignments {
+            let col = match &a.target {
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => name
+                    .0
+                    .iter()
+                    .filter_map(|p| match p {
+                        sqlparser::ast::ObjectNamePart::Identifier(id) => Some(id.value.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("."),
+                _ => return Err(MySqlError::unsupported("assignment target")),
+            };
+            out.push((col, self.bind_expr(a.value)?));
+        }
+        let selection = selection.map(|e| self.bind_expr(e)).transpose()?;
+        Ok(Plan::MultiUpdate { join: Box::new(join), targets, assignments: out, selection })
+    }
+
+    fn bind_multi_delete(
+        &mut self,
+        names: Vec<ObjectName>,
+        from: Vec<TableWithJoins>,
+        selection: Option<AstExpr>,
+    ) -> Result<Plan, MySqlError> {
+        let all = self.join_tables(&from)?;
+        let mut targets = Vec::new();
+        for n in names {
+            let last =
+                n.0.last().map(|p| p.to_string().trim_matches('`').to_string()).unwrap_or_default();
+            // A target names a table of the join by alias (or name).
+            let t = all
+                .iter()
+                .find(|(_, t, a)| a.eq_ignore_ascii_case(&last) || t.eq_ignore_ascii_case(&last))
+                .ok_or_else(|| {
+                    MySqlError::new(
+                        1109,
+                        "42S02",
+                        format!("Unknown table '{last}' in MULTI DELETE"),
+                    )
+                })?;
+            targets.push(t.clone());
+        }
+        let join = self.bind_from(from)?;
+        let selection = selection.map(|e| self.bind_expr(e)).transpose()?;
+        Ok(Plan::MultiDelete { join: Box::new(join), targets, selection })
     }
 
     fn bind_delete(
@@ -1670,6 +1770,11 @@ impl Binder {
         }
     }
 
+    /// Binds one expression outside any statement (`SET @x = expr`).
+    pub fn bind_scalar(&mut self, expr: AstExpr) -> Result<Expr, MySqlError> {
+        self.bind_expr(expr)
+    }
+
     fn bind_expr(&mut self, expr: AstExpr) -> Result<Expr, MySqlError> {
         match expr {
             AstExpr::Value(sqlparser::ast::ValueWithSpan {
@@ -1735,6 +1840,8 @@ impl Binder {
             AstExpr::Identifier(ident) => {
                 if ident.value.starts_with("@@") {
                     Ok(Expr::SysVar(ident.value[2..].to_string()))
+                } else if let Some(name) = ident.value.strip_prefix('@') {
+                    Ok(Expr::UserVar(name.trim_matches('`').to_ascii_lowercase()))
                 } else {
                     Ok(Expr::ColName(ident.value.clone()))
                 }
@@ -1840,6 +1947,14 @@ impl Binder {
                 Ok(Expr::InList { expr: bound_expr, list: bound_list, negated })
             }
             AstExpr::Nested(inner) => self.bind_expr(*inner),
+            // `expr [NOT] REGEXP|RLIKE pattern` is REGEXP_LIKE.
+            AstExpr::RLike { negated, expr, pattern, .. } => {
+                let call = Expr::Call {
+                    name: "REGEXP_LIKE".into(),
+                    args: vec![self.bind_expr(*expr)?, self.bind_expr(*pattern)?],
+                };
+                Ok(if negated { Expr::Not(Box::new(call)) } else { call })
+            }
             AstExpr::Subquery(q) => Ok(Expr::Subquery(Box::new(self.bind_query(*q)?))),
             AstExpr::InSubquery { expr, subquery, negated } => {
                 let expr = Box::new(self.bind_expr(*expr)?);
@@ -2167,21 +2282,115 @@ impl Binder {
                 let b = self.bind_function_arg(&args[2])?;
                 Ok(Expr::Call { name: upper, args: vec![Expr::Const(Value::Text(unit)), a, b] })
             }
-            "CONCAT" | "UPPER" | "LOWER" | "LENGTH" | "SUBSTRING" | "SUBSTR" | "COALESCE"
-            | "ANY_VALUE" | "IFNULL" | "DATABASE" | "SCHEMA" | "USER" | "CURRENT_USER"
-            | "SESSION_USER" | "SYSTEM_USER" | "CONNECTION_ID" | "VERSION" | "NOW"
-            | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" | "CURDATE"
-            | "CURRENT_DATE" | "IF" | "NULLIF" | "GREATEST" | "LEAST" | "ROUND" | "TRUNCATE"
-            | "ABS" | "CEIL" | "CEILING" | "FLOOR" | "MOD" | "POW" | "POWER" | "SQRT" | "SIGN"
-            | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "CONCAT_WS" | "TRIM" | "LTRIM" | "RTRIM"
-            | "REPLACE" | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "LOCATE"
-            | "INSTR" | "UCASE" | "LCASE" | "MID" | "DATE" | "TIME" | "YEAR" | "MONTH" | "DAY"
-            | "DAYOFMONTH" | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK" | "DAYOFYEAR"
-            | "WEEKDAY" | "DATE_FORMAT" | "DATEDIFF" | "UNIX_TIMESTAMP" | "FROM_UNIXTIME"
-            | "UTC_TIMESTAMP" | "UTC_DATE" | "LAST_DAY" | "JSON_EXTRACT" | "JSON_UNQUOTE"
-            | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_VALID" | "JSON_TYPE" | "JSON_LENGTH" | "HEX"
-            | "FIELD" | "ELT" | "STRCMP" | "CONVERT_TZ" | "JSON_CONTAINS"
-            | "JSON_CONTAINS_PATH" | "JSON_KEYS" => {
+            "CONCAT"
+            | "UPPER"
+            | "LOWER"
+            | "LENGTH"
+            | "SUBSTRING"
+            | "SUBSTR"
+            | "COALESCE"
+            | "ANY_VALUE"
+            | "REGEXP_LIKE"
+            | "REGEXP_REPLACE"
+            | "REGEXP_SUBSTR"
+            | "REGEXP_INSTR"
+            | "IFNULL"
+            | "DATABASE"
+            | "SCHEMA"
+            | "USER"
+            | "CURRENT_USER"
+            | "SESSION_USER"
+            | "SYSTEM_USER"
+            | "CONNECTION_ID"
+            | "VERSION"
+            | "NOW"
+            | "CURRENT_TIMESTAMP"
+            | "LOCALTIMESTAMP"
+            | "LOCALTIME"
+            | "SYSDATE"
+            | "CURDATE"
+            | "CURRENT_DATE"
+            | "IF"
+            | "NULLIF"
+            | "GREATEST"
+            | "LEAST"
+            | "ROUND"
+            | "TRUNCATE"
+            | "ABS"
+            | "CEIL"
+            | "CEILING"
+            | "FLOOR"
+            | "MOD"
+            | "POW"
+            | "POWER"
+            | "SQRT"
+            | "SIGN"
+            | "CHAR_LENGTH"
+            | "CHARACTER_LENGTH"
+            | "CONCAT_WS"
+            | "TRIM"
+            | "LTRIM"
+            | "RTRIM"
+            | "REPLACE"
+            | "LEFT"
+            | "RIGHT"
+            | "LPAD"
+            | "RPAD"
+            | "REPEAT"
+            | "REVERSE"
+            | "LOCATE"
+            | "INSTR"
+            | "UCASE"
+            | "LCASE"
+            | "MID"
+            | "DATE"
+            | "TIME"
+            | "YEAR"
+            | "MONTH"
+            | "DAY"
+            | "DAYOFMONTH"
+            | "HOUR"
+            | "MINUTE"
+            | "SECOND"
+            | "DAYOFWEEK"
+            | "DAYOFYEAR"
+            | "WEEKDAY"
+            | "DATE_FORMAT"
+            | "DATEDIFF"
+            | "UNIX_TIMESTAMP"
+            | "FROM_UNIXTIME"
+            | "UTC_TIMESTAMP"
+            | "UTC_DATE"
+            | "LAST_DAY"
+            | "JSON_EXTRACT"
+            | "JSON_UNQUOTE"
+            | "JSON_OBJECT"
+            | "JSON_ARRAY"
+            | "JSON_VALID"
+            | "JSON_TYPE"
+            | "JSON_LENGTH"
+            | "HEX"
+            | "FIELD"
+            | "ELT"
+            | "STRCMP"
+            | "CONVERT_TZ"
+            | "JSON_CONTAINS"
+            | "JSON_CONTAINS_PATH"
+            | "JSON_KEYS"
+            | "JSON_SET"
+            | "JSON_INSERT"
+            | "JSON_REPLACE"
+            | "JSON_REMOVE"
+            | "JSON_ARRAY_APPEND"
+            | "JSON_ARRAY_INSERT"
+            | "JSON_MERGE_PATCH"
+            | "JSON_MERGE_PRESERVE"
+            | "JSON_MERGE"
+            | "JSON_QUOTE"
+            | "JSON_DEPTH"
+            | "JSON_SEARCH"
+            | "JSON_OVERLAPS"
+            | "JSON_PRETTY" => {
                 let bound_args =
                     args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<_, _>>()?;
                 Ok(Expr::Call { name: upper, args: bound_args })

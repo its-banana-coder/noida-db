@@ -692,6 +692,21 @@ when two transactions wait for each other (the one that closes the cycle
 is rolled back). `NOWAIT` (3572) and `SKIP LOCKED` (job queues) work, and
 an INSERT duplicating another transaction's uncommitted key waits for it.
 
+Multi-table `UPDATE` (`UPDATE a JOIN b ON ... SET a.x = b.y`, `UPDATE a, b
+SET ...`) and `DELETE` (`DELETE a, b FROM a JOIN b ...`, `DELETE FROM a USING
+a JOIN b ...`) change each matched row once, with keys, foreign keys and
+`ON UPDATE` timestamps applied as in single-table statements. `REGEXP`/
+`RLIKE`, `REGEXP_LIKE`/`_REPLACE`/`_SUBSTR`/`_INSTR` (case-insensitive by
+default, match types `c i m n`). JSON paths take `[*]`, `.*`, `**`,
+`[last]`, `[last-N]`; `JSON_SET`/`_INSERT`/`_REPLACE`/`_REMOVE`/
+`_ARRAY_APPEND`/`_ARRAY_INSERT`/`_MERGE_PATCH`/`_MERGE_PRESERVE`/`_QUOTE`/
+`_DEPTH`/`_SEARCH`/`_OVERLAPS`/`_PRETTY` work. A client that enables
+`CLIENT_MULTI_STATEMENTS` can send several `;`-separated statements (one
+result each, stopping at the first error); without it, that's error 1064
+as in MySQL. User variables (`SET @x = expr`, `@x` anywhere) work, and a
+system variable can be set from one (`SET FOREIGN_KEY_CHECKS =
+@OLD_FOREIGN_KEY_CHECKS`, as dump files do).
+
 `UPDATE` reports the rows it changed (the rows it matched when the client
 connects with `CLIENT_FOUND_ROWS`, as Django does), and an
 `ON UPDATE CURRENT_TIMESTAMP` column only moves when the row changed.
@@ -713,8 +728,12 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
 **Not yet**
 - `RANGE` frames with a numeric or `INTERVAL` offset, `GROUPS` frames,
   `DISTINCT` inside a window aggregate (MySQL doesn't support it either),
-  `LATERAL` derived tables, and `REGEXP`.
-- Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
+  and `LATERAL` derived tables.
+- `'a' REGEXP NULL` with a literal NULL (the SQL parser rejects it; a
+  NULL column or parameter works). Regular expressions follow Rust's
+  `regex` syntax, which covers ICU's common subset (classes, POSIX
+  `[[:alpha:]]`, anchors, groups, repetition) but not look-around or
+  backreferences in the pattern.
 - Plain `KEY`/`INDEX`/`FULLTEXT` declarations are accepted and ignored;
   nothing is indexed, so a foreign key may reference any column (MySQL
   requires an index there, error 1822).
@@ -726,10 +745,6 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   locks aren't taken (an INSERT into a range another transaction read
   `FOR UPDATE` doesn't wait), and locking reads over joins or `GROUP BY`
   don't lock.
-- Multiple semicolon-separated statements in one `COM_QUERY` (only the
-  first is executed).
-- JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions
-  (`JSON_SET`, `JSON_INSERT`, ...).
 - Authentication (every password is currently accepted).
 
 ## Elasticsearch

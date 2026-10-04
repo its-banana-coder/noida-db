@@ -60,6 +60,11 @@ pub struct Executor {
     /// This connection's id, so reads skip other connections' uncommitted
     /// changes and writes wait for the rows they hold.
     pub conn_id: u64,
+    /// The session's user variables (`@name`).
+    pub user_vars: std::collections::HashMap<String, Value>,
+    /// Multi-table DML: every scan appends its row index as a trailing
+    /// `__rowid` column, so joined rows map back to base rows.
+    rowid_scans: bool,
     /// SKIP LOCKED: rows of (db, table) to leave out of the scan.
     skip_rows: Option<(String, String, std::collections::HashSet<String>)>,
     /// The session's `foreign_key_checks`.
@@ -91,6 +96,8 @@ impl Executor {
             found_rows: false,
             conn_id: 0,
             skip_rows: None,
+            rowid_scans: false,
+            user_vars: Default::default(),
             fk_checks: true,
             cte_rows: std::collections::HashMap::new(),
             win_vals: Default::default(),
@@ -109,6 +116,9 @@ impl Executor {
         match plan {
             Plan::Scan { db, table, alias } => {
                 let mut t = self.load_table(db, table)?;
+                if self.rowid_scans {
+                    t.columns.push(rowid_column());
+                }
                 // Found via a differential test against real MySQL before a
                 // public release: joins qualified columns by table name
                 // only, so `oi.product_id` (alias `oi`) never matched and
@@ -153,6 +163,7 @@ impl Executor {
         child.autocommit = self.autocommit;
         child.session_insert_id = self.session_insert_id;
         child.conn_id = self.conn_id;
+        child.user_vars = self.user_vars.clone();
         child.cte_rows = self.cte_rows.clone();
         child.outer = self.outer.clone();
         if let Some(t) = table {
@@ -1622,6 +1633,136 @@ impl Executor {
                 self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
+            Plan::Scan { db, table, .. } if self.rowid_scans => {
+                let t = self.load_table(&db, &table)?;
+                Ok(t.rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut r)| {
+                        r.push(Value::Int(i as i64));
+                        r
+                    })
+                    .collect())
+            }
+            Plan::MultiUpdate { join, targets, assignments, selection } => {
+                let (ctx, rows) = self.join_with_rowids(*join, selection)?;
+                let rid = self.rowid_positions(&ctx, &targets)?;
+                // Which target each assigned column belongs to.
+                let mut plan_cols: Vec<(usize, String, Expr)> = Vec::new();
+                for (col, expr) in assignments {
+                    let (q, bare) = match col.rsplit_once('.') {
+                        Some((q, c)) => {
+                            (Some(q.rsplit('.').next().unwrap_or(q).to_string()), c.to_string())
+                        }
+                        None => (None, col.clone()),
+                    };
+                    let mut hits = Vec::new();
+                    for (ti, (db, t, a)) in targets.iter().enumerate() {
+                        if q.as_ref().is_some_and(|q| !q.eq_ignore_ascii_case(a)) {
+                            continue;
+                        }
+                        let table = self.load_table(db, t)?;
+                        if resolve_column_index(&table.columns, &bare).is_some() {
+                            hits.push(ti);
+                        }
+                    }
+                    match hits.as_slice() {
+                        [ti] => plan_cols.push((*ti, bare, expr)),
+                        [] => return Err(MySqlError::unknown_column(&col)),
+                        _ => {
+                            return Err(MySqlError::new(
+                                1052,
+                                "23000",
+                                format!("Column '{col}' in field list is ambiguous"),
+                            ));
+                        }
+                    }
+                }
+                // Each target row is updated once, by the first joined row
+                // that reaches it.
+                let mut updates: Vec<std::collections::BTreeMap<usize, Vec<(String, Expr)>>> =
+                    vec![Default::default(); targets.len()];
+                for row in &rows {
+                    for (ti, col, expr) in &plan_cols {
+                        let Some(Value::Int(id)) = row.get(rid[*ti]) else { continue };
+                        let v = self.eval_expr(expr, row, Some(&ctx))?;
+                        let entry = updates[*ti].entry(*id as usize).or_default();
+                        if !entry.iter().any(|(c, _)| c == col) {
+                            entry.push((col.clone(), Expr::Const(v)));
+                        }
+                    }
+                }
+                let mut affected = 0u64;
+                for (ti, (db, t, _)) in targets.iter().enumerate() {
+                    if updates[ti].is_empty() {
+                        continue;
+                    }
+                    let mut work = self.load_table(db, t)?;
+                    let keys = work.keys();
+                    let fk = self.fk_relevant(db, &work);
+                    let (mut changes, mut to_check) = (Vec::new(), Vec::new());
+                    for (&i, sets) in &updates[ti] {
+                        if i >= work.rows.len() {
+                            continue;
+                        }
+                        let before = work.rows[i].clone();
+                        self.apply_assignments(&mut work, i, sets)?;
+                        if let Some((_, k)) =
+                            find_key_conflict(&work, &keys, &work.rows[i], Some(i))
+                        {
+                            return Err(duplicate_key_error(&work, &keys[k], &work.rows[i]));
+                        }
+                        if work.rows[i] != before {
+                            affected += 1;
+                            if fk {
+                                to_check.push(work.rows[i].clone());
+                                changes.push((before, Some(work.rows[i].clone())));
+                            }
+                        }
+                    }
+                    if fk {
+                        self.finish_write(db, work, changes, &to_check)?;
+                    } else {
+                        self.store_table(db, work)?;
+                    }
+                }
+                self.last_affected_rows = affected;
+                Ok(vec![])
+            }
+            Plan::MultiDelete { join, targets, selection } => {
+                let (ctx, rows) = self.join_with_rowids(*join, selection)?;
+                let rid = self.rowid_positions(&ctx, &targets)?;
+                let mut affected = 0u64;
+                for (ti, (db, t, _)) in targets.iter().enumerate() {
+                    let ids: std::collections::BTreeSet<usize> = rows
+                        .iter()
+                        .filter_map(|r| match r.get(rid[ti]) {
+                            Some(Value::Int(i)) => Some(*i as usize),
+                            _ => None,
+                        })
+                        .collect();
+                    if ids.is_empty() {
+                        continue;
+                    }
+                    let mut work = self.load_table(db, t)?;
+                    let removed: Vec<Vec<Value>> =
+                        ids.iter().filter_map(|&i| work.rows.get(i).cloned()).collect();
+                    affected += removed.len() as u64;
+                    let mut i = 0;
+                    work.rows.retain(|_| {
+                        i += 1;
+                        !ids.contains(&(i - 1))
+                    });
+                    if self.fk_relevant(db, &work) {
+                        let changes = removed.into_iter().map(|r| (r, None)).collect();
+                        self.finish_write(db, work, changes, &[])?;
+                    } else {
+                        self.store_table(db, work)?;
+                    }
+                }
+                self.last_affected_rows = affected;
+                Ok(vec![])
+            }
             Plan::Scan { db, table, .. } => {
                 let t = self.read_table(&db, &table)?;
                 match &self.skip_rows {
@@ -2060,6 +2201,45 @@ impl Executor {
         Ok(())
     }
 
+    /// A multi-table statement's join (filtered by its WHERE), every scan
+    /// carrying its row index (see `rowid_scans`).
+    fn join_with_rowids(
+        &mut self,
+        join: Plan,
+        selection: Option<Expr>,
+    ) -> Result<(Table, Vec<Vec<Value>>), MySqlError> {
+        self.rowid_scans = true;
+        let plan = match selection {
+            Some(predicate) => Plan::Filter { source: Box::new(join), predicate },
+            None => join,
+        };
+        let res = (|| {
+            let ctx = self
+                .resolve_table_context(&plan)?
+                .ok_or_else(|| MySqlError::unsupported("multi-table target"))?;
+            let rows = self.execute_plan(plan.clone())?;
+            Ok((ctx, rows))
+        })();
+        self.rowid_scans = false;
+        res
+    }
+
+    /// Where each target's `__rowid` sits in a joined row.
+    fn rowid_positions(
+        &self,
+        ctx: &Table,
+        targets: &[(String, String, String)],
+    ) -> Result<Vec<usize>, MySqlError> {
+        targets
+            .iter()
+            .map(|(_, _, a)| {
+                resolve_column(ctx, &format!("{a}.__rowid"))?
+                    .or(resolve_column(ctx, "__rowid").ok().flatten())
+                    .ok_or_else(|| MySqlError::unsupported("multi-table target"))
+            })
+            .collect()
+    }
+
     /// Before writing `t`: wait for every row the write changes that
     /// another transaction holds.
     fn check_write_locks(&self, db: &str, t: &Table) -> Result<(), MySqlError> {
@@ -2250,6 +2430,7 @@ impl Executor {
                 }
                 eval_in_list(l, &items, *negated)
             }
+            Expr::UserVar(name) => Ok(self.user_vars.get(name).cloned().unwrap_or(Value::Null)),
             Expr::Window { id, .. } => {
                 let vals = self.win_vals.borrow();
                 Ok(vals
@@ -2909,8 +3090,127 @@ pub(crate) fn mysql_like(s: &str, pattern: &str, esc: Option<char>) -> bool {
 /// (`value_as_text` returning `None`, which includes `NULL`) makes the
 /// whole call `NULL`, matching real MySQL's own NULL-propagation for
 /// these functions.
+/// A MySQL (ICU) regular expression: case-insensitive unless `match_type`
+/// says `c` (the default collation is case-insensitive), `m` multi-line,
+/// `n` dot matches newlines. A bad pattern is MySQL's 3691/3685.
+fn mysql_regex(pattern: &str, match_type: Option<&str>) -> Result<regex_lite::Regex, MySqlError> {
+    let mut ci = true;
+    let (mut multi, mut dotall) = (false, false);
+    for c in match_type.unwrap_or("").chars() {
+        match c {
+            'c' => ci = false,
+            'i' => ci = true,
+            'm' => multi = true,
+            'n' => dotall = true,
+            'u' => {}
+            _ => {
+                return Err(MySqlError::new(
+                    3693,
+                    "HY000",
+                    "Incorrect arguments to regexp_like: match_type",
+                ));
+            }
+        }
+    }
+    regex_lite::RegexBuilder::new(pattern)
+        .case_insensitive(ci)
+        .multi_line(multi)
+        .dot_matches_new_line(dotall)
+        .build()
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("group without closing")
+                || msg.contains("expected closing ')'")
+                || msg.contains("without matching '('")
+            {
+                MySqlError::new(3691, "HY000", "Mismatched parenthesis in regular expression.")
+            } else {
+                MySqlError::new(3685, "HY000", "Illegal argument to a regular expression.")
+            }
+        })
+}
+
+/// REGEXP_LIKE / _REPLACE / _SUBSTR / _INSTR (positions in characters,
+/// 1-based; occurrence 0 in REGEXP_REPLACE means every match).
+fn eval_regexp(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
+    if args.len() < 2 || args[0].is_null() || args[1].is_null() {
+        return Ok(Value::Null);
+    }
+    let text = value_as_text(&args[0]).unwrap_or_default();
+    let pattern = value_as_text(&args[1]).unwrap_or_default();
+    let int = |i: usize, d: i64| -> i64 {
+        args.get(i).filter(|v| !v.is_null()).map(|v| value_to_f64(v) as i64).unwrap_or(d)
+    };
+    let opt_text = |i: usize| args.get(i).and_then(value_as_text);
+    // Byte offset of the 1-based character position `pos`.
+    let byte_at = |pos: i64| -> Option<usize> {
+        if pos < 1 {
+            return None;
+        }
+        let n = text.chars().count() as i64;
+        if pos > n + 1 {
+            return None;
+        }
+        Some(text.char_indices().nth(pos as usize - 1).map(|(b, _)| b).unwrap_or(text.len()))
+    };
+    let char_pos = |byte: usize| text[..byte].chars().count() as i64 + 1;
+    let bad_pos =
+        || MySqlError::new(3686, "HY000", "Index out of bounds in regular expression search.");
+    match name {
+        "REGEXP_LIKE" => {
+            let re = mysql_regex(&pattern, opt_text(2).as_deref())?;
+            Ok(Value::Int(i64::from(re.is_match(&text))))
+        }
+        "REGEXP_INSTR" => {
+            let re = mysql_regex(&pattern, opt_text(5).as_deref())?;
+            let start = byte_at(int(2, 1)).ok_or_else(bad_pos)?;
+            let occurrence = int(3, 1).max(1) as usize;
+            let after = int(4, 0) == 1;
+            Ok(Value::Int(match re.find_iter(&text[start..]).nth(occurrence - 1) {
+                Some(m) => char_pos(start + if after { m.end() } else { m.start() }),
+                None => 0,
+            }))
+        }
+        "REGEXP_SUBSTR" => {
+            let re = mysql_regex(&pattern, opt_text(4).as_deref())?;
+            let start = byte_at(int(2, 1)).ok_or_else(bad_pos)?;
+            let occurrence = int(3, 1).max(1) as usize;
+            Ok(match re.find_iter(&text[start..]).nth(occurrence - 1) {
+                Some(m) => Value::Text(m.as_str().to_string()),
+                None => Value::Null,
+            })
+        }
+        _ => {
+            // REGEXP_REPLACE(expr, pat, repl[, pos[, occurrence[, match_type]]])
+            if args.get(2).is_none_or(|v| v.is_null()) {
+                return Ok(Value::Null);
+            }
+            let repl = value_as_text(&args[2]).unwrap_or_default();
+            let re = mysql_regex(&pattern, opt_text(5).as_deref())?;
+            let start = byte_at(int(3, 1)).ok_or_else(bad_pos)?;
+            let occurrence = int(4, 0).max(0) as usize;
+            let (head, tail) = text.split_at(start);
+            let replaced = if occurrence == 0 {
+                re.replace_all(tail, repl.as_str()).into_owned()
+            } else {
+                match re.find_iter(tail).nth(occurrence - 1) {
+                    Some(m) => {
+                        let one = re.replace(&tail[m.start()..], repl.as_str()).into_owned();
+                        format!("{}{one}", &tail[..m.start()])
+                    }
+                    None => tail.to_string(),
+                }
+            };
+            Ok(Value::Text(format!("{head}{replaced}")))
+        }
+    }
+}
+
 pub(crate) fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError> {
     match name {
+        "REGEXP_LIKE" | "REGEXP_REPLACE" | "REGEXP_SUBSTR" | "REGEXP_INSTR" => {
+            eval_regexp(name, args)
+        }
         "CONCAT" => {
             let mut out = String::new();
             for a in args {
@@ -3169,6 +3469,13 @@ pub(crate) fn value_to_f64(v: &Value) -> f64 {
         Value::Num(n) => n.to_f64(),
         Value::Bool(b) => *b as i64 as f64,
         Value::Text(s) => mysql_text_to_f64(s),
+        // A JSON number is its value; a JSON string is read like text.
+        Value::Json(j) => match &**j {
+            crate::sql::json::Json::Num(n) => n.to_f64(),
+            crate::sql::json::Json::Str(s) => mysql_text_to_f64(s),
+            crate::sql::json::Json::Bool(b) => *b as i64 as f64,
+            _ => 0.0,
+        },
         _ => 0.0,
     }
 }
@@ -3507,6 +3814,20 @@ pub(crate) fn coerce_to_column(
 /// Row equality for `DISTINCT`: column by column with MySQL's comparison
 /// rules, except that two NULLs count as the same value (SQL's DISTINCT
 /// treats NULLs as equal to each other, unlike `=`).
+fn rowid_column() -> Column {
+    Column {
+        name: "__rowid".into(),
+        ty: ColumnType::BigInt,
+        not_null: true,
+        default: None,
+        auto_increment: false,
+        primary_key: false,
+        default_now: false,
+        on_update_now: false,
+        unsigned: false,
+    }
+}
+
 /// A table context for a derived table or CTE: its alias and its output
 /// column names.
 fn derived_table(alias: &str, names: &[String]) -> Table {

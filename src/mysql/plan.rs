@@ -80,6 +80,8 @@ pub enum Expr {
         distinct: bool,
     },
     SysVar(String),
+    /// A user variable (`@name`), lower-cased.
+    UserVar(String),
     /// `expr [NOT] IN (list...)`. Real MySQL's three-valued semantics:
     /// true if `expr` equals any non-NULL list element, else NULL if
     /// `expr` or any list element is NULL, else false -- `negated` flips
@@ -510,6 +512,22 @@ pub enum Plan {
         exclusive: bool,
         nowait: bool,
         skip_locked: bool,
+    },
+    /// `UPDATE a JOIN b ON ... SET a.x = b.y, b.z = 1 WHERE ...` (and
+    /// `UPDATE a, b SET ...`): `targets` are every table in the join as
+    /// (db, table, alias); an assignment's column may be qualified.
+    MultiUpdate {
+        join: Box<Plan>,
+        targets: Vec<(String, String, String)>,
+        assignments: Vec<(String, Expr)>,
+        selection: Option<Expr>,
+    },
+    /// `DELETE a, b FROM a JOIN b ...` / `DELETE FROM a USING a JOIN b ...`:
+    /// deletes the matched rows of `targets` only.
+    MultiDelete {
+        join: Box<Plan>,
+        targets: Vec<(String, String, String)>,
+        selection: Option<Expr>,
     },
     /// The recursive step's reference to its own CTE.
     CteRef {

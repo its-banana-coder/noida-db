@@ -87,6 +87,24 @@ def run(port, scenario):
             t.start()
             pending[who] = (t, holder, action[1])
             continue
+        if isinstance(action, tuple) and action[0] == "multi" and KIND == "mysql":
+            # A connection with CLIENT_MULTI_STATEMENTS: every result set.
+            mc = pymysql.connect(host="127.0.0.1", port=port, user="root", password="",
+                                 autocommit=True, database="fdiff",
+                                 client_flag=pymysql.constants.CLIENT.MULTI_STATEMENTS)
+            sets = []
+            try:
+                cur = mc.cursor()
+                cur.execute(action[1])
+                while True:
+                    sets.append([tuple(r) for r in cur.fetchall()] if cur.description else ("ok", cur.rowcount))
+                    if not cur.nextset():
+                        break
+                trace.append((who, action[1], ("sets", sets)))
+            except Exception as e:  # noqa: BLE001
+                trace.append((who, action[1], ("sets", sets, "error", err_code(e))))
+            mc.close()
+            continue
         if isinstance(action, tuple) and action[0] == "join":
             t, holder, sql = pending.pop(who)
             t.join(timeout=30)
@@ -580,6 +598,68 @@ MYSQL_QUERIES = {
         (A, "commit"),
         (B, "commit"),
         (A, "SELECT id, v FROM t ORDER BY id"),
+    ],
+    "REGEXP functions": [
+        (A, "SELECT 'abc' REGEXP '^a', 'abc' RLIKE 'x', 'abc' NOT REGEXP 'b', REGEXP_LIKE('Abc','abc'), REGEXP_LIKE('Abc','abc','c')"),
+        (A, "SELECT REGEXP_REPLACE('a1b22','[0-9]+','#'), REGEXP_SUBSTR('a1b22','[0-9]+',1,2), REGEXP_INSTR('a1b22','[0-9]+'), REGEXP_REPLACE('aaa','a','b',2,1)"),
+        (A, "SELECT NULL REGEXP 'a', 'x.y' REGEXP '\\\\.', 'ABC' REGEXP '[[:lower:]]'"),
+        (A, "CREATE TABLE r (s VARCHAR(20))"),
+        (A, "INSERT INTO r VALUES ('apple'), ('Banana'), ('cherry'), (NULL)"),
+        (A, "SELECT s FROM r WHERE s REGEXP '^[ab]' ORDER BY s"),
+        (A, "SELECT 'a' REGEXP '('"),
+    ],
+    "JSON modification functions": [
+        (A, """SELECT JSON_SET('{"a":1}','$.b',2,'$.a',3), JSON_INSERT('{"a":1}','$.a',9,'$.c','x'), JSON_REPLACE('{"a":1}','$.a',5,'$.z',1)"""),
+        (A, """SELECT JSON_REMOVE('[1,2,3]','$[1]'), JSON_ARRAY_APPEND('{"a":[1]}','$.a',2), JSON_ARRAY_INSERT('[1,3]','$[1]',2), JSON_ARRAY_APPEND('{"a":1}','$.a',2)"""),
+        (A, """SELECT JSON_EXTRACT('{"a":[{"b":1},{"b":2}]}','$.a[*].b'), JSON_EXTRACT('{"a":{"b":{"c":5}}}','$**.c'), JSON_EXTRACT('[1,2,3]','$[*]')"""),
+        (A, """SELECT JSON_MERGE_PATCH('{"a":1,"b":2}','{"b":null,"c":3}'), JSON_MERGE_PRESERVE('[1]','[2]'), JSON_MERGE_PRESERVE('{"a":1}','{"a":2}')"""),
+        (A, """SELECT JSON_SET('{"a":{"b":1}}','$.a.c.d',1), JSON_SET('[1]','$[5]',9), JSON_REMOVE('{"a":1}','$'), JSON_SET(NULL,'$.a',1)"""),
+        (A, "CREATE TABLE j (id INT PRIMARY KEY, doc JSON)"),
+        (A, """INSERT INTO j VALUES (1, '{"tags":["a"],"n":1}')"""),
+        (A, """UPDATE j SET doc = JSON_SET(doc, '$.n', JSON_EXTRACT(doc,'$.n') + 1, '$.tags', JSON_ARRAY_APPEND(doc->'$.tags','$','b'))"""),
+        (A, "SELECT doc, doc->>'$.tags[1]', JSON_LENGTH(doc->'$.tags') FROM j"),
+    ],
+    "multi-table UPDATE and DELETE": [
+        (A, "CREATE TABLE c (id INT PRIMARY KEY, tier VARCHAR(5))"),
+        (A, "CREATE TABLE o (id INT PRIMARY KEY, cid INT, amount INT, flag INT DEFAULT 0)"),
+        (A, "INSERT INTO c VALUES (1,'gold'),(2,'basic'),(3,'gold')"),
+        (A, "INSERT INTO o (id, cid, amount) VALUES (10,1,50),(11,1,70),(12,2,20),(13,9,5)"),
+        (A, "UPDATE o JOIN c ON c.id = o.cid SET o.flag = 1 WHERE c.tier = 'gold'"),
+        (A, "UPDATE o, c SET o.amount = o.amount * 2, c.tier = 'vip' WHERE c.id = o.cid AND o.amount > 60"),
+        (A, "SELECT * FROM o ORDER BY id"),
+        (A, "SELECT * FROM c ORDER BY id"),
+        (A, "UPDATE o LEFT JOIN c ON c.id = o.cid SET o.flag = 2 WHERE c.id IS NULL"),
+        (A, "DELETE o FROM o JOIN c ON c.id = o.cid WHERE c.tier = 'basic'"),
+        (A, "DELETE o, c FROM o JOIN c ON c.id = o.cid WHERE o.amount > 100"),
+        (A, "DELETE FROM o USING o LEFT JOIN c ON c.id = o.cid WHERE c.id IS NULL"),
+        (A, "SELECT * FROM o ORDER BY id"),
+        (A, "SELECT * FROM c ORDER BY id"),
+        (A, "UPDATE o JOIN c ON c.id = o.cid SET nosuch = 1"),
+    ],
+    "multiple statements in one query": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, v INT)"),
+        (A, "SELECT 1; SELECT 2"),
+        (A, ("multi", "SELECT 1; SELECT 2, 3")),
+        (A, ("multi", "INSERT INTO t (v) VALUES (5); SELECT LAST_INSERT_ID(); UPDATE t SET v = 6")),
+        (A, ("multi", "INSERT INTO t (v) VALUES (7); INSERT INTO t (id, v) VALUES (1, 0); INSERT INTO t (v) VALUES (8)")),
+        (A, ("multi", "SELECT v FROM t ORDER BY id;")),
+        (A, ("multi", "SET @x = 1; SELECT @x + 1")),
+    ],
+    "user variables": [
+        (A, "SELECT @nosuch"),
+        (A, "SET @a = 5"),
+        (A, "SET @b = @a * 2, @c = CONCAT('x', @a)"),
+        (A, "SELECT @a, @b, @c, @A"),
+        (A, "SET @OLD_FOREIGN_KEY_CHECKS = @@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS = 0"),
+        (A, "SELECT @OLD_FOREIGN_KEY_CHECKS, @@foreign_key_checks"),
+        (A, "SET FOREIGN_KEY_CHECKS = @OLD_FOREIGN_KEY_CHECKS"),
+        (A, "SELECT @@foreign_key_checks"),
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 10), (2, 20)"),
+        (A, "SET @m = (SELECT MAX(v) FROM t)"),
+        (A, "SELECT id FROM t WHERE v = @m"),
+        (A, "UPDATE t SET v = @m + 1 WHERE id = 1"),
+        (A, "SELECT v FROM t ORDER BY id"),
     ],
 }
 MYSQL.update(MYSQL_QUERIES)
