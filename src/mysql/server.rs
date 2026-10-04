@@ -168,8 +168,10 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     // see a database selected at all, and every other real client would
     // hit "No database selected" on its very first query.
     // CLIENT_FOUND_ROWS (0x2): UPDATE reports matched rows, not changed.
+    // CLIENT_MULTI_STATEMENTS (0x10000): `;`-separated statements.
     if payload.len() >= 4 {
         session.engine.found_rows = payload[0] & 0x02 != 0;
+        session.engine.multi_statements = payload[2] & 0x01 != 0;
     }
     if let Some(db) = handshake_response_database(&payload) {
         session.engine.use_db(&db);
@@ -210,6 +212,39 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
             0x03 => {
                 // Query
                 let q = String::from_utf8_lossy(&payload[1..]);
+                // Several `;`-separated statements, for a client that asked
+                // for CLIENT_MULTI_STATEMENTS: one result each, all but the
+                // last flagged SERVER_MORE_RESULTS_EXISTS; the first error
+                // ends the batch.
+                if session.engine.multi_statements {
+                    let mut seq = seq.wrapping_add(1);
+                    let results = session.engine.execute_multi(&q);
+                    let n = results.len();
+                    for (k, r) in results.into_iter().enumerate() {
+                        let more = if k + 1 < n { 0x0008 } else { 0 };
+                        STATUS.with(|s| s.set(r.status | more));
+                        match r.result {
+                            Ok(rows) => {
+                                match send_resultset(
+                                    &mut stream,
+                                    seq,
+                                    rows,
+                                    r.affected,
+                                    r.insert_id,
+                                    &r.names,
+                                ) {
+                                    Ok(next) => seq = next,
+                                    Err(_) => break,
+                                }
+                            }
+                            Err(e) => {
+                                let _ = send_err(&mut stream, seq, e.code, e.sql_state, &e.message);
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let result = session.engine.execute(&q);
                 STATUS.with(|s| s.set(session.engine.status_flags()));
                 match result {
@@ -241,7 +276,8 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 // Stmt Prepare
                 let sql = String::from_utf8_lossy(&payload[1..]).to_string();
                 let dialect = MySqlDialect {};
-                match Parser::parse_sql(&dialect, &sql) {
+                let rewritten = crate::mysql::engine::rewrite_comma_update(&sql);
+                match Parser::parse_sql(&dialect, rewritten.as_deref().unwrap_or(&sql)) {
                     Ok(mut asts) => {
                         if asts.is_empty() {
                             let _ = send_err(
@@ -619,9 +655,10 @@ fn send_resultset(
     affected_rows: u64,
     last_insert_id: u64,
     names: &[String],
-) -> io::Result<()> {
+) -> io::Result<u8> {
     let Some(cols) = result_width(&rows, names) else {
-        return send_ok(stream, seq, affected_rows, last_insert_id);
+        send_ok(stream, seq, affected_rows, last_insert_id)?;
+        return Ok(seq.wrapping_add(1));
     };
     write_packet(stream, seq, &[cols as u8])?;
     seq = seq.wrapping_add(1);
@@ -658,7 +695,7 @@ fn send_resultset(
 
     write_packet(stream, seq, &eof)?;
 
-    Ok(())
+    Ok(seq.wrapping_add(1))
 }
 
 /// Length-encodes one non-NULL value as text (a length-encoded string),

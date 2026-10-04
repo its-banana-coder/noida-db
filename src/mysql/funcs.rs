@@ -409,18 +409,156 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             }
             let doc = to_json(&a[0], name)?;
             let mut found = Vec::new();
+            let mut wild = false;
             for p in &a[1..] {
                 let path = parse_path(&render_text(p))?;
-                if let Some(j) = walk(&doc, &path) {
-                    found.push(j.clone());
+                wild |= has_wildcard(&path);
+                walk_all(&doc, &path, &mut found);
+            }
+            // One plain path returns its value; wildcards or several paths
+            // return an array of every match.
+            match (a.len() == 2 && !wild, found.len()) {
+                (_, 0) => Value::Null,
+                (true, _) => Value::Json(Box::new(found.remove(0).clone())),
+                (false, _) => {
+                    Value::Json(Box::new(Json::Array(found.into_iter().cloned().collect())))
                 }
             }
-            match (a.len(), found.len()) {
-                (_, 0) => Value::Null,
-                (2, _) => Value::Json(Box::new(found.remove(0))),
-                _ => Value::Json(Box::new(Json::Array(found))),
+        }
+        "JSON_SET" | "JSON_INSERT" | "JSON_REPLACE" | "JSON_ARRAY_APPEND" | "JSON_ARRAY_INSERT" => {
+            if a.len() < 3 || a.len().is_multiple_of(2) {
+                return Err(MySqlError::new(
+                    1582,
+                    "42000",
+                    format!(
+                        "Incorrect parameter count in the call to native function '{}'",
+                        name.to_lowercase()
+                    ),
+                ));
+            }
+            if a[0].is_null() {
+                return Ok(Value::Null);
+            }
+            let mut doc = to_json(&a[0], name)?;
+            for pair in a[1..].chunks(2) {
+                if pair[0].is_null() {
+                    return Ok(Value::Null);
+                }
+                let path = parse_path(&render_text(&pair[0]))?;
+                if has_wildcard(&path) {
+                    return Err(no_wildcards());
+                }
+                json_modify(name, &mut doc, &path, value_to_json(&pair[1]))?;
+            }
+            Value::Json(Box::new(doc))
+        }
+        "JSON_REMOVE" => {
+            need(2)?;
+            if any_null(a.len()) {
+                return Ok(Value::Null);
+            }
+            let mut doc = to_json(&a[0], name)?;
+            for p in &a[1..] {
+                let path = parse_path(&render_text(p))?;
+                if has_wildcard(&path) {
+                    return Err(no_wildcards());
+                }
+                let Some((last, parent)) = path.split_last() else {
+                    return Err(MySqlError::new(
+                        3153,
+                        "42000",
+                        "The path expression '$' is not allowed in this context.",
+                    ));
+                };
+                match (walk_mut(&mut doc, parent), last) {
+                    (Some(Json::Object(m)), Step::Key(k)) => m.retain(|(x, _)| x != k),
+                    (Some(Json::Array(v)), Step::Index(i)) => {
+                        if let Some(i) = i.resolve(v.len()).filter(|&i| i < v.len()) {
+                            v.remove(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Value::Json(Box::new(doc))
+        }
+        "JSON_MERGE_PATCH" | "JSON_MERGE_PRESERVE" | "JSON_MERGE" => {
+            need(2)?;
+            let mut out: Option<Json> = None;
+            for v in a {
+                // MERGE_PATCH: a NULL argument makes the result NULL only
+                // until a later object replaces it.
+                if v.is_null() {
+                    if name != "JSON_MERGE_PATCH" {
+                        return Ok(Value::Null);
+                    }
+                    out = None;
+                    continue;
+                }
+                let j = to_json(v, name)?;
+                out = Some(match out {
+                    None => j,
+                    Some(acc) if name == "JSON_MERGE_PATCH" => merge_patch(acc, j),
+                    Some(acc) => merge_preserve(acc, j),
+                });
+            }
+            match out {
+                Some(j) => Value::Json(Box::new(j)),
+                None => Value::Null,
             }
         }
+        "JSON_QUOTE" => match arg(0) {
+            Value::Null => Value::Null,
+            v => Value::Text(Json::Str(render_text(&v)).to_jsonb_string()),
+        },
+        "JSON_DEPTH" => match arg(0) {
+            Value::Null => Value::Null,
+            v => Value::Int(json_depth(&to_json(&v, name)?)),
+        },
+        "JSON_OVERLAPS" => {
+            need(2)?;
+            if any_null(2) {
+                return Ok(Value::Null);
+            }
+            let (x, y) = (to_json(&a[0], name)?, to_json(&a[1], name)?);
+            let items = |j: &Json| match j {
+                Json::Array(v) => v.clone(),
+                other => vec![other.clone()],
+            };
+            let hit = match (&x, &y) {
+                (Json::Object(m1), Json::Object(m2)) => m1.iter().any(|kv| m2.contains(kv)),
+                _ => items(&x).iter().any(|i| items(&y).contains(i)),
+            };
+            Value::Int(i64::from(hit))
+        }
+        "JSON_SEARCH" => {
+            // JSON_SEARCH(doc, 'one'|'all', search[, escape[, path...]])
+            need(3)?;
+            if any_null(3) {
+                return Ok(Value::Null);
+            }
+            let doc = to_json(&a[0], name)?;
+            let mode = render_text(&a[1]).to_ascii_lowercase();
+            if mode != "one" && mode != "all" {
+                return Err(MySqlError::new(
+                    3154,
+                    "42000",
+                    "The oneOrAll argument to json_search may take these values: 'one' or 'all'.",
+                ));
+            }
+            let needle = render_text(&a[2]);
+            let mut hits = Vec::new();
+            search_strings(&doc, "$".to_string(), &needle, &mut hits);
+            match (hits.len(), mode.as_str()) {
+                (0, _) => Value::Null,
+                (_, "one") | (1, _) => Value::Json(Box::new(Json::Str(hits.remove(0)))),
+                _ => Value::Json(Box::new(Json::Array(hits.into_iter().map(Json::Str).collect()))),
+            }
+        }
+        "JSON_PRETTY" => match arg(0) {
+            Value::Null => Value::Null,
+            v => Value::Text(pretty(&to_json(&v, name)?, 0)),
+        },
         "JSON_UNQUOTE" => match arg(0) {
             Value::Null => Value::Null,
             Value::Json(j) => match *j {
@@ -908,6 +1046,10 @@ fn value_to_json(v: &Value) -> Json {
         Value::Bool(b) => Json::Bool(*b),
         Value::Int(i) => Json::Num(Numeric::from_i64(*i)),
         Value::Num(n) => Json::Num(n.clone()),
+        // A DOUBLE keeps its decimal point in JSON (`2.0`), as in MySQL.
+        Value::Float(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 1e15 => {
+            Json::Num(Numeric::parse(&format!("{f:.1}")).unwrap_or_else(|_| Numeric::from_f64(*f)))
+        }
         Value::Float(f) => Json::Num(Numeric::from_f64(*f)),
         Value::Json(j) => (**j).clone(),
         other => Json::Str(render_text(other)),
@@ -916,11 +1058,283 @@ fn value_to_json(v: &Value) -> Json {
 
 enum Step {
     Key(String),
-    Index(usize),
+    Index(Idx),
+    /// `.*`
+    AnyKey,
+    /// `[*]`
+    AnyIndex,
+    /// `**`: any depth (including none).
+    Descend,
 }
 
-/// A MySQL JSON path: `$`, `$.a.b`, `$."a key"`, `$[0]`, `$.a[2].b`.
-/// Wildcards (`*`, `**`) are rejected loudly rather than matched wrongly.
+/// An array index: `[3]`, `[last]`, `[last-1]`.
+#[derive(Clone, Copy)]
+enum Idx {
+    At(usize),
+    FromLast(usize),
+}
+
+impl Idx {
+    fn resolve(self, len: usize) -> Option<usize> {
+        match self {
+            Idx::At(i) => Some(i),
+            Idx::FromLast(k) => len.checked_sub(1 + k),
+        }
+    }
+}
+
+fn has_wildcard(path: &[Step]) -> bool {
+    path.iter().any(|s| matches!(s, Step::AnyKey | Step::AnyIndex | Step::Descend))
+}
+
+fn no_wildcards() -> MySqlError {
+    MySqlError::new(
+        3149,
+        "42000",
+        "In this situation, path expressions may not contain the * and ** tokens.",
+    )
+}
+
+/// Every value `path` matches in `doc`, in document order.
+fn walk_all<'a>(doc: &'a Json, path: &[Step], out: &mut Vec<&'a Json>) {
+    let Some((step, rest)) = path.split_first() else {
+        out.push(doc);
+        return;
+    };
+    match (step, doc) {
+        (Step::Key(k), Json::Object(_)) => {
+            if let Some(v) = doc.get(k) {
+                walk_all(v, rest, out);
+            }
+        }
+        (Step::Index(i), Json::Array(v)) => {
+            if let Some(x) = i.resolve(v.len()).and_then(|i| v.get(i)) {
+                walk_all(x, rest, out);
+            }
+        }
+        // MySQL: `$[0]` (and `$[last]`) on a non-array is the value itself.
+        (Step::Index(Idx::At(0) | Idx::FromLast(0)), other) => walk_all(other, rest, out),
+        (Step::AnyKey, Json::Object(m)) => m.iter().for_each(|(_, v)| walk_all(v, rest, out)),
+        (Step::AnyIndex, Json::Array(v)) => v.iter().for_each(|x| walk_all(x, rest, out)),
+        (Step::Descend, _) => {
+            walk_all(doc, rest, out);
+            match doc {
+                Json::Object(m) => m.iter().for_each(|(_, v)| walk_all(v, path, out)),
+                Json::Array(v) => v.iter().for_each(|x| walk_all(x, path, out)),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_mut<'a>(doc: &'a mut Json, path: &[Step]) -> Option<&'a mut Json> {
+    let mut cur = doc;
+    for step in path {
+        cur = match (step, cur) {
+            (Step::Key(k), Json::Object(m)) => &mut m.iter_mut().find(|(x, _)| x == k)?.1,
+            (Step::Index(i), Json::Array(v)) => {
+                let i = i.resolve(v.len())?;
+                v.get_mut(i)?
+            }
+            (Step::Index(Idx::At(0) | Idx::FromLast(0)), other) => other,
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+fn not_a_cell() -> MySqlError {
+    MySqlError::new(3165, "42000", "A path expression is not a path to a cell in an array.")
+}
+
+/// One JSON_SET/INSERT/REPLACE/ARRAY_APPEND/ARRAY_INSERT path-value pair.
+fn json_modify(func: &str, doc: &mut Json, path: &[Step], val: Json) -> Result<(), MySqlError> {
+    if func == "JSON_ARRAY_APPEND" {
+        if let Some(target) = walk_mut(doc, path) {
+            match target {
+                Json::Array(v) => v.push(val),
+                other => {
+                    let old = std::mem::replace(other, Json::Null);
+                    *other = Json::Array(vec![old, val]);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let Some((last, parent)) = path.split_last() else {
+        // `$` itself: SET and REPLACE replace the document.
+        match func {
+            "JSON_SET" | "JSON_REPLACE" => *doc = val,
+            "JSON_ARRAY_INSERT" => return Err(not_a_cell()),
+            _ => {}
+        }
+        return Ok(());
+    };
+    if func == "JSON_ARRAY_INSERT" {
+        let Step::Index(i) = last else { return Err(not_a_cell()) };
+        if let Some(Json::Array(v)) = walk_mut(doc, parent) {
+            let at = i.resolve(v.len()).unwrap_or(0).min(v.len());
+            v.insert(at, val);
+        }
+        return Ok(());
+    }
+    let (set, insert) = match func {
+        "JSON_SET" => (true, true),
+        "JSON_INSERT" => (false, true),
+        _ => (true, false),
+    };
+    let Some(target) = walk_mut(doc, parent) else { return Ok(()) };
+    match (last, target) {
+        (Step::Key(k), Json::Object(m)) => match m.iter_mut().find(|(x, _)| x == k) {
+            Some((_, v)) if set => *v = val,
+            None if insert => m.push((k.clone(), val)),
+            _ => {}
+        },
+        (Step::Index(i), Json::Array(v)) => match i.resolve(v.len()).filter(|&i| i < v.len()) {
+            Some(i) if set => v[i] = val,
+            None if insert => v.push(val),
+            _ => {}
+        },
+        // A scalar or object is a one-element array to `$[n]`.
+        (Step::Index(i), other) => {
+            if matches!(i, Idx::At(0) | Idx::FromLast(0)) {
+                if set {
+                    *other = val;
+                }
+            } else if insert {
+                let old = std::mem::replace(other, Json::Null);
+                *other = Json::Array(vec![old, val]);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// RFC 7396 merge patch.
+fn merge_patch(target: Json, patch: Json) -> Json {
+    match patch {
+        Json::Object(pm) => {
+            let mut tm = match target {
+                Json::Object(m) => m,
+                _ => Vec::new(),
+            };
+            for (k, v) in pm {
+                let existing = tm.iter().position(|(x, _)| *x == k);
+                if matches!(v, Json::Null) {
+                    if let Some(i) = existing {
+                        tm.remove(i);
+                    }
+                } else if let Some(i) = existing {
+                    let old = std::mem::replace(&mut tm[i].1, Json::Null);
+                    tm[i].1 = merge_patch(old, v);
+                } else {
+                    tm.push((k, merge_patch(Json::Null, v)));
+                }
+            }
+            Json::Object(tm)
+        }
+        other => other,
+    }
+}
+
+/// JSON_MERGE_PRESERVE: arrays concatenate, objects merge (a shared key's
+/// values merge too), anything else is wrapped in an array first.
+fn merge_preserve(a: Json, b: Json) -> Json {
+    match (a, b) {
+        (Json::Object(mut am), Json::Object(bm)) => {
+            for (k, v) in bm {
+                match am.iter().position(|(x, _)| *x == k) {
+                    Some(i) => {
+                        let old = std::mem::replace(&mut am[i].1, Json::Null);
+                        am[i].1 = merge_preserve(old, v);
+                    }
+                    None => am.push((k, v)),
+                }
+            }
+            Json::Object(am)
+        }
+        (a, b) => {
+            let items = |j: Json| match j {
+                Json::Array(v) => v,
+                other => vec![other],
+            };
+            let mut v = items(a);
+            v.extend(items(b));
+            Json::Array(v)
+        }
+    }
+}
+
+fn json_depth(j: &Json) -> i64 {
+    match j {
+        Json::Array(v) if !v.is_empty() => 1 + v.iter().map(json_depth).max().unwrap_or(0),
+        Json::Object(m) if !m.is_empty() => {
+            1 + m.iter().map(|(_, v)| json_depth(v)).max().unwrap_or(0)
+        }
+        _ => 1,
+    }
+}
+
+/// Paths of the string values in `j` matching `needle` (JSON_SEARCH; `%`
+/// and `_` wildcards as in LIKE).
+fn search_strings(j: &Json, at: String, needle: &str, out: &mut Vec<String>) {
+    match j {
+        Json::Str(s) => {
+            if crate::mysql::exec::mysql_like(s, needle, Some('\\')) {
+                out.push(at);
+            }
+        }
+        Json::Array(v) => {
+            for (i, x) in v.iter().enumerate() {
+                search_strings(x, format!("{at}[{i}]"), needle, out);
+            }
+        }
+        Json::Object(m) => {
+            for (k, v) in m {
+                let key = if k.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    k.clone()
+                } else {
+                    format!("\"{k}\"")
+                };
+                search_strings(v, format!("{at}.{key}"), needle, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pretty(j: &Json, indent: usize) -> String {
+    let pad = "  ".repeat(indent + 1);
+    let end = "  ".repeat(indent);
+    match j {
+        Json::Array(v) if !v.is_empty() => format!(
+            "[\n{}\n{end}]",
+            v.iter()
+                .map(|x| format!("{pad}{}", pretty(x, indent + 1)))
+                .collect::<Vec<_>>()
+                .join(",\n")
+        ),
+        Json::Object(m) if !m.is_empty() => format!(
+            "{{\n{}\n{end}}}",
+            m.iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{pad}{}: {}",
+                        Json::Str(k.clone()).to_jsonb_string(),
+                        pretty(v, indent + 1)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n")
+        ),
+        other => other.to_jsonb_string(),
+    }
+}
+
+/// A MySQL JSON path: `$`, `$.a.b`, `$."a key"`, `$[0]`, `$.a[2].b`,
+/// `$[last]`, `$[last-1]`, and the wildcards `.*`, `[*]` and `**`.
 fn parse_path(p: &str) -> Result<Vec<Step>, MySqlError> {
     let bad = || {
         MySqlError::new(
@@ -935,7 +1349,17 @@ fn parse_path(p: &str) -> Result<Vec<Step>, MySqlError> {
     let mut rest = s.strip_prefix('$').ok_or_else(bad)?;
     let mut out = Vec::new();
     while !rest.is_empty() {
-        if let Some(r) = rest.strip_prefix('.') {
+        if let Some(r) = rest.strip_prefix("**") {
+            out.push(Step::Descend);
+            rest = r;
+            // `**` must be followed by a member or cell.
+            if rest.is_empty() {
+                return Err(bad());
+            }
+        } else if let Some(r) = rest.strip_prefix(".*") {
+            out.push(Step::AnyKey);
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('.') {
             if let Some(r) = r.strip_prefix('"') {
                 let end = r.find('"').ok_or_else(bad)?;
                 out.push(Step::Key(r[..end].to_string()));
@@ -951,8 +1375,20 @@ fn parse_path(p: &str) -> Result<Vec<Step>, MySqlError> {
             }
         } else if let Some(r) = rest.strip_prefix('[') {
             let end = r.find(']').ok_or_else(bad)?;
-            let i = r[..end].trim().parse::<usize>().map_err(|_| bad())?;
-            out.push(Step::Index(i));
+            let inner = r[..end].trim();
+            if inner == "*" {
+                out.push(Step::AnyIndex);
+            } else if let Some(l) = inner.strip_prefix("last") {
+                let l = l.trim();
+                let k = match l.strip_prefix('-') {
+                    Some(n) => n.trim().parse::<usize>().map_err(|_| bad())?,
+                    None if l.is_empty() => 0,
+                    None => return Err(bad()),
+                };
+                out.push(Step::Index(Idx::FromLast(k)));
+            } else {
+                out.push(Step::Index(Idx::At(inner.parse::<usize>().map_err(|_| bad())?)));
+            }
             rest = &r[end + 1..];
         } else {
             return Err(bad());
@@ -962,15 +1398,7 @@ fn parse_path(p: &str) -> Result<Vec<Step>, MySqlError> {
 }
 
 fn walk<'a>(doc: &'a Json, path: &[Step]) -> Option<&'a Json> {
-    let mut cur = doc;
-    for step in path {
-        cur = match (step, cur) {
-            (Step::Key(k), Json::Object(_)) => cur.get(k)?,
-            (Step::Index(i), Json::Array(v)) => v.get(*i)?,
-            // MySQL: `$[0]` on a non-array is the value itself.
-            (Step::Index(0), other) => other,
-            _ => return None,
-        };
-    }
-    Some(cur)
+    let mut found = Vec::new();
+    walk_all(doc, path, &mut found);
+    found.into_iter().next()
 }

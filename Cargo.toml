@@ -37,7 +37,7 @@ redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
 sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
-mysql = ["sql", "dep:sqlparser", "dep:bytes"]
+mysql = ["sql", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = ["dep:kafka-protocol", "dep:bytes"]
 elasticsearch = ["dep:regex-lite"]
 mongodb = []
