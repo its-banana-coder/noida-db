@@ -270,6 +270,76 @@ pub struct DbState {
     pub domains: BTreeMap<u32, Domain>,
     pub next_oid: u32,
     pub db_comment: Option<String>,
+    /// User functions and procedures (PL/pgSQL, SQL), by OID.
+    #[serde(default)]
+    pub functions: BTreeMap<u32, Function>,
+    /// Triggers, by OID.
+    #[serde(default)]
+    pub triggers: BTreeMap<u32, Trigger>,
+}
+
+/// A `CREATE FUNCTION` / `CREATE PROCEDURE`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Function {
+    pub oid: u32,
+    pub schema: u32,
+    pub name: String,
+    /// Parameter names ("" for an unnamed one), types and DEFAULTs (SQL).
+    pub arg_names: Vec<String>,
+    pub arg_types: Vec<Type>,
+    pub arg_defaults: Vec<Option<String>>,
+    pub ret: Type,
+    pub returns_set: bool,
+    /// `RETURNS TABLE (...)` columns.
+    pub out_cols: Vec<(String, Type)>,
+    /// `plpgsql` or `sql`.
+    pub language: String,
+    pub body: String,
+    pub procedure: bool,
+    pub strict: bool,
+    /// `i`mmutable, `s`table or `v`olatile.
+    pub volatility: char,
+}
+
+impl Default for Function {
+    fn default() -> Self {
+        Function {
+            oid: 0,
+            schema: 0,
+            name: String::new(),
+            arg_names: vec![],
+            arg_types: vec![],
+            arg_defaults: vec![],
+            ret: Type::of(super::types::Base::Void),
+            returns_set: false,
+            out_cols: vec![],
+            language: "plpgsql".into(),
+            body: String::new(),
+            procedure: false,
+            strict: false,
+            volatility: 'v',
+        }
+    }
+}
+
+/// A `CREATE TRIGGER`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Trigger {
+    pub oid: u32,
+    pub name: String,
+    pub table: u32,
+    /// BEFORE, AFTER or INSTEAD OF.
+    pub timing: String,
+    /// INSERT, UPDATE, DELETE, TRUNCATE.
+    pub events: Vec<String>,
+    /// `UPDATE OF cols`.
+    pub update_cols: Vec<String>,
+    /// FOR EACH ROW (else STATEMENT).
+    pub row: bool,
+    /// `WHEN (...)`, as SQL text.
+    pub when: Option<String>,
+    pub function: u32,
+    pub args: Vec<String>,
 }
 
 impl Default for DbState {
@@ -299,6 +369,8 @@ impl Default for DbState {
             domains: BTreeMap::new(),
             next_oid: FIRST_USER_OID,
             db_comment: None,
+            functions: BTreeMap::new(),
+            triggers: BTreeMap::new(),
         }
     }
 }
@@ -333,6 +405,13 @@ impl DbState {
 
     pub fn table_mut(&mut self, oid: u32) -> Option<&mut Table> {
         self.tables.get_mut(&oid).map(Arc::make_mut)
+    }
+
+    /// A table by name, searching `search_path`.
+    pub fn find_table_by_name(&self, name: &str, search_path: &[String]) -> Option<&Table> {
+        search_path
+            .iter()
+            .find_map(|s| self.schema_by_name(s).and_then(|sid| self.find_table(sid, name)))
     }
 
     pub fn find_table(&self, schema: u32, name: &str) -> Option<&Table> {

@@ -65,6 +65,20 @@ macro_rules! env {
 pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
     Ok(match e {
         Expr::Const(v) => v.clone(),
+        Expr::UserFunc { oid, args } => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval(a, row, ctx)?);
+            }
+            let func = ctx.db.functions.get(oid).cloned().ok_or_else(|| {
+                PgError::new(
+                    code::UNDEFINED_FUNCTION,
+                    format!("function with OID {oid} does not exist"),
+                )
+            })?;
+            let info = super::dml::session_info(ctx);
+            super::plpgsql::call_function(ctx, &info, &func, vals)?
+        }
         Expr::Param(i) => ctx.params.get(*i).cloned().unwrap_or(Value::Null),
         Expr::Col(i) => row.get(*i).cloned().unwrap_or(Value::Null),
         Expr::Outer(depth, i) => {
@@ -438,6 +452,9 @@ pub fn build_reg_names(db: &DbState, user: &str, path: &[String]) -> types::RegN
     }
     for sig in super::sigs::all_sigs() {
         r.procs.insert(sig.oid, sig.name.to_string());
+    }
+    for f in db.functions.values() {
+        r.procs.insert(f.oid, f.name.clone());
     }
     for s in db.schemas.values() {
         r.namespaces.insert(s.oid, s.name.clone());
@@ -1432,7 +1449,28 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
 /// A set-returning function in FROM; `row` is the left-hand row a LATERAL
 /// function's arguments refer to.
 fn exec_func(f: &From, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
-    let From::Func { name, args, arg_tys, ordinality, .. } = f else { return Ok(vec![]) };
+    let From::Func { name, args, arg_tys, ordinality, user, .. } = f else { return Ok(vec![]) };
+    if let Some(oid) = user {
+        let mut vals = vec![];
+        for a in args {
+            vals.push(eval(a, row, ctx)?);
+        }
+        let func = ctx.db.functions.get(oid).cloned().ok_or_else(|| {
+            PgError::new(
+                code::UNDEFINED_FUNCTION,
+                format!("function with OID {oid} does not exist"),
+            )
+        })?;
+        let info = super::dml::session_info(ctx);
+        let v = super::plpgsql::call_function(ctx, &info, &func, vals)?;
+        let mut rows = if func.returns_set { super::plpgsql::set_rows(v) } else { vec![vec![v]] };
+        if *ordinality {
+            for (i, r) in rows.iter_mut().enumerate() {
+                r.push(Value::Int(i as i64 + 1));
+            }
+        }
+        return Ok(rows);
+    }
     // A scalar function in FROM (`SELECT * FROM current_schema()`) is valid
     // Postgres and returns one row of one column, not a set.
     if super::sigs::kind_of(name) != Some(super::sigs::Kind::Srf) {

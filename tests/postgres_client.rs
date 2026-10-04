@@ -574,3 +574,46 @@ fn derived_tables_in_dml_and_writable_ctes() {
         .collect();
     assert_eq!(top, vec![("e".into(), "bob".into()), ("w".into(), "cat".into())]);
 }
+
+/// PL/pgSQL functions and triggers, through the extended protocol too.
+#[test]
+fn plpgsql_functions_and_triggers() {
+    let mut c = client();
+    c.batch_execute(
+        "CREATE TABLE doc (id serial PRIMARY KEY, title text NOT NULL, rev int NOT NULL DEFAULT 0);
+         CREATE TABLE doc_log (doc_id int, op text);
+         CREATE FUNCTION bump_rev() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             NEW.title := initcap(NEW.title);
+             IF TG_OP = 'UPDATE' THEN NEW.rev := OLD.rev + 1; END IF;
+             RETURN NEW;
+           END $$;
+         CREATE FUNCTION log_doc() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN INSERT INTO doc_log VALUES (COALESCE(NEW.id, OLD.id), TG_OP); RETURN NULL; END $$;
+         CREATE TRIGGER a BEFORE INSERT OR UPDATE ON doc FOR EACH ROW EXECUTE FUNCTION bump_rev();
+         CREATE TRIGGER b AFTER INSERT OR UPDATE OR DELETE ON doc FOR EACH ROW EXECUTE FUNCTION log_doc();
+         CREATE FUNCTION doc_count(min_rev int DEFAULT 0) RETURNS bigint LANGUAGE sql AS
+           'SELECT count(*) FROM doc WHERE rev >= min_rev';",
+    )
+    .unwrap();
+    let row = c
+        .query_one("INSERT INTO doc (title) VALUES ($1) RETURNING title, rev", &[&"hello world"])
+        .unwrap();
+    assert_eq!(row.get::<_, &str>(0), "Hello World");
+    c.execute("UPDATE doc SET title = 'again' WHERE id = 1", &[]).unwrap();
+    c.execute("DELETE FROM doc", &[]).unwrap();
+    let ops: Vec<String> = c
+        .query("SELECT op FROM doc_log ORDER BY op", &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(ops, ["DELETE", "INSERT", "UPDATE"]);
+    let n: i64 = c.query_one("SELECT doc_count($1)", &[&0i32]).unwrap().get(0);
+    assert_eq!(n, 0);
+    let err = c
+        .batch_execute("DO $$ BEGIN RAISE EXCEPTION 'nope %', 42 USING ERRCODE = '22023'; END $$")
+        .unwrap_err();
+    assert_eq!(err.code().unwrap().code(), "22023");
+    assert_eq!(err.as_db_error().unwrap().message(), "nope 42");
+}

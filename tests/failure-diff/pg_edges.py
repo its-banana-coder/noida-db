@@ -113,3 +113,143 @@ PG_EDGES = {
         "SELECT id FROM e GROUP BY id HAVING sal > 1",
     ),
 }
+
+PG_EDGES.update({
+    "pg plpgsql: functions": steps(
+        """CREATE FUNCTION add(a int, b int DEFAULT 10) RETURNS int AS $$ BEGIN RETURN a + b; END $$ LANGUAGE plpgsql""",
+        "SELECT add(1, 2), add(5), add(NULL, 1)",
+        """CREATE FUNCTION sq(x numeric) RETURNS numeric LANGUAGE sql IMMUTABLE AS $$ SELECT x * x $$""",
+        "SELECT sq(1.5), sq(NULL)",
+        """CREATE FUNCTION fact(n int) RETURNS bigint LANGUAGE plpgsql AS $$
+           DECLARE r bigint := 1; i int;
+           BEGIN
+             IF n < 0 THEN RAISE EXCEPTION 'negative: %', n USING ERRCODE = '22023'; END IF;
+             FOR i IN 1..n LOOP r := r * i; END LOOP;
+             RETURN r;
+           END $$""",
+        "SELECT fact(0), fact(5), fact(20)",
+        "SELECT fact(-1)",
+        """CREATE FUNCTION classify(x int) RETURNS text LANGUAGE plpgsql AS $$
+           BEGIN
+             CASE WHEN x < 0 THEN RETURN 'neg'; WHEN x = 0 THEN RETURN 'zero'; ELSE RETURN 'pos'; END CASE;
+           END $$""",
+        "SELECT classify(-3), classify(0), classify(7)",
+        """CREATE FUNCTION loopy(n int) RETURNS text LANGUAGE plpgsql AS $$
+           DECLARE s text := ''; i int := 0;
+           BEGIN
+             <<outer>> LOOP
+               i := i + 1;
+               CONTINUE WHEN i % 2 = 0;
+               EXIT outer WHEN i > n;
+               s := s || i::text || ',';
+             END LOOP;
+             WHILE length(s) > 0 AND right(s, 1) = ',' LOOP s := left(s, -1); END LOOP;
+             RETURN s;
+           END $$""",
+        "SELECT loopy(7), loopy(0)",
+        "CREATE TABLE acct (id int PRIMARY KEY, bal numeric NOT NULL CHECK (bal >= 0))",
+        "INSERT INTO acct VALUES (1, 100), (2, 50)",
+        """CREATE FUNCTION transfer(a int, b int, amt numeric) RETURNS text LANGUAGE plpgsql AS $$
+           DECLARE n int;
+           BEGIN
+             UPDATE acct SET bal = bal - amt WHERE id = a;
+             GET DIAGNOSTICS n = ROW_COUNT;
+             IF n = 0 THEN RAISE EXCEPTION 'no account %', a; END IF;
+             UPDATE acct SET bal = bal + amt WHERE id = b;
+             RETURN 'ok';
+           EXCEPTION
+             WHEN check_violation THEN RETURN 'insufficient funds';
+           END $$""",
+        "SELECT transfer(1, 2, 30)",
+        "SELECT transfer(1, 2, 500)",
+        "SELECT id, bal FROM acct ORDER BY id",
+        "SELECT transfer(9, 2, 1)",
+        """CREATE FUNCTION lookup(k int) RETURNS numeric LANGUAGE plpgsql AS $$
+           DECLARE v numeric;
+           BEGIN
+             SELECT bal INTO STRICT v FROM acct WHERE id = k;
+             RETURN v;
+           EXCEPTION WHEN no_data_found THEN RETURN -1;
+           END $$""",
+        "SELECT lookup(1), lookup(99)",
+        """CREATE FUNCTION evens(n int) RETURNS SETOF int LANGUAGE plpgsql AS $$
+           BEGIN FOR i IN 1..n LOOP IF i % 2 = 0 THEN RETURN NEXT i; END IF; END LOOP; END $$""",
+        "SELECT * FROM evens(9)",
+        """CREATE FUNCTION accts(min numeric) RETURNS TABLE(aid int, abal numeric) LANGUAGE plpgsql AS $$
+           BEGIN RETURN QUERY SELECT id, bal FROM acct WHERE bal >= min ORDER BY id; END $$""",
+        "SELECT * FROM accts(60)",
+        """CREATE FUNCTION nums() RETURNS SETOF int LANGUAGE sql AS $$ SELECT generate_series(1, 3) $$""",
+        "SELECT n * 10 FROM nums() AS n",
+        "DO $$ DECLARE c int; BEGIN SELECT count(*) INTO c FROM acct; IF c <> 2 THEN RAISE EXCEPTION 'bad'; END IF; END $$",
+        "DO $$ BEGIN PERFORM 1 / 0; EXCEPTION WHEN division_by_zero THEN INSERT INTO acct VALUES (3, 0); END $$",
+        "SELECT count(*) FROM acct",
+        "CREATE PROCEDURE add_acct(i int, b numeric) LANGUAGE plpgsql AS $$ BEGIN INSERT INTO acct VALUES (i, b); END $$",
+        "CALL add_acct(4, 40)",
+        "SELECT id, bal FROM acct ORDER BY id",
+        "DROP FUNCTION add(int, int)",
+        "SELECT add(1, 2)",
+        "DROP FUNCTION IF EXISTS nosuch(int)",
+        "CREATE FUNCTION bad() RETURNS int LANGUAGE plpgsql AS $$ BEGIN RETURN 1 END $$",
+        "CREATE FUNCTION noret() RETURNS int LANGUAGE plpgsql AS $$ BEGIN NULL; END $$",
+        "SELECT noret()",
+    ),
+    "pg plpgsql: triggers": steps(
+        "CREATE TABLE item (id serial PRIMARY KEY, name text NOT NULL, price numeric, updated_at timestamp, version int NOT NULL DEFAULT 0)",
+        "CREATE TABLE audit (id serial PRIMARY KEY, op text, item_id int, old_name text, new_name text)",
+        """CREATE FUNCTION touch() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN NEW.updated_at := '2024-01-01 00:00:00'; NEW.version := OLD.version + 1; RETURN NEW; END $$""",
+        """CREATE FUNCTION log_item() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF TG_OP = 'DELETE' THEN
+               INSERT INTO audit (op, item_id, old_name) VALUES (TG_OP, OLD.id, OLD.name);
+               RETURN OLD;
+             ELSIF TG_OP = 'UPDATE' THEN
+               INSERT INTO audit (op, item_id, old_name, new_name) VALUES (TG_OP, NEW.id, OLD.name, NEW.name);
+             ELSE
+               INSERT INTO audit (op, item_id, new_name) VALUES (TG_OP, NEW.id, NEW.name);
+             END IF;
+             RETURN NEW;
+           END $$""",
+        """CREATE FUNCTION check_price() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.price < 0 THEN RAISE EXCEPTION 'price % is negative', NEW.price USING ERRCODE = 'check_violation'; END IF;
+             IF NEW.name = 'skip' THEN RETURN NULL; END IF;
+             NEW.name := trim(NEW.name);
+             RETURN NEW;
+           END $$""",
+        "CREATE TRIGGER a_check BEFORE INSERT OR UPDATE ON item FOR EACH ROW EXECUTE FUNCTION check_price()",
+        "CREATE TRIGGER b_touch BEFORE UPDATE ON item FOR EACH ROW EXECUTE FUNCTION touch()",
+        "CREATE TRIGGER z_log AFTER INSERT OR UPDATE OR DELETE ON item FOR EACH ROW EXECUTE FUNCTION log_item()",
+        "INSERT INTO item (name, price) VALUES ('  apple ', 1.5), ('skip', 2), ('pear', 3) RETURNING id, name, version",
+        "INSERT INTO item (name, price) VALUES ('bad', -1)",
+        "UPDATE item SET price = price * 2 WHERE name = 'apple' RETURNING name, price, updated_at, version",
+        "UPDATE item SET name = 'skip'",
+        "SELECT id, name, price, version FROM item ORDER BY id",
+        "DELETE FROM item WHERE name = 'pear'",
+        "SELECT op, item_id, old_name, new_name FROM audit ORDER BY id",
+        """CREATE FUNCTION keep_one() RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN IF (SELECT count(*) FROM item) <= 1 THEN RETURN NULL; END IF; RETURN OLD; END $$""",
+        "CREATE TRIGGER guard BEFORE DELETE ON item FOR EACH ROW EXECUTE FUNCTION keep_one()",
+        "DELETE FROM item",
+        "SELECT count(*) FROM item",
+        "CREATE TABLE cnt (n int)",
+        "INSERT INTO cnt VALUES (0)",
+        """CREATE FUNCTION bump() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE cnt SET n = n + 1; RETURN NULL; END $$""",
+        "CREATE TRIGGER per_stmt AFTER UPDATE ON item FOR EACH STATEMENT EXECUTE FUNCTION bump()",
+        "CREATE TRIGGER only_price AFTER UPDATE OF price ON item FOR EACH ROW WHEN (NEW.price > 100) EXECUTE FUNCTION bump()",
+        "UPDATE item SET name = name",
+        "UPDATE item SET price = 500",
+        "UPDATE item SET price = 1 WHERE false",
+        "SELECT n FROM cnt",
+        "DROP TRIGGER per_stmt ON item",
+        "DROP TRIGGER per_stmt ON item",
+        "DROP FUNCTION bump()",
+        "CREATE FUNCTION not_trigger() RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        "CREATE TRIGGER t BEFORE INSERT ON item FOR EACH ROW EXECUTE FUNCTION not_trigger()",
+        "CREATE TABLE rec (n int)",
+        "CREATE FUNCTION again() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO rec VALUES (NEW.n + 1); RETURN NEW; END $$",
+        "CREATE TRIGGER loop_t AFTER INSERT ON rec FOR EACH ROW WHEN (NEW.n < 5) EXECUTE FUNCTION again()",
+        "INSERT INTO rec VALUES (1)",
+        "SELECT n FROM rec ORDER BY n",
+    ),
+})

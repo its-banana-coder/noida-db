@@ -66,6 +66,11 @@ pub enum SubKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Const(Value),
+    /// A user function (`CREATE FUNCTION`), by OID.
+    UserFunc {
+        oid: u32,
+        args: Vec<Expr>,
+    },
     Param(usize),
     /// Column of the current row.
     Col(usize),
@@ -152,6 +157,7 @@ impl Expr {
     pub fn children_mut(&mut self, f: &mut dyn FnMut(&mut Expr)) {
         match self {
             Expr::Call { args, .. }
+            | Expr::UserFunc { args, .. }
             | Expr::And(args)
             | Expr::Or(args)
             | Expr::Coalesce(args)
@@ -299,6 +305,8 @@ pub enum From {
         ncols: usize,
         ordinality: bool,
         lateral: bool,
+        /// A user set-returning function (its OID) instead of a builtin.
+        user: Option<u32>,
     },
     /// A single empty row (SELECT without FROM).
     One,

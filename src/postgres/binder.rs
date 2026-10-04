@@ -1463,6 +1463,21 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// The user function `name` callable with `nargs` arguments.
+    fn user_function(&self, name: &str, nargs: usize) -> Option<super::catalog::Function> {
+        self.db
+            .functions
+            .values()
+            .find(|f| {
+                f.name == name
+                    && !f.procedure
+                    && nargs <= f.arg_types.len()
+                    && nargs + f.arg_defaults.iter().filter(|d| d.is_some()).count()
+                        >= f.arg_types.len()
+            })
+            .cloned()
+    }
+
     fn bind_from_function(
         &mut self,
         fname: &str,
@@ -1491,6 +1506,7 @@ impl<'a> Binder<'a> {
         let arg_tys: Vec<Type> = bound.iter().map(|t| t.ty).collect();
         // `unnest(a, b, ...)` in FROM: one column per array, padded with NULLs.
         let multi_unnest = fname == "unnest" && bound.len() > 1;
+        let mut user = None;
         let (sig_name, arg_exprs, arg_tys, mut cols) = if multi_unnest {
             let mut cols = vec![];
             for t in &arg_tys {
@@ -1508,6 +1524,20 @@ impl<'a> Binder<'a> {
             }
             let exprs = bound.into_iter().map(|t| t.e).collect();
             ("unnest", exprs, arg_tys, cols)
+        } else if sigs::kind_of(fname).is_none()
+            && let Some(uf) = self.user_function(fname, bound.len())
+        {
+            let mut arg_exprs = vec![];
+            for (i, te) in bound.into_iter().enumerate() {
+                arg_exprs.push(self.coerce(te, uf.arg_types[i], -1, CastCtx::Implicit, fname)?);
+            }
+            let cols: Vec<OutCol> = if uf.out_cols.is_empty() {
+                vec![OutCol::new(fname.to_string(), uf.ret)]
+            } else {
+                uf.out_cols.iter().map(|(n, t)| OutCol::new(n.clone(), *t)).collect()
+            };
+            user = Some(uf.oid);
+            ("user_function", arg_exprs, uf.arg_types.clone(), cols)
         } else {
             let r = sigs::resolve(fname, &arg_tys)?;
             let mut arg_exprs = vec![];
@@ -1560,6 +1590,7 @@ impl<'a> Binder<'a> {
                 ncols,
                 ordinality,
                 lateral: left.is_some(),
+                user,
             },
             scope,
         ))
@@ -2986,6 +3017,24 @@ impl<'a> Binder<'a> {
             _ => {}
         }
         let kind = sigs::kind_of(&name);
+        // Not a builtin: a user function?
+        if kind.is_none()
+            && f.over.is_none()
+            && let Some(uf) = self.user_function(&name, args.len())
+        {
+            if uf.returns_set {
+                return Err(PgError::new(
+                    code::FEATURE_NOT_SUPPORTED,
+                    format!("set-returning function {name}() is only supported in FROM"),
+                ));
+            }
+            let mut out = vec![];
+            for (i, e) in args.iter().enumerate() {
+                let te = self.bind_expr(e)?;
+                out.push(self.coerce(te, uf.arg_types[i], -1, CastCtx::Implicit, &name)?);
+            }
+            return Ok(TE::new(Expr::UserFunc { oid: uf.oid, args: out }, uf.ret));
+        }
         let is_agg = kind == Some(Kind::Agg) || (star && name == "count");
         let is_win = kind == Some(Kind::Window);
         if (is_agg || is_win) && f.over.is_none() {
