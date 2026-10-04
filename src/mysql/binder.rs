@@ -38,6 +38,13 @@ pub struct Binder {
     /// Set when a `Plan::CteRef` is bound, to tell a recursive CTE's step
     /// that refers to itself from one that doesn't.
     cte_ref_used: bool,
+    /// Whether a window function is allowed where binding is now (the
+    /// select list and ORDER BY; MySQL rejects it elsewhere with 3593).
+    window_ok: bool,
+    /// The current SELECT's `WINDOW name AS (...)` definitions.
+    named_windows: Vec<sqlparser::ast::NamedWindowDefinition>,
+    /// Gives each window function in the statement its own id.
+    window_counter: usize,
 }
 
 impl Binder {
@@ -50,6 +57,9 @@ impl Binder {
             sql: String::new(),
             ctes: Vec::new(),
             cte_ref_used: false,
+            window_ok: false,
+            named_windows: Vec::new(),
+            window_counter: 0,
         }
     }
 
@@ -874,6 +884,16 @@ impl Binder {
     }
 
     fn bind_query(&mut self, query: Query) -> Result<Plan, MySqlError> {
+        // A subquery is its own scope for window functions and names.
+        let saved_ok = std::mem::replace(&mut self.window_ok, false);
+        let saved_named = std::mem::take(&mut self.named_windows);
+        let res = self.bind_query_scoped(query);
+        self.window_ok = saved_ok;
+        self.named_windows = saved_named;
+        res
+    }
+
+    fn bind_query_scoped(&mut self, query: Query) -> Result<Plan, MySqlError> {
         let scope = self.ctes.len();
         let res = (|| {
             if let Some(with) = query.with {
@@ -1072,6 +1092,8 @@ impl Binder {
                 // aliases, not plain column names.
                 let mut aliases: Vec<(String, Expr)> = Vec::new();
                 let mut has_wildcard = false;
+                self.named_windows = select.named_window.clone();
+                self.window_ok = true;
                 for item in select.projection {
                     match item {
                         SelectItem::UnnamedExpr(expr) => {
@@ -1112,6 +1134,7 @@ impl Binder {
                         _ => return Err(MySqlError::unsupported("select item")),
                     }
                 }
+                self.window_ok = false;
                 let alias_of = |e: &AstExpr| -> Option<Expr> {
                     match e {
                         AstExpr::Identifier(i) => aliases
@@ -1188,7 +1211,12 @@ impl Binder {
                         }
                         let bound = match alias_of(&item.expr) {
                             Some(x) => x,
-                            None => self.bind_expr(item.expr)?,
+                            None => {
+                                self.window_ok = true;
+                                let b = self.bind_expr(item.expr);
+                                self.window_ok = false;
+                                b?
+                            }
                         };
                         hidden_exprs.push(bound);
                         order.push((SortKey::Hidden(hidden_exprs.len() - 1), asc));
@@ -1353,6 +1381,182 @@ impl Binder {
             }
             _ => Err(MySqlError::unsupported("table factor")),
         }
+    }
+
+    /// A window function call: `func(args) OVER (spec)` or `OVER name`.
+    fn bind_window(
+        &mut self,
+        upper: &str,
+        func: Function,
+        over: sqlparser::ast::WindowType,
+    ) -> Result<Expr, MySqlError> {
+        if !self.window_ok {
+            return Err(MySqlError::new(
+                3593,
+                "HY000",
+                format!(
+                    "You cannot use the window function '{}' in this context.'",
+                    upper.to_lowercase()
+                ),
+            ));
+        }
+        let ast_spec = match over {
+            sqlparser::ast::WindowType::WindowSpec(spec) => spec,
+            sqlparser::ast::WindowType::NamedWindow(name) => self.named_window_spec(&name.value)?,
+        };
+        let args = match func.args {
+            FunctionArguments::List(list) => {
+                if matches!(
+                    list.duplicate_treatment,
+                    Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                ) {
+                    return Err(MySqlError::unsupported(&format!(
+                        "<window function>({upper} DISTINCT)"
+                    )));
+                }
+                list.args
+            }
+            FunctionArguments::None => vec![],
+            FunctionArguments::Subquery(_) => {
+                return Err(MySqlError::unsupported("window function with subquery argument"));
+            }
+        };
+        // Nothing inside a window may itself be a window function.
+        self.window_ok = false;
+        let res = self.bind_window_parts(upper, &args, ast_spec);
+        self.window_ok = true;
+        let (name, bound_args, spec) = res?;
+        self.window_counter += 1;
+        Ok(Expr::Window {
+            id: self.window_counter,
+            func: name,
+            args: bound_args,
+            spec: Box::new(spec),
+        })
+    }
+
+    fn bind_window_parts(
+        &mut self,
+        upper: &str,
+        args: &[FunctionArg],
+        ast_spec: sqlparser::ast::WindowSpec,
+    ) -> Result<(String, Vec<Expr>, plan::WindowSpec), MySqlError> {
+        let star =
+            args.len() == 1 && matches!(&args[0], FunctionArg::Unnamed(FunctionArgExpr::Wildcard));
+        let name = match upper {
+            "COUNT" if star => "COUNT_STAR".to_string(),
+            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST" | "NTILE"
+            | "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "SUM" | "AVG"
+            | "COUNT" | "MIN" | "MAX" => upper.to_string(),
+            _ => {
+                return Err(MySqlError::syntax_error(&format!(
+                    "{upper}() is not a window function"
+                )));
+            }
+        };
+        let arity = match name.as_str() {
+            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "PERCENT_RANK" | "CUME_DIST" | "COUNT_STAR" => {
+                0..=0
+            }
+            "LAG" | "LEAD" => 1..=3,
+            "NTH_VALUE" => 2..=2,
+            _ => 1..=1,
+        };
+        let bound_args = if star {
+            vec![]
+        } else {
+            args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<Vec<_>, _>>()?
+        };
+        if !arity.contains(&bound_args.len()) {
+            return Err(MySqlError::new(
+                1582,
+                "42000",
+                format!(
+                    "Incorrect parameter count in the call to native function '{}'",
+                    upper.to_lowercase()
+                ),
+            ));
+        }
+        let ast_spec = self.merge_base_window(ast_spec)?;
+        let partition = ast_spec
+            .partition_by
+            .into_iter()
+            .map(|e| self.bind_expr(e))
+            .collect::<Result<_, _>>()?;
+        let mut order = Vec::new();
+        for o in ast_spec.order_by {
+            let asc = !matches!(o.options.sort, Some(OrderBySort::Desc));
+            order.push((self.bind_expr(o.expr)?, asc));
+        }
+        let frame = match ast_spec.window_frame {
+            None => None,
+            Some(f) => Some(self.bind_frame(f)?),
+        };
+        Ok((name, bound_args, plan::WindowSpec { partition, order, frame }))
+    }
+
+    /// `OVER (w ORDER BY ...)`: the named window `w` with this spec's own
+    /// additions (MySQL lets the referring spec add ORDER BY and a frame,
+    /// not PARTITION BY).
+    fn merge_base_window(
+        &self,
+        spec: sqlparser::ast::WindowSpec,
+    ) -> Result<sqlparser::ast::WindowSpec, MySqlError> {
+        let Some(base_name) = spec.window_name.clone() else { return Ok(spec) };
+        let base = self.merge_base_window(self.named_window_spec(&base_name.value)?)?;
+        Ok(sqlparser::ast::WindowSpec {
+            window_name: None,
+            partition_by: base.partition_by,
+            order_by: if spec.order_by.is_empty() { base.order_by } else { spec.order_by },
+            window_frame: spec.window_frame.or(base.window_frame),
+        })
+    }
+
+    fn named_window_spec(&self, name: &str) -> Result<sqlparser::ast::WindowSpec, MySqlError> {
+        use sqlparser::ast::NamedWindowExpr;
+        let def = self.named_windows.iter().find(|d| d.0.value.eq_ignore_ascii_case(name));
+        match def.map(|d| &d.1) {
+            Some(NamedWindowExpr::WindowSpec(s)) => Ok(s.clone()),
+            Some(NamedWindowExpr::NamedWindow(other)) => self.named_window_spec(&other.value),
+            None => {
+                Err(MySqlError::new(3579, "HY000", format!("Window name '{name}' is not defined.")))
+            }
+        }
+    }
+
+    fn bind_frame(&mut self, f: sqlparser::ast::WindowFrame) -> Result<plan::Frame, MySqlError> {
+        use sqlparser::ast::{WindowFrameBound as B, WindowFrameUnits as U};
+        let rows = match f.units {
+            U::Rows => true,
+            U::Range => false,
+            U::Groups => return Err(MySqlError::syntax_error("GROUPS frame")),
+        };
+        let offset = |e: &AstExpr| -> Result<u64, MySqlError> {
+            match e {
+                AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                    value: AstValue::Number(n, _),
+                    ..
+                }) if rows => {
+                    n.parse::<u64>().map_err(|_| MySqlError::syntax_error("frame offset"))
+                }
+                _ => Err(MySqlError::unsupported("RANGE frame with an offset")),
+            }
+        };
+        let bound = |b: &B| -> Result<plan::FrameBound, MySqlError> {
+            Ok(match b {
+                B::CurrentRow => plan::FrameBound::CurrentRow,
+                B::Preceding(None) => plan::FrameBound::UnboundedPreceding,
+                B::Following(None) => plan::FrameBound::UnboundedFollowing,
+                B::Preceding(Some(e)) => plan::FrameBound::Preceding(offset(e)?),
+                B::Following(Some(e)) => plan::FrameBound::Following(offset(e)?),
+            })
+        };
+        let start = bound(&f.start_bound)?;
+        let end = match &f.end_bound {
+            Some(b) => bound(b)?,
+            None => plan::FrameBound::CurrentRow,
+        };
+        Ok(plan::Frame { rows, start, end })
     }
 
     /// `expr op ALL|ANY|SOME (SELECT ...)`.
@@ -1730,10 +1934,8 @@ impl Binder {
             .collect::<Vec<_>>()
             .join(".");
         let upper = name.to_uppercase();
-        // Window functions aren't implemented; `SUM(x) OVER (...)` must not
-        // quietly bind as the plain aggregate `SUM(x)`.
-        if func.over.is_some() {
-            return Err(MySqlError::unsupported(&format!("window function {upper}() OVER")));
+        if let Some(over) = func.over.clone() {
+            return self.bind_window(&upper, func, over);
         }
 
         let mut agg_distinct = false;

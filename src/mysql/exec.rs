@@ -59,6 +59,10 @@ pub struct Executor {
     /// A recursive CTE's rows from the previous round, by name, for its
     /// step's `Plan::CteRef`.
     cte_rows: std::collections::HashMap<String, Vec<Vec<Value>>>,
+    /// Each window function's value for every row of the result being
+    /// built, by window id, and which row is being evaluated.
+    win_vals: std::cell::RefCell<std::collections::HashMap<usize, Vec<Value>>>,
+    win_row: std::cell::Cell<usize>,
 }
 
 impl Executor {
@@ -78,6 +82,8 @@ impl Executor {
             outer: Vec::new(),
             found_rows: false,
             cte_rows: std::collections::HashMap::new(),
+            win_vals: Default::default(),
+            win_row: std::cell::Cell::new(0),
         }
     }
 
@@ -151,6 +157,183 @@ impl Executor {
             }
         }
         Ok(None)
+    }
+
+    /// Computes every window function in `exprs` over the `n` rows of the
+    /// result being built (`eval_at(i, e)` evaluates `e` for row `i`), for
+    /// `Expr::Window` to read while each row is evaluated.
+    fn compute_windows(
+        &self,
+        exprs: &[Expr],
+        n: usize,
+        eval_at: &dyn Fn(usize, &Expr) -> Result<Value, MySqlError>,
+    ) -> Result<(), MySqlError> {
+        let mut wins = Vec::new();
+        for e in exprs {
+            crate::mysql::plan::collect_windows(e, &mut wins);
+        }
+        for w in wins {
+            let Expr::Window { id, func, args, spec } = w else { continue };
+            let eval_all = |e: &Expr| (0..n).map(|i| eval_at(i, e)).collect::<Result<Vec<_>, _>>();
+            let keys_of = |es: &[&Expr]| -> Result<Vec<Vec<Value>>, MySqlError> {
+                let cols = es.iter().map(|e| eval_all(e)).collect::<Result<Vec<_>, _>>()?;
+                Ok((0..n).map(|i| cols.iter().map(|c| c[i].clone()).collect()).collect())
+            };
+            let part = keys_of(&spec.partition.iter().collect::<Vec<_>>())?;
+            let ord = keys_of(&spec.order.iter().map(|(e, _)| e).collect::<Vec<_>>())?;
+            let argv = keys_of(&args.iter().collect::<Vec<_>>())?;
+            let asc: Vec<bool> = spec.order.iter().map(|(_, a)| *a).collect();
+
+            // Partitions in order of first appearance, each sorted stably.
+            let mut parts: Vec<Vec<usize>> = Vec::new();
+            for i in 0..n {
+                match parts.iter_mut().find(|p| keys_equal(&part[p[0]], &part[i])) {
+                    Some(p) => p.push(i),
+                    None => parts.push(vec![i]),
+                }
+            }
+            let mut out = vec![Value::Null; n];
+            for mut idx in parts {
+                idx.sort_by(|&a, &b| {
+                    for (k, up) in asc.iter().enumerate() {
+                        let o = sort_cmp(&ord[a][k], &ord[b][k]);
+                        let o = if *up { o } else { o.reverse() };
+                        if o != Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    Ordering::Equal
+                });
+                let m = idx.len();
+                // Peer groups: rows equal on every ORDER BY key.
+                let mut peer_start = vec![0; m];
+                let mut peer_end = vec![0; m];
+                let mut dense = vec![0; m];
+                let mut s0 = 0;
+                let mut g = 0;
+                for p in 0..m {
+                    if p > 0 && !keys_equal(&ord[idx[p - 1]], &ord[idx[p]]) {
+                        s0 = p;
+                        g += 1;
+                    }
+                    peer_start[p] = s0;
+                    dense[p] = g;
+                }
+                for p in (0..m).rev() {
+                    peer_end[p] = if p + 1 < m && peer_start[p + 1] == peer_start[p] {
+                        peer_end[p + 1]
+                    } else {
+                        p
+                    };
+                }
+                let int_arg = |i: usize, k: usize, default: i64| -> i64 {
+                    argv[i].get(k).map(|v| value_to_f64(v) as i64).unwrap_or(default)
+                };
+                for p in 0..m {
+                    let i = idx[p];
+                    // The frame, as positions [lo, hi] in this partition.
+                    let (lo, hi): (i64, i64) = match spec.frame {
+                        None if spec.order.is_empty() => (0, m as i64 - 1),
+                        None => (0, peer_end[p] as i64),
+                        Some(f) => {
+                            let at = |b: crate::mysql::plan::FrameBound, start: bool| -> i64 {
+                                use crate::mysql::plan::FrameBound as B;
+                                match b {
+                                    B::UnboundedPreceding => 0,
+                                    B::UnboundedFollowing => m as i64 - 1,
+                                    B::CurrentRow if f.rows => p as i64,
+                                    B::CurrentRow if start => peer_start[p] as i64,
+                                    B::CurrentRow => peer_end[p] as i64,
+                                    B::Preceding(k) => p as i64 - k as i64,
+                                    B::Following(k) => p as i64 + k as i64,
+                                }
+                            };
+                            (at(f.start, true).max(0), at(f.end, false).min(m as i64 - 1))
+                        }
+                    };
+                    let frame: Vec<usize> = if lo > hi {
+                        vec![]
+                    } else {
+                        (lo as usize..=hi as usize).map(|q| idx[q]).collect()
+                    };
+                    let frame_vals =
+                        || frame.iter().map(|&q| argv[q][0].clone()).collect::<Vec<_>>();
+                    out[i] = match func.as_str() {
+                        "ROW_NUMBER" => Value::Int(p as i64 + 1),
+                        "RANK" => Value::Int(peer_start[p] as i64 + 1),
+                        "DENSE_RANK" => Value::Int(dense[p] as i64 + 1),
+                        "PERCENT_RANK" => Value::Float(if m > 1 {
+                            peer_start[p] as f64 / (m - 1) as f64
+                        } else {
+                            0.0
+                        }),
+                        "CUME_DIST" => Value::Float((peer_end[p] + 1) as f64 / m as f64),
+                        "NTILE" => {
+                            let k = int_arg(i, 0, 1);
+                            if k <= 0 {
+                                return Err(MySqlError::new(
+                                    1210,
+                                    "HY000",
+                                    "Incorrect arguments to ntile",
+                                ));
+                            }
+                            let k = k as usize;
+                            let (size, extra) = (m / k, m % k);
+                            // The first `extra` buckets hold one more row.
+                            let big = extra * (size + 1);
+                            let bucket = if p < big {
+                                p / (size + 1)
+                            } else {
+                                extra + (p - big) / size.max(1)
+                            };
+                            Value::Int(bucket as i64 + 1)
+                        }
+                        "LAG" | "LEAD" => {
+                            let off = int_arg(i, 1, 1);
+                            let q = if func == "LAG" { p as i64 - off } else { p as i64 + off };
+                            if q >= 0 && (q as usize) < m {
+                                argv[idx[q as usize]][0].clone()
+                            } else {
+                                argv[i].get(2).cloned().unwrap_or(Value::Null)
+                            }
+                        }
+                        "FIRST_VALUE" => {
+                            frame.first().map(|&q| argv[q][0].clone()).unwrap_or(Value::Null)
+                        }
+                        "LAST_VALUE" => {
+                            frame.last().map(|&q| argv[q][0].clone()).unwrap_or(Value::Null)
+                        }
+                        "NTH_VALUE" => {
+                            let k = int_arg(i, 1, 1);
+                            if k <= 0 {
+                                return Err(MySqlError::new(
+                                    1210,
+                                    "HY000",
+                                    "Incorrect arguments to nth_value",
+                                ));
+                            }
+                            frame
+                                .get(k as usize - 1)
+                                .map(|&q| argv[q][0].clone())
+                                .unwrap_or(Value::Null)
+                        }
+                        "COUNT_STAR" => Value::Int(frame.len() as i64),
+                        other => {
+                            let f = match other {
+                                "SUM" => AggFunc::Sum,
+                                "AVG" => AggFunc::Avg,
+                                "COUNT" => AggFunc::Count,
+                                "MIN" => AggFunc::Min,
+                                _ => AggFunc::Max,
+                            };
+                            compute_agg(f, &frame_vals())
+                        }
+                    };
+                }
+            }
+            self.win_vals.borrow_mut().insert(*id, out);
+        }
+        Ok(())
     }
 
     pub fn execute_plan(&mut self, plan: Plan) -> Result<Vec<Vec<Value>>, MySqlError> {
@@ -709,8 +892,11 @@ impl Executor {
                 if rows.is_empty() {
                     check_columns(exprs.iter(), table_context.as_ref(), &self.outer)?;
                 }
+                let ctx = table_context.as_ref();
+                self.compute_windows(&exprs, rows.len(), &|i, e| self.eval_expr(e, &rows[i], ctx))?;
                 let mut out_rows = Vec::new();
-                for row in rows {
+                for (i, row) in rows.into_iter().enumerate() {
+                    self.win_row.set(i);
                     let mut out_row = Vec::new();
                     for expr in &exprs {
                         if matches!(expr, Expr::Wildcard) {
@@ -757,7 +943,7 @@ impl Executor {
                     }
                 }
 
-                let mut out_rows = Vec::new();
+                let mut kept: Vec<&Vec<Vec<Value>>> = Vec::new();
                 for (_key, group_rows) in &groups {
                     if let Some(having) = &having {
                         let val =
@@ -766,6 +952,15 @@ impl Executor {
                             continue;
                         }
                     }
+                    kept.push(group_rows);
+                }
+                let ctx = table_context.as_ref();
+                self.compute_windows(&exprs, kept.len(), &|i, e| {
+                    self.eval_group_expr(e, kept[i], ctx)
+                })?;
+                let mut out_rows = Vec::new();
+                for (i, group_rows) in kept.into_iter().enumerate() {
+                    self.win_row.set(i);
                     let mut out_row = Vec::new();
                     for expr in &exprs {
                         out_row.push(self.eval_group_expr(
@@ -1097,6 +1292,14 @@ impl Executor {
                     return Ok(Value::Int(i64::from(*negated)));
                 }
                 eval_in_list(l, &items, *negated)
+            }
+            Expr::Window { id, .. } => {
+                let vals = self.win_vals.borrow();
+                Ok(vals
+                    .get(id)
+                    .and_then(|v| v.get(self.win_row.get()))
+                    .cloned()
+                    .unwrap_or(Value::Null))
             }
             Expr::Quantified { op, expr, plan, all } => {
                 let l = self.eval_expr(expr, row, table)?;
@@ -1528,16 +1731,18 @@ fn compute_agg(func: AggFunc, vals: &[Value]) -> Value {
             let mut max_scale = 0u32;
             for v in &non_null {
                 if let Some(n) = value_to_numeric(v) {
-                    max_scale = max_scale.max(n.scale());
+                    max_scale = max_scale.max(n.display_scale());
                     sum = sum.add(&n);
                 }
             }
             match func {
-                AggFunc::Sum => Value::Num(sum),
+                AggFunc::Sum => Value::Num(sum.with_display_scale(max_scale)),
                 _ => {
                     let count = Numeric::from_i64(non_null.len() as i64);
-                    match sum.div_scale(&count, max_scale as i64 + 4, false) {
-                        Ok(avg) => Value::Num(avg),
+                    let shown = (max_scale + 4).min(30);
+                    let inner = (shown.div_ceil(9) * 9).max(sum.scale()).min(30);
+                    match sum.div_scale(&count, inner as i64, false) {
+                        Ok(avg) => Value::Num(avg.with_display_scale(shown)),
                         Err(_) => Value::Null,
                     }
                 }
@@ -1865,16 +2070,22 @@ pub(crate) fn eval_arith(op: ArithOp, l: Value, r: Value) -> Result<Value, MySql
         let (Some(a), Some(b)) = (value_to_numeric(&l), value_to_numeric(&r)) else {
             return Ok(Value::Null);
         };
+        // Each result keeps every digit its operands had (and a quotient
+        // 9-digit-word precision, as MySQL computes it) but displays the
+        // scale MySQL's type rules give it.
+        let (da, db) = (a.display_scale(), b.display_scale());
         return Ok(match op {
-            ArithOp::Add => Value::Num(a.add(&b)),
-            ArithOp::Sub => Value::Num(a.sub(&b)),
-            ArithOp::Mul => Value::Num(a.mul(&b)),
+            ArithOp::Add => Value::Num(a.add(&b).with_display_scale(da.max(db))),
+            ArithOp::Sub => Value::Num(a.sub(&b).with_display_scale(da.max(db))),
+            ArithOp::Mul => Value::Num(a.mul(&b).with_display_scale((da + db).min(30))),
             ArithOp::Div => {
                 if b.to_f64() == 0.0 {
                     Value::Null
                 } else {
-                    match a.div_scale(&b, a.scale() as i64 + 4, false) {
-                        Ok(v) => Value::Num(v),
+                    let shown = (da + 4).min(30);
+                    let inner = (shown.div_ceil(9) * 9).max(a.scale()).min(30);
+                    match a.div_scale(&b, inner as i64, false) {
+                        Ok(v) => Value::Num(v.with_display_scale(shown)),
                         Err(_) => Value::Null,
                     }
                 }
@@ -2394,6 +2605,15 @@ fn set_op(
             if all { out } else { dedupe(out) }
         }
     }
+}
+
+/// Window partition/peer keys: equal values, NULL equal to NULL.
+fn keys_equal(a: &[Value], b: &[Value]) -> bool {
+    a.iter().zip(b).all(|(x, y)| match (x.is_null(), y.is_null()) {
+        (true, true) => true,
+        (false, false) => mysql_cmp(x, y) == Some(Ordering::Equal),
+        _ => false,
+    })
 }
 
 fn rows_distinct_equal(a: &[Value], b: &[Value]) -> bool {

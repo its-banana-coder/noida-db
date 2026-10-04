@@ -333,6 +333,23 @@ MYSQL_QUERIES = {
         (A, "SELECT id FROM c WHERE id <> ALL (SELECT cid FROM o) ORDER BY id"),
         (A, "SELECT 100 > ALL (SELECT cid FROM o), 0 = ANY (SELECT cid FROM o)"),
     ],
+    "window functions": QSETUP + [
+        (A, "SELECT id, cid, amount, ROW_NUMBER() OVER (PARTITION BY cid ORDER BY amount DESC) AS rn FROM o ORDER BY id"),
+        (A, "SELECT id, status, RANK() OVER w, DENSE_RANK() OVER w, PERCENT_RANK() OVER w, CUME_DIST() OVER w FROM o WINDOW w AS (ORDER BY status) ORDER BY id"),
+        (A, "SELECT id, amount, SUM(amount) OVER (ORDER BY id) AS running, SUM(amount) OVER () AS total, AVG(amount) OVER (PARTITION BY status) AS avg_st FROM o ORDER BY id"),
+        (A, "SELECT id, LAG(amount) OVER (ORDER BY id), LEAD(amount, 2, -1) OVER (ORDER BY id), FIRST_VALUE(amount) OVER (ORDER BY id), LAST_VALUE(amount) OVER (ORDER BY id) FROM o ORDER BY id"),
+        (A, "SELECT id, LAST_VALUE(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), NTH_VALUE(amount, 2) OVER (ORDER BY id) FROM o ORDER BY id"),
+        (A, "SELECT id, SUM(amount) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), COUNT(*) OVER (ORDER BY id ROWS 2 PRECEDING), MAX(amount) OVER (ORDER BY status RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM o ORDER BY id"),
+        (A, "SELECT id, NTILE(2) OVER (ORDER BY id), NTILE(3) OVER (ORDER BY id) FROM o ORDER BY id"),
+        (A, "SELECT status, SUM(amount) AS s, RANK() OVER (ORDER BY SUM(amount) DESC) AS r, SUM(SUM(amount)) OVER () AS grand FROM o GROUP BY status ORDER BY r"),
+        (A, "SELECT name, city, COUNT(*) OVER (PARTITION BY city) FROM c ORDER BY name"),
+        (A, "SELECT id, ROW_NUMBER() OVER (ORDER BY amount DESC) AS rn FROM o ORDER BY rn LIMIT 2"),
+        (A, "SELECT * FROM (SELECT id, cid, ROW_NUMBER() OVER (PARTITION BY cid ORDER BY amount DESC) AS rn FROM o) t WHERE rn = 1 ORDER BY id"),
+        (A, "WITH m AS (SELECT status, SUM(amount) AS rev FROM o GROUP BY status) SELECT status, ROUND(rev / NULLIF(SUM(rev) OVER (), 0) * 100, 4) AS pct FROM m ORDER BY rev DESC"),
+        (A, "SELECT id FROM o WHERE ROW_NUMBER() OVER () > 1"),
+        (A, "SELECT id, RANK() OVER nosuch FROM o"),
+        (A, "SELECT cid, COUNT(*) FROM o GROUP BY cid HAVING ROW_NUMBER() OVER () > 0"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

@@ -727,8 +727,16 @@ async fn subqueries_unions_and_ctes_with_parameters() {
     assert_eq!(err_code(&mut c, "SELECT (SELECT amount FROM o)").await, 1242);
     assert_eq!(err_code(&mut c, "SELECT * FROM (SELECT id FROM c)").await, 1248);
     assert_eq!(err_code(&mut c, "SELECT id FROM c UNION SELECT id, cid FROM o").await, 1222);
-    // Not yet implemented: an explicit error, never a wrong answer.
-    assert_eq!(err_code(&mut c, "SELECT id, SUM(id) OVER () FROM c").await, 1235);
+    // A window function outside the select list / ORDER BY.
+    assert_eq!(err_code(&mut c, "SELECT id FROM c WHERE ROW_NUMBER() OVER () > 1").await, 3593);
+    let ranked: Vec<(i64, i64)> = c
+        .exec(
+            "SELECT id, RANK() OVER (ORDER BY amount DESC) FROM o WHERE amount > ? ORDER BY id",
+            (10,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ranked, vec![(10, 2), (11, 1), (12, 3)]);
     drop(c);
     pool.disconnect().await.unwrap();
 }

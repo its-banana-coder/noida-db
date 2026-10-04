@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | tables with enforced keys, upserts, `ALTER TABLE`, joins, aggregates, JSON/ENUM, ~90 functions, transactions (incl. `autocommit=0`) and savepoints, prepared statements (text and binary protocol), `information_schema`, subqueries, `UNION`/`INTERSECT`/`EXCEPT`, CTEs (incl. recursive), `INSERT ... SELECT`, `sql_mode`; no window functions yet (see below) | yes: mysql_async, pymysql, SQLAlchemy, Django, mysql2, Go + GORM, JDBC, WordPress |
+| MySQL | tables with enforced keys, upserts, `ALTER TABLE`, joins, aggregates, JSON/ENUM, ~90 functions, transactions (incl. `autocommit=0`) and savepoints, prepared statements (text and binary protocol), `information_schema`, subqueries, `UNION`/`INTERSECT`/`EXCEPT`, CTEs (incl. recursive), window functions, `INSERT ... SELECT`, `sql_mode` | yes: mysql_async, pymysql, SQLAlchemy, Django, mysql2, Go + GORM, JDBC, WordPress |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
 | Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
@@ -658,9 +658,24 @@ string that grows past the anchor's width).
 connects with `CLIENT_FOUND_ROWS`, as Django does), and an
 `ON UPDATE CURRENT_TIMESTAMP` column only moves when the row changed.
 
+Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`,
+`CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`,
+`NTH_VALUE`, and `SUM`/`AVG`/`COUNT`/`MIN`/`MAX` over a window, with
+`PARTITION BY`, `ORDER BY` (peers share a rank and the default frame), named
+windows (`WINDOW w AS (...)`, `OVER (w ORDER BY ...)`), and `ROWS` frames
+(`n PRECEDING`/`FOLLOWING`, `UNBOUNDED`, `CURRENT ROW`) and `RANGE` frames
+bounded by `UNBOUNDED` or `CURRENT ROW`; over plain and `GROUP BY` queries
+(`RANK() OVER (ORDER BY SUM(x))`). A window function in `WHERE`/`HAVING` is
+error 3593, as in MySQL.
+
+Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
+0.3333 but is 0.333333333 inside, so `1/3*3` is 1.0000 and
+`ROUND(169/244*100, 4)` is 69.2623.
+
 **Not yet**
-- Window functions (`... OVER (...)`: an explicit 1235 error), `LATERAL`
-  derived tables, and `REGEXP`.
+- `RANGE` frames with a numeric or `INTERVAL` offset, `GROUPS` frames,
+  `DISTINCT` inside a window aggregate (MySQL doesn't support it either),
+  `LATERAL` derived tables, and `REGEXP`.
 - Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
 - `FOREIGN KEY` constraints are accepted but not enforced (no
   referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
