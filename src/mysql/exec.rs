@@ -503,6 +503,285 @@ impl Executor {
         Ok(())
     }
 
+    /// ONLY_FULL_GROUP_BY: every non-aggregated column in the select list
+    /// (and, with GROUP BY, ORDER BY) must be functionally dependent on the
+    /// GROUP BY columns: grouped itself, fixed by `col = constant` or an
+    /// equality with a dependent column, or in a table whose primary key
+    /// (or a NOT NULL unique key) is dependent. Errors 1055/1140 as MySQL.
+    /// Columns of derived tables are not checked (MySQL can see through
+    /// them; this doesn't), so this only ever under-reports.
+    fn check_full_group_by(
+        &self,
+        source: &Plan,
+        group_exprs: &[Expr],
+        exprs: &[Expr],
+        visible: usize,
+    ) -> Result<(), MySqlError> {
+        struct Src {
+            alias: String,
+            db: String,
+            table: Option<Table>,
+            cols: Vec<String>,
+        }
+        let mut srcs: Vec<Src> = Vec::new();
+        let mut preds: Vec<Expr> = Vec::new();
+        fn walk(
+            ex: &Executor,
+            p: &Plan,
+            srcs: &mut Vec<Src>,
+            preds: &mut Vec<Expr>,
+        ) -> Result<(), MySqlError> {
+            match p {
+                Plan::Scan { db, table, alias } => {
+                    let t = ex.load_table(db, table)?;
+                    srcs.push(Src {
+                        alias: alias.clone().unwrap_or_else(|| table.clone()),
+                        db: db.clone(),
+                        cols: t.columns.iter().map(|c| c.name.clone()).collect(),
+                        table: Some(t),
+                    });
+                }
+                Plan::Derived { alias, .. } | Plan::CteRef { alias, .. } => {
+                    let cols = {
+                        let state = ex.db.lock().unwrap();
+                        crate::mysql::plan::column_names(p, &state)
+                    };
+                    srcs.push(Src { alias: alias.clone(), db: String::new(), table: None, cols });
+                }
+                Plan::Filter { source, predicate } => {
+                    preds.push(predicate.clone());
+                    walk(ex, source, srcs, preds)?;
+                }
+                Plan::Join { left, right, op } => {
+                    walk(ex, left, srcs, preds)?;
+                    walk(ex, right, srcs, preds)?;
+                    if let JoinOp::Inner(e) | JoinOp::Left(e) = op {
+                        preds.push(e.clone());
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        walk(self, source, &mut srcs, &mut preds)?;
+        let resolve = |name: &str| -> Option<(usize, usize)> {
+            let find = |s: &Src, c: &str| s.cols.iter().position(|x| x.eq_ignore_ascii_case(c));
+            match name.rsplit_once('.') {
+                Some((q, c)) => {
+                    let q = q.rsplit('.').next().unwrap_or(q);
+                    srcs.iter().enumerate().find_map(|(i, s)| {
+                        if s.alias.eq_ignore_ascii_case(q) {
+                            find(s, c).map(|j| (i, j))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                None => {
+                    let hits: Vec<(usize, usize)> = srcs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| find(s, name).map(|j| (i, j)))
+                        .collect();
+                    if hits.len() == 1 { Some(hits[0]) } else { None }
+                }
+            }
+        };
+        let mut dep: std::collections::HashSet<(usize, usize)> = Default::default();
+        for g in group_exprs {
+            if let Expr::ColName(n) = g
+                && let Some(c) = resolve(n)
+            {
+                dep.insert(c);
+            }
+        }
+        // Equalities from WHERE and ON: AND-ed `col = const` / `col = col`.
+        type Col = Option<(usize, usize)>;
+        let mut eqs: Vec<(Col, Col, bool)> = Vec::new();
+        fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::And(v) => v.iter().for_each(|x| conjuncts(x, out)),
+                other => out.push(other),
+            }
+        }
+        let mut cs = Vec::new();
+        for p in &preds {
+            conjuncts(p, &mut cs);
+        }
+        for c in cs {
+            if let Expr::Compare { op: CmpOp::Eq, left, right } = c {
+                let side = |e: &Expr| match e {
+                    Expr::ColName(n) => (resolve(n), false),
+                    Expr::Const(_) | Expr::Param(_) => (None, true),
+                    _ => (None, false),
+                };
+                let ((l, lc), (r, rc)) = (side(left), side(right));
+                if l.is_some() && rc {
+                    eqs.push((l, None, true));
+                } else if r.is_some() && lc {
+                    eqs.push((r, None, true));
+                } else if l.is_some() && r.is_some() {
+                    eqs.push((l, r, false));
+                }
+            }
+        }
+        loop {
+            let before = dep.len();
+            for (a, b, constant) in &eqs {
+                match (a, b, constant) {
+                    (Some(a), None, true) => {
+                        dep.insert(*a);
+                    }
+                    (Some(a), Some(b), false) => {
+                        if dep.contains(a) {
+                            dep.insert(*b);
+                        }
+                        if dep.contains(b) {
+                            dep.insert(*a);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (i, s) in srcs.iter().enumerate() {
+                let Some(t) = &s.table else { continue };
+                let keys = t.keys();
+                let determined = keys.iter().any(|(name, cols)| {
+                    (name == "PRIMARY" || cols.iter().all(|&c| t.columns[c].not_null))
+                        && !cols.is_empty()
+                        && cols.iter().all(|&c| dep.contains(&(i, c)))
+                });
+                if determined {
+                    for c in 0..t.columns.len() {
+                        dep.insert((i, c));
+                    }
+                }
+            }
+            if dep.len() == before {
+                break;
+            }
+        }
+        // The first non-aggregated, non-dependent base-table column in `e`.
+        fn offending(
+            e: &Expr,
+            resolve: &dyn Fn(&str) -> Option<(usize, usize)>,
+            ok: &dyn Fn((usize, usize)) -> bool,
+        ) -> Option<(usize, usize)> {
+            let mut found = None;
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                match x {
+                    Expr::ColName(n) => {
+                        if let Some(c) = resolve(n)
+                            && !ok(c)
+                        {
+                            found = Some(c);
+                        }
+                    }
+                    Expr::Agg { .. } | Expr::Subquery(_) | Expr::Exists { .. } => {}
+                    Expr::Call { name, .. } if name.eq_ignore_ascii_case("ANY_VALUE") => {}
+                    Expr::And(v) | Expr::Or(v) | Expr::Call { args: v, .. } => {
+                        stack.extend(v.iter().rev())
+                    }
+                    Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                    Expr::InList { expr, list, .. } => {
+                        stack.extend(list.iter().rev());
+                        stack.push(expr);
+                    }
+                    Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => {
+                        stack.push(expr)
+                    }
+                    Expr::Not(e) | Expr::IsNull(e, _) => stack.push(e),
+                    Expr::Like { expr, pattern, escape, .. } => {
+                        stack.push(escape);
+                        stack.push(pattern);
+                        stack.push(expr);
+                    }
+                    Expr::Case { conditions, else_result } => {
+                        if let Some(e) = else_result {
+                            stack.push(e);
+                        }
+                        for (c, r) in conditions.iter().rev() {
+                            stack.push(r);
+                            stack.push(c);
+                        }
+                    }
+                    Expr::Window { args, spec, .. } => stack.extend(
+                        crate::mysql::plan::window_exprs(args, spec)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev(),
+                    ),
+                    _ => {}
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        }
+        let is_base = |c: (usize, usize)| srcs[c.0].table.is_some();
+        let ok = |c: (usize, usize)| !is_base(c) || dep.contains(&c);
+        let label = |c: (usize, usize)| {
+            let s = &srcs[c.0];
+            format!("{}.{}.{}", s.db, s.alias, s.cols[c.1])
+        };
+        let grouped = !group_exprs.is_empty();
+        let mut pos = 0usize;
+        for (i, e) in exprs.iter().enumerate() {
+            let in_select = i < visible;
+            if !in_select && !grouped {
+                break;
+            }
+            let bad = if matches!(e, Expr::Wildcard) {
+                let mut first = None;
+                'outer: for (si, s) in srcs.iter().enumerate() {
+                    for ci in 0..s.cols.len() {
+                        pos += 1;
+                        if !ok((si, ci)) {
+                            first = Some((si, ci));
+                            break 'outer;
+                        }
+                    }
+                }
+                first
+            } else {
+                pos += 1;
+                if group_exprs.iter().any(|g| g == e) { None } else { offending(e, &resolve, &ok) }
+            };
+            if let Some(c) = bad {
+                return Err(if !grouped {
+                    MySqlError::new(
+                        1140,
+                        "42000",
+                        format!(
+                            "In aggregated query without GROUP BY, expression #{pos} of SELECT list contains nonaggregated column '{}'; this is incompatible with sql_mode=only_full_group_by",
+                            label(c)
+                        ),
+                    )
+                } else {
+                    let (n, clause) = if in_select {
+                        (pos, "SELECT list")
+                    } else {
+                        (i - visible + 1, "ORDER BY clause")
+                    };
+                    MySqlError::new(
+                        1055,
+                        "42000",
+                        format!(
+                            "Expression #{n} of {clause} is not in GROUP BY clause and contains nonaggregated column '{}' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
+                            label(c)
+                        ),
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// What dropping or renaming a column does to foreign keys: a column a
     /// foreign key uses can't be dropped (1828, or 1829 for a referenced
     /// one); a renamed column stays in the foreign keys under its new name.
@@ -1440,7 +1719,17 @@ impl Executor {
                 }
                 Ok(out_rows)
             }
-            Plan::Aggregate { source, group_exprs, exprs, having, .. } => {
+            Plan::Aggregate { source, group_exprs, exprs, having, names } => {
+                if self.sql_mode.only_full_group_by() {
+                    // HAVING without GROUP BY or any aggregate (JDBC's
+                    // metadata queries) doesn't make a query aggregated.
+                    let aggregated = !group_exprs.is_empty()
+                        || exprs.iter().any(crate::mysql::plan::contains_agg)
+                        || having.as_ref().is_some_and(crate::mysql::plan::contains_agg);
+                    if aggregated {
+                        self.check_full_group_by(&source, &group_exprs, &exprs, names.len())?;
+                    }
+                }
                 let table_context = self.resolve_table_context(&source)?;
                 let rows = self.execute_plan(*source)?;
                 if rows.is_empty() {
@@ -1491,6 +1780,12 @@ impl Executor {
                     self.win_row.set(i);
                     let mut out_row = Vec::new();
                     for expr in &exprs {
+                        if matches!(expr, Expr::Wildcard) {
+                            // `SELECT t.*, COUNT(*) ... GROUP BY t.id`: the
+                            // group's (first) row.
+                            out_row.extend(group_rows.first().cloned().unwrap_or_default());
+                            continue;
+                        }
                         out_row.push(self.eval_group_expr(
                             expr,
                             group_rows,
@@ -2538,6 +2833,8 @@ pub(crate) fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError>
             }
             Ok(Value::Null)
         }
+        // Exempts its argument from ONLY_FULL_GROUP_BY; any row's value.
+        "ANY_VALUE" => Ok(args.first().cloned().unwrap_or(Value::Null)),
         "IFNULL" => {
             let Some(a) = args.first() else { return Ok(Value::Null) };
             if !a.is_null() {

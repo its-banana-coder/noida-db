@@ -227,11 +227,6 @@ MYSQL = {
         (B, "SELECT COUNT(*) FROM u"),
         (A, "rollback"),
     ],
-    "ONLY_FULL_GROUP_BY": [
-        (A, "CREATE TABLE t (id INT, g INT)"),
-        (A, "INSERT INTO t VALUES (1, 1), (2, 1)"),
-        (A, "SELECT id, COUNT(*) FROM t GROUP BY g"),
-    ],
 }
 
 # Subqueries, UNION/INTERSECT/EXCEPT, derived tables, CTEs and INSERT ...
@@ -437,6 +432,43 @@ MYSQL_QUERIES = {
         (A, "ALTER TABLE c DROP FOREIGN KEY fk"),
         (A, "ALTER TABLE c DROP COLUMN parent"),
     ],
+    "ONLY_FULL_GROUP_BY": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, u INT NOT NULL UNIQUE, nu INT UNIQUE)"),
+        (A, "CREATE TABLE s (id INT PRIMARY KEY, tid INT, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 1, 10, 1, 1), (2, 1, 20, 2, NULL), (3, 2, 30, 3, 3)"),
+        (A, "INSERT INTO s VALUES (1, 1, 5), (2, 1, 6)"),
+        (A, "SELECT a, b FROM t GROUP BY a"),
+        (A, "SELECT a, COUNT(*) FROM t"),
+        (A, "SELECT id, b FROM t GROUP BY id"),
+        (A, "SELECT u, b FROM t GROUP BY u"),
+        (A, "SELECT nu, b FROM t GROUP BY nu"),
+        (A, "SELECT a, b FROM t WHERE b = 1 GROUP BY a"),
+        (A, "SELECT a, COUNT(*) FROM t WHERE a = 1"),
+        (A, "SELECT a FROM t GROUP BY a ORDER BY b"),
+        (A, "SELECT a+1, COUNT(*) FROM t GROUP BY a+1"),
+        (A, "SELECT a+1 FROM t GROUP BY a"),
+        (A, "SELECT ANY_VALUE(b), a FROM t GROUP BY a"),
+        (A, "SELECT t.id, s.v FROM t JOIN s ON s.id = t.id GROUP BY t.id"),
+        (A, "SELECT t.id, s.v FROM t JOIN s ON s.tid = t.id GROUP BY t.id"),
+        (A, "SELECT s.id, t.b FROM t JOIN s ON s.tid = t.id GROUP BY s.id"),
+        (A, "SELECT a AS x, COUNT(*) FROM t GROUP BY x"),
+        (A, "SELECT a, b FROM t GROUP BY a, b ORDER BY COUNT(*)"),
+        (A, "SELECT DISTINCT a FROM t ORDER BY b"),
+        (A, "SELECT DISTINCT a, b FROM t ORDER BY b DESC, a"),
+        (A, "SELECT a, b FROM t WHERE a = b GROUP BY a"),
+        (A, "SELECT COUNT(*) FROM t ORDER BY b"),
+        (A, "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY MAX(b)"),
+        (A, "SELECT t.*, COUNT(*) FROM t GROUP BY t.id"),
+        (A, "SELECT * FROM t GROUP BY a"),
+        (A, "SELECT x.a, x.b FROM t AS x GROUP BY x.a"),
+        (A, "SELECT a, RANK() OVER (ORDER BY b) FROM t GROUP BY a"),
+        (A, "SELECT a, SUM(b), RANK() OVER (ORDER BY SUM(b)) FROM t GROUP BY a ORDER BY a"),
+        (A, "SELECT a, b AS bb FROM t HAVING bb > 15 ORDER BY a, bb"),
+        (A, "SELECT a FROM t HAVING COUNT(*) > 1"),
+        (A, "SET SESSION sql_mode = ''"),
+        (A, "SELECT a, b FROM t GROUP BY a ORDER BY a"),
+        (A, "SELECT a, COUNT(*) FROM t"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 
@@ -532,7 +564,6 @@ POSTGRES = {
 KNOWN = {
     "mysql": {
         "uncommitted writes are invisible to other connections": "no isolation between MySQL connections",
-        "ONLY_FULL_GROUP_BY": "ONLY_FULL_GROUP_BY is not enforced",
     },
     "postgres": {},
 }

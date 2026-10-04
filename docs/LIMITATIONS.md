@@ -590,7 +590,13 @@ these become MySQL's adjusted values instead: clamped to the type's
 range, the numeric prefix of a string, the zero date, truncated text,
 `''`, the type's implicit default, and `NULL`. Invalid `JSON` is always
 3140, and an unknown column is always 1054, even on an empty table.
-`ONLY_FULL_GROUP_BY` is not enforced, and the other modes (`ANSI_QUOTES`,
+`ONLY_FULL_GROUP_BY` is enforced (1055, and 1140 without `GROUP BY`) with
+MySQL's functional dependencies: a grouped column, a primary key or NOT
+NULL unique key in `GROUP BY` covering its table, `col = constant` and
+column equalities in `WHERE`/`ON`, `ANY_VALUE()`. Columns of derived tables
+and CTEs aren't checked (MySQL sees through them; this doesn't), so it may
+accept a query MySQL rejects, never the reverse. `SELECT DISTINCT ...
+ORDER BY` a column that isn't selected is 3065. The other modes (`ANSI_QUOTES`,
 `PIPES_AS_CONCAT`, `NO_BACKSLASH_ESCAPES`, ...) are reported but have no
 effect. A failed `INSERT` still uses up the `AUTO_INCREMENT` ids it took,
 as in InnoDB. `DROP DATABASE [IF EXISTS]` works. Every failure path above is

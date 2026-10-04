@@ -80,6 +80,11 @@ impl SqlMode {
         self.has("ERROR_FOR_DIVISION_BY_ZERO")
     }
 
+    /// Non-aggregated columns must be functionally dependent on GROUP BY.
+    pub fn only_full_group_by(&self) -> bool {
+        self.has("ONLY_FULL_GROUP_BY")
+    }
+
     pub fn as_str(&self) -> String {
         self.modes.join(",")
     }

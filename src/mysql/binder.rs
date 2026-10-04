@@ -1260,10 +1260,47 @@ impl Binder {
                 let calc_found_rows =
                     select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
 
-                let is_aggregate = !group_exprs.is_empty()
+                // SELECT DISTINCT can only sort by what it selects (3065).
+                if distinct && !has_wildcard {
+                    for (k, h) in hidden_exprs.iter().enumerate() {
+                        if exprs.contains(h) || contains_agg(h) {
+                            continue;
+                        }
+                        let mut missing = None;
+                        crate::mysql::plan::for_each_colname(h, &mut |n| {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            let selected = exprs.iter().any(|e| {
+                                matches!(e, Expr::ColName(x)
+                                    if x.rsplit('.').next().unwrap_or(x).eq_ignore_ascii_case(bare))
+                            });
+                            if !selected && missing.is_none() {
+                                missing = Some(n.to_string());
+                            }
+                        });
+                        if let Some(col) = missing {
+                            return Err(MySqlError::new(
+                                3065,
+                                "HY000",
+                                format!(
+                                    "Expression #{} of ORDER BY clause is not in SELECT list, references column '{col}' which is not in SELECT list; this is incompatible with DISTINCT",
+                                    k + 1
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let mut having = having;
+                let has_agg = !group_exprs.is_empty()
                     || exprs.iter().any(contains_agg)
                     || hidden_exprs.iter().any(contains_agg)
-                    || having.is_some();
+                    || having.as_ref().is_some_and(contains_agg);
+                // HAVING in a query with no GROUP BY or aggregate filters its
+                // rows like WHERE (over the select list's aliases), as in
+                // MySQL; JDBC's metadata queries rely on it.
+                if !has_agg && let Some(h) = having.take() {
+                    source = Plan::Filter { source: Box::new(source), predicate: h };
+                }
+                let is_aggregate = has_agg || having.is_some();
                 let hidden = hidden_exprs.len();
                 exprs.extend(hidden_exprs);
                 let plan = if is_aggregate {
@@ -2111,14 +2148,14 @@ impl Binder {
                 Ok(Expr::Call { name: upper, args: vec![Expr::Const(Value::Text(unit)), a, b] })
             }
             "CONCAT" | "UPPER" | "LOWER" | "LENGTH" | "SUBSTRING" | "SUBSTR" | "COALESCE"
-            | "IFNULL" | "DATABASE" | "SCHEMA" | "USER" | "CURRENT_USER" | "SESSION_USER"
-            | "SYSTEM_USER" | "CONNECTION_ID" | "VERSION" | "NOW" | "CURRENT_TIMESTAMP"
-            | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" | "CURDATE" | "CURRENT_DATE" | "IF"
-            | "NULLIF" | "GREATEST" | "LEAST" | "ROUND" | "TRUNCATE" | "ABS" | "CEIL"
-            | "CEILING" | "FLOOR" | "MOD" | "POW" | "POWER" | "SQRT" | "SIGN" | "CHAR_LENGTH"
-            | "CHARACTER_LENGTH" | "CONCAT_WS" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
-            | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "LOCATE" | "INSTR"
-            | "UCASE" | "LCASE" | "MID" | "DATE" | "TIME" | "YEAR" | "MONTH" | "DAY"
+            | "ANY_VALUE" | "IFNULL" | "DATABASE" | "SCHEMA" | "USER" | "CURRENT_USER"
+            | "SESSION_USER" | "SYSTEM_USER" | "CONNECTION_ID" | "VERSION" | "NOW"
+            | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" | "CURDATE"
+            | "CURRENT_DATE" | "IF" | "NULLIF" | "GREATEST" | "LEAST" | "ROUND" | "TRUNCATE"
+            | "ABS" | "CEIL" | "CEILING" | "FLOOR" | "MOD" | "POW" | "POWER" | "SQRT" | "SIGN"
+            | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "CONCAT_WS" | "TRIM" | "LTRIM" | "RTRIM"
+            | "REPLACE" | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "LOCATE"
+            | "INSTR" | "UCASE" | "LCASE" | "MID" | "DATE" | "TIME" | "YEAR" | "MONTH" | "DAY"
             | "DAYOFMONTH" | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK" | "DAYOFYEAR"
             | "WEEKDAY" | "DATE_FORMAT" | "DATEDIFF" | "UNIX_TIMESTAMP" | "FROM_UNIXTIME"
             | "UTC_TIMESTAMP" | "UTC_DATE" | "LAST_DAY" | "JSON_EXTRACT" | "JSON_UNQUOTE"
