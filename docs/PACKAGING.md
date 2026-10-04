@@ -15,12 +15,14 @@ Apple Silicon, Windows x64.
 | **npm** | `npm install -g noida-db` (or `npx noida-db start`) |
 | **PyPI** | `pip install noida-db` |
 | **Homebrew** | `brew install its-banana-coder/noida-db/noida-db` |
+| **Docker** | `docker run -p 5432:5432 -p 3306:3306 -p 6379:6379 -p 9092:9092 -p 9200:9200 ghcr.io/its-banana-coder/noida-db` |
 | **crates.io** | `cargo install noida-db --all-features` (builds from source) |
 | **GitHub Releases** | an archive per target, with the binary inside |
 | **From source** | `cargo install --path . --all-features` |
 
-**Docker**: a `Dockerfile` ships at the repo root. The `Docker Publish`
-workflow pushes `ghcr.io/its-banana-coder/noida-db` on each release:
+**Docker**: `ghcr.io/its-banana-coder/noida-db` (tags `latest` and each
+`vX.Y.Z`, amd64 + arm64), pushed by the `Docker Publish` workflow on each
+release. To build it yourself from the repo's `Dockerfile`:
 
 ```sh
 docker build -t noida-db .

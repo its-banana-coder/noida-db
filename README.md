@@ -168,25 +168,20 @@ pip install noida-db
 # Homebrew
 brew install its-banana-coder/noida-db/noida-db
 
+# Docker (amd64 + arm64)
+docker run -p 5432:5432 -p 3306:3306 -p 6379:6379 -p 9092:9092 -p 9200:9200 ghcr.io/its-banana-coder/noida-db
+
 # crates.io (builds from source)
 cargo install noida-db --all-features
 ```
 
 Or download an archive from
-[GitHub Releases](https://github.com/its-banana-coder/noida-db/releases), or
-build the Docker image yourself:
-
-```sh
-docker build -t noida-db .
-docker run -p 5432:5432 -p 3306:3306 -p 6379:6379 -p 9092:9092 -p 9200:9200 noida-db
-```
+[GitHub Releases](https://github.com/its-banana-coder/noida-db/releases).
 
 Details for each channel: [docs/PACKAGING.md](docs/PACKAGING.md).
 
 ## What's next
 
-- **A published Docker image** — the `Dockerfile` builds today; a
-  prebuilt image on `ghcr.io` is next.
 - **Wider benchmark coverage** — a native long-lived Kafka client for
   producer/fetch numbers, plus index and persistence-cost benchmarks.
 - **More real applications** — see [the table above](#tested-against-real-applications).
