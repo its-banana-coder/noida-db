@@ -7,7 +7,7 @@
 #   NOIDA_MYSQL_PORT=3306 tests/clients/mysql/run.sh    # an already-running, empty server
 #
 # Each client exits non-zero on any failed check. Missing toolchains are
-# skipped, not failed. Dependencies are cached under target/clients/mysql/.
+# skipped, not failed (except in CI). Dependencies are cached under target/clients/mysql/.
 set -uo pipefail
 
 cd "$(dirname "$0")/../../.."
@@ -48,7 +48,9 @@ run() {  # name, command...
   echo "-- $name"
   if "$@"; then summary+=("PASS  $name"); else summary+=("FAIL  $name"); status=1; fi
 }
-skip() { summary+=("SKIP  $1 ($2)"); }
+# Locally a missing toolchain is skipped; in CI ($CI is set) it's a failure,
+# so a broken install can't turn the job green.
+skip() { summary+=("SKIP  $1 ($2)"); [ -n "${CI:-}" ] && status=1; return 0; }
 
 # 1-3. Python: pymysql, SQLAlchemy, Django
 if command -v python3 >/dev/null; then
