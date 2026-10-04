@@ -10,6 +10,27 @@ use sqlparser::parser::Parser;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+/// One statement's outcome in a multi-statement batch.
+pub struct StatementResult {
+    pub result: Result<Vec<Vec<Value>>, MySqlError>,
+    pub affected: u64,
+    pub insert_id: u64,
+    pub names: Vec<String>,
+    pub status: u16,
+}
+
+impl StatementResult {
+    fn from(e: &Engine, result: Result<Vec<Vec<Value>>, MySqlError>) -> Self {
+        Self {
+            result,
+            affected: e.last_affected_rows,
+            insert_id: e.last_insert_id,
+            names: e.last_column_names.clone(),
+            status: e.status_flags(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub db: Arc<Mutex<DbState>>,
@@ -50,6 +71,10 @@ pub struct Engine {
     /// The session's `sql_mode` (MySQL 8's strict default until a
     /// `SET sql_mode = '...'`, which WordPress sends on every connection).
     pub sql_mode: crate::mysql::sqlmode::SqlMode,
+    /// User variables (`SET @x = ...`), by lower-cased name.
+    pub user_vars: std::collections::HashMap<String, Value>,
+    /// The client set CLIENT_MULTI_STATEMENTS.
+    pub multi_statements: bool,
     /// `foreign_key_checks` (on by default; dump files and migrations turn
     /// it off while loading tables in any order).
     pub fk_checks: bool,
@@ -85,6 +110,8 @@ impl Default for Engine {
             sql_mode: crate::mysql::sqlmode::SqlMode::default(),
             found_rows: false,
             fk_checks: true,
+            multi_statements: false,
+            user_vars: Default::default(),
             lock_wait_timeout: 50,
             in_tx: false,
             savepoints: Vec::new(),
@@ -251,6 +278,24 @@ impl Engine {
                 self.commit();
                 vec![]
             }
+            Plan::MultiUpdate { targets, .. } | Plan::MultiDelete { targets, .. } => {
+                let mut keys = Vec::new();
+                for (db, table, _) in targets {
+                    let probe = Plan::Delete {
+                        db: db.clone(),
+                        table: table.clone(),
+                        selection: None,
+                        order: vec![],
+                        limit: None,
+                    };
+                    for k in self.before_plan(&probe) {
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                }
+                keys
+            }
             Plan::Insert { db, table, .. }
             | Plan::Update { db, table, .. }
             | Plan::Delete { db, table, .. } => {
@@ -294,17 +339,62 @@ impl Engine {
         }
     }
 
+    /// Runs every `;`-separated statement in `sql`, stopping at the first
+    /// error (CLIENT_MULTI_STATEMENTS).
+    pub fn execute_multi(&mut self, sql: &str) -> Vec<StatementResult> {
+        let dialect = MySqlDialect {};
+        let rewritten = rewrite_comma_update(sql);
+        let text = rewritten.as_deref().unwrap_or(sql);
+        let asts = match Parser::parse_sql(&dialect, text) {
+            Ok(a) => a,
+            Err(e) => {
+                return vec![StatementResult::from(
+                    self,
+                    Err(MySqlError::syntax_error(&e.to_string())),
+                )];
+            }
+        };
+        let mut out = Vec::new();
+        if asts.is_empty() {
+            out.push(StatementResult::from(self, Ok(vec![])));
+        }
+        for stmt in asts {
+            let r = self.execute_statement(stmt, text);
+            let failed = r.is_err();
+            out.push(StatementResult::from(self, r));
+            if failed {
+                break;
+            }
+        }
+        out
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
+        let rewritten = rewrite_comma_update(sql);
+        let sql = rewritten.as_deref().unwrap_or(sql);
         let mut asts = Parser::parse_sql(&dialect, sql)
             .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
 
         if asts.is_empty() {
             return Ok(vec![]);
         }
-
+        // Without CLIENT_MULTI_STATEMENTS, a second statement is a syntax
+        // error in MySQL (never silently dropped).
+        if asts.len() > 1 {
+            return Err(MySqlError::syntax_error(
+                "check the manual that corresponds to your MySQL server version for the right syntax to use near ';' (multiple statements need CLIENT_MULTI_STATEMENTS)",
+            ));
+        }
         let stmt = asts.remove(0);
+        self.execute_statement(stmt, sql)
+    }
 
+    fn execute_statement(
+        &mut self,
+        stmt: Statement,
+        sql: &str,
+    ) -> Result<Vec<Vec<Value>>, MySqlError> {
         // Transaction control statements are handled here, at the
         // session/engine level, rather than as a `Plan` variant: they need
         // state (`tx_snapshot`) that lives across separate `execute` calls,
@@ -336,6 +426,31 @@ impl Engine {
             // engine has no per-session mode/charset/isolation state for it
             // to change.
             Statement::Set(set) => {
+                // A system variable set from an expression (`SET
+                // FOREIGN_KEY_CHECKS = @OLD_FOREIGN_KEY_CHECKS`, as dump
+                // files end) gets its value first.
+                let set = &self.literal_set(set, sql)?;
+                // `SET @x = expr, @y = ...`: user variables, evaluated in
+                // order (a later one sees an earlier one).
+                if let sqlparser::ast::Set::SingleAssignment { variable, values, .. } = set
+                    && let Some(name) = variable.to_string().strip_prefix('@')
+                    && !name.starts_with('@')
+                    && let Some(v) = values.first()
+                {
+                    let value = self.eval_scalar(v.clone(), sql)?;
+                    self.user_vars.insert(name.trim_matches('`').to_ascii_lowercase(), value);
+                }
+                if let sqlparser::ast::Set::MultipleAssignments { assignments } = set {
+                    for a in assignments {
+                        if let Some(name) = a.name.to_string().strip_prefix('@')
+                            && !name.starts_with('@')
+                        {
+                            let value = self.eval_scalar(a.value.clone(), sql)?;
+                            self.user_vars
+                                .insert(name.trim_matches('`').to_ascii_lowercase(), value);
+                        }
+                    }
+                }
                 // `SET autocommit = 0|1` is the one setting with an effect:
                 // turning it back on commits an open transaction.
                 if let Some(on) = bool_assignment(set, "autocommit") {
@@ -525,6 +640,71 @@ impl Engine {
         Ok(res)
     }
 
+    /// `set` with each system variable's non-literal value evaluated to a
+    /// literal (user variables are evaluated where they're assigned).
+    fn literal_set(
+        &mut self,
+        set: &sqlparser::ast::Set,
+        sql: &str,
+    ) -> Result<sqlparser::ast::Set, MySqlError> {
+        use sqlparser::ast::{Expr as E, Set, Value as V};
+        let mut set = set.clone();
+        // Literals and bare words (`ON`, `DEFAULT`) are used as written;
+        // anything else, `@var`s included, is evaluated.
+        let needs_eval = |name: &str, e: &E| {
+            (!name.starts_with('@') || name.starts_with("@@"))
+                && match e {
+                    E::Value(_) => false,
+                    E::Identifier(i) => i.value.starts_with('@'),
+                    _ => true,
+                }
+        };
+        let lit = |this: &mut Self, e: &mut E| -> Result<(), MySqlError> {
+            let v = this.eval_scalar(e.clone(), sql)?;
+            let value = match v {
+                Value::Null => V::Null,
+                Value::Int(i) => V::Number(i.to_string(), false),
+                Value::Num(n) => V::Number(n.to_string(), false),
+                Value::Float(f) => V::Number(f.to_string(), false),
+                other => V::SingleQuotedString(
+                    crate::mysql::exec::value_as_text(&other).unwrap_or_default(),
+                ),
+            };
+            *e = E::Value(value.into());
+            Ok(())
+        };
+        match &mut set {
+            Set::SingleAssignment { variable, values, .. } => {
+                let name = variable.to_string();
+                for v in values.iter_mut() {
+                    if needs_eval(&name, v) {
+                        lit(self, v)?;
+                    }
+                }
+            }
+            Set::MultipleAssignments { assignments } => {
+                for a in assignments.iter_mut() {
+                    let name = a.name.to_string();
+                    if needs_eval(&name, &a.value) {
+                        lit(self, &mut a.value)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(set)
+    }
+
+    /// Evaluates a standalone expression (a `SET @x = ...` value).
+    fn eval_scalar(&mut self, e: sqlparser::ast::Expr, sql: &str) -> Result<Value, MySqlError> {
+        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql);
+        let expr = binder.bind_scalar(e)?;
+        let plan =
+            Plan::Project { source: Box::new(Plan::Dummy), exprs: vec![expr], names: vec![] };
+        let rows = self.executor().execute_plan(plan)?;
+        Ok(rows.into_iter().next().and_then(|r| r.into_iter().next()).unwrap_or(Value::Null))
+    }
+
     /// A new executor carrying this session's settings.
     pub fn executor(&self) -> Executor {
         let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
@@ -535,6 +715,7 @@ impl Engine {
         executor.found_rows = self.found_rows;
         executor.fk_checks = self.fk_checks;
         executor.conn_id = self.conn_id;
+        executor.user_vars = self.user_vars.clone();
         executor
     }
 
@@ -722,6 +903,58 @@ fn sql_mode_assignment(set: &sqlparser::ast::Set) -> Option<crate::mysql::sqlmod
 
 /// `Some(on)` if `set` assigns `autocommit` (`SET autocommit = 0`,
 /// `SET @@autocommit = 1`, `SET SESSION autocommit = OFF`, ...).
+/// `UPDATE a, b SET ...` (MySQL's comma join in a multi-table UPDATE)
+/// as `UPDATE a CROSS JOIN b SET ...`, which the SQL parser accepts and
+/// means the same. None when there's nothing to rewrite.
+pub fn rewrite_comma_update(sql: &str) -> Option<String> {
+    let trimmed = sql.trim_start();
+    if trimmed.len() < 7 || !trimmed[..7].eq_ignore_ascii_case("UPDATE ") {
+        return None;
+    }
+    let start = sql.len() - trimmed.len() + 7;
+    let bytes = sql.as_bytes();
+    let (mut depth, mut quote) = (0i32, None::<u8>);
+    let mut commas = Vec::new();
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' | b'`' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => commas.push(i),
+                _ if depth == 0
+                    && (c == b'S' || c == b's')
+                    && sql[i..].len() > 3
+                    && sql[i..i + 3].eq_ignore_ascii_case("SET")
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes.get(i + 3).is_some_and(|b| b.is_ascii_whitespace()) =>
+                {
+                    break;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if commas.is_empty() || i >= bytes.len() {
+        return None;
+    }
+    let mut out = sql.to_string();
+    for &c in commas.iter().rev() {
+        out.replace_range(c..c + 1, " CROSS JOIN ");
+    }
+    Some(out)
+}
+
 /// `Some(n)` if `set` assigns the integer variable `var`.
 fn int_assignment(set: &sqlparser::ast::Set, var: &str) -> Option<i64> {
     use sqlparser::ast::{Expr as E, Set, Value as V};
