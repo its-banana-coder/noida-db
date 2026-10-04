@@ -121,7 +121,11 @@ whatever changed since the last clean shutdown but never corrupts the
 on-disk snapshot.
 
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 665 results) and by psycopg,
+servers by `tests/postgres_diff.rs` (about 700 results), by an edge-case
+differential (`tests/failure-diff/pg_edges.py`: numbers and casts, strings,
+dates, arrays and JSON, DML corner cases, `GROUPING SETS`/`ROLLUP`/`CUBE`,
+ordered-set aggregates `percentile_cont`/`percentile_disc`/`mode() WITHIN
+GROUP`, named `WINDOW`s) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM,
 Sequelize, pgx, GORM, sqlx, Npgsql and JDBC (`tests/clients/postgres/run.sh`).
 Django's own management commands (`migrate`, including the built-in
@@ -211,6 +215,9 @@ constraints.
   config other than `'english'`/`'simple'`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
+
+- `BETWEEN SYMMETRIC` (the SQL parser rejects it) and the `GROUPING()`
+  function.
 
 **Differs**
 

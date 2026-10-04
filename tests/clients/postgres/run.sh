@@ -27,6 +27,9 @@ if [ -z "${PGPORT:-}" ]; then
   echo "== starting noida-db"
   cargo build --quiet --features postgres --bin noida-db || exit 1
   PGPORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+  # A fresh database every run (a stale one from an interrupted run makes
+  # the clients' CREATE TABLEs fail).
+  rm -rf "$cache/noida-db-data"
   "$root/target/debug/noida-db" start --only postgres --postgres-port "$PGPORT" \
     --data-dir "$cache/noida-db-data" >"$cache/noida-db.log" 2>&1 &
   started_noida=$!

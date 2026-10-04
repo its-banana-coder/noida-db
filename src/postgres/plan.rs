@@ -235,6 +235,9 @@ pub struct AggCall {
     pub order: Vec<(Expr, bool, bool)>,
     /// `count(*)`.
     pub star: bool,
+    /// An ordered-set aggregate's direct argument (`percentile_cont(0.5)
+    /// WITHIN GROUP (ORDER BY x)`: the 0.5); its data is `args[0]`.
+    pub direct: Option<Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
