@@ -1,0 +1,47 @@
+name: Setup noida-db
+description: >-
+  Start Postgres, MySQL, Redis, Kafka and Elasticsearch (real wire protocols)
+  from one tiny binary, and wait until every port accepts connections.
+branding:
+  icon: database
+  color: purple
+inputs:
+  version:
+    description: noida-db version (npm), e.g. "0.1.3" or "latest"
+    default: latest
+  services:
+    description: Comma-separated services to start
+    default: postgres,mysql,redis,kafka,elasticsearch
+  args:
+    description: Extra arguments for `noida-db start`, e.g. "--postgres-port 5433"
+    default: ""
+  timeout:
+    description: Seconds to wait for the services to accept connections
+    default: "60"
+runs:
+  using: composite
+  steps:
+    - name: Start noida-db
+      shell: bash
+      env:
+        NOIDA_VERSION: ${{ inputs.version }}
+        NOIDA_SERVICES: ${{ inputs.services }}
+        NOIDA_ARGS: ${{ inputs.args }}
+        NOIDA_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        log="$RUNNER_TEMP/noida-db.log"
+        # shellcheck disable=SC2086  # NOIDA_ARGS is a list of flags
+        nohup npx --yes "noida-db@$NOIDA_VERSION" start --only "$NOIDA_SERVICES" \
+          --data-dir "$RUNNER_TEMP/noida-db-data" $NOIDA_ARGS > "$log" 2>&1 &
+        deadline=$((SECONDS + NOIDA_TIMEOUT))
+        until grep -q "press Ctrl-C" "$log" 2>/dev/null; do
+          if [ "$SECONDS" -ge "$deadline" ]; then echo "::error::noida-db did not start"; cat "$log"; exit 1; fi
+          sleep 0.2
+        done
+        for port in $(grep -oE '127\.0\.0\.1:[0-9]+' "$log" | cut -d: -f2); do
+          until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then echo "::error::port $port never opened"; cat "$log"; exit 1; fi
+            sleep 0.1
+          done
+        done
+        cat "$log"
