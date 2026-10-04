@@ -31,4 +31,3 @@ pub mod elasticsearch;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
-
