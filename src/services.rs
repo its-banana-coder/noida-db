@@ -46,14 +46,10 @@ pub fn start(name: &str, addr: &str) -> Option<io::Result<SocketAddr>> {
         "kafka" => Some(crate::kafka::spawn(addr)),
         #[cfg(feature = "mongodb")]
         "mongodb" => Some(crate::mongodb::spawn(addr)),
-        #[cfg(feature = "memcached")]
-        "memcached" => Some(crate::memcached::spawn(addr)),
         #[cfg(feature = "elasticsearch")]
         "elasticsearch" => Some(crate::elasticsearch::spawn(addr)),
         #[cfg(feature = "clickhouse")]
         "clickhouse" => Some(crate::clickhouse::spawn(addr)),
-        #[cfg(feature = "rabbitmq")]
-        "rabbitmq" => Some(crate::rabbitmq::spawn(addr)),
         _ => {
             let _ = addr;
             None

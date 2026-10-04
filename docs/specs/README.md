@@ -9,9 +9,7 @@ agent (or person) can pick one up without other context.
 | Postgres | (in progress) | 5432 | building (`svc/postgres`) |
 | MySQL | [mysql.md](mysql.md) | 3306 | open (after Postgres engine lands) |
 | Kafka | [kafka.md](kafka.md) | 9092 | open |
-| Memcached | [memcached.md](memcached.md) | 11211 | open |
 | MongoDB | [mongodb.md](mongodb.md) | 27017 | open |
-| RabbitMQ | [rabbitmq.md](rabbitmq.md) | 5672, 15672 | open |
 | Elasticsearch | [elasticsearch.md](elasticsearch.md) | 9200 | building (`svc/elasticsearch`, milestone 2/3) |
 | ClickHouse | [clickhouse.md](clickhouse.md) | 8123, 9000 | building (`svc/clickhouse`) |
 
@@ -122,10 +120,8 @@ of the exact version you read; these change between releases. What we know:
 | Redis | 7.2 and earlier (BSD-3-Clause) | 7.4 and later (RSAL/SSPL, later AGPL) |
 | PostgreSQL | any version (PostgreSQL licence) | |
 | Kafka | Apache-2.0 | |
-| Memcached | BSD-3-Clause | |
 | ClickHouse | Apache-2.0 | |
 | Elasticsearch | 7.10 and earlier (Apache-2.0); Lucene (Apache-2.0) | 7.11 and later (SSPL/Elastic licence) |
-| RabbitMQ | check each file's header (MPL-2.0 is file-level copyleft; prefer Apache-2.0 client libraries) | |
 | MySQL | | server source is GPL: use protocol documentation, MIT/Apache crates (for example `opensrv-mysql`) and client behaviour instead |
 | MongoDB | drivers and `bson` (Apache-2.0) | server source is SSPL: use the public wire-protocol docs and driver behaviour |
 
@@ -139,7 +135,7 @@ copying source.
   every push.
 - Only touch your service's module (`src/<service>/`), your tests, and the
   shared files where unavoidable: `Cargo.toml` (your feature and deps),
-  `src/lib.rs` and `src/services.rs` (Postgres, Kafka and Memcached are
+  `src/lib.rs` and `src/services.rs` (Postgres and Kafka are
   already scaffolded; other services add their feature, module line and
   registry entry following the same pattern),
   `.github/workflows/ci.yml` (your reference-server container), and your

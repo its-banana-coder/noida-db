@@ -25,7 +25,7 @@ same MySQL error class a real server would use.
 
 **Status as of 2026-09-28: Postgres is done and merged to `main`.** This
 branch (`svc/mysql`) is still on an old base (commit `26a5759`, from before
-Postgres, Kafka, ClickHouse, Elasticsearch and Memcached all landed) — the
+Postgres, Kafka, ClickHouse and Elasticsearch all landed) — the
 **first thing to do is `git fetch origin main && git rebase origin/main`**,
 not write new code on the stale base. Everything below assumes you're
 starting from current `main`.

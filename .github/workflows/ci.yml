@@ -79,9 +79,6 @@ jobs:
       - run: scripts/check-size.sh
       # Real Redis client libraries (redis-py, ioredis) against the server.
       - run: tests/clients/redis/run.sh
-      # Django's built-in PyMemcacheCache backend (via pymemcache) against
-      # the real Memcached text protocol.
-      - run: tests/clients/memcached/run.sh
       # Real Kafka clients (kafkajs, confluent-kafka-python, kafka-go, Java
       # kafka-clients/Spring Kafka, a transactional producer) plus a real
       # Faust streaming application.
