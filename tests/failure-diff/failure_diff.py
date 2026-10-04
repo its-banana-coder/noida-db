@@ -423,6 +423,20 @@ MYSQL_QUERIES = {
         (B, "SELECT id FROM t ORDER BY id"),
         (B, "SELECT id FROM note ORDER BY id"),
     ],
+    "foreign keys: column DDL": [
+        (A, "CREATE TABLE p (id INT PRIMARY KEY, x INT)"),
+        (A, "CREATE TABLE c (id INT PRIMARY KEY, pid INT, CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id))"),
+        (A, "ALTER TABLE c DROP COLUMN pid"),
+        (A, "ALTER TABLE p DROP COLUMN id"),
+        (A, "ALTER TABLE c RENAME COLUMN pid TO parent"),
+        (A, "ALTER TABLE p RENAME COLUMN id TO pk"),
+        (A, "SHOW CREATE TABLE c"),
+        (A, "INSERT INTO c VALUES (1, 1)"),
+        (A, "ALTER TABLE p RENAME TO parent_t"),
+        (A, "SHOW CREATE TABLE c"),
+        (A, "ALTER TABLE c DROP FOREIGN KEY fk"),
+        (A, "ALTER TABLE c DROP COLUMN parent"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

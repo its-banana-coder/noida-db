@@ -610,7 +610,9 @@ impl Binder {
                         AlterOp::AddUnique(UniqueKey { name, columns })
                     }
                     TableConstraint::PrimaryKey(pk) => AlterOp::AddPrimaryKey(idents(&pk.columns)),
-                    TableConstraint::ForeignKey(fk) => AlterOp::AddForeignKey(self.bind_foreign_key(&fk)?),
+                    TableConstraint::ForeignKey(fk) => {
+                        AlterOp::AddForeignKey(self.bind_foreign_key(&fk)?)
+                    }
                     // INDEX, CHECK: accepted, not enforced.
                     _ => AlterOp::Noop,
                 },
@@ -2164,6 +2166,13 @@ impl Binder {
             ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
             on_delete: action(&fk.on_delete)?,
             on_update: action(&fk.on_update)?,
+            // MySQL names the index after the CONSTRAINT symbol first.
+            index: fk
+                .name
+                .as_ref()
+                .or(fk.index_name.as_ref())
+                .map(|n| n.value.clone())
+                .unwrap_or_default(),
         })
     }
 

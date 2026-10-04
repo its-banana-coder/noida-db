@@ -418,17 +418,22 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 .flat_map(|(db, t)| {
                     t.foreign_keys.iter().map(move |fk| {
                         // The parent key the foreign key points at.
-                        let unique = crate::mysql::infoschema::lookup_table(state, &fk.ref_db, &fk.ref_table)
-                            .and_then(|p| {
-                                p.keys().into_iter().find(|(_, cols)| {
-                                    cols.len() == fk.ref_columns.len()
-                                        && cols.iter().zip(&fk.ref_columns).all(|(&c, r)| {
-                                            p.columns[c].name.eq_ignore_ascii_case(r)
-                                        })
-                                })
+                        let unique = crate::mysql::infoschema::lookup_table(
+                            state,
+                            &fk.ref_db,
+                            &fk.ref_table,
+                        )
+                        .and_then(|p| {
+                            p.keys().into_iter().find(|(_, cols)| {
+                                cols.len() == fk.ref_columns.len()
+                                    && cols
+                                        .iter()
+                                        .zip(&fk.ref_columns)
+                                        .all(|(&c, r)| p.columns[c].name.eq_ignore_ascii_case(r))
                             })
-                            .map(|(name, _)| text(&name))
-                            .unwrap_or(Value::Null);
+                        })
+                        .map(|(name, _)| text(&name))
+                        .unwrap_or(Value::Null);
                         vec![
                             text("def"),
                             text(db),

@@ -85,6 +85,9 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
     pub on_delete: FkAction,
     pub on_update: FkAction,
+    /// The index backing it (SHOW CREATE TABLE's `KEY` line).
+    #[serde(default)]
+    pub index: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
