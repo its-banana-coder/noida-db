@@ -1561,7 +1561,7 @@ fn numeric_recv(b: &[u8]) -> PgResult<Numeric> {
     let groups: Vec<i16> =
         (0..nd).map(|i| i16::from_be_bytes([b[8 + i * 2], b[9 + i * 2]])).collect();
     if groups.is_empty() {
-        return Ok(Numeric::Fin(Dec { neg: false, digits: vec![], scale: dscale }));
+        return Ok(Numeric::Fin(Dec { neg: false, digits: vec![], scale: dscale, hidden: 0 }));
     }
     let int_groups = (weight + 1).max(0) as usize;
     for i in 0..int_groups {

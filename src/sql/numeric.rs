@@ -25,11 +25,16 @@ pub struct Dec {
     /// Most significant first, no leading zeros; empty means zero.
     pub digits: Vec<u8>,
     pub scale: u32,
+    /// MySQL only: how many of the `scale` fraction digits are extra
+    /// precision kept for further arithmetic but not shown (`1/3` is
+    /// 0.333333333 inside and displays as 0.3333). Always 0 for Postgres.
+    #[serde(default)]
+    pub hidden: u32,
 }
 
 impl Dec {
     fn zero(scale: u32) -> Dec {
-        Dec { neg: false, digits: vec![], scale }
+        Dec { neg: false, digits: vec![], scale, hidden: 0 }
     }
 
     fn normalize(mut self) -> Dec {
@@ -60,7 +65,7 @@ impl Dec {
         let cur = self.scale as i64;
         if scale >= cur {
             let s = scale.min(MAX_DISPLAY_SCALE) as u32;
-            return Dec { neg: self.neg, digits: self.with_scale(s), scale: s };
+            return Dec { neg: self.neg, digits: self.with_scale(s), scale: s, hidden: 0 };
         }
         let drop = (cur - scale) as usize;
         let keep_scale = scale.max(0) as u32;
@@ -83,7 +88,7 @@ impl Dec {
                 kept.extend(std::iter::repeat_n(0, pad));
             }
         }
-        Dec { neg: self.neg, digits: kept, scale: keep_scale }.normalize()
+        Dec { neg: self.neg, digits: kept, scale: keep_scale, hidden: 0 }.normalize()
     }
 
     /// Base-10000 weight and first digit, as Postgres's `NumericVar` has them.
@@ -218,13 +223,13 @@ impl Numeric {
     pub fn from_i64(v: i64) -> Numeric {
         let neg = v < 0;
         let digits = strip(v.unsigned_abs().to_string().bytes().map(|b| b - b'0').collect());
-        Numeric::Fin(Dec { neg, digits, scale: 0 }.normalize())
+        Numeric::Fin(Dec { neg, digits, scale: 0, hidden: 0 }.normalize())
     }
 
     pub fn from_i128(v: i128) -> Numeric {
         let neg = v < 0;
         let digits = strip(v.unsigned_abs().to_string().bytes().map(|b| b - b'0').collect());
-        Numeric::Fin(Dec { neg, digits, scale: 0 }.normalize())
+        Numeric::Fin(Dec { neg, digits, scale: 0, hidden: 0 }.normalize())
     }
 
     /// Postgres converts float8 to numeric through `%.15g`.
@@ -315,7 +320,9 @@ impl Numeric {
             digits.extend(std::iter::repeat_n(0, (-scale) as usize));
             scale = 0;
         }
-        Ok(Numeric::Fin(Dec { neg, digits: strip(digits), scale: scale as u32 }.normalize()))
+        Ok(Numeric::Fin(
+            Dec { neg, digits: strip(digits), scale: scale as u32, hidden: 0 }.normalize(),
+        ))
     }
 
     pub fn is_nan(&self) -> bool {
@@ -326,6 +333,30 @@ impl Numeric {
         match self {
             Numeric::Fin(d) => d.scale,
             _ => 0,
+        }
+    }
+
+    /// The scale shown (`scale` minus MySQL's hidden digits).
+    pub fn display_scale(&self) -> u32 {
+        match self {
+            Numeric::Fin(d) => d.scale - d.hidden.min(d.scale),
+            _ => 0,
+        }
+    }
+
+    /// This value, displayed with `display` fraction digits while keeping
+    /// every digit it has for further arithmetic (MySQL).
+    pub fn with_display_scale(self, display: u32) -> Numeric {
+        match self {
+            Numeric::Fin(mut d) => {
+                if d.scale < display {
+                    d.digits = d.with_scale(display);
+                    d.scale = display;
+                }
+                d.hidden = d.scale - display;
+                Numeric::Fin(d)
+            }
+            other => other,
         }
     }
 
@@ -388,6 +419,7 @@ impl Numeric {
                     neg: a.neg != b.neg,
                     digits: mul_mag(&a.digits, &b.digits),
                     scale: a.scale + b.scale,
+                    hidden: 0,
                 }
                 .normalize();
                 let d = if d.scale as i64 > MAX_DISPLAY_SCALE {
@@ -575,7 +607,7 @@ impl Numeric {
                     n.truncate(keep);
                 }
                 let root = isqrt(&strip(n));
-                let r = Dec { neg: false, digits: root, scale: work as u32 }.normalize();
+                let r = Dec { neg: false, digits: root, scale: work as u32, hidden: 0 }.normalize();
                 Some(Numeric::Fin(r.round_to(rscale, false)))
             }
         }
@@ -618,12 +650,16 @@ fn add_dec(a: &Dec, b: &Dec) -> Dec {
     let da = a.with_scale(scale);
     let db = b.with_scale(scale);
     if a.neg == b.neg {
-        return Dec { neg: a.neg, digits: add_mag(&da, &db), scale }.normalize();
+        return Dec { neg: a.neg, digits: add_mag(&da, &db), scale, hidden: 0 }.normalize();
     }
     match cmp_mag(&da, &db) {
         Ordering::Equal => Dec::zero(scale),
-        Ordering::Greater => Dec { neg: a.neg, digits: sub_mag(&da, &db), scale }.normalize(),
-        Ordering::Less => Dec { neg: b.neg, digits: sub_mag(&db, &da), scale }.normalize(),
+        Ordering::Greater => {
+            Dec { neg: a.neg, digits: sub_mag(&da, &db), scale, hidden: 0 }.normalize()
+        }
+        Ordering::Less => {
+            Dec { neg: b.neg, digits: sub_mag(&db, &da), scale, hidden: 0 }.normalize()
+        }
     }
 }
 
@@ -653,7 +689,8 @@ fn div_dec(a: &Dec, b: &Dec, rscale: i64, truncate: bool) -> Dec {
         den.extend(std::iter::repeat_n(0, (-shift) as usize));
     }
     let (q, _) = divmod_mag(&num, &den);
-    let d = Dec { neg: a.neg != b.neg, digits: q, scale: work.max(0) as u32 }.normalize();
+    let d =
+        Dec { neg: a.neg != b.neg, digits: q, scale: work.max(0) as u32, hidden: 0 }.normalize();
     // `work` digits then round (or truncate) to rscale.
     d.round_to(rscale, truncate)
 }
@@ -696,6 +733,10 @@ impl std::fmt::Display for Numeric {
             Numeric::NaN => f.write_str("NaN"),
             Numeric::Inf(false) => f.write_str("Infinity"),
             Numeric::Inf(true) => f.write_str("-Infinity"),
+            Numeric::Fin(d) if d.hidden > 0 => {
+                let shown = d.round_to((d.scale - d.hidden.min(d.scale)) as i64, false);
+                std::fmt::Display::fmt(&Numeric::Fin(Dec { hidden: 0, ..shown }), f)
+            }
             Numeric::Fin(d) => {
                 let scale = d.scale as usize;
                 let mut s = String::with_capacity(d.digits.len() + 3);

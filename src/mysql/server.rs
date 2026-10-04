@@ -566,7 +566,7 @@ fn column_type_for(val: Option<&Value>) -> (u8, u16, u8) {
         Some(Value::Int(_)) => (0x08, BINARY, 0), // LONGLONG (i64 storage)
         Some(Value::Bool(_)) => (0x01, BINARY, 0), // TINY
         Some(Value::Float(_)) => (0x05, BINARY, 31), // DOUBLE, 31 = not fixed
-        Some(Value::Num(n)) => (0xf6, BINARY, n.scale().min(30) as u8), // NEWDECIMAL
+        Some(Value::Num(n)) => (0xf6, BINARY, n.display_scale().min(30) as u8), // NEWDECIMAL
         Some(Value::Date(_)) => (0x0a, BINARY, 0), // DATE
         Some(Value::Ts(_)) => (0x0c, BINARY, 0),  // DATETIME
         Some(Value::Time(_)) => (0x0b, BINARY, 0), // TIME

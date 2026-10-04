@@ -120,6 +120,17 @@ pub enum Expr {
         plan: Box<Plan>,
         all: bool,
     },
+    /// A window function (`ROW_NUMBER() OVER (...)`, `SUM(x) OVER w`, ...).
+    /// `id` is unique within the statement; the executor computes each
+    /// window's values over the whole result before evaluating the select
+    /// list, and this node reads the current row's value.
+    Window {
+        id: usize,
+        /// Upper-case name; `COUNT(*)` is `COUNT_STAR`.
+        func: String,
+        args: Vec<Expr>,
+        spec: Box<WindowSpec>,
+    },
     /// `[NOT] EXISTS (SELECT ...)`.
     Exists {
         plan: Box<Plan>,
@@ -149,6 +160,7 @@ pub fn contains_agg(expr: &Expr) -> bool {
         Expr::InList { expr, list, .. } => contains_agg(expr) || list.iter().any(contains_agg),
         Expr::Not(e) => contains_agg(e),
         Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => contains_agg(expr),
+        Expr::Window { args, spec, .. } => window_exprs(args, spec).any(contains_agg),
         Expr::IsNull(e, _) => contains_agg(e),
         Expr::Like { expr, pattern, escape, .. } => {
             contains_agg(expr) || contains_agg(pattern) || contains_agg(escape)
@@ -180,6 +192,9 @@ pub fn for_each_colname<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a str)) {
         }
         Expr::Not(e) | Expr::IsNull(e, _) => for_each_colname(e, f),
         Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => for_each_colname(expr, f),
+        Expr::Window { args, spec, .. } => {
+            window_exprs(args, spec).for_each(|e| for_each_colname(e, f))
+        }
         Expr::Like { expr, pattern, escape, .. } => {
             for_each_colname(expr, f);
             for_each_colname(pattern, f);
@@ -221,6 +236,76 @@ pub enum InsertMode {
     /// existing row instead. `VALUES(col)` in an `expr` is the value the
     /// row would have been inserted with.
     Upsert(Vec<(String, Expr)>),
+}
+
+/// A window's `PARTITION BY`, `ORDER BY` and frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowSpec {
+    pub partition: Vec<Expr>,
+    pub order: Vec<(Expr, bool)>, // (key, ascending)
+    pub frame: Option<Frame>,
+}
+
+/// `ROWS|RANGE BETWEEN start AND end`. `RANGE` bounds are only
+/// unbounded or `CURRENT ROW` (the row and its peers).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frame {
+    pub rows: bool,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+/// Every expression a window node holds, for the generic walkers.
+pub fn window_exprs<'a>(args: &'a [Expr], spec: &'a WindowSpec) -> impl Iterator<Item = &'a Expr> {
+    args.iter().chain(spec.partition.iter()).chain(spec.order.iter().map(|(e, _)| e))
+}
+
+/// Every window node in `expr` (not inside subqueries), each id once.
+pub fn collect_windows<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    let mut sub = |e: &'a Expr| collect_windows(e, out);
+    match expr {
+        Expr::Window { id, .. } => {
+            if !out.iter().any(|w| matches!(w, Expr::Window { id: i, .. } if i == id)) {
+                out.push(expr);
+            }
+        }
+        Expr::And(v) | Expr::Or(v) | Expr::Call { args: v, .. } => v.iter().for_each(sub),
+        Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+            sub(left);
+            sub(right);
+        }
+        Expr::Agg { arg: Some(a), .. } => sub(a),
+        Expr::InList { expr, list, .. } => {
+            sub(expr);
+            list.iter().for_each(sub);
+        }
+        Expr::Not(e) | Expr::IsNull(e, _) => sub(e),
+        Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => sub(expr),
+        Expr::Like { expr, pattern, escape, .. } => {
+            sub(expr);
+            sub(pattern);
+            sub(escape);
+        }
+        Expr::Case { conditions, else_result } => {
+            for (c, r) in conditions {
+                sub(c);
+                sub(r);
+            }
+            if let Some(e) = else_result {
+                sub(e);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -489,6 +574,9 @@ pub fn count_params(plan: &Plan) -> usize {
                 expr_max(expr, max);
                 plan_max(plan, max);
             }
+            Expr::Window { args, spec, .. } => {
+                window_exprs(args, spec).for_each(|e| expr_max(e, max))
+            }
             _ => {}
         }
     }
@@ -714,6 +802,14 @@ pub fn map_colnames(e: Expr, f: &dyn Fn(String) -> Expr) -> Expr {
         }
         Expr::Quantified { op, expr, plan, all } => {
             Expr::Quantified { op, expr: mb(expr), plan, all }
+        }
+        Expr::Window { id, func, args, spec } => {
+            let spec = WindowSpec {
+                partition: spec.partition.into_iter().map(m).collect(),
+                order: spec.order.into_iter().map(|(e, a)| (m(e), a)).collect(),
+                frame: spec.frame,
+            };
+            Expr::Window { id, func, args: args.into_iter().map(m).collect(), spec: Box::new(spec) }
         }
         other => other,
     }
