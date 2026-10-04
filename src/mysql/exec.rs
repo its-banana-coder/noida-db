@@ -1,6 +1,8 @@
 use crate::mysql::catalog::{Column, ColumnType, DbState, Table, UniqueKey};
 use crate::mysql::error::MySqlError;
-use crate::mysql::plan::{AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SortKey};
+use crate::mysql::plan::{
+    AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SetOpKind, SortKey,
+};
 use crate::mysql::types::Value;
 use crate::sql::numeric::Numeric;
 use std::cmp::Ordering;
@@ -47,6 +49,16 @@ pub struct Executor {
     /// Set while evaluating the values an INSERT/UPDATE writes, where
     /// division by zero is an error in strict mode (not just NULL).
     writing: std::cell::Cell<bool>,
+    /// The enclosing queries' rows while a subquery runs, innermost last
+    /// (column names only, no rows), so a correlated reference to an outer
+    /// column resolves.
+    outer: Vec<(Table, Vec<Value>)>,
+    /// The client set `CLIENT_FOUND_ROWS` (Django does): an UPDATE reports
+    /// the rows it matched, not only the ones it changed.
+    pub found_rows: bool,
+    /// A recursive CTE's rows from the previous round, by name, for its
+    /// step's `Plan::CteRef`.
+    cte_rows: std::collections::HashMap<String, Vec<Vec<Value>>>,
 }
 
 impl Executor {
@@ -63,6 +75,9 @@ impl Executor {
             sql_mode: Default::default(),
             autocommit: true,
             writing: std::cell::Cell::new(false),
+            outer: Vec::new(),
+            found_rows: false,
+            cte_rows: std::collections::HashMap::new(),
         }
     }
 
@@ -91,6 +106,13 @@ impl Executor {
             Plan::Filter { source, .. } => self.resolve_table_context(source),
             Plan::Project { source, .. } => self.resolve_table_context(source),
             Plan::Finish { source, .. } => self.resolve_table_context(source),
+            Plan::Derived { alias, .. } | Plan::CteRef { alias, .. } => {
+                let names = {
+                    let state = self.db.lock().unwrap();
+                    crate::mysql::plan::column_names(plan, &state)
+                };
+                Ok(Some(derived_table(alias, &names)))
+            }
             Plan::Join { left, right, .. } => {
                 let l = self.resolve_table_context(left)?;
                 let r = self.resolve_table_context(right)?;
@@ -98,6 +120,37 @@ impl Executor {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Runs a subquery for the current row of the enclosing query, which
+    /// its correlated column references read.
+    fn run_subquery(
+        &self,
+        plan: &Plan,
+        row: &[Value],
+        table: Option<&Table>,
+    ) -> Result<Vec<Vec<Value>>, MySqlError> {
+        let mut child = Executor::new(self.db.clone(), self.current_db.clone());
+        child.params = self.params.clone();
+        child.sql_mode = self.sql_mode.clone();
+        child.autocommit = self.autocommit;
+        child.session_insert_id = self.session_insert_id;
+        child.cte_rows = self.cte_rows.clone();
+        child.outer = self.outer.clone();
+        if let Some(t) = table {
+            child.outer.push((Table::new(t.name.clone(), t.columns.clone()), row.to_vec()));
+        }
+        child.execute_plan(plan.clone())
+    }
+
+    /// An enclosing query's column, for a correlated subquery.
+    fn outer_column(&self, name: &str) -> Result<Option<Value>, MySqlError> {
+        for (t, row) in self.outer.iter().rev() {
+            if let Some(i) = resolve_column(t, name)? {
+                return Ok(Some(row.get(i).cloned().unwrap_or(Value::Null)));
+            }
+        }
+        Ok(None)
     }
 
     pub fn execute_plan(&mut self, plan: Plan) -> Result<Vec<Vec<Value>>, MySqlError> {
@@ -497,10 +550,12 @@ impl Executor {
                                         &work.rows[i],
                                     ));
                                 }
-                                // MySQL: 2 for an updated row, 0 if the update
-                                // left it as it was.
+                                // MySQL: 2 for an updated row; one the update
+                                // left as it was is 0 (1 with FOUND_ROWS).
                                 if work.rows[i] != before {
                                     affected += 2;
+                                } else if self.found_rows {
+                                    affected += 1;
                                 }
                             }
                         }
@@ -528,14 +583,22 @@ impl Executor {
                 let keys = work.keys();
                 let targets =
                     self.dml_targets(&work, selection.as_ref(), &order, limit.as_ref())?;
+                let mut changed = 0u64;
                 for &i in &targets {
+                    let before = work.rows[i].clone();
                     self.apply_assignments(&mut work, i, &assignments)?;
                     if let Some((_, k)) = find_key_conflict(&work, &keys, &work.rows[i], Some(i)) {
                         return Err(duplicate_key_error(&work, &keys[k], &work.rows[i]));
                     }
+                    if work.rows[i] != before {
+                        changed += 1;
+                    }
                 }
                 self.store_table(&db, work)?;
-                self.last_affected_rows = targets.len() as u64;
+                // MySQL reports the rows an UPDATE changed; with the
+                // client's FOUND_ROWS flag, the rows it matched.
+                self.last_affected_rows =
+                    if self.found_rows { targets.len() as u64 } else { changed };
                 Ok(vec![])
             }
             Plan::Delete { db, table, selection, order, limit } => {
@@ -553,12 +616,82 @@ impl Executor {
                 Ok(vec![])
             }
             Plan::Scan { db, table, .. } => Ok(self.load_table(&db, &table)?.rows),
+            Plan::Derived { plan, .. } => self.execute_plan(*plan),
+            Plan::InsertSelect { insert, query } => {
+                // The SELECT runs first, over the table as it was (so
+                // `INSERT INTO t SELECT ... FROM t` doesn't see its own rows).
+                let rows = self.execute_plan(*query)?;
+                let Plan::Insert { db, table, columns, mode, .. } = *insert else {
+                    unreachable!("InsertSelect always wraps an Insert")
+                };
+                let rows =
+                    rows.into_iter().map(|r| r.into_iter().map(Expr::Const).collect()).collect();
+                self.execute_plan(Plan::Insert { db, table, columns, rows, mode })
+            }
+            Plan::CteRef { name, .. } => Ok(self.cte_rows.get(&name).cloned().unwrap_or_default()),
+            Plan::SetOp { op, all, left, right } => {
+                let width = |p: &Plan, rows: &[Vec<Value>]| {
+                    crate::mysql::plan::static_names(p)
+                        .map(|n| n.len())
+                        .or_else(|| rows.first().map(|r| r.len()))
+                };
+                let (lw, rw) = (left.clone(), right.clone());
+                let l = self.execute_plan(*left)?;
+                let r = self.execute_plan(*right)?;
+                if let (Some(a), Some(b)) = (width(&lw, &l), width(&rw, &r))
+                    && a != b
+                {
+                    return Err(MySqlError::new(
+                        1222,
+                        "21000",
+                        "The used SELECT statements have a different number of columns",
+                    ));
+                }
+                Ok(set_op(op, all, l, r))
+            }
+            Plan::RecursiveCte { name, anchor, step, all, .. } => {
+                let mut rows = self.execute_plan(*anchor)?;
+                if !all {
+                    rows = set_op(SetOpKind::Union, false, rows, Vec::new());
+                }
+                let mut frontier = rows.clone();
+                let mut rounds = 0;
+                let saved = self.cte_rows.remove(&name);
+                while !frontier.is_empty() {
+                    rounds += 1;
+                    if rounds > 1000 {
+                        return Err(MySqlError::new(
+                            3636,
+                            "HY000",
+                            "Recursive query aborted after 1001 iterations. Try increasing \
+                             @@cte_max_recursion_depth to a larger value.",
+                        ));
+                    }
+                    self.cte_rows.insert(name.clone(), frontier);
+                    let mut new = self.execute_plan((*step).clone())?;
+                    if !all {
+                        new = set_op(SetOpKind::Union, false, new, Vec::new());
+                        new.retain(|n| !rows.iter().any(|r| rows_distinct_equal(r, n)));
+                    }
+                    rows.extend(new.iter().cloned());
+                    frontier = new;
+                }
+                self.cte_rows.remove(&name);
+                if let Some(v) = saved {
+                    self.cte_rows.insert(name, v);
+                }
+                Ok(rows)
+            }
             Plan::Filter { source, predicate } => {
                 let table_context = self.resolve_table_context(&source)?;
 
                 let rows = self.execute_plan(*source)?;
                 if rows.is_empty() {
-                    check_columns(std::iter::once(&predicate), table_context.as_ref())?;
+                    check_columns(
+                        std::iter::once(&predicate),
+                        table_context.as_ref(),
+                        &self.outer,
+                    )?;
                 }
                 let mut out_rows = Vec::new();
                 for row in rows {
@@ -574,7 +707,7 @@ impl Executor {
 
                 let rows = self.execute_plan(*source)?;
                 if rows.is_empty() {
-                    check_columns(exprs.iter(), table_context.as_ref())?;
+                    check_columns(exprs.iter(), table_context.as_ref(), &self.outer)?;
                 }
                 let mut out_rows = Vec::new();
                 for row in rows {
@@ -597,7 +730,7 @@ impl Executor {
                 let table_context = self.resolve_table_context(&source)?;
                 let rows = self.execute_plan(*source)?;
                 if rows.is_empty() {
-                    check_columns(exprs.iter(), table_context.as_ref())?;
+                    check_columns(exprs.iter(), table_context.as_ref(), &self.outer)?;
                 }
 
                 // Group rows by the evaluated GROUP BY key. `Value`'s
@@ -873,6 +1006,7 @@ impl Executor {
         i: usize,
         assignments: &[(String, Expr)],
     ) -> Result<(), MySqlError> {
+        let before = t.rows[i].clone();
         let mut assigned = Vec::with_capacity(assignments.len());
         for (col_name, expr) in assignments {
             let idx = resolve_column_index(&t.columns, col_name)
@@ -888,10 +1022,14 @@ impl Executor {
             t.rows[i][idx] = coerce_to_column(val, col, &self.sql_mode)?;
             assigned.push(idx);
         }
-        let now = now_ts();
-        for idx in 0..t.columns.len() {
-            if t.columns[idx].on_update_now && !assigned.contains(&idx) {
-                t.rows[i][idx] = Value::Ts(now);
+        // ON UPDATE CURRENT_TIMESTAMP only moves when something else in
+        // the row actually changed, as in MySQL.
+        if t.rows[i] != before {
+            let now = now_ts();
+            for idx in 0..t.columns.len() {
+                if t.columns[idx].on_update_now && !assigned.contains(&idx) {
+                    t.rows[i][idx] = Value::Ts(now);
+                }
             }
         }
         Ok(())
@@ -911,17 +1049,86 @@ impl Executor {
             Expr::ColName(name) => match table {
                 Some(t) => match resolve_column(t, name)? {
                     Some(idx) => Ok(row.get(idx).cloned().unwrap_or(Value::Null)),
-                    // Found via testing before a public release: a mistyped
-                    // column used to evaluate to NULL, so `WHERE nosuch = 1`
-                    // silently matched nothing instead of erroring.
-                    None => Err(MySqlError::new(
-                        1054,
-                        "42S22",
-                        format!("Unknown column '{name}' in 'field list'"),
-                    )),
+                    None => match self.outer_column(name)? {
+                        Some(v) => Ok(v),
+                        // Found via testing before a public release: a
+                        // mistyped column used to evaluate to NULL, so
+                        // `WHERE nosuch = 1` silently matched nothing
+                        // instead of erroring.
+                        None => Err(MySqlError::new(
+                            1054,
+                            "42S22",
+                            format!("Unknown column '{name}' in 'field list'"),
+                        )),
+                    },
                 },
-                None => Ok(Value::Null),
+                None => Ok(self.outer_column(name)?.unwrap_or(Value::Null)),
             },
+            Expr::Subquery(plan) => {
+                let rows = self.run_subquery(plan, row, table)?;
+                match rows.as_slice() {
+                    [] => Ok(Value::Null),
+                    [r] => {
+                        if r.len() != 1 {
+                            return Err(MySqlError::new(
+                                1241,
+                                "21000",
+                                "Operand should contain 1 column(s)",
+                            ));
+                        }
+                        Ok(r[0].clone())
+                    }
+                    _ => Err(MySqlError::new(1242, "21000", "Subquery returns more than 1 row")),
+                }
+            }
+            Expr::InSubquery { expr, plan, negated } => {
+                let l = self.eval_expr(expr, row, table)?;
+                let rows = self.run_subquery(plan, row, table)?;
+                if rows.first().is_some_and(|r| r.len() != 1) {
+                    return Err(MySqlError::new(
+                        1241,
+                        "21000",
+                        "Operand should contain 1 column(s)",
+                    ));
+                }
+                let items: Vec<Value> = rows.into_iter().map(|mut r| r.swap_remove(0)).collect();
+                if items.is_empty() {
+                    // Nothing to match, so even `NULL IN (empty)` is false.
+                    return Ok(Value::Int(i64::from(*negated)));
+                }
+                eval_in_list(l, &items, *negated)
+            }
+            Expr::Quantified { op, expr, plan, all } => {
+                let l = self.eval_expr(expr, row, table)?;
+                let rows = self.run_subquery(plan, row, table)?;
+                if rows.first().is_some_and(|r| r.len() != 1) {
+                    return Err(MySqlError::new(
+                        1241,
+                        "21000",
+                        "Operand should contain 1 column(s)",
+                    ));
+                }
+                // ALL: true unless some comparison is false (true for no
+                // rows); ANY: true if some comparison is true. Otherwise a
+                // NULL comparison makes the result NULL.
+                let mut saw_null = false;
+                for r in rows {
+                    let v =
+                        eval_compare(*op, l.clone(), r.into_iter().next().unwrap_or(Value::Null))?;
+                    match v {
+                        Value::Null => saw_null = true,
+                        Value::Int(0) if *all => return Ok(Value::Int(0)),
+                        Value::Int(0) => {}
+                        _ if !*all => return Ok(Value::Int(1)),
+                        _ => {}
+                    }
+                }
+                Ok(if saw_null { Value::Null } else { Value::Int(i64::from(*all)) })
+            }
+            Expr::Exists { plan, negated } => {
+                let found = !self.run_subquery(plan, row, table)?.is_empty();
+                Ok(Value::Int(i64::from(found != *negated)))
+            }
             Expr::And(exprs) => {
                 let mut res = Value::Int(1);
                 for e in exprs {
@@ -2127,6 +2334,68 @@ pub(crate) fn coerce_to_column(
 /// Row equality for `DISTINCT`: column by column with MySQL's comparison
 /// rules, except that two NULLs count as the same value (SQL's DISTINCT
 /// treats NULLs as equal to each other, unlike `=`).
+/// A table context for a derived table or CTE: its alias and its output
+/// column names.
+fn derived_table(alias: &str, names: &[String]) -> Table {
+    let columns = names
+        .iter()
+        .map(|n| Column {
+            name: n.rsplit('.').next().unwrap_or(n).to_string(),
+            ty: ColumnType::Text,
+            not_null: false,
+            default: None,
+            auto_increment: false,
+            primary_key: false,
+            default_now: false,
+            on_update_now: false,
+            unsigned: false,
+        })
+        .collect();
+    Table::new(alias.to_string(), columns)
+}
+
+/// `UNION`/`INTERSECT`/`EXCEPT` over two row sets: duplicates removed
+/// unless `all`, compared the way `DISTINCT` compares.
+fn set_op(
+    op: SetOpKind,
+    all: bool,
+    left: Vec<Vec<Value>>,
+    right: Vec<Vec<Value>>,
+) -> Vec<Vec<Value>> {
+    let dedupe = |rows: Vec<Vec<Value>>| {
+        let mut kept: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for r in rows {
+            if !kept.iter().any(|k| rows_distinct_equal(k, &r)) {
+                kept.push(r);
+            }
+        }
+        kept
+    };
+    match op {
+        SetOpKind::Union => {
+            let mut rows = left;
+            rows.extend(right);
+            if all { rows } else { dedupe(rows) }
+        }
+        SetOpKind::Intersect | SetOpKind::Except => {
+            let keep_matches = op == SetOpKind::Intersect;
+            let mut pool = right;
+            let mut out = Vec::new();
+            for r in left {
+                let hit = pool.iter().position(|p| rows_distinct_equal(p, &r));
+                if all && let Some(i) = hit {
+                    // Multiset semantics: each right row matches once.
+                    pool.swap_remove(i);
+                }
+                if hit.is_some() == keep_matches {
+                    out.push(r);
+                }
+            }
+            if all { out } else { dedupe(out) }
+        }
+    }
+}
+
 fn rows_distinct_equal(a: &[Value], b: &[Value]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| match (x.is_null(), y.is_null()) {
@@ -2219,14 +2488,18 @@ fn column_default_text(col: &Column) -> Option<String> {
 fn check_columns<'a>(
     exprs: impl Iterator<Item = &'a Expr>,
     table: Option<&Table>,
+    outer: &[(Table, Vec<Value>)],
 ) -> Result<(), MySqlError> {
     let Some(t) = table else { return Ok(()) };
     let mut res = Ok(());
     for e in exprs {
         crate::mysql::plan::for_each_colname(e, &mut |name| {
             if res.is_ok() {
+                let in_outer =
+                    || outer.iter().any(|(o, _)| matches!(resolve_column(o, name), Ok(Some(_))));
                 res = match resolve_column(t, name) {
                     Ok(Some(_)) => Ok(()),
+                    Ok(None) if in_outer() => Ok(()),
                     Ok(None) => Err(MySqlError::new(
                         1054,
                         "42S22",

@@ -1,15 +1,15 @@
 use crate::mysql::catalog::{Column, ColumnType, UniqueKey};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{
-    AggFunc, AlterOp, ArithOp, CmpOp, ColumnPos, Expr, InsertMode, JoinOp, Plan, SortKey,
-    contains_agg,
+    self as plan, AggFunc, AlterOp, ArithOp, CmpOp, ColumnPos, Expr, InsertMode, JoinOp, Plan,
+    SetOpKind, SortKey, contains_agg,
 };
 use crate::mysql::types::Value;
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
     FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, Statement, TableConstraint,
-    TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
+    ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
 use std::collections::HashMap;
 
@@ -31,6 +31,13 @@ pub struct Binder {
     placeholder_at: Vec<(u64, u64)>,
     /// The statement's text (see `with_sql`), for labeling result columns.
     sql: String,
+    /// `WITH` queries in scope, innermost last: each name with the plan a
+    /// reference to it binds to (`Plan::Derived`, or `Plan::CteRef` inside
+    /// a recursive CTE's own step).
+    ctes: Vec<(String, Plan)>,
+    /// Set when a `Plan::CteRef` is bound, to tell a recursive CTE's step
+    /// that refers to itself from one that doesn't.
+    cte_ref_used: bool,
 }
 
 impl Binder {
@@ -41,6 +48,8 @@ impl Binder {
             param_counter: 0,
             placeholder_at: Vec::new(),
             sql: String::new(),
+            ctes: Vec::new(),
+            cte_ref_used: false,
         }
     }
 
@@ -714,6 +723,7 @@ impl Binder {
             })
             .collect();
         let mut rows = Vec::new();
+        let mut select = None;
 
         if let Some(source) = insert.source {
             if let SetExpr::Values(values) = *source.body {
@@ -725,7 +735,7 @@ impl Binder {
                     rows.push(r);
                 }
             } else {
-                return Err(MySqlError::unsupported("INSERT ... SELECT"));
+                select = Some(self.bind_query(*source)?);
             }
         } else if !insert.assignments.is_empty() {
             // `INSERT INTO t SET a = 1, b = 2` -- found via testing before a
@@ -766,7 +776,11 @@ impl Binder {
             InsertMode::Error
         };
 
-        Ok(Plan::Insert { db, table, columns, rows, mode })
+        let insert = Plan::Insert { db, table, columns, rows, mode };
+        Ok(match select {
+            Some(query) => Plan::InsertSelect { insert: Box::new(insert), query: Box::new(query) },
+            None => insert,
+        })
     }
 
     fn bind_update(
@@ -860,14 +874,180 @@ impl Binder {
     }
 
     fn bind_query(&mut self, query: Query) -> Result<Plan, MySqlError> {
-        // Said plainly rather than ignoring the WITH clause and then
-        // failing with "Table 'totals' doesn't exist".
-        if query.with.is_some() {
-            return Err(MySqlError::unsupported("WITH (common table expressions)"));
+        let scope = self.ctes.len();
+        let res = (|| {
+            if let Some(with) = query.with {
+                for cte in with.cte_tables {
+                    self.bind_cte(cte, with.recursive)?;
+                }
+            }
+            self.bind_body(*query.body, query.order_by, query.limit_clause)
+        })();
+        self.ctes.truncate(scope);
+        res
+    }
+
+    /// Puts one `WITH` query in scope for the rest of the statement.
+    fn bind_cte(&mut self, cte: sqlparser::ast::Cte, recursive: bool) -> Result<(), MySqlError> {
+        let name = cte.alias.name.value.clone();
+        let columns: Vec<String> = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
+        let query = *cte.query;
+        if recursive
+            && query.order_by.is_none()
+            && query.limit_clause.is_none()
+            && let SetExpr::SetOperation { op: SetOperator::Union, set_quantifier, left, right } =
+                &*query.body
+        {
+            let all = matches!(set_quantifier, SetQuantifier::All);
+            let anchor = self.bind_body((**left).clone(), None, None)?;
+            let columns = if columns.is_empty() {
+                plan::static_names(&anchor).ok_or_else(|| {
+                    MySqlError::unsupported("SELECT * in a recursive CTE without a column list")
+                })?
+            } else {
+                columns
+            };
+            self.ctes.push((
+                name.clone(),
+                Plan::CteRef { name: name.clone(), alias: name.clone(), columns: columns.clone() },
+            ));
+            let used_before = std::mem::replace(&mut self.cte_ref_used, false);
+            let step = self.bind_body((**right).clone(), None, None);
+            let refers_to_itself = self.cte_ref_used;
+            self.cte_ref_used = used_before;
+            self.ctes.pop();
+            let step = step?;
+            let plan = if refers_to_itself {
+                Plan::RecursiveCte {
+                    name: name.clone(),
+                    columns: columns.clone(),
+                    anchor: Box::new(anchor),
+                    step: Box::new(step),
+                    all,
+                }
+            } else {
+                Plan::SetOp {
+                    op: SetOpKind::Union,
+                    all,
+                    left: Box::new(anchor),
+                    right: Box::new(step),
+                }
+            };
+            self.ctes
+                .push((name.clone(), Plan::Derived { plan: Box::new(plan), alias: name, columns }));
+            return Ok(());
         }
-        let order_by = query.order_by;
-        let limit_clause = query.limit_clause;
-        match *query.body {
+        let plan = self.bind_query(query)?;
+        self.ctes
+            .push((name.clone(), Plan::Derived { plan: Box::new(plan), alias: name, columns }));
+        Ok(())
+    }
+
+    fn bind_limit(
+        &mut self,
+        limit_clause: Option<LimitClause>,
+    ) -> Result<(Option<Expr>, Option<Expr>), MySqlError> {
+        match limit_clause {
+            Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+                if !limit_by.is_empty() {
+                    return Err(MySqlError::unsupported("LIMIT BY"));
+                }
+                let limit = limit.map(|e| self.bind_count(e)).transpose()?;
+                let offset = offset.map(|o| self.bind_count(o.value)).transpose()?;
+                Ok((limit, offset))
+            }
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                // `LIMIT offset, count`: bind in textual order.
+                let offset = self.bind_count(offset)?;
+                Ok((Some(self.bind_count(limit)?), Some(offset)))
+            }
+            None => Ok((None, None)),
+        }
+    }
+
+    /// `ORDER BY`/`LIMIT` on a `UNION` (or a parenthesized query): sorts
+    /// by output column, named or numbered.
+    fn finish_set(
+        &mut self,
+        plan: Plan,
+        order_by: Option<sqlparser::ast::OrderBy>,
+        limit_clause: Option<LimitClause>,
+    ) -> Result<Plan, MySqlError> {
+        if order_by.is_none() && limit_clause.is_none() {
+            return Ok(plan);
+        }
+        let names = plan::static_names(&plan);
+        let mut order = Vec::new();
+        if let Some(ob) = order_by {
+            let OrderByKind::Expressions(items) = ob.kind else {
+                return Err(MySqlError::unsupported("ORDER BY ALL"));
+            };
+            for item in items {
+                let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
+                let idx = match &item.expr {
+                    AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                        value: AstValue::Number(n, _),
+                        ..
+                    }) => n.parse::<usize>().ok().filter(|n| *n > 0).map(|n| n - 1),
+                    AstExpr::Identifier(i) => names
+                        .as_ref()
+                        .and_then(|ns| ns.iter().position(|n| n.eq_ignore_ascii_case(&i.value))),
+                    AstExpr::CompoundIdentifier(ids) => names.as_ref().and_then(|ns| {
+                        let last = &ids.last()?.value;
+                        ns.iter().position(|n| n.eq_ignore_ascii_case(last))
+                    }),
+                    _ => return Err(MySqlError::unsupported("ORDER BY expression on a UNION")),
+                };
+                let Some(idx) = idx else {
+                    return Err(MySqlError::new(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{}' in 'order clause'", item.expr),
+                    ));
+                };
+                order.push((SortKey::Output(idx), asc));
+            }
+        }
+        let (limit, offset) = self.bind_limit(limit_clause)?;
+        Ok(Plan::Finish {
+            source: Box::new(plan),
+            order,
+            hidden: 0,
+            distinct: false,
+            limit,
+            offset,
+            calc_found_rows: false,
+        })
+    }
+
+    fn bind_body(
+        &mut self,
+        body: SetExpr,
+        order_by: Option<sqlparser::ast::OrderBy>,
+        limit_clause: Option<LimitClause>,
+    ) -> Result<Plan, MySqlError> {
+        match body {
+            SetExpr::Query(q) => {
+                let plan = self.bind_query(*q)?;
+                self.finish_set(plan, order_by, limit_clause)
+            }
+            SetExpr::SetOperation { op, set_quantifier, left, right } => {
+                let kind = match op {
+                    SetOperator::Union => SetOpKind::Union,
+                    SetOperator::Intersect => SetOpKind::Intersect,
+                    SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
+                };
+                let all = match set_quantifier {
+                    SetQuantifier::All => true,
+                    SetQuantifier::Distinct | SetQuantifier::None => false,
+                    _ => return Err(MySqlError::unsupported("set quantifier")),
+                };
+                let left = self.bind_body(*left, None, None)?;
+                let right = self.bind_body(*right, None, None)?;
+                let plan =
+                    Plan::SetOp { op: kind, all, left: Box::new(left), right: Box::new(right) };
+                self.finish_set(plan, order_by, limit_clause)
+            }
             SetExpr::Select(select) => {
                 let mut source =
                     if select.from.is_empty() { Plan::Dummy } else { self.bind_from(select.from)? };
@@ -1128,6 +1308,44 @@ impl Binder {
             {
                 Ok(Plan::Dummy)
             }
+            TableFactor::Table { name, alias, .. }
+                if let [sqlparser::ast::ObjectNamePart::Identifier(id)] = name.0.as_slice()
+                    && let Some((_, plan)) =
+                        self.ctes.iter().rev().find(|(n, _)| *n == id.value) =>
+            {
+                let mut plan = plan.clone();
+                let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+                match &mut plan {
+                    Plan::Derived { alias: a, .. } | Plan::CteRef { alias: a, .. } => {
+                        if let Some(x) = alias_name {
+                            *a = x;
+                        }
+                    }
+                    _ => {}
+                }
+                if matches!(plan, Plan::CteRef { .. }) {
+                    self.cte_ref_used = true;
+                }
+                Ok(plan)
+            }
+            TableFactor::Derived { lateral, subquery, alias, .. } => {
+                if *lateral {
+                    return Err(MySqlError::unsupported("LATERAL"));
+                }
+                let Some(alias) = alias else {
+                    return Err(MySqlError::new(
+                        1248,
+                        "42000",
+                        "Every derived table must have its own alias",
+                    ));
+                };
+                let plan = self.bind_query((**subquery).clone())?;
+                Ok(Plan::Derived {
+                    plan: Box::new(plan),
+                    alias: alias.name.value.clone(),
+                    columns: alias.columns.iter().map(|c| c.name.value.clone()).collect(),
+                })
+            }
             TableFactor::Table { name, alias, .. } => {
                 let (db, table) = self.resolve_table_name(name)?;
                 let alias = alias.as_ref().map(|a| a.name.value.clone());
@@ -1135,6 +1353,34 @@ impl Binder {
             }
             _ => Err(MySqlError::unsupported("table factor")),
         }
+    }
+
+    /// `expr op ALL|ANY|SOME (SELECT ...)`.
+    fn bind_quantified(
+        &mut self,
+        left: AstExpr,
+        op: BinaryOperator,
+        right: AstExpr,
+        all: bool,
+    ) -> Result<Expr, MySqlError> {
+        let op = match op {
+            BinaryOperator::Eq => CmpOp::Eq,
+            BinaryOperator::NotEq => CmpOp::Ne,
+            BinaryOperator::Lt => CmpOp::Lt,
+            BinaryOperator::LtEq => CmpOp::Le,
+            BinaryOperator::Gt => CmpOp::Gt,
+            BinaryOperator::GtEq => CmpOp::Ge,
+            _ => return Err(MySqlError::unsupported("ALL/ANY operator")),
+        };
+        let mut right = right;
+        while let AstExpr::Nested(inner) = right {
+            right = *inner;
+        }
+        let AstExpr::Subquery(q) = right else {
+            return Err(MySqlError::unsupported("ALL/ANY without a subquery"));
+        };
+        let expr = Box::new(self.bind_expr(left)?);
+        Ok(Expr::Quantified { op, expr, plan: Box::new(self.bind_query(*q)?), all })
     }
 
     fn bind_join_constraint(&mut self, c: &JoinConstraint) -> Result<Expr, MySqlError> {
@@ -1314,6 +1560,21 @@ impl Binder {
                 Ok(Expr::InList { expr: bound_expr, list: bound_list, negated })
             }
             AstExpr::Nested(inner) => self.bind_expr(*inner),
+            AstExpr::Subquery(q) => Ok(Expr::Subquery(Box::new(self.bind_query(*q)?))),
+            AstExpr::InSubquery { expr, subquery, negated } => {
+                let expr = Box::new(self.bind_expr(*expr)?);
+                let plan = Box::new(self.bind_query(*subquery)?);
+                Ok(Expr::InSubquery { expr, plan, negated })
+            }
+            AstExpr::AnyOp { left, compare_op, right, .. } => {
+                self.bind_quantified(*left, compare_op, *right, false)
+            }
+            AstExpr::AllOp { left, compare_op, right } => {
+                self.bind_quantified(*left, compare_op, *right, true)
+            }
+            AstExpr::Exists { subquery, negated } => {
+                Ok(Expr::Exists { plan: Box::new(self.bind_query(*subquery)?), negated })
+            }
             AstExpr::Interval(iv) => {
                 let unit = iv
                     .leading_field
@@ -1469,6 +1730,11 @@ impl Binder {
             .collect::<Vec<_>>()
             .join(".");
         let upper = name.to_uppercase();
+        // Window functions aren't implemented; `SUM(x) OVER (...)` must not
+        // quietly bind as the plain aggregate `SUM(x)`.
+        if func.over.is_some() {
+            return Err(MySqlError::unsupported(&format!("window function {upper}() OVER")));
+        }
 
         let mut agg_distinct = false;
         let mut clauses = Vec::new();

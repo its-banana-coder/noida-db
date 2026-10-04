@@ -234,6 +234,108 @@ MYSQL = {
     ],
 }
 
+# Subqueries, UNION/INTERSECT/EXCEPT, derived tables, CTEs and INSERT ...
+# SELECT: happy paths and their errors, compared row for row.
+QSETUP = [
+    (A, "CREATE TABLE c (id INT PRIMARY KEY, name VARCHAR(20), city VARCHAR(20))"),
+    (A, "CREATE TABLE o (id INT PRIMARY KEY, cid INT, amount INT, status VARCHAR(10))"),
+    (A, "INSERT INTO c VALUES (1,'ann','pune'),(2,'bob','noida'),(3,'cat','noida'),(4,'dan',NULL)"),
+    (A, "INSERT INTO o VALUES (10,1,50,'paid'),(11,1,70,'open'),(12,2,20,'paid'),(13,9,99,'paid'),(14,NULL,5,'open')"),
+]
+MYSQL_QUERIES = {
+    "derived tables": QSETUP + [
+        (A, "SELECT d.cid, d.total FROM (SELECT cid, SUM(amount) AS total FROM o GROUP BY cid) AS d WHERE d.total > 30 ORDER BY d.cid"),
+        (A, "SELECT x.a, x.b FROM (SELECT id, name FROM c) AS x (a, b) ORDER BY x.a DESC LIMIT 2"),
+        (A, "SELECT c.name, t.n FROM c JOIN (SELECT cid, COUNT(*) AS n FROM o GROUP BY cid) t ON t.cid = c.id ORDER BY c.name"),
+        (A, "SELECT * FROM (SELECT id, city FROM c WHERE city = 'noida') q ORDER BY id"),
+        (A, "SELECT COUNT(*) FROM (SELECT DISTINCT city FROM c) z"),
+        (A, "SELECT * FROM (SELECT id FROM c)"),
+        (A, "SELECT nosuch FROM (SELECT id FROM c) d"),
+    ],
+    "scalar and correlated subqueries": QSETUP + [
+        (A, "SELECT name, (SELECT COUNT(*) FROM o WHERE o.cid = c.id) AS n FROM c ORDER BY id"),
+        (A, "SELECT id FROM o WHERE amount > (SELECT AVG(amount) FROM o) ORDER BY id"),
+        (A, "SELECT (SELECT MAX(amount) FROM o)"),
+        (A, "SELECT (SELECT amount FROM o WHERE id = 999)"),
+        (A, "SELECT (SELECT amount FROM o)"),
+        (A, "SELECT (SELECT id, amount FROM o WHERE id = 10)"),
+        (A, "SELECT name FROM c WHERE (SELECT SUM(amount) FROM o WHERE o.cid = c.id) >= 20 ORDER BY name"),
+    ],
+    "IN and EXISTS subqueries": QSETUP + [
+        (A, "SELECT name FROM c WHERE id IN (SELECT cid FROM o WHERE status = 'paid') ORDER BY name"),
+        (A, "SELECT name FROM c WHERE id NOT IN (SELECT cid FROM o) ORDER BY name"),
+        (A, "SELECT name FROM c WHERE id NOT IN (SELECT cid FROM o WHERE cid IS NOT NULL) ORDER BY name"),
+        (A, "SELECT name FROM c WHERE EXISTS (SELECT 1 FROM o WHERE o.cid = c.id) ORDER BY name"),
+        (A, "SELECT name FROM c WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.cid = c.id AND o.status = 'open') ORDER BY name"),
+        (A, "SELECT 5 IN (SELECT amount FROM o), 6 IN (SELECT amount FROM o), NULL IN (SELECT amount FROM o WHERE id = 0)"),
+        (A, "SELECT id IN (SELECT cid FROM o) AS has FROM c ORDER BY id"),
+        (A, "SELECT id FROM c WHERE id IN (SELECT cid, amount FROM o)"),
+    ],
+    "UNION, INTERSECT and EXCEPT": QSETUP + [
+        (A, "SELECT city FROM c UNION SELECT status FROM o ORDER BY city"),
+        (A, "SELECT cid FROM o UNION ALL SELECT id FROM c ORDER BY 1"),
+        (A, "SELECT id, name FROM c WHERE id < 3 UNION SELECT id, status FROM o WHERE id > 12 ORDER BY id DESC LIMIT 3"),
+        (A, "(SELECT id FROM c ORDER BY id DESC LIMIT 1) UNION (SELECT id FROM o ORDER BY id LIMIT 1) ORDER BY id"),
+        (A, "SELECT id FROM c UNION SELECT id, name FROM c"),
+        (A, "SELECT id FROM c INTERSECT SELECT cid FROM o ORDER BY id"),
+        (A, "SELECT id FROM c EXCEPT SELECT cid FROM o ORDER BY id"),
+        (A, "SELECT COUNT(*) FROM (SELECT cid FROM o UNION SELECT id FROM c) u"),
+    ],
+    "common table expressions": QSETUP + [
+        (A, "WITH t AS (SELECT cid, SUM(amount) AS s FROM o GROUP BY cid) SELECT c.name, t.s FROM c JOIN t ON t.cid = c.id ORDER BY t.s DESC"),
+        (A, "WITH a AS (SELECT id FROM c WHERE city = 'noida'), b AS (SELECT id FROM a WHERE id > 2) SELECT * FROM b"),
+        (A, "WITH t (x) AS (SELECT amount FROM o) SELECT MIN(x), MAX(x) FROM t"),
+        (A, "WITH t AS (SELECT 1 AS v) SELECT * FROM t AS l JOIN t AS r ON l.v = r.v"),
+        (A, "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT SUM(i), COUNT(*) FROM n"),
+        (A, "CREATE TABLE emp (id INT PRIMARY KEY, boss INT, name VARCHAR(10))"),
+        (A, "INSERT INTO emp VALUES (1,NULL,'ceo'),(2,1,'cto'),(3,2,'dev'),(4,2,'ops'),(5,3,'intern')"),
+        (A, "WITH RECURSIVE chain AS (SELECT id, name, 0 AS depth FROM emp WHERE id = 1 UNION ALL SELECT e.id, e.name, chain.depth + 1 FROM emp e JOIN chain ON e.boss = chain.id) SELECT name, depth FROM chain ORDER BY depth, name"),
+        (A, "WITH RECURSIVE r (i) AS (SELECT 1 UNION SELECT 1 FROM r) SELECT * FROM r"),
+        (A, "WITH RECURSIVE r (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r) SELECT COUNT(*) FROM r"),
+    ],
+    "INSERT ... SELECT and DML with subqueries": QSETUP + [
+        (A, "CREATE TABLE arch (id INT PRIMARY KEY, amount INT)"),
+        (A, "INSERT INTO arch SELECT id, amount FROM o WHERE status = 'paid'"),
+        (A, "INSERT INTO arch (id, amount) SELECT id + 100, amount * 2 FROM o WHERE amount > 60"),
+        (A, "INSERT INTO arch SELECT id, amount FROM o"),
+        (A, "INSERT INTO arch SELECT id FROM o"),
+        (A, "SELECT * FROM arch ORDER BY id"),
+        (A, "UPDATE o SET status = 'vip' WHERE cid IN (SELECT id FROM c WHERE city = 'pune')"),
+        (A, "DELETE FROM o WHERE NOT EXISTS (SELECT 1 FROM c WHERE c.id = o.cid)"),
+        (A, "SELECT id, status FROM o ORDER BY id"),
+    ],
+    "subqueries in other clauses": QSETUP + [
+        (A, "SELECT cid, SUM(amount) s FROM o GROUP BY cid HAVING SUM(amount) > (SELECT AVG(amount) FROM o) ORDER BY cid"),
+        (A, "SELECT name FROM c ORDER BY (SELECT COUNT(*) FROM o WHERE o.cid = c.id) DESC, name"),
+        (A, "SELECT * FROM (SELECT c.id, c.name, o.amount FROM c JOIN o ON o.cid = c.id) j ORDER BY amount"),
+        (A, "ALTER TABLE c ADD COLUMN spent INT NOT NULL DEFAULT 0"),
+        (A, "UPDATE c SET spent = (SELECT COALESCE(SUM(amount), 0) FROM o WHERE o.cid = c.id)"),
+        (A, "SELECT id, spent FROM c ORDER BY id"),
+        (A, "SELECT id FROM c WHERE id = (SELECT MAX(cid) FROM o WHERE cid < (SELECT COUNT(*) FROM c))"),
+        (A, "WITH t AS (SELECT 1 AS x) SELECT (WITH t AS (SELECT 2 AS x) SELECT x FROM t) AS inner_x, x FROM t"),
+        (A, "SELECT c.name FROM c WHERE c.id IN (SELECT o.cid FROM o WHERE o.amount > (SELECT MIN(o2.amount) FROM o o2 WHERE o2.cid = c.id)) ORDER BY 1"),
+        (A, "SELECT COUNT(*) FROM c WHERE city IN (SELECT city FROM c WHERE id > 1)"),
+    ],
+    "affected rows count changed rows": QSETUP + [
+        (A, "UPDATE c SET city = 'noida' WHERE id <= 3"),
+        (A, "UPDATE c SET city = city"),
+        (A, "CREATE TABLE kv (k INT PRIMARY KEY, v INT)"),
+        (A, "INSERT INTO kv VALUES (1, 1)"),
+        (A, "INSERT INTO kv VALUES (1, 1) ON DUPLICATE KEY UPDATE v = 1"),
+        (A, "INSERT INTO kv VALUES (1, 1) ON DUPLICATE KEY UPDATE v = 2"),
+        (A, "SELECT * FROM kv"),
+    ],
+    "ALL, ANY and SOME": QSETUP + [
+        (A, "SELECT id FROM o WHERE amount > ALL (SELECT amount FROM o WHERE status = 'open') ORDER BY id"),
+        (A, "SELECT id FROM o WHERE amount < ANY (SELECT amount FROM o WHERE status = 'paid') ORDER BY id"),
+        (A, "SELECT id FROM o WHERE amount = SOME (SELECT amount FROM o WHERE cid = 1) ORDER BY id"),
+        (A, "SELECT 1 > ALL (SELECT amount FROM o WHERE id = 0), 1 > ANY (SELECT amount FROM o WHERE id = 0)"),
+        (A, "SELECT id FROM c WHERE id <> ALL (SELECT cid FROM o) ORDER BY id"),
+        (A, "SELECT 100 > ALL (SELECT cid FROM o), 0 = ANY (SELECT cid FROM o)"),
+    ],
+}
+MYSQL.update(MYSQL_QUERIES)
+
 POSTGRES = {
     "error aborts the transaction until rollback": [
         (A, "CREATE TABLE u (id int PRIMARY KEY, email text UNIQUE)"),

@@ -1,4 +1,4 @@
-use super::catalog::{DbState, Table, UniqueKey};
+use super::catalog::{DbState, UniqueKey};
 use super::types::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,6 +104,27 @@ pub enum Expr {
         escape: Box<Expr>,
         negated: bool,
     },
+    /// `(SELECT ...)` as a value: NULL with no rows, error 1242 with more
+    /// than one. May reference the enclosing query's columns (correlated).
+    Subquery(Box<Plan>),
+    /// `expr [NOT] IN (SELECT ...)`, with `IN (...)`'s NULL semantics.
+    InSubquery {
+        expr: Box<Expr>,
+        plan: Box<Plan>,
+        negated: bool,
+    },
+    /// `expr op ALL (SELECT ...)` / `expr op ANY|SOME (SELECT ...)`.
+    Quantified {
+        op: CmpOp,
+        expr: Box<Expr>,
+        plan: Box<Plan>,
+        all: bool,
+    },
+    /// `[NOT] EXISTS (SELECT ...)`.
+    Exists {
+        plan: Box<Plan>,
+        negated: bool,
+    },
     /// Searched `CASE WHEN cond1 THEN r1 WHEN cond2 THEN r2 ... [ELSE e] END`.
     /// A simple `CASE operand WHEN v THEN r ... END` is rewritten by the
     /// binder into this same shape, with each condition being
@@ -127,6 +148,7 @@ pub fn contains_agg(expr: &Expr) -> bool {
         Expr::Call { args, .. } => args.iter().any(contains_agg),
         Expr::InList { expr, list, .. } => contains_agg(expr) || list.iter().any(contains_agg),
         Expr::Not(e) => contains_agg(e),
+        Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => contains_agg(expr),
         Expr::IsNull(e, _) => contains_agg(e),
         Expr::Like { expr, pattern, escape, .. } => {
             contains_agg(expr) || contains_agg(pattern) || contains_agg(escape)
@@ -157,6 +179,7 @@ pub fn for_each_colname<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a str)) {
             list.iter().for_each(|e| for_each_colname(e, f));
         }
         Expr::Not(e) | Expr::IsNull(e, _) => for_each_colname(e, f),
+        Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => for_each_colname(expr, f),
         Expr::Like { expr, pattern, escape, .. } => {
             for_each_colname(expr, f);
             for_each_colname(pattern, f);
@@ -198,6 +221,13 @@ pub enum InsertMode {
     /// existing row instead. `VALUES(col)` in an `expr` is the value the
     /// row would have been inserted with.
     Upsert(Vec<(String, Expr)>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -352,6 +382,43 @@ pub enum Plan {
     /// column (so a key can be any expression: a column not in the SELECT
     /// list, an alias, an aggregate like `COUNT(*)`); those `hidden`
     /// trailing columns are dropped before the rows reach the client.
+    /// A subquery in `FROM` (`(SELECT ...) AS d`) or a reference to a
+    /// `WITH` query: the inner rows, addressed by `alias` and `columns`
+    /// (the inner query's own names when empty).
+    Derived {
+        plan: Box<Plan>,
+        alias: String,
+        columns: Vec<String>,
+    },
+    /// `UNION [ALL]`, `INTERSECT` and `EXCEPT`. Column names come from the
+    /// left side.
+    SetOp {
+        op: SetOpKind,
+        all: bool,
+        left: Box<Plan>,
+        right: Box<Plan>,
+    },
+    /// `WITH RECURSIVE name (columns) AS (anchor UNION [ALL] step)`: the
+    /// anchor's rows, then `step` run again over the rows the previous
+    /// round added (read through `CteRef`) until a round adds none.
+    RecursiveCte {
+        name: String,
+        columns: Vec<String>,
+        anchor: Box<Plan>,
+        step: Box<Plan>,
+        all: bool,
+    },
+    /// `INSERT ... SELECT`: `query`'s rows become `insert`'s `VALUES`.
+    InsertSelect {
+        insert: Box<Plan>,
+        query: Box<Plan>,
+    },
+    /// The recursive step's reference to its own CTE.
+    CteRef {
+        name: String,
+        alias: String,
+        columns: Vec<String>,
+    },
     Finish {
         source: Box<Plan>,
         order: Vec<(SortKey, bool)>, // (key, ascending)
@@ -416,6 +483,11 @@ pub fn count_params(plan: &Plan) -> usize {
                 if let Some(e) = else_result {
                     expr_max(e, max);
                 }
+            }
+            Expr::Subquery(p) | Expr::Exists { plan: p, .. } => plan_max(p, max),
+            Expr::InSubquery { expr, plan, .. } | Expr::Quantified { expr, plan, .. } => {
+                expr_max(expr, max);
+                plan_max(plan, max);
             }
             _ => {}
         }
@@ -490,6 +562,19 @@ pub fn count_params(plan: &Plan) -> usize {
                 plan_max(source, max);
                 limit.iter().chain(offset.iter()).for_each(|e| expr_max(e, max));
             }
+            Plan::Derived { plan, .. } => plan_max(plan, max),
+            Plan::InsertSelect { insert, query } => {
+                plan_max(insert, max);
+                plan_max(query, max);
+            }
+            Plan::SetOp { left, right, .. } => {
+                plan_max(left, max);
+                plan_max(right, max);
+            }
+            Plan::RecursiveCte { anchor, step, .. } => {
+                plan_max(anchor, max);
+                plan_max(step, max);
+            }
             _ => {}
         }
     }
@@ -512,9 +597,9 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
             let mut out = Vec::with_capacity(names.len());
             for (expr, name) in exprs.iter().zip(names) {
                 if matches!(expr, Expr::Wildcard)
-                    && let Some(table) = source_table(source, db)
+                    && let Some(cols) = source_columns(source, db)
                 {
-                    out.extend(table.columns.iter().map(|c| c.name.clone()));
+                    out.extend(cols);
                     continue;
                 }
                 out.push(name.clone());
@@ -522,6 +607,15 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
             out
         }
         Plan::Filter { source, .. } | Plan::Finish { source, .. } => column_names(source, db),
+        Plan::SetOp { left, .. } => column_names(left, db),
+        Plan::Derived { plan, columns, .. } => {
+            if columns.is_empty() {
+                column_names(plan, db)
+            } else {
+                columns.clone()
+            }
+        }
+        Plan::RecursiveCte { columns, .. } | Plan::CteRef { columns, .. } => columns.clone(),
         Plan::ShowDatabases => vec!["Database".to_string()],
         Plan::ShowTables { db: db_name, full, .. } => {
             let mut v = vec![format!("Tables_in_{db_name}")];
@@ -550,12 +644,42 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
 /// `Join`'s two tables would be ambiguous, so wildcards aren't expanded
 /// there -- `column_names` falls back to `"*"`, which `server.rs`
 /// already treats as "no better name" the same way it does `"?"`).
-fn source_table(plan: &Plan, db: &DbState) -> Option<std::sync::Arc<Table>> {
+fn source_columns(plan: &Plan, db: &DbState) -> Option<Vec<String>> {
     match plan {
         Plan::Scan { db: db_name, table, .. } => {
             crate::mysql::infoschema::lookup_table(db, db_name, table)
+                .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
         }
-        Plan::Filter { source, .. } | Plan::Finish { source, .. } => source_table(source, db),
+        Plan::Filter { source, .. } | Plan::Finish { source, .. } => source_columns(source, db),
+        Plan::Derived { .. } | Plan::CteRef { .. } => Some(column_names(plan, db)),
+        // A joined row is the left table's columns, then the right's.
+        Plan::Join { left, right, .. } => {
+            let mut cols = source_columns(left, db)?;
+            cols.extend(source_columns(right, db)?);
+            Some(cols)
+        }
+        _ => None,
+    }
+}
+
+/// Output column names known without the catalog (no `*`), for binding
+/// a `UNION`'s `ORDER BY name` and a recursive CTE's columns.
+pub fn static_names(plan: &Plan) -> Option<Vec<String>> {
+    match plan {
+        Plan::Project { exprs, names, .. } | Plan::Aggregate { exprs, names, .. } => {
+            (!exprs.iter().any(|e| matches!(e, Expr::Wildcard))).then(|| names.clone())
+        }
+        Plan::Filter { source, .. } | Plan::Finish { source, .. } => static_names(source),
+        Plan::SetOp { left, .. } => static_names(left),
+        Plan::Derived { plan, columns, .. } => {
+            if columns.is_empty() {
+                static_names(plan)
+            } else {
+                Some(columns.clone())
+            }
+        }
+        Plan::RecursiveCte { columns, .. } | Plan::CteRef { columns, .. } => Some(columns.clone()),
+        Plan::Dummy => Some(vec![]),
         _ => None,
     }
 }
@@ -584,6 +708,13 @@ pub fn map_colnames(e: Expr, f: &dyn Fn(String) -> Expr) -> Expr {
             conditions: conditions.into_iter().map(|(c, r)| (m(c), m(r))).collect(),
             else_result: else_result.map(mb),
         },
+        // A subquery's own names belong to its own scope.
+        Expr::InSubquery { expr, plan, negated } => {
+            Expr::InSubquery { expr: mb(expr), plan, negated }
+        }
+        Expr::Quantified { op, expr, plan, all } => {
+            Expr::Quantified { op, expr: mb(expr), plan, all }
+        }
         other => other,
     }
 }

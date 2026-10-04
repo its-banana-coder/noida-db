@@ -50,6 +50,8 @@ pub struct Engine {
     /// The session's `sql_mode` (MySQL 8's strict default until a
     /// `SET sql_mode = '...'`, which WordPress sends on every connection).
     pub sql_mode: crate::mysql::sqlmode::SqlMode,
+    /// The client connected with `CLIENT_FOUND_ROWS` (see `Executor`).
+    pub found_rows: bool,
     /// Whether a transaction is open (explicit BEGIN, or implicit).
     pub in_tx: bool,
     /// Open savepoints, oldest first: each name with the tables the
@@ -75,6 +77,7 @@ impl Default for Engine {
             conn_id: NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             autocommit: true,
             sql_mode: crate::mysql::sqlmode::SqlMode::default(),
+            found_rows: false,
             in_tx: false,
             savepoints: Vec::new(),
         }
@@ -217,6 +220,7 @@ impl Engine {
     /// table a write targets, for `after_plan`.
     pub fn before_plan(&mut self, plan: &Plan) -> Option<(String, String)> {
         match plan {
+            Plan::InsertSelect { insert, .. } => self.before_plan(insert),
             Plan::CreateTable { .. }
             | Plan::DropTable { .. }
             | Plan::Truncate { .. }
@@ -474,6 +478,7 @@ impl Engine {
         executor.session_insert_id = self.session_insert_id;
         executor.sql_mode = self.sql_mode.clone();
         executor.autocommit = self.autocommit;
+        executor.found_rows = self.found_rows;
         let written = self.before_plan(&plan);
         let res = executor.execute_plan(plan)?;
         self.after_plan(written);
