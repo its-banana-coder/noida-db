@@ -759,11 +759,16 @@ KNOWN = {
     "postgres": {},
 }
 
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+from pg_edges import PG_EDGES  # noqa: E402
+
+POSTGRES.update(PG_EDGES)
 scenarios = MYSQL if KIND == "mysql" else POSTGRES
 failed, known, fixed = [], [], []
 for name, steps in scenarios.items():
     got, want = run(NOIDA_PORT, steps), run(REF_PORT, steps)
-    same = got == want
+    # repr: NaN never equals itself, but the same NaN prints the same.
+    same = repr(got) == repr(want)
     if name in KNOWN[KIND]:
         (fixed if same else known).append(name)
         continue

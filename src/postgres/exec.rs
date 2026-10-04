@@ -65,6 +65,20 @@ macro_rules! env {
 pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
     Ok(match e {
         Expr::Const(v) => v.clone(),
+        Expr::UserFunc { oid, args } => {
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(eval(a, row, ctx)?);
+            }
+            let func = ctx.db.functions.get(oid).cloned().ok_or_else(|| {
+                PgError::new(
+                    code::UNDEFINED_FUNCTION,
+                    format!("function with OID {oid} does not exist"),
+                )
+            })?;
+            let info = super::dml::session_info(ctx);
+            super::plpgsql::call_function(ctx, &info, &func, vals)?
+        }
         Expr::Param(i) => ctx.params.get(*i).cloned().unwrap_or(Value::Null),
         Expr::Col(i) => row.get(*i).cloned().unwrap_or(Value::Null),
         Expr::Outer(depth, i) => {
@@ -438,6 +452,9 @@ pub fn build_reg_names(db: &DbState, user: &str, path: &[String]) -> types::RegN
     }
     for sig in super::sigs::all_sigs() {
         r.procs.insert(sig.oid, sig.name.to_string());
+    }
+    for f in db.functions.values() {
+        r.procs.insert(f.oid, f.name.clone());
     }
     for s in db.schemas.values() {
         r.namespaces.insert(s.oid, s.name.clone());
@@ -1177,7 +1194,32 @@ fn run_select(s: &Select, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         rows = kept;
     }
     // Grouping and aggregation.
-    if let Some(keys) = &s.group {
+    if let (Some(keys), Some(sets)) = (&s.group, &s.grouping_sets) {
+        // One aggregation per grouping set; keys outside the set are NULL.
+        let mut out = vec![];
+        for set in sets {
+            let masked: Vec<Expr> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| if set.contains(&i) { k.clone() } else { Expr::Const(Value::Null) })
+                .collect();
+            let only_constants = masked.iter().all(|k| matches!(k, Expr::Const(_)));
+            // The empty set is one group even over no rows.
+            let part = if only_constants {
+                let mut r = aggregate(&rows, &[], &s.aggs, ctx)?;
+                for row in &mut r {
+                    let mut full: Row = vec![Value::Null; keys.len()];
+                    full.append(row);
+                    *row = full;
+                }
+                r
+            } else {
+                aggregate(&rows, &masked, &s.aggs, ctx)?
+            };
+            out.extend(part);
+        }
+        rows = out;
+    } else if let Some(keys) = &s.group {
         rows = aggregate(&rows, keys, &s.aggs, ctx)?;
     } else if !s.aggs.is_empty() {
         rows = aggregate(&rows, &[], &s.aggs, ctx)?;
@@ -1407,7 +1449,28 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
 /// A set-returning function in FROM; `row` is the left-hand row a LATERAL
 /// function's arguments refer to.
 fn exec_func(f: &From, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
-    let From::Func { name, args, arg_tys, ordinality, .. } = f else { return Ok(vec![]) };
+    let From::Func { name, args, arg_tys, ordinality, user, .. } = f else { return Ok(vec![]) };
+    if let Some(oid) = user {
+        let mut vals = vec![];
+        for a in args {
+            vals.push(eval(a, row, ctx)?);
+        }
+        let func = ctx.db.functions.get(oid).cloned().ok_or_else(|| {
+            PgError::new(
+                code::UNDEFINED_FUNCTION,
+                format!("function with OID {oid} does not exist"),
+            )
+        })?;
+        let info = super::dml::session_info(ctx);
+        let v = super::plpgsql::call_function(ctx, &info, &func, vals)?;
+        let mut rows = if func.returns_set { super::plpgsql::set_rows(v) } else { vec![vec![v]] };
+        if *ordinality {
+            for (i, r) in rows.iter_mut().enumerate() {
+                r.push(Value::Int(i as i64 + 1));
+            }
+        }
+        return Ok(rows);
+    }
     // A scalar function in FROM (`SELECT * FROM current_schema()`) is valid
     // Postgres and returns one row of one column, not a set.
     if super::sigs::kind_of(name) != Some(super::sigs::Kind::Srf) {
@@ -1910,11 +1973,23 @@ fn finish(st: AggState, agg: &AggCall, n_rows: i64, ctx: &mut Ctx) -> PgResult<V
                 Value::Float(r)
             }
         }
-        AggState::Values(items) => finish_collect(agg, items, &env)?,
+        AggState::Values(items) => {
+            // An ordered-set aggregate's direct argument (a fraction).
+            let direct = match &agg.direct {
+                Some(d) => Some(eval(d, &Vec::new(), ctx)?),
+                None => None,
+            };
+            finish_collect(agg, items, &env, direct)?
+        }
     })
 }
 
-fn finish_collect(agg: &AggCall, items: Vec<Value>, env: &Env) -> PgResult<Value> {
+fn finish_collect(
+    agg: &AggCall,
+    items: Vec<Value>,
+    env: &Env,
+    direct: Option<Value>,
+) -> PgResult<Value> {
     let arg = agg.arg_tys.first().copied().unwrap_or(Type::TEXT);
     Ok(match agg.name {
         "array_agg" => {
@@ -1975,6 +2050,44 @@ fn finish_collect(agg: &AggCall, items: Vec<Value>, env: &Env) -> PgResult<Value
                     .map(|(k, v)| format!("{} : {}", super::json::escape(k), v.to_compact_string()))
                     .collect();
                 Value::text(format!("{{ {} }}", parts.join(", ")))
+            }
+        }
+        "percentile_cont" | "percentile_disc" => {
+            // Items arrive in the WITHIN GROUP order; NULLs don't count.
+            let vals: Vec<&Value> = items.iter().filter(|v| !v.is_null()).collect();
+            let at = |f: f64| -> PgResult<Value> {
+                if !(0.0..=1.0).contains(&f) || f.is_nan() {
+                    return Err(PgError::new(
+                        code::NUMERIC_VALUE_OUT_OF_RANGE,
+                        format!(
+                            "percentile value {} is not between 0 and 1",
+                            types::format_float(f, false, 1)
+                        ),
+                    ));
+                }
+                if vals.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let n = vals.len();
+                if agg.name == "percentile_disc" {
+                    let i = ((f * n as f64).ceil() as usize).max(1) - 1;
+                    return Ok(vals[i.min(n - 1)].clone());
+                }
+                let pos = f * (n - 1) as f64;
+                let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+                let (a, b) = (funcs::as_f64(vals[lo]), funcs::as_f64(vals[hi]));
+                Ok(Value::Float(a + (b - a) * (pos - lo as f64)))
+            };
+            match direct {
+                Some(Value::Array(fs)) => {
+                    let mut out = vec![];
+                    for f in &fs.items {
+                        out.push(if f.is_null() { Value::Null } else { at(funcs::as_f64(f))? });
+                    }
+                    Value::Array(Box::new(Array::new(out)))
+                }
+                Some(Value::Null) | None => Value::Null,
+                Some(f) => at(funcs::as_f64(&f))?,
             }
         }
         "mode" => {

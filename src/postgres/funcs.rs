@@ -1185,6 +1185,18 @@ pub fn quote_ident(s: &str) -> String {
     if safe { s.to_string() } else { format!("\"{}\"", s.replace('"', "\"\"")) }
 }
 
+/// Each character upper- or lower-cased only when that gives exactly one
+/// character.
+pub fn simple_case(s: &str, upper: bool) -> String {
+    s.chars()
+        .map(|c| {
+            let mut m: Vec<char> =
+                if upper { c.to_uppercase().collect() } else { c.to_lowercase().collect() };
+            if m.len() == 1 { m.pop().unwrap() } else { c }
+        })
+        .collect()
+}
+
 pub fn quote_literal(s: &str) -> String {
     if s.contains('\\') {
         format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
@@ -1521,8 +1533,10 @@ pub fn call(
             let r = ranges::parse(text(&a[0]), tys[0].base, &env.dctx())?;
             return Ok(Some(if name == "lower" { r.lower_value() } else { r.upper_value() }));
         }
-        "lower" => Text(text(&a[0]).to_lowercase()),
-        "upper" => Text(text(&a[0]).to_uppercase()),
+        // Per character, as Postgres's locales map case: a character with
+        // no single-character counterpart (`ß`) stays as it is.
+        "lower" => Text(simple_case(text(&a[0]), false)),
+        "upper" => Text(simple_case(text(&a[0]), true)),
         "initcap" => Text(initcap(text(&a[0]))),
         "length" | "char_length" | "character_length" => match &a[0] {
             Bytes(b) => Int(b.len() as i64),

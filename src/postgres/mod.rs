@@ -20,6 +20,7 @@ pub mod funcs;
 pub mod keywords;
 pub mod pgcatalog;
 pub mod plan;
+pub mod plpgsql;
 pub mod ranges;
 pub mod refresh;
 pub mod seqddl;
@@ -43,7 +44,9 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let after_seq = seqddl::rewrite(sql)?;
     let sql1 = after_seq.as_deref().unwrap_or(sql);
     let after_refresh = refresh::rewrite(sql1)?;
-    let sql = after_refresh.as_deref().unwrap_or(sql1);
+    let sql2 = after_refresh.as_deref().unwrap_or(sql1);
+    let after_routines = plpgsql::rewrite(sql2)?;
+    let sql = after_routines.as_deref().unwrap_or(sql2);
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(syntax_error)
 }
 

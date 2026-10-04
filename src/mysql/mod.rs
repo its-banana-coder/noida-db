@@ -14,6 +14,7 @@ pub mod types;
 mod tests {
     use crate::mysql::engine::Engine;
     use crate::mysql::types::Value;
+    use crate::sql::numeric::Numeric;
 
     #[test]
     fn select_with_where_resolves_real_column_values() {
@@ -59,7 +60,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Int(3));
-        assert_eq!(rows[0][1], Value::Int(35));
+        assert_eq!(rows[0][1], Value::Num(Numeric::from_i64(35)));
         // Real MySQL: AVG of integers is a DECIMAL with
         // `div_precision_increment` (4) extra digits -- 11.6667, not a float
         // (kept to more digits inside for further arithmetic).
@@ -76,8 +77,17 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![Value::Text("alice".to_string()), Value::Int(2), Value::Int(30)],
-                vec![Value::Text("bob".to_string()), Value::Int(1), Value::Int(5)],
+                // SUM of integers is a DECIMAL, as in MySQL.
+                vec![
+                    Value::Text("alice".to_string()),
+                    Value::Int(2),
+                    Value::Num(Numeric::from_i64(30))
+                ],
+                vec![
+                    Value::Text("bob".to_string()),
+                    Value::Int(1),
+                    Value::Num(Numeric::from_i64(5))
+                ],
             ]
         );
 

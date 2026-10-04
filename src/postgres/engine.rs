@@ -772,7 +772,14 @@ impl Engine {
         params: &[Value],
         param_types: &[Type],
     ) -> PgResult<StmtResult> {
-        let writes = statement_writes(stmt);
+        // A query calling a user function may write through it.
+        let writes = statement_writes(stmt)
+            || (matches!(stmt, a::Statement::Query(_)) && {
+                let text = stmt.to_string().to_lowercase();
+                self.with_db(s, |db| {
+                    db.functions.values().any(|f| text.contains(&format!("{}(", f.name)))
+                })
+            });
         let implicit = s.txn.is_none();
         if implicit {
             self.begin(s);
@@ -820,7 +827,12 @@ impl Engine {
             fmt: ctx.rt.settings.fmt(),
             now: ctx.rt.now,
         };
-        let result = run_one(&mut ctx, stmt, &info, param_types);
+        let mut result = run_one(&mut ctx, stmt, &info, param_types);
+        // RAISE NOTICE and friends from functions and triggers.
+        let raised = std::mem::take(&mut ctx.rt.notices);
+        if let Ok(r) = &mut result {
+            r.notices.extend(raised);
+        }
         let notifies = std::mem::take(&mut ctx.notifies);
         drop(g);
         for (chan, payload) in notifies {
@@ -1213,7 +1225,7 @@ fn set_value_text(values: &[a::Expr]) -> PgResult<String> {
 }
 
 /// Runs a query, DML or DDL statement inside an open transaction.
-fn run_one(
+pub(crate) fn run_one(
     ctx: &mut Ctx,
     stmt: &a::Statement,
     info: &SessionInfo,
@@ -1267,6 +1279,11 @@ fn run_one(
             Ok(StmtResult::tag(tag))
         }
         // REFRESH MATERIALIZED VIEW arrives as a CALL (see refresh.rs).
+        // Functions, procedures, triggers, DO and CALL (see plpgsql.rs).
+        S::Call(f) if f.name.to_string() == super::plpgsql::CALL_NAME => {
+            let tag = super::plpgsql::ddl(ctx, info, &call_arg_text(f))?;
+            Ok(StmtResult::tag(tag))
+        }
         S::Call(f) if f.name.to_string() == super::refresh::CALL_NAME => {
             let r = super::refresh::parse(&call_arg_text(f))?;
             let mut d = ddl(ctx, info);
