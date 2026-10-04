@@ -8,8 +8,8 @@
 [![CI](https://github.com/its-banana-coder/noida-db/actions/workflows/ci.yml/badge.svg)](https://github.com/its-banana-coder/noida-db/actions/workflows/ci.yml)
 [![Real apps](https://github.com/its-banana-coder/noida-db/actions/workflows/real-apps.yml/badge.svg)](https://github.com/its-banana-coder/noida-db/actions/workflows/real-apps.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![idle RAM](https://img.shields.io/badge/idle%20RAM-~2MB-brightgreen)
-![binary size](https://img.shields.io/badge/single%20binary-%3C40MB-blue)
+![idle RAM](https://img.shields.io/badge/idle%20RAM-~5MB-brightgreen)
+![binary size](https://img.shields.io/badge/single%20binary-~7MB-blue)
 
 No Docker Compose stack idling at 2.5–4GB. No five heavy servers to boot
 before `npm run dev` works. One Rust binary, real wire protocols, your
@@ -35,7 +35,7 @@ See `noida-db help` for the full option list, or jump to
 |---|---|
 | 🚀 **4 real applications**, end to end | Gitea, Miniflux, WordPress, Faust — unmodified, real schemas, real workflows, all green in CI |
 | 📦 **34 real client libraries & ORMs** verified | psycopg, SQLAlchemy, Django, redis-py, ioredis, kafkajs, Sequelize, GORM, JDBC, and more |
-| 🪶 **~2MB idle**, ~15MB under real app load | vs. the multi-gigabyte real stack |
+| 🪶 **~7MB binary, ~5MB idle** with all five services running, ~15MB under real app load | vs. the multi-gigabyte real stack |
 | ⚡ **Sub-100µs** reads on Redis/Elasticsearch paths | measured, not claimed — see [Benchmarks](#benchmarks) |
 | 💾 **On-disk persistence** for Postgres, Redis, Elasticsearch, MySQL, Kafka | survives a clean restart |
 | 🔍 **Every gap tracked, not hidden** | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — updated by every PR |
