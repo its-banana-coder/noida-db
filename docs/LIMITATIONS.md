@@ -120,8 +120,34 @@ domains) survives a clean restart; a hard kill (`kill -9`) loses
 whatever changed since the last clean shutdown but never corrupts the
 on-disk snapshot.
 
+User functions, procedures, `DO` blocks and triggers work for the common
+cases. `CREATE [OR REPLACE] FUNCTION`/`PROCEDURE` in `LANGUAGE plpgsql` or
+`sql` (named, defaulted and `STRICT` parameters; scalar, `void`, `SETOF` and
+`RETURNS TABLE` results, the last two in `FROM`), `CALL`, `DO`, `DROP
+FUNCTION`/`PROCEDURE`. PL/pgSQL: `DECLARE` (with defaults, `CONSTANT`, `NOT
+NULL`, `ALIAS FOR`), `:=`, `IF`/`ELSIF`, `CASE`, `LOOP`/`WHILE`/`FOR i IN
+a..b [BY n] [REVERSE]`/`FOR rec IN query`/`FOR ... IN EXECUTE`/`FOREACH`,
+labels with `EXIT`/`CONTINUE [WHEN]`, `RETURN`/`RETURN NEXT`/`RETURN QUERY`,
+`PERFORM`, `SELECT ... INTO [STRICT]`, DML with `RETURNING ... INTO`,
+`EXECUTE ... [INTO] [USING]`, `GET DIAGNOSTICS ... ROW_COUNT`, `FOUND`,
+`RAISE` (levels, `%` placeholders, `USING ERRCODE/DETAIL/HINT`, re-raise),
+`ASSERT`, and `EXCEPTION WHEN <condition> [OR ...]` blocks that roll the
+block's work back, with `SQLSTATE`/`SQLERRM`. `CREATE [OR REPLACE] TRIGGER`
+`BEFORE`/`AFTER` `INSERT`/`UPDATE [OF cols]`/`DELETE`, `FOR EACH ROW`/
+`STATEMENT`, `WHEN (...)`, arguments, with `NEW`/`OLD` (NULL rows where they
+don't apply), `TG_OP`/`TG_NAME`/`TG_WHEN`/`TG_LEVEL`/`TG_TABLE_NAME`/
+`TG_TABLE_SCHEMA`/`TG_ARGV`; a `BEFORE` trigger can change `NEW` or return
+NULL to skip the row, and triggers fire in name order. Functions and
+triggers persist and show up in `pg_proc` and `pg_trigger`. All of this is
+compared statement by statement against a real PostgreSQL
+(`tests/failure-diff/pg_edges.py`).
+
 Target: PostgreSQL 16 behaviour (14 also compared). Verified against real
-servers by `tests/postgres_diff.rs` (about 665 results) and by psycopg,
+servers by `tests/postgres_diff.rs` (about 700 results), by an edge-case
+differential (`tests/failure-diff/pg_edges.py`: numbers and casts, strings,
+dates, arrays and JSON, DML corner cases, `GROUPING SETS`/`ROLLUP`/`CUBE`,
+ordered-set aggregates `percentile_cont`/`percentile_disc`/`mode() WITHIN
+GROUP`, named `WINDOW`s) and by psycopg,
 SQLAlchemy, Django, asyncpg, Alembic, node-postgres, Knex, TypeORM,
 Sequelize, pgx, GORM, sqlx, Npgsql and JDBC (`tests/clients/postgres/run.sh`).
 Django's own management commands (`migrate`, including the built-in
@@ -200,17 +226,20 @@ constraints.
 
 **Not yet**
 
-- PL/pgSQL, stored procedures, `CREATE PROCEDURE`/`CALL` and triggers,
-  and extensions. Deliberately deferred: unlike everything else on this
-  list, PL/pgSQL is a real procedural language embedded in SQL (its own
-  grammar, control flow, exception handling, `NEW`/`OLD` row access) that
-  needs its own interpreter wired into the binder/executor, not a bounded
-  parse-and-evaluate addition — it's planned as its own dedicated effort
-  once the rest of the compatibility work here is done.
+- PL/pgSQL beyond the subset below: cursors (`OPEN`/`FETCH`/`refcursor`),
+  `RETURN QUERY EXECUTE`, OUT/INOUT/VARIADIC parameters, `COMMIT`/
+  `ROLLBACK` inside procedures, `%ROWTYPE` declared records' typed fields
+  before assignment, transition tables (`REFERENCING NEW TABLE`), triggers
+  on views (`INSTEAD OF`) and `TRUNCATE` triggers, and event triggers.
+  Extensions (`CREATE EXTENSION` is accepted and does nothing).
 - Full-text search: GIN/GiST indexes, `ts_headline`, any text search
   config other than `'english'`/`'simple'`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
+
+- A set-returning user function in a select list (it works in `FROM`).
+- `BETWEEN SYMMETRIC` (the SQL parser rejects it) and the `GROUPING()`
+  function.
 
 **Differs**
 

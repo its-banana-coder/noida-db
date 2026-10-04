@@ -7,14 +7,57 @@ use super::catalog::{Constraint, ConstraintKind, FkAction, Row, Table};
 use super::error::{PgError, PgResult, code};
 use super::exec::{self, Ctx};
 use super::plan::{ConflictAction, Dml, Expr, From, Query};
+use super::plpgsql::{self, Event};
 use super::types::{self, Type, Value};
+
+/// BEFORE ROW triggers for one row: the row to write (a trigger may change
+/// it), or None when one returned NULL to skip it.
+fn before_row(
+    ctx: &mut Ctx,
+    table: u32,
+    event: Event,
+    set_cols: &[usize],
+    old: Option<&Row>,
+    new: Option<Row>,
+) -> PgResult<Option<Row>> {
+    let trs = plpgsql::triggers_for(ctx, table, "BEFORE", event, true, set_cols);
+    let mut cur = new.or_else(|| old.cloned());
+    for tr in &trs {
+        let Some(row) = cur else { return Ok(None) };
+        let new_arg = if event == Event::Delete { None } else { Some(row.clone()) };
+        cur = match plpgsql::fire_row(ctx, tr, event, old, new_arg)? {
+            Some(r) => Some(r),
+            None => return Ok(None),
+        };
+    }
+    Ok(cur)
+}
+
+/// AFTER ROW triggers for the rows a statement wrote, then AFTER STATEMENT.
+fn after_rows(
+    ctx: &mut Ctx,
+    table: u32,
+    event: Event,
+    set_cols: &[usize],
+    rows: &[(Option<Row>, Option<Row>)],
+) -> PgResult<()> {
+    let trs = plpgsql::triggers_for(ctx, table, "AFTER", event, true, set_cols);
+    for (old, new) in rows {
+        for tr in &trs {
+            plpgsql::fire_row(ctx, tr, event, old.as_ref(), new.clone())?;
+        }
+    }
+    plpgsql::fire_statement(ctx, table, "AFTER", event, set_cols)
+}
 
 pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     match d {
         Dml::Insert { table, cols, source, defaults, on_conflict, returning, .. } => {
             let rows = exec::run_query(source, ctx)?;
+            plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Insert, &[])?;
             let mut out = vec![];
             let mut count = 0;
+            let mut written: Vec<(Option<Row>, Option<Row>)> = vec![];
             for src in rows {
                 let t = table_of(ctx, *table)?;
                 let ncols = t.columns.len();
@@ -38,6 +81,16 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 }
                 apply_generated(ctx, *table, &mut row)?;
                 coerce_row(ctx, *table, &mut row)?;
+                if !plpgsql::triggers_for(ctx, *table, "BEFORE", Event::Insert, true, &[])
+                    .is_empty()
+                {
+                    match before_row(ctx, *table, Event::Insert, &[], None, Some(row))? {
+                        Some(r) => row = r,
+                        None => continue,
+                    }
+                    apply_generated(ctx, *table, &mut row)?;
+                    coerce_row(ctx, *table, &mut row)?;
+                }
                 // ON CONFLICT
                 if let Some(oc) = on_conflict {
                     let t = table_of(ctx, *table)?;
@@ -81,11 +134,15 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 if !returning.is_empty() {
                     out.push(project(returning, &row, ctx)?);
                 }
+                written.push((None, Some(row)));
             }
+            after_rows(ctx, *table, Event::Insert, &[], &written)?;
             ctx.affected = count;
             Ok(out)
         }
         Dml::Update { table, from, filter, sets, defaults, returning } => {
+            let set_cols: Vec<usize> = sets.iter().map(|(c, _)| *c).collect();
+            plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Update, &set_cols)?;
             let t = table_of(ctx, *table)?;
             let base = t.rows.clone();
             let sys_cols: Vec<[Value; 6]> =
@@ -124,6 +181,26 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     break;
                 }
             }
+            if !plpgsql::triggers_for(ctx, *table, "BEFORE", Event::Update, true, &set_cols)
+                .is_empty()
+            {
+                let mut kept = vec![];
+                for (i, new) in updates {
+                    if let Some(mut r) = before_row(
+                        ctx,
+                        *table,
+                        Event::Update,
+                        &set_cols,
+                        Some(&base[i]),
+                        Some(new),
+                    )? {
+                        apply_generated(ctx, *table, &mut r)?;
+                        coerce_row(ctx, *table, &mut r)?;
+                        kept.push((i, r));
+                    }
+                }
+                updates = kept;
+            }
             for (i, new) in &updates {
                 check_row(ctx, *table, new, Some(*i))?;
                 cascade_update(ctx, *table, &base[*i], new)?;
@@ -135,10 +212,16 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     out.push(project(returning, new, ctx)?);
                 }
             }
+            let written: Vec<(Option<Row>, Option<Row>)> = updates
+                .iter()
+                .map(|(i, new)| (Some(base[*i].clone()), Some(new.clone())))
+                .collect();
+            after_rows(ctx, *table, Event::Update, &set_cols, &written)?;
             ctx.affected = updates.len();
             Ok(out)
         }
         Dml::Delete { table, using, filter, returning } => {
+            plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Delete, &[])?;
             let t = table_of(ctx, *table)?;
             let base = t.rows.clone();
             let sys_cols: Vec<[Value; 6]> =
@@ -160,10 +243,23 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         continue;
                     }
                     doomed.push(i);
-                    if !returning.is_empty() {
-                        out.push(project(returning, r, ctx)?);
-                    }
                     break;
+                }
+            }
+            // BEFORE DELETE triggers may spare a row (by returning NULL).
+            if !plpgsql::triggers_for(ctx, *table, "BEFORE", Event::Delete, true, &[]).is_empty() {
+                let mut kept = vec![];
+                for i in doomed {
+                    if before_row(ctx, *table, Event::Delete, &[], Some(&base[i]), None)?.is_some()
+                    {
+                        kept.push(i);
+                    }
+                }
+                doomed = kept;
+            }
+            if !returning.is_empty() {
+                for &i in &doomed {
+                    out.push(project(returning, &base[i], ctx)?);
                 }
             }
             for &i in &doomed {
@@ -176,6 +272,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 keep += 1;
                 !doomed.contains(&k)
             });
+            let written: Vec<(Option<Row>, Option<Row>)> =
+                doomed.iter().map(|&i| (Some(base[i].clone()), None)).collect();
+            after_rows(ctx, *table, Event::Delete, &[], &written)?;
             ctx.affected = doomed.len();
             Ok(out)
         }

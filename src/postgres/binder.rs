@@ -87,6 +87,8 @@ pub struct Binder<'a> {
     cte_level: usize,
     pub cte_slots: usize,
     frames: Vec<AggFrame>,
+    /// The current SELECT's `WINDOW name AS (...)` definitions.
+    named_windows: Vec<a::NamedWindowDefinition>,
 }
 
 fn ident(id: &a::Ident) -> String {
@@ -128,6 +130,7 @@ impl<'a> Binder<'a> {
             cte_level: 0,
             cte_slots: 0,
             frames: vec![],
+            named_windows: vec![],
         }
     }
 
@@ -548,9 +551,57 @@ impl<'a> Binder<'a> {
         // FROM
         let (from, scope) = self.bind_from(&sel.from)?;
         self.scopes.push(scope);
+        let saved = std::mem::replace(&mut self.named_windows, sel.named_window.clone());
         let result = self.bind_select_body(sel, q, from);
+        self.named_windows = saved;
         self.scopes.pop();
         result
+    }
+
+    /// A window spec with any named window it refers to (`OVER w`,
+    /// `OVER (w ORDER BY x)`) merged in, as Postgres does: the reference
+    /// supplies PARTITION BY, and ORDER BY or the frame when the new spec
+    /// leaves them out.
+    fn resolve_window(&self, over: &a::WindowType) -> PgResult<a::WindowSpec> {
+        let (spec, base) = match over {
+            a::WindowType::WindowSpec(s) => (s.clone(), s.window_name.clone()),
+            a::WindowType::NamedWindow(n) => (
+                a::WindowSpec {
+                    window_name: None,
+                    partition_by: vec![],
+                    order_by: vec![],
+                    window_frame: None,
+                },
+                Some(n.clone()),
+            ),
+        };
+        let Some(base) = base else { return Ok(spec) };
+        let def = self.named_windows.iter().find(|d| d.0.value == base.value).ok_or_else(|| {
+            PgError::new(
+                code::UNDEFINED_OBJECT,
+                format!("window \"{}\" does not exist", base.value),
+            )
+        })?;
+        let base_spec = match &def.1 {
+            a::NamedWindowExpr::WindowSpec(s) => {
+                self.resolve_window(&a::WindowType::WindowSpec(s.clone()))?
+            }
+            a::NamedWindowExpr::NamedWindow(n) => {
+                self.resolve_window(&a::WindowType::NamedWindow(n.clone()))?
+            }
+        };
+        if !spec.partition_by.is_empty() {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                format!("cannot override PARTITION BY clause of window \"{}\"", base.value),
+            ));
+        }
+        Ok(a::WindowSpec {
+            window_name: None,
+            partition_by: base_spec.partition_by,
+            order_by: if spec.order_by.is_empty() { base_spec.order_by } else { spec.order_by },
+            window_frame: spec.window_frame.or(base_spec.window_frame),
+        })
     }
 
     fn bind_select_body(
@@ -612,10 +663,66 @@ impl<'a> Binder<'a> {
         };
         // Select list is bound first so GROUP BY can refer to output names.
         let (mut proj, mut out_cols, mut proj_asts) = self.bind_projection(&sel.projection)?;
+        // GROUPING SETS / ROLLUP / CUBE: each set as indexes into the group
+        // keys. Plain GROUP BY expressions are in every set; several set
+        // clauses combine as a cross product, as in Postgres.
+        let mut sets: Option<Vec<Vec<usize>>> = None;
+        let mut plain: Vec<usize> = vec![];
+        let key_of = |this: &mut Self, keys: &mut Vec<Expr>, e: &a::Expr| -> PgResult<usize> {
+            let te = this.bind_expr_no_agg(e, "GROUP BY")?;
+            Ok(match keys.iter().position(|k| *k == te.e) {
+                Some(i) => i,
+                None => {
+                    keys.push(te.e);
+                    keys.len() - 1
+                }
+            })
+        };
         for g in &group_exprs {
-            if matches!(g, a::Expr::GroupingSets(_) | a::Expr::Cube(_) | a::Expr::Rollup(_)) {
-                return Err(unsupported("GROUPING SETS/CUBE/ROLLUP"));
+            let lists: Option<Vec<Vec<a::Expr>>> = match g {
+                a::Expr::Rollup(items) => {
+                    let mut out = vec![];
+                    for n in (0..=items.len()).rev() {
+                        out.push(items[..n].concat());
+                    }
+                    Some(out)
+                }
+                a::Expr::Cube(items) => {
+                    let n = items.len();
+                    let mut out = vec![];
+                    for mask in (0..(1u32 << n)).rev() {
+                        let mut set = vec![];
+                        for (i, it) in items.iter().enumerate() {
+                            if mask & (1 << (n - 1 - i)) != 0 {
+                                set.extend(it.iter().cloned());
+                            }
+                        }
+                        out.push(set);
+                    }
+                    Some(out)
+                }
+                a::Expr::GroupingSets(items) => Some(items.clone()),
+                _ => None,
+            };
+            if let Some(lists) = lists {
+                let mut these = vec![];
+                for l in lists {
+                    let mut idx = vec![];
+                    for e in &l {
+                        idx.push(key_of(self, &mut group_keys, e)?);
+                    }
+                    these.push(idx);
+                }
+                sets = Some(match sets {
+                    None => these,
+                    Some(prev) => prev
+                        .iter()
+                        .flat_map(|p| these.iter().map(move |t| [p.clone(), t.clone()].concat()))
+                        .collect(),
+                });
+                continue;
             }
+            let before = group_keys.len();
             // GROUP BY 1 / GROUP BY alias
             if let a::Expr::Value(v) = g
                 && let a::Value::Number(n, _) = &v.value
@@ -644,7 +751,18 @@ impl<'a> Binder<'a> {
             let te = self.bind_expr_no_agg(g, "GROUP BY")?;
             group_keys.push(te.e);
             group_asts.push(g.clone());
+            plain.extend(before..group_keys.len());
         }
+        let grouping_sets = sets.map(|ss| {
+            ss.into_iter()
+                .map(|mut s| {
+                    s.extend(plain.iter().copied());
+                    s.sort_unstable();
+                    s.dedup();
+                    s
+                })
+                .collect::<Vec<_>>()
+        });
         // HAVING
         let having_te = match &sel.having {
             Some(h) => Some(self.bind_expr(h)?),
@@ -721,8 +839,11 @@ impl<'a> Binder<'a> {
         // Rewrite everything above the aggregation step.
         let mut having = having_te.map(|te| te.e);
         if grouped {
-            let extra = self.expand_group_keys(&mut group_keys);
-            let _ = extra;
+            // Functional dependencies on a primary key don't apply across
+            // grouping sets (a key may be NULLed out).
+            if grouping_sets.is_none() {
+                self.expand_group_keys(&mut group_keys);
+            }
             for p in &mut proj {
                 p.e = self.regroup(p.e.clone(), &group_keys, aggs.len())?;
             }
@@ -821,7 +942,7 @@ impl<'a> Binder<'a> {
             from,
             filter,
             group: grouped.then(|| group_keys.clone()),
-            grouping_sets: None,
+            grouping_sets,
             aggs,
             having,
             windows,
@@ -1342,6 +1463,21 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// The user function `name` callable with `nargs` arguments.
+    fn user_function(&self, name: &str, nargs: usize) -> Option<super::catalog::Function> {
+        self.db
+            .functions
+            .values()
+            .find(|f| {
+                f.name == name
+                    && !f.procedure
+                    && nargs <= f.arg_types.len()
+                    && nargs + f.arg_defaults.iter().filter(|d| d.is_some()).count()
+                        >= f.arg_types.len()
+            })
+            .cloned()
+    }
+
     fn bind_from_function(
         &mut self,
         fname: &str,
@@ -1370,6 +1506,7 @@ impl<'a> Binder<'a> {
         let arg_tys: Vec<Type> = bound.iter().map(|t| t.ty).collect();
         // `unnest(a, b, ...)` in FROM: one column per array, padded with NULLs.
         let multi_unnest = fname == "unnest" && bound.len() > 1;
+        let mut user = None;
         let (sig_name, arg_exprs, arg_tys, mut cols) = if multi_unnest {
             let mut cols = vec![];
             for t in &arg_tys {
@@ -1387,6 +1524,20 @@ impl<'a> Binder<'a> {
             }
             let exprs = bound.into_iter().map(|t| t.e).collect();
             ("unnest", exprs, arg_tys, cols)
+        } else if sigs::kind_of(fname).is_none()
+            && let Some(uf) = self.user_function(fname, bound.len())
+        {
+            let mut arg_exprs = vec![];
+            for (i, te) in bound.into_iter().enumerate() {
+                arg_exprs.push(self.coerce(te, uf.arg_types[i], -1, CastCtx::Implicit, fname)?);
+            }
+            let cols: Vec<OutCol> = if uf.out_cols.is_empty() {
+                vec![OutCol::new(fname.to_string(), uf.ret)]
+            } else {
+                uf.out_cols.iter().map(|(n, t)| OutCol::new(n.clone(), *t)).collect()
+            };
+            user = Some(uf.oid);
+            ("user_function", arg_exprs, uf.arg_types.clone(), cols)
         } else {
             let r = sigs::resolve(fname, &arg_tys)?;
             let mut arg_exprs = vec![];
@@ -1439,6 +1590,7 @@ impl<'a> Binder<'a> {
                 ncols,
                 ordinality,
                 lateral: left.is_some(),
+                user,
             },
             scope,
         ))
@@ -2865,6 +3017,24 @@ impl<'a> Binder<'a> {
             _ => {}
         }
         let kind = sigs::kind_of(&name);
+        // Not a builtin: a user function?
+        if kind.is_none()
+            && f.over.is_none()
+            && let Some(uf) = self.user_function(&name, args.len())
+        {
+            if uf.returns_set {
+                return Err(PgError::new(
+                    code::FEATURE_NOT_SUPPORTED,
+                    format!("set-returning function {name}() is only supported in FROM"),
+                ));
+            }
+            let mut out = vec![];
+            for (i, e) in args.iter().enumerate() {
+                let te = self.bind_expr(e)?;
+                out.push(self.coerce(te, uf.arg_types[i], -1, CastCtx::Implicit, &name)?);
+            }
+            return Ok(TE::new(Expr::UserFunc { oid: uf.oid, args: out }, uf.ret));
+        }
         let is_agg = kind == Some(Kind::Agg) || (star && name == "count");
         let is_win = kind == Some(Kind::Window);
         if (is_agg || is_win) && f.over.is_none() {
@@ -2873,6 +3043,9 @@ impl<'a> Binder<'a> {
                     code::WINDOWING_ERROR,
                     format!("window function {name} requires an OVER clause"),
                 ));
+            }
+            if !f.within_group.is_empty() {
+                return self.bind_ordered_set(&name, &args, &f.within_group, &f.filter);
             }
             return self.bind_aggregate(&name, &args, star, distinct, &f.filter, &order_by);
         }
@@ -3042,6 +3215,15 @@ impl<'a> Binder<'a> {
                 _ => Value::Null,
             })
             .collect();
+        // A strict function of a NULL is NULL (as the executor does).
+        let strict = super::sigs::all_sigs()
+            .iter()
+            .find(|s| s.name == *name)
+            .map(|s| s.strict)
+            .unwrap_or(true);
+        if strict && vals.iter().any(Value::is_null) && !matches!(*name, "subscript" | "slice") {
+            return Ok(Expr::Const(Value::Null));
+        }
         let env = self.env();
         match super::funcs::call(name, &vals, arg_tys, *ty, &env) {
             Ok(Some(v)) => Ok(Expr::Const(v)),
@@ -3115,6 +3297,7 @@ impl<'a> Binder<'a> {
             filter: filter_e,
             order,
             star,
+            direct: None,
         };
         let frame = self.frames.last_mut().unwrap();
         let idx = match frame.aggs.iter().position(|x| *x == call) {
@@ -3125,6 +3308,108 @@ impl<'a> Binder<'a> {
             }
         };
         Ok(TE::new(Expr::AggRef(idx), r.ret))
+    }
+
+    /// `mode() / percentile_cont(f) / percentile_disc(f) WITHIN GROUP
+    /// (ORDER BY x)`: aggregated over x in that order, with `f` (a fraction
+    /// or an array of them) as the direct argument.
+    fn bind_ordered_set(
+        &mut self,
+        name: &str,
+        args: &[a::Expr],
+        within: &[a::OrderByExpr],
+        filter: &Option<Box<a::Expr>>,
+    ) -> PgResult<TE> {
+        let fname: &'static str = match name {
+            "mode" => "mode",
+            "percentile_cont" => "percentile_cont",
+            "percentile_disc" => "percentile_disc",
+            other => {
+                return Err(PgError::new(
+                    code::WRONG_OBJECT_TYPE,
+                    format!(
+                        "{other} is not an ordered-set aggregate, so it cannot have WITHIN GROUP"
+                    ),
+                ));
+            }
+        };
+        if self.frames.is_empty() || self.frames.last().unwrap().forbid.is_some() {
+            return Err(PgError::new(
+                code::GROUPING_ERROR,
+                "aggregate functions are not allowed here",
+            ));
+        }
+        if within.len() != 1 {
+            return Err(PgError::new(
+                code::UNDEFINED_FUNCTION,
+                format!("function {name} must have exactly one ORDER BY column"),
+            ));
+        }
+        self.frames.push(AggFrame { forbid: Some("an aggregate argument"), ..Default::default() });
+        let data = self.bind_expr(&within[0].expr);
+        let direct = args.first().map(|x| self.bind_expr(x));
+        let filter_te = filter.as_ref().map(|f| self.bind_expr(f));
+        self.frames.pop();
+        let mut data = data?;
+        let desc = within[0].options.sort == Some(a::OrderBySort::Desc);
+        let nulls_first = within[0].options.nulls_first.unwrap_or(desc);
+        let (direct, ret) = match fname {
+            "mode" => {
+                if direct.is_some() {
+                    return Err(PgError::new(
+                        code::UNDEFINED_FUNCTION,
+                        "function mode takes no direct arguments",
+                    ));
+                }
+                (None, data.ty)
+            }
+            _ => {
+                let Some(d) = direct else {
+                    return Err(PgError::new(
+                        code::UNDEFINED_FUNCTION,
+                        format!("function {name} needs a fraction"),
+                    ));
+                };
+                let d = d?;
+                let is_array = d.ty.array;
+                let target = if is_array { Type::array_of(Base::Float8) } else { Type::FLOAT8 };
+                let d = self.coerce(d, target, -1, CastCtx::Implicit, name)?;
+                let elem = if fname == "percentile_cont" {
+                    data = TE::new(
+                        self.coerce(data, Type::FLOAT8, -1, CastCtx::Implicit, name)?,
+                        Type::FLOAT8,
+                    );
+                    Type::FLOAT8
+                } else {
+                    data.ty
+                };
+                (Some(d), Type { base: elem.base, array: is_array })
+            }
+        };
+        let filter = match filter_te {
+            Some(t) => Some(self.bool_expr(t?, "FILTER")?),
+            None => None,
+        };
+        let call = AggCall {
+            name: fname,
+            args: vec![data.e.clone()],
+            arg_tys: vec![data.ty],
+            ty: ret,
+            distinct: false,
+            filter,
+            order: vec![(data.e, desc, nulls_first)],
+            star: false,
+            direct,
+        };
+        let frame = self.frames.last_mut().unwrap();
+        let idx = match frame.aggs.iter().position(|x| *x == call) {
+            Some(i) => i,
+            None => {
+                frame.aggs.push(call);
+                frame.aggs.len() - 1
+            }
+        };
+        Ok(TE::new(Expr::AggRef(idx), ret))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3139,12 +3424,8 @@ impl<'a> Binder<'a> {
         distinct: bool,
         order_by: &[a::OrderByExpr],
     ) -> PgResult<TE> {
-        let a::WindowType::WindowSpec(spec) = over else {
-            return Err(unsupported("named windows"));
-        };
-        if spec.window_name.is_some() {
-            return Err(unsupported("named windows"));
-        }
+        let resolved = self.resolve_window(over)?;
+        let spec = &resolved;
         if self.frames.is_empty() || self.frames.last().unwrap().forbid.is_some() {
             return Err(PgError::new(
                 code::WINDOWING_ERROR,
@@ -3199,6 +3480,7 @@ impl<'a> Binder<'a> {
                 },
                 order: vec![],
                 star,
+                direct: None,
             })
         } else {
             None

@@ -9,6 +9,9 @@
 # password) and Postgres (postgres/postgres). A service whose *_REF_PORT
 # isn't set is skipped.
 set -uo pipefail
+# Compare in UTC (the reference server would otherwise show timestamptz in
+# the local zone; noida-db and CI use UTC).
+export PGTZ="${PGTZ:-UTC}"
 
 cd "$(dirname "$0")/../.."
 here="tests/failure-diff"

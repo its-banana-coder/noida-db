@@ -50,6 +50,9 @@ provariadic oid, prosupport regproc, prokind char, prosecdef bool, proleakproof 
 proretset bool, provolatile char, proparallel char, pronargs int2, pronargdefaults int2, prorettype oid, \
 proargtypes oidvector, proallargtypes _oid, proargmodes _char, proargnames _text, proargdefaults pg_node_tree, \
 protrftypes _oid, prosrc text, probin text, prosqlbody pg_node_tree, proconfig _text, proacl _aclitem
+pg_trigger/2620/r: oid oid, tgrelid oid, tgparentid oid, tgname name, tgfoid oid, tgtype int2, tgenabled char, \
+tgisinternal bool, tgconstrrelid oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool, tginitdeferred bool, \
+tgnargs int2, tgattr int2vector, tgargs bytea, tgqual pg_node_tree, tgoldtable name, tgnewtable name
 pg_enum/3501/r: oid oid, enumtypid oid, enumsortorder float4, enumlabel name
 pg_description/2609/r: objoid oid, classoid oid, objsubid int4, description text
 pg_shdescription/2396/r: objoid oid, classoid oid, description text
@@ -804,6 +807,91 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     t(s.name),
                     NULL,
                     NULL,
+                    NULL,
+                    NULL,
+                ]);
+            }
+            // User functions and procedures.
+            for f in db.functions.values() {
+                let named = f.arg_names.iter().any(|a| !a.is_empty());
+                out.push(vec![
+                    n(f.oid as i64),
+                    t(f.name.clone()),
+                    n(f.schema as i64),
+                    n(10),
+                    n(if f.language == "sql" { 14 } else { 13000 }),
+                    Value::Float(100.0),
+                    Value::Float(if f.returns_set { 1000.0 } else { 0.0 }),
+                    n(0),
+                    n(0),
+                    ch(if f.procedure { 'p' } else { 'f' }),
+                    b(false),
+                    b(false),
+                    b(f.strict),
+                    b(f.returns_set),
+                    ch(f.volatility),
+                    ch('u'),
+                    n(f.arg_types.len() as i64),
+                    n(f.arg_defaults.iter().filter(|d| d.is_some()).count() as i64),
+                    n(f.ret.oid() as i64),
+                    arr(f.arg_types.iter().map(|a| n(a.oid() as i64)).collect()),
+                    NULL,
+                    NULL,
+                    if named {
+                        arr(f.arg_names.iter().map(|a| t(a.clone())).collect())
+                    } else {
+                        NULL
+                    },
+                    NULL,
+                    NULL,
+                    t(f.body.clone()),
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                ]);
+            }
+        }
+        "pg_trigger" => {
+            for tr in db.triggers.values() {
+                // tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16,
+                // TRUNCATE 32, INSTEAD 64.
+                let mut ty = 0i64;
+                if tr.row {
+                    ty |= 1;
+                }
+                match tr.timing.as_str() {
+                    "BEFORE" => ty |= 2,
+                    "INSTEAD OF" => ty |= 64,
+                    _ => {}
+                }
+                for e in &tr.events {
+                    ty |= match e.as_str() {
+                        "INSERT" => 4,
+                        "DELETE" => 8,
+                        "UPDATE" => 16,
+                        _ => 32,
+                    };
+                }
+                let args: Vec<u8> = tr.args.iter().flat_map(|a| a.bytes().chain([0u8])).collect();
+                out.push(vec![
+                    n(tr.oid as i64),
+                    n(tr.table as i64),
+                    n(0),
+                    t(tr.name.clone()),
+                    n(tr.function as i64),
+                    n(ty),
+                    ch('O'),
+                    b(false),
+                    n(0),
+                    n(0),
+                    n(0),
+                    b(false),
+                    b(false),
+                    n(tr.args.len() as i64),
+                    arr(vec![]),
+                    Value::Bytes(args),
+                    tr.when.clone().map(t).unwrap_or(NULL),
                     NULL,
                     NULL,
                 ]);
