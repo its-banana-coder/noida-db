@@ -2322,7 +2322,13 @@ fn parse_version(v: &str) -> (u32, u32) {
 struct Reference {
     addr: SocketAddr,
     _child: Option<ChildGuard>,
+    // Held for the test's lifetime when the server is shared
+    // (NOIDA_REDIS_REF, as in CI): the tests FLUSHALL it, and cargo runs
+    // them in parallel.
+    _shared: Option<std::sync::MutexGuard<'static, ()>>,
 }
+
+static SHARED_REFERENCE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct ChildGuard(Child);
 
@@ -2336,7 +2342,8 @@ impl Drop for ChildGuard {
 fn reference() -> Option<Reference> {
     if let Ok(addr) = std::env::var("NOIDA_REDIS_REF") {
         let addr = addr.to_socket_addrs().ok()?.next()?;
-        return Some(Reference { addr, _child: None });
+        let lock = SHARED_REFERENCE.lock().unwrap_or_else(|e| e.into_inner());
+        return Some(Reference { addr, _child: None, _shared: Some(lock) });
     }
     let port = TcpListener::bind("127.0.0.1:0").ok()?.local_addr().ok()?.port();
     let child = Command::new("redis-server")
@@ -2354,7 +2361,7 @@ fn reference() -> Option<Reference> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Some(Reference { addr, _child: Some(guard) })
+    Some(Reference { addr, _child: Some(guard), _shared: None })
 }
 
 fn server_version(c: &mut RawClient) -> (u32, u32) {
@@ -2465,8 +2472,7 @@ fn replies_match_real_redis() {
     }
     // HyperLogLog: generated scripts (too many elements to list by hand),
     // compared reply for reply, including the raw bytes of the stored string.
-    // They run here, in sequence with the rest, because the parallel tests
-    // FLUSHALL the shared CI server.
+    // They run here, in sequence with the rest.
     let mut generated = 0;
     for (name, cmds) in hll_scripts() {
         if name.starts_with("@7.0 ") && version < (7, 0) {
