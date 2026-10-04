@@ -149,7 +149,7 @@ Postgres's server already disabled Nagle's algorithm (`TCP_NODELAY`) on
 every connection; MySQL's never did, so its two-syscall-per-packet wire
 protocol stalled on the client's ~40ms delayed-ACK timer on every single
 response. Fixed, and applied to every other service that was missing it
-too (Kafka, Elasticsearch, RabbitMQ, MongoDB, ClickHouse).
+too (Kafka, Elasticsearch, MongoDB, ClickHouse).
 
 </details>
 

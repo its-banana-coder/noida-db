@@ -182,10 +182,6 @@ Every service is its own module:
 - **Out of scope (for now):** distributed tables, dictionaries, the native TCP
   protocol, the long tail of functions.
 
-### Memcached (port 11211)
-- **In scope:** the text and binary protocols, every command, including
-  `meta` commands; `stats` returns minimal counters.
-
 ### MongoDB (port 27017)
 - **In scope:**
   - The OP_MSG wire protocol and handshake (`hello`), SCRAM auth.
@@ -196,15 +192,6 @@ Every service is its own module:
   replica set so transactions and change streams work), `$where` and
   server-side JavaScript.
 
-### RabbitMQ (port 5672, management HTTP 15672)
-- **In scope:**
-  - AMQP 0-9-1 in full: exchanges (direct, fanout, topic, headers),
-    queues, bindings, acks and nacks, prefetch, TTLs, dead-lettering,
-    publisher confirms.
-  - The parts of the management HTTP API that tools and Spring AMQP use.
-- **Out of scope:** clustering, federation and shovel, plugins, streams,
-  MQTT and STOMP.
-
 ## Build order
 
 1. Redis
@@ -213,6 +200,4 @@ Every service is its own module:
 4. MySQL
 5. Elasticsearch
 6. ClickHouse
-7. Memcached (small; can come earlier since it reuses Redis storage)
-8. MongoDB
-9. RabbitMQ
+7. MongoDB
