@@ -190,7 +190,7 @@ fn memory_malloc_stats(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
 
 /// A rough size in bytes: enough for tools to rank keys, not an exact
 /// figure (noida-db's memory layout is not Redis's).
-fn estimate(key: &[u8], entry: &Entry) -> i64 {
+pub(crate) fn estimate(key: &[u8], entry: &Entry) -> i64 {
     let value = match &entry.data {
         Data::Str(s) => s.len() + 16,
         Data::Hash(h) => 64 + h.map.iter().map(|(k, v)| k.len() + v.len() + 16).sum::<usize>(),

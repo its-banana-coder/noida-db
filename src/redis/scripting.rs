@@ -63,6 +63,7 @@ end
 /// gives no position when the caller is `pcall`, as in Redis.
 const WRAP_LIB_ERRORS: &str = r#"
 local pcall, tostring, error, type, select, unpack = pcall, tostring, error, type, select, unpack
+local getinfo = debug.getinfo
 local function pack(...) return {n = select('#', ...), ...} end
 return function (lib)
   for name, f in pairs(lib) do
@@ -72,6 +73,10 @@ return function (lib)
         if r[1] then return unpack(r, 2, r.n) end
         local e = tostring(r[2])
         e = e:match('^runtime error: (.-)\nstack traceback:') or e:match('^runtime error: (.*)$') or e
+        -- luaL_argerror names the function as its caller wrote it ('?'
+        -- when that's unknown, e.g. through pcall).
+        local called = getinfo(1, 'n').name or '?'
+        e = e:gsub("^(bad argument #%d+ to ')[^']*(')", '%1' .. called:gsub('%%', '%%%%') .. '%2')
         -- Not a tail call, so level 2 is the script (or pcall) that called us.
         error(e, 2)
       end
@@ -90,15 +95,17 @@ local rawcall, dbg = ...
 -- call into this Lua wrapper), so the stack no longer says where the script
 -- was. Redis's C implementation keeps the frame, so track the running line
 -- of the script with a line hook and use it for that case.
-local script_line = -1
+local script_line, script_source = -1, '@user_script'
 dbg.sethook(function (_, line)
   local i = dbg.getinfo(2, 'S')
-  if i and i.source == '@user_script' then script_line = line end
+  if i and (i.source == '@user_script' or i.source == '@user_function') then
+    script_line = line; script_source = i.source
+  end
 end, 'l')
 local function locate(r)
   local i = dbg.getinfo(3, 'nSl')
   if i and i.what == 'tail' then
-    r.source = '@user_script'; r.line = script_line
+    r.source = script_source; r.line = script_line
   elseif i then
     r.source = i.source; r.line = i.currentline
   end
@@ -132,6 +139,8 @@ setmetatable(_G, {
 #[derive(Default)]
 pub struct Scripts {
     pub cache: std::collections::HashMap<String, Vec<u8>>,
+    /// FUNCTION libraries, in load order.
+    pub libraries: Vec<super::functions::Library>,
 }
 
 impl Engine {
@@ -432,6 +441,8 @@ fn build_env(
     let wrap: mlua::Function = lua.load(WRAP_LIB_ERRORS).set_name("@wrap_lib").call(())?;
     globals.raw_set("cjson", wrap.call::<Table>(super::cjson::table(lua)?)?)?;
     globals.raw_set("cmsgpack", wrap.call::<Table>(super::cmsgpack::table(lua)?)?)?;
+    globals.raw_set("bit", wrap.call::<Table>(super::luabit::bit_table(lua)?)?)?;
+    globals.raw_set("struct", wrap.call::<Table>(super::luabit::struct_table(lua)?)?)?;
 
     // Globals Redis doesn't expose to scripts.
     for name in ["print", "dofile", "loadfile", "os", "io", "package", "require", "module"] {
@@ -660,6 +671,247 @@ fn number_arg(n: f64) -> String {
         return i.to_string();
     }
     super::double::d2string(n)
+}
+
+// ---- functions (FUNCTION LOAD / FCALL) ----
+
+/// A library's code without its `#!lua ...` metadata line (kept as an
+/// empty line, so line numbers in errors stay the same as Redis's).
+fn library_body(code: &[u8]) -> Vec<u8> {
+    match code.iter().position(|&b| b == b'\n') {
+        Some(i) if code.starts_with(b"#!") => code[i..].to_vec(),
+        None if code.starts_with(b"#!") => vec![],
+        _ => code.to_vec(),
+    }
+}
+
+/// The message at the root of a Lua error (a Rust callback's own message,
+/// without mlua's traceback).
+fn root_message(e: &mlua::Error) -> String {
+    match e {
+        mlua::Error::CallbackError { cause, .. } => root_message(cause),
+        mlua::Error::RuntimeError(m) => first_line(m.trim_start_matches("runtime error: ")),
+        mlua::Error::SyntaxError { message, .. } => first_line(message),
+        other => first_line(&other.to_string()),
+    }
+}
+
+/// `redis.register_function(name, callback)` or `({function_name=,
+/// callback=, flags=, description=})`: the name, callback and metadata, with
+/// Redis's validation messages.
+fn registration(
+    args: &Variadic<Lv>,
+) -> mlua::Result<(String, mlua::Function, super::functions::FunctionMeta)> {
+    let err = |m: &str| Err(mlua::Error::RuntimeError(m.to_string()));
+    let (name, cb, flags, desc) = match args.as_slice() {
+        [Lv::Table(t)] => {
+            let (mut name, mut cb, mut flags, mut desc) = (Lv::Nil, Lv::Nil, Lv::Nil, Lv::Nil);
+            for pair in t.pairs::<Lv, Lv>() {
+                let (k, v) = pair?;
+                let key = match &k {
+                    Lv::String(s) => s.to_string_lossy().to_string(),
+                    _ => {
+                        return err(
+                            "named argument key given to redis.register_function is not a string",
+                        );
+                    }
+                };
+                match key.as_str() {
+                    "function_name" => name = v,
+                    "callback" => cb = v,
+                    "flags" => flags = v,
+                    "description" => desc = v,
+                    _ => return err("unknown argument given to redis.register_function"),
+                }
+            }
+            (name, cb, flags, desc)
+        }
+        [name, cb] => (name.clone(), cb.clone(), Lv::Nil, Lv::Nil),
+        [_] => {
+            return err(
+                "calling redis.register_function with a single argument is only applicable to Lua table (representing named arguments).",
+            );
+        }
+        _ => return err("wrong number of arguments to redis.register_function"),
+    };
+    let Lv::String(name) = name else {
+        return err("function_name argument given to redis.register_function must be a string");
+    };
+    let Lv::Function(cb) = cb else {
+        return err("callback argument given to redis.register_function must be a function");
+    };
+    let description = match desc {
+        Lv::Nil => None,
+        Lv::String(s) => Some(s.to_string_lossy().to_string()),
+        _ => return err("description argument given to redis.register_function must be a string"),
+    };
+    let mut fl = vec![];
+    match flags {
+        Lv::Nil => {}
+        Lv::Table(t) => {
+            for v in t.sequence_values::<Lv>() {
+                let Lv::String(f) = v? else { return err("unknown flag given") };
+                let f = f.to_string_lossy().to_string();
+                if !super::functions::FLAGS.contains(&f.as_str()) {
+                    return err("unknown flag given");
+                }
+                fl.push(f);
+            }
+        }
+        _ => {
+            return err(
+                "flags argument to redis.register_function must be a table representing function flags",
+            );
+        }
+    }
+    let name = name.to_string_lossy().to_string();
+    // (Redis reports a bad function name with its library-name message.)
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return err(
+            "Library names can only contain letters, numbers, or underscores(_) and must be at least one character long",
+        );
+    }
+    Ok((name.clone(), cb, super::functions::FunctionMeta { name, description, flags: fl }))
+}
+
+/// Runs a library's code in Redis's load environment (only
+/// `redis.register_function`, `redis.log` and the version constants) and
+/// returns the functions it registers.
+pub fn library_functions(code: &[u8]) -> Result<Vec<super::functions::FunctionMeta>, Value> {
+    let lua = new_lua();
+    let body = library_body(code);
+    let f = lua.load(&body).set_name("@user_function").into_function().map_err(|e| {
+        let msg = lua_error_message(&e);
+        let msg =
+            msg.rsplit_once("]:").map_or(msg.clone(), |(_, rest)| format!("user_function:{rest}"));
+        Value::err(format!("ERR Error compiling function: {}", first_line(&msg)))
+    })?;
+    let registered: RefCell<Vec<super::functions::FunctionMeta>> = RefCell::new(vec![]);
+    let res: mlua::Result<()> = lua.scope(|scope| {
+        let globals = lua.globals();
+        let redis = lua.create_table()?;
+        redis.raw_set(
+            "register_function",
+            scope.create_function(|_, args: Variadic<Lv>| {
+                let (name, _, meta) = registration(&args)?;
+                let mut r = registered.borrow_mut();
+                if r.iter().any(|m| m.name == name) {
+                    return Err(mlua::Error::RuntimeError(
+                        "Function already exists in the library".into(),
+                    ));
+                }
+                r.push(meta);
+                Ok(())
+            })?,
+        )?;
+        redis.raw_set("log", lua.create_function(|_, _: Variadic<Lv>| Ok(()))?)?;
+        for (name, level) in
+            [("LOG_DEBUG", 0), ("LOG_VERBOSE", 1), ("LOG_NOTICE", 2), ("LOG_WARNING", 3)]
+        {
+            redis.raw_set(name, level)?;
+        }
+        redis.raw_set("REDIS_VERSION", REDIS_VERSION)?;
+        let v: Vec<u32> = REDIS_VERSION.split('.').filter_map(|p| p.parse().ok()).collect();
+        redis.raw_set("REDIS_VERSION_NUM", ((v[0] << 16) | (v[1] << 8) | v[2]) as i64)?;
+        globals.raw_set("redis", &redis)?;
+        globals.raw_set("server", &redis)?;
+        let wrap: mlua::Function = lua.load(WRAP_LIB_ERRORS).set_name("@wrap_lib").call(())?;
+        globals.raw_set("cjson", wrap.call::<Table>(super::cjson::table(&lua)?)?)?;
+        globals.raw_set("cmsgpack", wrap.call::<Table>(super::cmsgpack::table(&lua)?)?)?;
+        globals.raw_set("bit", wrap.call::<Table>(super::luabit::bit_table(&lua)?)?)?;
+        globals.raw_set("struct", wrap.call::<Table>(super::luabit::struct_table(&lua)?)?)?;
+        for name in
+            ["print", "dofile", "loadfile", "os", "io", "package", "require", "module", "debug"]
+        {
+            globals.raw_set(name, Lv::Nil)?;
+        }
+        // Reading anything else (`redis.call`, an unknown global) fails.
+        lua.load(PROTECT_GLOBALS).set_name("@protect").exec()?;
+        lua.load("setmetatable(redis, getmetatable(_G))").set_name("@protect").exec()?;
+        f.call::<()>(())
+    });
+    if let Err(e) = res {
+        return Err(Value::err(format!(
+            "ERR Error registering functions: ERR {}",
+            root_message(&e)
+        )));
+    }
+    Ok(registered.into_inner())
+}
+
+/// FCALL: runs function `fname` of the library `code` with `keys` and
+/// `args` (its two arguments), in the sandbox EVAL uses.
+pub fn run_function(
+    ctx: &mut Ctx,
+    code: &[u8],
+    fname: &str,
+    keys: &[Vec<u8>],
+    args: &[Vec<u8>],
+    read_only: bool,
+) -> Result<Value, Value> {
+    let lua = new_lua();
+    let resp = RefCell::new(2u8);
+    let out: Result<Value, Value> = {
+        let ctx_cell = RefCell::new(ctx);
+        lua.scope(|scope| {
+            let rawcall = scope.create_function(|lua, args: Variadic<Lv>| -> mlua::Result<Lv> {
+                let mut c = ctx_cell.borrow_mut();
+                let resp = *resp.borrow();
+                Ok(do_call(lua, &mut c, args, read_only, resp))
+            })?;
+            let setresp = scope.create_function(|_, v: f64| -> mlua::Result<()> {
+                if v != 2.0 && v != 3.0 {
+                    return Err(script_error("RESP version must be 2 or 3."));
+                }
+                *resp.borrow_mut() = v as u8;
+                Ok(())
+            })?;
+            build_env(&lua, rawcall, setresp, &[], &[])?;
+            let globals = lua.globals();
+            // Functions get their keys and arguments as parameters only.
+            globals.raw_set("KEYS", Lv::Nil)?;
+            globals.raw_set("ARGV", Lv::Nil)?;
+            let redis: Table = globals.raw_get("redis")?;
+            let fns = lua.create_table()?;
+            let fns2 = fns.clone();
+            redis.raw_set(
+                "register_function",
+                lua.create_function(move |_, args: Variadic<Lv>| {
+                    let (name, cb, _) = registration(&args)?;
+                    fns2.raw_set(name, cb)
+                })?,
+            )?;
+            let body = library_body(code);
+            let chunk = match lua.load(&body).set_name("@user_function").into_function() {
+                Ok(f) => f,
+                Err(e) => return Ok(Err(Value::err(format!("ERR {}", root_message(&e))))),
+            };
+            chunk.call::<()>(())?;
+            // At run time `redis.register_function` doesn't exist.
+            redis.raw_set("register_function", Lv::Nil)?;
+            let callback: mlua::Function = fns.raw_get(fname)?;
+            let handler: mlua::Function = lua.load(ERR_HANDLER).set_name("@err_handler").call(())?;
+            globals.raw_set("debug", Lv::Nil)?;
+            lua.load(PROTECT_GLOBALS).set_name("@protect").exec()?;
+            // Lua 5.1's xpcall passes no arguments: close over them.
+            let call: mlua::Function = lua
+                .load("local f, k, a = ...; return function() return f(k, a) end")
+                .set_name("@fcall")
+                .call((callback, string_array(&lua, keys)?, string_array(&lua, args)?))?;
+            let xpcall: mlua::Function = globals.raw_get("xpcall")?;
+            let res: MultiValue = xpcall.call((call, handler))?;
+            let mut it = res.into_iter();
+            let ok = matches!(it.next(), Some(Lv::Boolean(true)));
+            let value = it.next().unwrap_or(Lv::Nil);
+            if ok {
+                Ok(Ok(lua_to_reply(&value, *resp.borrow())))
+            } else {
+                Ok(Err(script_failure(&value, fname)))
+            }
+        })
+        .map_err(|e| Value::err(format!("ERR {}", root_message(&e))))?
+    };
+    out
 }
 
 #[cfg(test)]

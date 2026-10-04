@@ -62,14 +62,25 @@ pub fn spawn_persistent_for_test(
     {
         engine.dbs = dbs;
     }
+    // FUNCTION libraries persist too, as in Redis (a separate file, so a
+    // snapshot from before functions existed still loads).
+    let fn_path = data_dir.join("redis-functions.json");
+    if let Ok(bytes) = std::fs::read(&fn_path)
+        && let Ok(libs) = serde_json::from_slice::<Vec<super::functions::Library>>(&bytes)
+    {
+        engine.scripts.libraries = libs;
+    }
     let engine = Arc::new(Shared { engine: Mutex::new(engine), replies: Condvar::new() });
 
     let save_shared = engine.clone();
     let save_path = path.clone();
     let save = move || {
-        let dbs = &save_shared.engine.lock().unwrap().dbs;
-        if let Ok(bytes) = serde_json::to_vec(dbs) {
+        let engine = save_shared.engine.lock().unwrap();
+        if let Ok(bytes) = serde_json::to_vec(&engine.dbs) {
             let _ = crate::persistence::write_snapshot_atomically(&save_path, &bytes);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&engine.scripts.libraries) {
+            let _ = crate::persistence::write_snapshot_atomically(&fn_path, &bytes);
         }
     };
 

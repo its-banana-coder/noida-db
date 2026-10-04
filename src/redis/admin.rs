@@ -313,11 +313,18 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         add(
             "Memory",
             vec![
-                f("used_memory", "0".into()),
-                f("used_memory_human", "0B".into()),
-                f("maxmemory", "0".into()),
-                f("maxmemory_human", "0B".into()),
-                f("maxmemory_policy", "noeviction".into()),
+                f("used_memory", ctx.engine.used_memory().to_string()),
+                f("used_memory_human", human_bytes(ctx.engine.used_memory())),
+                f("maxmemory", ctx.engine.config_num("maxmemory").to_string()),
+                f("maxmemory_human", human_bytes(ctx.engine.config_num("maxmemory").max(0) as u64)),
+                f(
+                    "maxmemory_policy",
+                    ctx.engine
+                        .config
+                        .get("maxmemory-policy")
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "noeviction".into()),
+                ),
                 f("mem_allocator", "libc".into()),
             ],
         );
@@ -348,7 +355,7 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 f("instantaneous_ops_per_sec", "0".into()),
                 f("rejected_connections", "0".into()),
                 f("expired_keys", "0".into()),
-                f("evicted_keys", "0".into()),
+                f("evicted_keys", ctx.engine.evicted_keys.to_string()),
                 f("keyspace_hits", "0".into()),
                 f("keyspace_misses", "0".into()),
                 f("pubsub_channels", ctx.engine.pubsub.counts().0.to_string()),
@@ -408,4 +415,18 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         add("Keyspace", fields);
     }
     Ok(Value::Verbatim("txt", sections.join("\r\n").into_bytes()))
+}
+
+/// `bytesToHuman`: 1.50K, 2.00M, ...
+fn human_bytes(n: u64) -> String {
+    let n = n as f64;
+    if n < 1024.0 {
+        format!("{n}B")
+    } else if n < 1024.0 * 1024.0 {
+        format!("{:.2}K", n / 1024.0)
+    } else if n < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.2}M", n / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2}G", n / 1024.0 / 1024.0 / 1024.0)
+    }
 }

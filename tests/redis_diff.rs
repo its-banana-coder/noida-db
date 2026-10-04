@@ -2033,6 +2033,78 @@ const SCRIPTS: &[((u32, u32), &[&str])] = &[
             "=3 XREADGROUP GROUP g carol BLOCK 10 STREAMS s >",
         ],
     ),
+    // Lua's bit and struct libraries.
+    (
+        (6, 0),
+        &[
+            "EVAL return{bit.band(12,10),bit.bor(1,2,4),bit.bxor(5,3),bit.bnot(0),bit.lshift(1,31),bit.rshift(-1,28),bit.arshift(-256,4),bit.rol(1,33),bit.ror(1,1),bit.tobit(4294967295)} 0",
+            "EVAL return{bit.tohex(255),bit.tohex(-1,-4),bit.tohex(0x12345678,2),bit.bswap(0x12345678)} 0",
+            "EVAL return(struct.pack('>I2HbB',258,65535,-1,255)) 0",
+            "EVAL return{struct.unpack('<i2Hd',struct.pack('<i2Hd',-2,513,1.5))} 0",
+            "EVAL return{struct.unpack('s\tc3\tB',struct.pack('s\tc3\tB','hi','abcdef',7))} 0",
+            "EVAL return{struct.unpack('I1c0',struct.pack('I1c0',3,'xyz'))} 0",
+            "EVAL return(struct.size('>!4bi')) 0",
+            "EVAL local\tok,e=pcall(struct.unpack,'i','ab')\treturn\te 0",
+        ],
+    ),
+    // Functions.
+    (
+        (7, 0),
+        &[
+            "FUNCTION FLUSH",
+            "FUNCTION LOAD #!lua\tname=dl\nredis.register_function('dfa',function(keys,args)return\tredis.call('INCRBY',keys[1],args[1])end)\nredis.register_function{function_name='dfr',callback=function(keys)return\tredis.call('GET',keys[1])end,flags={'no-writes'}}",
+            "FCALL dfa 1 cnt 5",
+            "FCALL_RO dfr 1 cnt",
+            "FCALL_RO dfa 1 cnt 1",
+            "FCALL nosuch 0",
+            "FUNCTION LOAD #!lua\tname=dl\nredis.register_function('x',function()return\t1\tend)",
+            "FUNCTION LOAD #!lua\tname=d2\nredis.register_function('dfa',function()return\t1\tend)",
+            "FUNCTION LOAD #!lua\nreturn\t1",
+            "FUNCTION LOAD #!lua\tname=d3\nlocal\tx=1",
+            "FUNCTION LOAD #!lua\tname=d4\nredis.call('GET','a')",
+            "FUNCTION LOAD #!lua\tname=d5\nredis.register_function{function_name='f',callback=function()end,flags={'bogus'}}",
+            "FUNCTION LOAD REPLACE #!lua\tname=dl\nredis.register_function('dfa',function()return\t42\tend)",
+            "FCALL dfa 0",
+            "FCALL dfr 1 cnt",
+            "FUNCTION STATS",
+            "FUNCTION DELETE dl",
+            "FUNCTION DELETE dl",
+            "FUNCTION KILL",
+            "FUNCTION FLUSH",
+        ],
+    ),
+    // Keyspace events of moves, pops, range removals and multi-key writes.
+    (
+        (7, 0),
+        &[
+            "CONFIG SET notify-keyspace-events KEA",
+            "&1 PSUBSCRIBE __keyevent@0__:*",
+            "<1",
+            "MSET ka 1 kb 2",
+            "<1",
+            "<1",
+            "SET kc v EX 100",
+            "<1",
+            "<1",
+            "GETEX kc PERSIST",
+            "<1",
+            "RPUSH kl a b",
+            "<1",
+            "LMOVE kl kl2 LEFT RIGHT",
+            "<1",
+            "<1",
+            "ZADD kz 1 a 2 b 3 c",
+            "<1",
+            "ZPOPMIN kz",
+            "<1",
+            "ZREMRANGEBYSCORE kz 2 2",
+            "<1",
+            "DEL kz ka nosuch",
+            "<1",
+            "<1",
+            "CONFIG SET notify-keyspace-events \"\"",
+        ],
+    ),
     // Lua scripting. Scripts have no spaces (the harness splits on them);
     // `\t` and `\n` stand in where Lua needs a separator.
     (
@@ -2683,4 +2755,99 @@ fn hll_scripts() -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
         ],
     ));
     out
+}
+
+/// DUMP payloads cross between real Redis and noida-db in both directions
+/// (Redis writes compact encodings noida-db must read; noida-db writes
+/// plain ones Redis must accept), and FUNCTION libraries do too.
+#[test]
+fn dump_restore_and_functions_cross_real_redis() {
+    let Some(reference) = reference() else {
+        eprintln!("SKIPPED: no reference Redis (set NOIDA_REDIS_REF or install redis-server)");
+        return;
+    };
+    let mut real = RawClient::connect(reference.addr);
+    let mut ours = RawClient::connect(common::start_noida_redis());
+    if server_version(&mut real) < (7, 0) {
+        eprintln!("SKIPPED: FUNCTION needs Redis 7.0");
+        return;
+    }
+    let long = "x".repeat(300);
+    let many: Vec<String> = (0..300).map(|i| format!("item{i}")).collect();
+    let mut setup: Vec<Vec<String>> = vec![
+        vec!["SET".into(), "s_int".into(), "12345".into()],
+        vec!["SET".into(), "s_long".into(), long],
+        vec!["RPUSH".into(), "l_small".into(), "a".into(), "-5".into(), "70000".into()],
+        vec!["SADD".into(), "set_int".into(), "1".into(), "300".into(), "-40000".into()],
+        vec!["SADD".into(), "set_lp".into(), "a".into(), "b".into()],
+        vec!["ZADD".into(), "z_lp".into(), "1.5".into(), "a".into(), "-2".into(), "b".into()],
+        vec!["HSET".into(), "h_lp".into(), "f1".into(), "v1".into(), "f2".into(), "2".into()],
+    ];
+    let mut big_list = vec!["RPUSH".to_string(), "l_big".to_string()];
+    big_list.extend(many.iter().cloned());
+    setup.push(big_list);
+    let mut big_hash = vec!["HSET".to_string(), "h_big".to_string()];
+    for m in &many {
+        big_hash.push(m.clone());
+        big_hash.push(m.clone());
+    }
+    setup.push(big_hash);
+    for c in [&mut real, &mut ours] {
+        c.run("FLUSHALL");
+        c.run("FUNCTION FLUSH");
+        for cmd in &setup {
+            let args: Vec<&[u8]> = cmd.iter().map(|s| s.as_bytes()).collect();
+            c.cmd(&args);
+        }
+    }
+    let keys =
+        ["s_int", "s_long", "l_small", "l_big", "set_int", "set_lp", "z_lp", "h_lp", "h_big"];
+    let read = |c: &mut RawClient, k: &str| -> String {
+        let t = match c.run(&format!("TYPE {k}")) {
+            Value::Simple(t) => t,
+            other => panic!("{other:?}"),
+        };
+        let cmd = match t.as_str() {
+            "string" => format!("GET {k}"),
+            "list" => format!("LRANGE {k} 0 -1"),
+            "set" => format!("SORT {k} ALPHA"),
+            "zset" => format!("ZRANGE {k} 0 -1 WITHSCORES"),
+            "hash" => format!("HGETALL {k}"),
+            other => panic!("{other}"),
+        };
+        let mut v = format!("{:?}", c.run(&cmd));
+        if t == "hash" {
+            // Field order isn't defined.
+            let Value::Array(items) = c.run(&cmd) else { panic!() };
+            let mut pairs: Vec<String> = items.chunks(2).map(|p| format!("{p:?}")).collect();
+            pairs.sort();
+            v = pairs.join(",");
+        }
+        v
+    };
+    for (from_real, label) in [(true, "real -> noida"), (false, "noida -> real")] {
+        for k in keys {
+            let (src, dst): (&mut RawClient, &mut RawClient) =
+                if from_real { (&mut real, &mut ours) } else { (&mut ours, &mut real) };
+            let Value::Bulk(payload) = src.cmd(&[b"DUMP", k.as_bytes()]) else {
+                panic!("DUMP {k}")
+            };
+            let target = format!("{k}:copy");
+            let r = dst.cmd(&[b"RESTORE", target.as_bytes(), b"0", &payload, b"REPLACE"]);
+            assert_eq!(r, Value::Simple("OK".into()), "{label}: RESTORE {k}");
+            let (want, got) = (read(src, k), read(dst, &target));
+            assert_eq!(want, got, "{label}: {k}");
+        }
+    }
+    // FUNCTION DUMP / RESTORE across servers.
+    let lib = b"#!lua name=crosslib\nredis.register_function('crossf', function(keys, args) return args[1] end)";
+    assert_eq!(real.cmd(&[b"FUNCTION", b"LOAD", lib]), Value::Bulk(b"crosslib".to_vec()));
+    let Value::Bulk(payload) = real.run("FUNCTION DUMP") else { panic!() };
+    assert_eq!(ours.cmd(&[b"FUNCTION", b"RESTORE", &payload]), Value::Simple("OK".into()));
+    assert_eq!(ours.run("FCALL crossf 0 hello"), Value::Bulk(b"hello".to_vec()));
+    let Value::Bulk(payload) = ours.run("FUNCTION DUMP") else { panic!() };
+    real.run("FUNCTION FLUSH");
+    assert_eq!(real.cmd(&[b"FUNCTION", b"RESTORE", &payload]), Value::Simple("OK".into()));
+    assert_eq!(real.run("FCALL crossf 0 back"), Value::Bulk(b"back".to_vec()));
+    real.run("FUNCTION FLUSH");
 }

@@ -682,6 +682,14 @@ fn zremrange(ctx: &mut Ctx, a: &[Vec<u8>], kind: RangeType) -> Reply {
     for m in &victims {
         z.remove(m);
     }
+    if !victims.is_empty() {
+        let event = match kind {
+            RangeType::Score => "zremrangebyscore",
+            RangeType::Lex => "zremrangebylex",
+            _ => "zremrangebyrank",
+        };
+        ctx.notify_keyspace_event('z', event, &a[1]);
+    }
     ctx.drop_if_empty(&a[1]);
     Ok(Value::Integer(victims.len() as i64))
 }
@@ -729,6 +737,9 @@ fn pop_from(
             let item = item.expect("non-empty");
             z.scores.remove(&item.1);
             popped.push(item);
+        }
+        if n > 0 {
+            ctx.notify_keyspace_event('z', if max { "zpopmax" } else { "zpopmin" }, key);
         }
         ctx.drop_if_empty(key);
         let pairs = |items: &[(f64, Vec<u8>)]| {

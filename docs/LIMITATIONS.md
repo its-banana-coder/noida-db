@@ -44,11 +44,11 @@ Storage is now persistent (on-disk) and is saved to
 no incremental autosave -- see `src/persistence.rs`. All 16 logical
 databases, every key's value (strings, hashes, lists, sets, sorted sets,
 streams including consumer groups) and its expiry survive a clean
-restart; `DUMP`/`RESTORE`/real RDB/AOF file compatibility is still out
-of scope (see below).
+restart; real RDB/AOF *files* aren't written or read (a value's RDB
+serialization is, through `DUMP`/`RESTORE`).
 
 Target: Redis 7.2 behaviour, RESP2 and RESP3. Of Redis 7.2's 242 commands,
-217 are implemented, 22 are out of scope (below) and 3 are not built yet (as of
+222 are implemented and 20 are out of scope (below), so none in scope are left (as of
 this writing; `cargo test --test redis_coverage -- --nocapture` prints the
 current count).
 
@@ -56,7 +56,7 @@ current count).
 
 | Commands | Why |
 |---|---|
-| `DUMP` `RESTORE` `RESTORE-ASKING` `MIGRATE` | RDB payloads and key migration are production tooling |
+| `RESTORE-ASKING` `MIGRATE` | key migration between servers is production tooling |
 | `PSYNC` `SYNC` `REPLCONF` `REPLICAOF` `SLAVEOF` `ROLE` `WAIT` `WAITAOF` `FAILOVER` | replication |
 | `SENTINEL` | sentinel |
 | `CLUSTER` `ASKING` `READONLY` `READWRITE` | clustering |
@@ -66,38 +66,16 @@ current count).
 
 **Not yet**
 
-- `FUNCTION` `FCALL` `FCALL_RO` (Redis Functions). `EVAL`/`EVALSHA`/`SCRIPT`
-  work.
-- Keyspace notifications: `notify-keyspace-events` is enforced and
-  `__keyspace@*__` / `__keyevent@*__` messages are published for generic
-  events (key `del`, `expired`, `expire`, `persist`, `rename_from`/
-  `rename_to`, `move_from`/`move_to`, `copy_to`), streams (`xadd`/`xtrim`/
-  `xdel`/`xsetid`/`xclaim`/`xautoclaim`/`xgroup-*`), the HyperLogLog commands
-  (`pfadd`/`pfmerge`), and ordinary string/hash/list/set/zset mutations
-  (`set`/`setnx`/`setex`/`psetex`/`getset`/`getdel`/`append`/`setrange`/
-  `setbit`/`incr`/`decr`/`incrby`/`decrby`/`incrbyfloat`, `hset`/`hmset`/
-  `hsetnx`/`hdel`/`hincrby`/`hincrbyfloat`, `lpush`/`rpush`/`lpushx`/
-  `rpushx`/`lpop`/`rpop`/`lset`/`lrem`/`linsert`/`ltrim`, `sadd`/`srem`/
-  `spop`/`smove` (as `srem`+`sadd`, matching real Redis)/`sinterstore`/
-  `sunionstore`/`sdiffstore`, `zadd`/`zincrby` (as `zincr`, matching real
-  Redis)/`zrem`/`zinterstore`/`zunionstore`/`zdiffstore`/`zrangestore`, and
-  the generic `expire`/`pexpire`/`expireat`/`pexpireat`/`persist`/`rename`/
-  `renamenx`/`move`/`copy` commands. Not yet wired: `GETEX`/`MSET`/`MSETNX`/
-  `ZREMRANGEBYRANK`/`ZREMRANGEBYSCORE`/`ZREMRANGEBYLEX`/`ZPOPMIN`/`ZPOPMAX`/
-  `LMOVE`/`RPOPLPUSH`/`LMPOP`/`ZMPOP` and the blocking variants of the
-  list/zset pop and move commands - those still don't emit events even
-  though their event-type flags are accepted by `CONFIG SET`.
-- `maxmemory`, eviction policies and the OOM error. The setting is stored; it
-  is not enforced.
-- Lua libraries `struct` and `bit`. `cjson`, `cmsgpack` and the `redis` table
-  are available.
-- Real RDB/AOF file format compatibility (`DUMP`/`RESTORE`, a real RDB
-  file another Redis could load) — see the persistence paragraph above:
-  data survives a clean restart via this project's own on-disk JSON
-  snapshot format, not Redis's actual binary formats.
+- `DUMP` of a stream (an error); `FUNCTION DUMP`'s other library metadata
+  beyond the code.
 
 **Differs**
 
+- Eviction (`maxmemory` with a policy) is exact: LRU evicts the least
+  recently used key and LFU the least used, where Redis samples
+  (`maxmemory-samples`) and uses a 1-second LRU clock, so it may evict a
+  different key. Memory use is an estimate (a fixed base plus each key's
+  approximate size), not Redis's allocator figure.
 - `SLOWLOG` and `LATENCY` are always empty. `MEMORY USAGE`/`MEMORY STATS`
   report estimates, not Redis's exact byte counts. `INFO` counters that only
   matter for performance analysis are zero.

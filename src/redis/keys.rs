@@ -29,6 +29,8 @@ pub static COMMANDS: &[Command] = &[
     cmd("rename", rename),
     cmd("renamenx", renamenx),
     cmd("copy", copy),
+    cmd("dump", dump_cmd),
+    cmd("restore", restore),
     cmd("move", move_cmd),
     cmd("dbsize", dbsize),
     cmd("flushdb", flushdb),
@@ -47,8 +49,14 @@ static OBJECT: &[Command] = &[
 
 fn del(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let now = ctx.now;
-    let n = a[1..].iter().filter(|k| ctx.db().remove(k, now).is_some()).count();
-    Ok(Value::Integer(n as i64))
+    let mut n = 0;
+    for k in &a[1..] {
+        if ctx.db().remove(k, now).is_some() {
+            ctx.notify_keyspace_event('g', "del", k);
+            n += 1;
+        }
+    }
+    Ok(Value::Integer(n))
 }
 
 /// EXISTS and TOUCH: counts keys, repeats included.
@@ -335,6 +343,81 @@ fn copy(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     Ok(Value::Integer(1))
 }
 
+fn dump_cmd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let Some(entry) = ctx.lookup(&a[1]) else { return Ok(Value::Null) };
+    match super::rdb::dump(&entry.data) {
+        Some(p) => Ok(Value::Bulk(p)),
+        None => Err(Value::err("ERR DUMP of streams is not supported by noida-db")),
+    }
+}
+
+/// RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME s] [FREQ f]
+fn restore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let key = &a[1];
+    let ttl = super::engine::int_arg(&a[2])?;
+    let (mut replace, mut absttl, mut idle, mut freq) = (false, false, false, false);
+    let mut i = 4;
+    while i < a.len() {
+        if eq_ic(&a[i], "replace") {
+            replace = true;
+        } else if eq_ic(&a[i], "absttl") {
+            absttl = true;
+        } else if eq_ic(&a[i], "idletime") && i + 1 < a.len() && !freq {
+            if super::engine::int_arg(&a[i + 1])? < 0 {
+                return Err(Value::err("ERR Invalid IDLETIME value, must be >= 0"));
+            }
+            idle = true;
+            i += 1;
+        } else if eq_ic(&a[i], "freq") && i + 1 < a.len() && !idle {
+            let f = super::engine::int_arg(&a[i + 1])?;
+            if !(0..=255).contains(&f) {
+                return Err(Value::err("ERR Invalid FREQ value, must be >= 0 and <= 255"));
+            }
+            freq = true;
+            i += 1;
+        } else {
+            return Err(syntax());
+        }
+        i += 1;
+    }
+    if ttl < 0 {
+        return Err(Value::err("ERR Invalid TTL value, must be >= 0"));
+    }
+    let now = ctx.now;
+    let db = ctx.db_index();
+    let exists = ctx.engine.dbs[db].contains(key, now);
+    if exists && !replace {
+        return Err(Value::err("BUSYKEY Target key name already exists."));
+    }
+    let Some(body) = super::rdb::unseal(&a[3]) else {
+        return Err(Value::err("ERR DUMP payload version or checksum are wrong"));
+    };
+    let Some(data) =
+        super::rdb::load(body, ctx.limits("set"), ctx.limits("zset"), ctx.limits("hash"))
+    else {
+        return Err(Value::err("ERR Bad data format"));
+    };
+    let expires_at = match ttl {
+        0 => None,
+        t if absttl => Some(t as u64),
+        t => Some(now + t as u64),
+    };
+    // An already expired TTL creates nothing (and REPLACE still deletes).
+    if expires_at.is_some_and(|at| at < now) {
+        if exists {
+            ctx.engine.dbs[db].remove(key, now);
+            ctx.engine.notify_keyspace_event_engine(db, 'g', "del", key);
+        }
+        return Ok(Value::ok());
+    }
+    if exists {
+        ctx.engine.dbs[db].remove(key, now);
+    }
+    ctx.engine.dbs[db].insert(key.clone(), super::engine::Entry { data, expires_at });
+    ctx.engine.notify_keyspace_event_engine(db, 'g', "restore", key);
+    Ok(Value::ok())
+}
+
 fn move_cmd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let dst_db = db_arg(&a[2])?;
     if dst_db == ctx.db_index() {
@@ -476,7 +559,14 @@ fn object_refcount(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 }
 
 fn object_idletime(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    Ok(ctx.lookup(&a[2]).map_or(Value::Null, |_| Value::Integer(0)))
+    // OBJECT doesn't count as an access itself.
+    let now = ctx.now;
+    let access = ctx.db().access_of(&a[2]);
+    if ctx.lookup(&a[2]).is_none() {
+        return Ok(Value::Null);
+    }
+    let (last, _) = access.unwrap_or((now, 0));
+    Ok(Value::Integer((now.saturating_sub(last) / 1000) as i64))
 }
 
 const NO_LFU: &str = "ERR An LFU maxmemory policy is not selected, access frequency not tracked. \
@@ -484,8 +574,13 @@ Please note that when switching between policies at runtime LRU and LFU data wil
 to adjust.";
 
 fn object_freq(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let access = ctx.db().access_of(&a[2]);
     if ctx.lookup(&a[2]).is_none() {
         return Ok(Value::Null);
     }
-    Err(Value::err(NO_LFU))
+    let lfu = ctx.engine.config.get("maxmemory-policy").is_some_and(|p| p.ends_with("lfu"));
+    if !lfu {
+        return Err(Value::err(NO_LFU));
+    }
+    Ok(Value::Integer(access.map_or(0, |a| a.1) as i64))
 }
