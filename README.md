@@ -180,6 +180,29 @@ Or download an archive from
 
 Details for each channel: [docs/PACKAGING.md](docs/PACKAGING.md).
 
+## Use it in CI
+
+One step replaces the five service containers:
+
+```yaml
+- uses: its-banana-coder/noida-db@main
+  with:
+    version: "0.1.3"                                       # optional, default: latest
+    services: postgres,mysql,redis,kafka,elasticsearch     # optional, default: all five
+```
+
+It starts noida-db on the standard ports and waits until every port accepts
+connections. Or without the action: `npx noida-db start &`.
+
+Measured on GitHub Actions with the same integration tests
+([`examples/ci-demo`](examples/ci-demo), 3 runs each):
+
+| | Official service containers | noida-db |
+|---|---:|---:|
+| Databases ready | 74–76 s | 4–6 s (including the npm download) |
+| Tests | 5–6 s | ~1 s |
+| Whole job | ~90 s | ~14–23 s |
+
 ## What's next
 
 - **Wider benchmark coverage** — a native long-lived Kafka client for
