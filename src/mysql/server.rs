@@ -167,6 +167,10 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     // afterward (as this project's own test helpers were doing) would ever
     // see a database selected at all, and every other real client would
     // hit "No database selected" on its very first query.
+    // CLIENT_FOUND_ROWS (0x2): UPDATE reports matched rows, not changed.
+    if payload.len() >= 4 {
+        session.engine.found_rows = payload[0] & 0x02 != 0;
+    }
     if let Some(db) = handshake_response_database(&payload) {
         session.engine.use_db(&db);
     }
@@ -368,6 +372,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                         executor.session_insert_id = session.engine.session_insert_id;
                         executor.sql_mode = session.engine.sql_mode.clone();
                         executor.autocommit = session.engine.autocommit;
+                        executor.found_rows = session.engine.found_rows;
                         let names = {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)

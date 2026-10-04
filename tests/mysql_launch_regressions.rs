@@ -679,3 +679,56 @@ async fn drop_database() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// Subqueries, UNION and CTEs, including `?` placeholders inside them over
+/// the binary protocol (parameters are numbered across the whole statement).
+#[tokio::test]
+async fn subqueries_unions_and_ctes_with_parameters() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE c (id INT PRIMARY KEY, city VARCHAR(10))").await.unwrap();
+    c.query_drop("CREATE TABLE o (id INT PRIMARY KEY, cid INT, amount INT)").await.unwrap();
+    c.query_drop("INSERT INTO c VALUES (1,'pune'),(2,'noida'),(3,'noida')").await.unwrap();
+    c.query_drop("INSERT INTO o VALUES (10,1,50),(11,1,70),(12,2,20)").await.unwrap();
+
+    let ids: Vec<i64> = c
+        .exec(
+            "SELECT id FROM c WHERE city = ? AND id IN (SELECT cid FROM o WHERE amount > ?) ORDER BY id",
+            ("noida", 10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids, vec![2]);
+    let totals: Vec<(i64, i64)> = c
+        .exec(
+            "WITH t AS (SELECT cid, SUM(amount) AS s FROM o WHERE amount >= ? GROUP BY cid) \
+             SELECT cid, s FROM t WHERE s > ? ORDER BY cid",
+            (20, 15),
+        )
+        .await
+        .unwrap();
+    assert_eq!(totals, vec![(1, 120), (2, 20)]);
+    let union: Vec<i64> = c
+        .exec(
+            "SELECT id FROM c WHERE id = ? UNION SELECT id FROM o WHERE id = ? ORDER BY 1",
+            (3, 11),
+        )
+        .await
+        .unwrap();
+    assert_eq!(union, vec![3, 11]);
+    let n: Option<i64> = c
+        .exec_first(
+            "WITH RECURSIVE r (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM r WHERE i < ?) \
+             SELECT SUM(i) FROM r",
+            (100,),
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, Some(5050));
+    assert_eq!(err_code(&mut c, "SELECT (SELECT amount FROM o)").await, 1242);
+    assert_eq!(err_code(&mut c, "SELECT * FROM (SELECT id FROM c)").await, 1248);
+    assert_eq!(err_code(&mut c, "SELECT id FROM c UNION SELECT id, cid FROM o").await, 1222);
+    // Not yet implemented: an explicit error, never a wrong answer.
+    assert_eq!(err_code(&mut c, "SELECT id, SUM(id) OVER () FROM c").await, 1235);
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
