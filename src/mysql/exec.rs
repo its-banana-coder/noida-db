@@ -1,7 +1,8 @@
 use crate::mysql::catalog::{Column, ColumnType, DbState, Table, UniqueKey};
+use crate::mysql::catalog::{FkAction, ForeignKey};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{
-    AggFunc, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SetOpKind, SortKey,
+    AggFunc, AlterOp, ArithOp, CmpOp, Expr, InsertMode, JoinOp, Plan, SetOpKind, SortKey,
 };
 use crate::mysql::types::Value;
 use crate::sql::numeric::Numeric;
@@ -56,6 +57,8 @@ pub struct Executor {
     /// The client set `CLIENT_FOUND_ROWS` (Django does): an UPDATE reports
     /// the rows it matched, not only the ones it changed.
     pub found_rows: bool,
+    /// The session's `foreign_key_checks`.
+    pub fk_checks: bool,
     /// A recursive CTE's rows from the previous round, by name, for its
     /// step's `Plan::CteRef`.
     cte_rows: std::collections::HashMap<String, Vec<Vec<Value>>>,
@@ -81,6 +84,7 @@ impl Executor {
             writing: std::cell::Cell::new(false),
             outer: Vec::new(),
             found_rows: false,
+            fk_checks: true,
             cte_rows: std::collections::HashMap::new(),
             win_vals: Default::default(),
             win_row: std::cell::Cell::new(0),
@@ -336,6 +340,356 @@ impl Executor {
         Ok(())
     }
 
+    /// Whether a write to `t` needs foreign-key work: it has foreign keys,
+    /// or another table references it (and checks are on).
+    fn fk_relevant(&self, db: &str, t: &Table) -> bool {
+        self.fk_checks
+            && (!t.foreign_keys.is_empty()
+                || !self.db.lock().unwrap().referencing(db, &t.name).is_empty())
+    }
+
+    /// Stores a written table after its foreign-key work: `check` rows must
+    /// each have their parent row, and `changes` (old row, new row or None
+    /// for deleted) apply ON DELETE / ON UPDATE to the tables referencing it.
+    fn finish_write(
+        &mut self,
+        db: &str,
+        work: Table,
+        changes: Vec<(Vec<Value>, Option<Vec<Value>>)>,
+        check: &[Vec<Value>],
+    ) -> Result<(), MySqlError> {
+        self.check_parents(db, &work, check)?;
+        let mut pending = std::collections::BTreeMap::new();
+        let name = work.name.clone();
+        pending.insert((db.to_string(), name.clone()), work);
+        self.on_parent_change(&mut pending, db, &name, changes, 0)?;
+        for ((d, _), t) in pending {
+            self.store_table(&d, t)?;
+        }
+        Ok(())
+    }
+
+    /// Error 1452 unless every row in `rows` of `t` (a child table) has a
+    /// matching parent row for each of its foreign keys.
+    fn check_parents(&self, db: &str, t: &Table, rows: &[Vec<Value>]) -> Result<(), MySqlError> {
+        if !self.fk_checks || rows.is_empty() {
+            return Ok(());
+        }
+        for fk in &t.foreign_keys {
+            let loaded;
+            let parent = if fk.ref_db == db && fk.ref_table == t.name {
+                t
+            } else {
+                loaded = self.load_table(&fk.ref_db, &fk.ref_table).ok();
+                match &loaded {
+                    Some(p) => p,
+                    None => return Err(child_row_error(db, &t.name, fk)),
+                }
+            };
+            for row in rows {
+                let Some(key) = fk_values(t, row, &fk.columns) else { continue };
+                if key.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                let found = parent.rows.iter().any(|p| {
+                    fk_values(parent, p, &fk.ref_columns).is_some_and(|k| keys_equal(&k, &key))
+                });
+                if !found {
+                    return Err(child_row_error(db, &t.name, fk));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies ON DELETE / ON UPDATE to every table referencing
+    /// `db`.`table` for the parent rows in `changes`, recursively. Tables
+    /// are modified in `pending`, stored by the caller once all succeed.
+    fn on_parent_change(
+        &self,
+        pending: &mut std::collections::BTreeMap<(String, String), Table>,
+        db: &str,
+        table: &str,
+        changes: Vec<(Vec<Value>, Option<Vec<Value>>)>,
+        depth: usize,
+    ) -> Result<(), MySqlError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        if depth > 15 {
+            return Err(MySqlError::new(
+                3008,
+                "HY000",
+                "Foreign key cascade delete/update exceeds max depth of 15.",
+            ));
+        }
+        let refs = self.db.lock().unwrap().referencing(db, table);
+        let parent_shape = pending[&(db.to_string(), table.to_string())].clone();
+        for (cdb, ct, fk) in refs {
+            let key = (cdb.clone(), ct.clone());
+            if !pending.contains_key(&key) {
+                pending.insert(key.clone(), self.load_table(&cdb, &ct)?);
+            }
+            let mut child_changes = Vec::new();
+            for (old, new) in &changes {
+                let Some(old_key) = fk_values(&parent_shape, old, &fk.ref_columns) else {
+                    continue;
+                };
+                if old_key.iter().any(|v| v.is_null()) {
+                    continue;
+                }
+                let new_key = match new {
+                    Some(n) => {
+                        let k = fk_values(&parent_shape, n, &fk.ref_columns).unwrap_or_default();
+                        if keys_equal(&k, &old_key) {
+                            continue;
+                        }
+                        Some(k)
+                    }
+                    None => None,
+                };
+                let child = pending.get_mut(&key).expect("loaded above");
+                let cols: Vec<usize> = fk
+                    .columns
+                    .iter()
+                    .filter_map(|c| resolve_column_index(&child.columns, c))
+                    .collect();
+                let hits: Vec<usize> = (0..child.rows.len())
+                    .filter(|&i| {
+                        fk_values(child, &child.rows[i], &fk.columns)
+                            .is_some_and(|k| keys_equal(&k, &old_key))
+                    })
+                    .collect();
+                if hits.is_empty() {
+                    continue;
+                }
+                let action = if new_key.is_none() { fk.on_delete } else { fk.on_update };
+                match (action, &new_key) {
+                    (FkAction::Restrict | FkAction::NoAction, _) => {
+                        return Err(MySqlError::new(
+                            1451,
+                            "23000",
+                            format!(
+                                "Cannot delete or update a parent row: a foreign key constraint fails ({})",
+                                fk_description(&cdb, &ct, &fk)
+                            ),
+                        ));
+                    }
+                    (FkAction::Cascade, None) => {
+                        let mut keep = vec![true; child.rows.len()];
+                        for &i in &hits {
+                            keep[i] = false;
+                            child_changes.push((child.rows[i].clone(), None));
+                        }
+                        let mut k = keep.iter();
+                        child.rows.retain(|_| *k.next().unwrap());
+                    }
+                    (FkAction::Cascade | FkAction::SetNull, _) => {
+                        for &i in &hits {
+                            let before = child.rows[i].clone();
+                            for (n, &c) in cols.iter().enumerate() {
+                                child.rows[i][c] = match (action, &new_key) {
+                                    (FkAction::Cascade, Some(k)) => k[n].clone(),
+                                    _ => Value::Null,
+                                };
+                            }
+                            child_changes.push((before, Some(child.rows[i].clone())));
+                        }
+                    }
+                }
+            }
+            self.on_parent_change(pending, &cdb, &ct, child_changes, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// What dropping or renaming a column does to foreign keys: a column a
+    /// foreign key uses can't be dropped (1828, or 1829 for a referenced
+    /// one); a renamed column stays in the foreign keys under its new name.
+    fn fk_column_ddl(&self, db: &str, t: &mut Table, op: &AlterOp) -> Result<(), MySqlError> {
+        let (old, new) = match op {
+            AlterOp::DropColumn { name, .. } => (name, None),
+            AlterOp::RenameColumn { old, new } => (old, Some(new)),
+            AlterOp::ReplaceColumn { old, col, .. } if !col.name.eq_ignore_ascii_case(old) => {
+                (old, Some(&col.name))
+            }
+            _ => return Ok(()),
+        };
+        let mut state = self.db.lock().unwrap();
+        let children = state.referencing(db, &t.name);
+        match new {
+            None => {
+                if let Some(fk) = t
+                    .foreign_keys
+                    .iter()
+                    .find(|f| f.columns.iter().any(|c| c.eq_ignore_ascii_case(old)))
+                {
+                    return Err(MySqlError::new(
+                        1828,
+                        "HY000",
+                        format!(
+                            "Cannot drop column '{old}': needed in a foreign key constraint '{}'",
+                            fk.name
+                        ),
+                    ));
+                }
+                if let Some((_, ct, fk)) = children
+                    .iter()
+                    .find(|(_, _, f)| f.ref_columns.iter().any(|c| c.eq_ignore_ascii_case(old)))
+                {
+                    return Err(MySqlError::new(
+                        1829,
+                        "HY000",
+                        format!(
+                            "Cannot drop column '{old}': needed in a foreign key constraint '{}' of table '{ct}'",
+                            fk.name
+                        ),
+                    ));
+                }
+            }
+            Some(new) => {
+                let rename = |cols: &mut Vec<String>| {
+                    for c in cols.iter_mut() {
+                        if c.eq_ignore_ascii_case(old) {
+                            *c = new.clone();
+                        }
+                    }
+                };
+                for fk in &mut t.foreign_keys {
+                    rename(&mut fk.columns);
+                    if fk.ref_db == db && fk.ref_table == t.name {
+                        rename(&mut fk.ref_columns);
+                    }
+                }
+                for (cdb, ct, _) in children {
+                    if cdb == db && ct == t.name {
+                        continue;
+                    }
+                    if let Some(child) =
+                        state.schemas.get_mut(&cdb).and_then(|s| s.tables.get_mut(&ct))
+                    {
+                        for fk in &mut Arc::make_mut(child).foreign_keys {
+                            if fk.ref_db == db && fk.ref_table == t.name {
+                                rename(&mut fk.ref_columns);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a foreign key to `t` (CREATE TABLE or ALTER TABLE): names it
+    /// MySQL's way if unnamed and, with checks on, validates the parent
+    /// and (`existing_rows`) the rows already in `t`.
+    fn add_foreign_key(
+        &self,
+        db: &str,
+        t: &mut Table,
+        mut fk: ForeignKey,
+        existing_rows: bool,
+    ) -> Result<(), MySqlError> {
+        for c in &fk.columns {
+            if resolve_column_index(&t.columns, c).is_none() {
+                return Err(MySqlError::new(
+                    1072,
+                    "42000",
+                    format!("Key column '{c}' doesn't exist in table"),
+                ));
+            }
+        }
+        // The index InnoDB creates for it: named after the constraint, else
+        // its first column.
+        if fk.index.is_empty() {
+            fk.index = if fk.name.is_empty() { fk.columns[0].clone() } else { fk.name.clone() };
+        }
+        if fk.name.is_empty() {
+            let prefix = format!("{}_ibfk_", t.name);
+            let n = t
+                .foreign_keys
+                .iter()
+                .filter_map(|f| f.name.strip_prefix(&prefix)?.parse::<usize>().ok())
+                .max()
+                .unwrap_or(0);
+            fk.name = format!("{prefix}{}", n + 1);
+        }
+        if t.foreign_keys.iter().any(|f| f.name.eq_ignore_ascii_case(&fk.name)) {
+            return Err(MySqlError::new(
+                1826,
+                "HY000",
+                format!("Duplicate foreign key constraint name '{}'", fk.name),
+            ));
+        }
+        for action in [fk.on_delete, fk.on_update] {
+            if action == FkAction::SetNull {
+                for c in &fk.columns {
+                    if let Some(i) = resolve_column_index(&t.columns, c)
+                        && t.columns[i].not_null
+                    {
+                        return Err(MySqlError::new(
+                            1830,
+                            "HY000",
+                            format!(
+                                "Column '{}' cannot be NOT NULL: needed in a foreign key constraint '{}' SET NULL",
+                                t.columns[i].name, fk.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        if self.fk_checks {
+            let self_ref = fk.ref_db == db && fk.ref_table == t.name;
+            let parent_cols: Vec<String> = if self_ref {
+                t.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                match self.load_table(&fk.ref_db, &fk.ref_table) {
+                    Ok(p) => p.columns.iter().map(|c| c.name.clone()).collect(),
+                    Err(_) => {
+                        return Err(MySqlError::new(
+                            1824,
+                            "HY000",
+                            format!("Failed to open the referenced table '{}'", fk.ref_table),
+                        ));
+                    }
+                }
+            };
+            if let Some(missing) = fk
+                .ref_columns
+                .iter()
+                .find(|r| !parent_cols.iter().any(|c| c.eq_ignore_ascii_case(r)))
+            {
+                return Err(MySqlError::new(
+                    3734,
+                    "HY000",
+                    format!(
+                        "Failed to add the foreign key constraint. Missing column '{missing}' for constraint '{}' in the referenced table '{}'",
+                        fk.name, fk.ref_table
+                    ),
+                ));
+            }
+            if fk.ref_columns.len() != fk.columns.len() {
+                return Err(MySqlError::new(
+                    1822,
+                    "HY000",
+                    format!(
+                        "Failed to add the foreign key constraint. Missing index for constraint '{}' in the referenced table '{}'",
+                        fk.name, fk.ref_table
+                    ),
+                ));
+            }
+        }
+        t.foreign_keys.push(fk);
+        if existing_rows {
+            let rows = t.rows.clone();
+            let probe =
+                Table { foreign_keys: vec![t.foreign_keys.last().cloned().unwrap()], ..t.clone() };
+            self.check_parents(db, &probe, &rows)?;
+        }
+        Ok(())
+    }
+
     pub fn execute_plan(&mut self, plan: Plan) -> Result<Vec<Vec<Value>>, MySqlError> {
         match plan {
             Plan::Dummy => Ok(vec![vec![]]),
@@ -444,12 +798,48 @@ impl Executor {
                         .collect::<Vec<_>>()
                         .join(",")
                 };
-                for (name, cols) in t.keys() {
+                let keys = t.keys();
+                for (name, cols) in &keys {
                     if name == "PRIMARY" {
-                        lines.push(format!("  PRIMARY KEY ({})", quote(&cols)));
+                        lines.push(format!("  PRIMARY KEY ({})", quote(cols)));
                     } else {
-                        lines.push(format!("  UNIQUE KEY `{name}` ({})", quote(&cols)));
+                        lines.push(format!("  UNIQUE KEY `{name}` ({})", quote(cols)));
                     }
+                }
+                // InnoDB gives a foreign key an index of its own unless an
+                // existing key already starts with its columns.
+                let names = |cs: &[String]| cs.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>();
+                for fk in &t.foreign_keys {
+                    let covered = keys.iter().any(|(_, cols)| {
+                        cols.len() >= fk.columns.len()
+                            && cols
+                                .iter()
+                                .zip(&fk.columns)
+                                .all(|(&c, f)| t.columns[c].name.eq_ignore_ascii_case(f))
+                    });
+                    if !covered {
+                        let index = if fk.index.is_empty() { &fk.name } else { &fk.index };
+                        lines.push(format!("  KEY `{index}` ({})", names(&fk.columns).join(",")));
+                    }
+                }
+                for fk in &t.foreign_keys {
+                    let parent = if fk.ref_db == db {
+                        format!("`{}`", fk.ref_table)
+                    } else {
+                        format!("`{}`.`{}`", fk.ref_db, fk.ref_table)
+                    };
+                    let mut l = format!(
+                        "  CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES {parent} ({})",
+                        fk.name,
+                        names(&fk.columns).join(", "),
+                        names(&fk.ref_columns).join(", ")
+                    );
+                    for (what, a) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
+                        if matches!(a, FkAction::Cascade | FkAction::SetNull) {
+                            l.push_str(&format!(" ON {what} {}", a.sql()));
+                        }
+                    }
+                    lines.push(l);
                 }
                 let sql = format!(
                     "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
@@ -458,7 +848,12 @@ impl Executor {
                 );
                 Ok(vec![vec![Value::Text(t.name.clone()), Value::Text(sql)]])
             }
-            Plan::CreateTable { db, table, columns, unique_keys, if_not_exists } => {
+            Plan::CreateTable { db, table, columns, unique_keys, foreign_keys, if_not_exists } => {
+                let mut t = Table::new(table.clone(), columns);
+                t.unique_keys = unique_keys;
+                for fk in foreign_keys {
+                    self.add_foreign_key(&db, &mut t, fk, false)?;
+                }
                 let mut state = self.db.lock().unwrap();
                 let schema = state.schemas.get_mut(&db).ok_or_else(|| {
                     MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
@@ -475,8 +870,6 @@ impl Executor {
                         format!("Table '{}' already exists", table),
                     ));
                 }
-                let mut t = Table::new(table.clone(), columns);
-                t.unique_keys = unique_keys;
                 schema.tables.insert(table, Arc::new(t));
                 Ok(vec![])
             }
@@ -496,6 +889,26 @@ impl Executor {
                         format!("Unknown table '{}'", missing.join(",")),
                     ));
                 }
+                if self.fk_checks {
+                    for (db, t) in &tables {
+                        let dropped =
+                            |d: &String, n: &String| tables.iter().any(|(a, b)| a == d && b == n);
+                        if let Some((_, ct, fk)) = state
+                            .referencing(db, t)
+                            .into_iter()
+                            .find(|(cd, ct, _)| !dropped(cd, ct))
+                        {
+                            return Err(MySqlError::new(
+                                3730,
+                                "HY000",
+                                format!(
+                                    "Cannot drop table '{t}' referenced by a foreign key constraint '{}' on table '{ct}'.",
+                                    fk.name
+                                ),
+                            ));
+                        }
+                    }
+                }
                 for (db, t) in &tables {
                     if let Some(schema) = state.schemas.get_mut(db) {
                         schema.tables.remove(t);
@@ -505,6 +918,21 @@ impl Executor {
             }
             Plan::Truncate { db, table } => {
                 let mut state = self.db.lock().unwrap();
+                if self.fk_checks
+                    && let Some((cdb, ct, fk)) = state
+                        .referencing(&db, &table)
+                        .into_iter()
+                        .find(|(cdb, ct, _)| !(*cdb == db && *ct == table))
+                {
+                    return Err(MySqlError::new(
+                        1701,
+                        "42000",
+                        format!(
+                            "Cannot truncate a table referenced in a foreign key constraint ({})",
+                            fk_description(&cdb, &ct, &fk)
+                        ),
+                    ));
+                }
                 let schema = state.schemas.get_mut(&db).ok_or_else(|| {
                     MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
                 })?;
@@ -577,8 +1005,33 @@ impl Executor {
             Plan::AlterTable { db, table, ops } => {
                 let mut t = self.load_table(&db, &table)?;
                 let mut rename_to = None;
+                // Adding a checked foreign key copies the table: MySQL
+                // reports every row as affected.
+                self.last_affected_rows = 0;
                 for op in ops {
-                    alter_table(&mut t, op, &mut rename_to, &self.sql_mode)?;
+                    if matches!(op, AlterOp::AddForeignKey(_)) && self.fk_checks {
+                        self.last_affected_rows = t.rows.len() as u64;
+                    }
+                    match op {
+                        AlterOp::AddForeignKey(fk) => {
+                            self.add_foreign_key(&db, &mut t, fk, true)?
+                        }
+                        AlterOp::DropForeignKey(name) => {
+                            let before = t.foreign_keys.len();
+                            t.foreign_keys.retain(|f| !f.name.eq_ignore_ascii_case(&name));
+                            if t.foreign_keys.len() == before {
+                                return Err(MySqlError::new(
+                                    1091,
+                                    "42000",
+                                    format!("Can't DROP '{name}'; check that column/key exists"),
+                                ));
+                            }
+                        }
+                        op => {
+                            self.fk_column_ddl(&db, &mut t, &op)?;
+                            alter_table(&mut t, op, &mut rename_to, &self.sql_mode)?
+                        }
+                    }
                 }
                 let mut state = self.db.lock().unwrap();
                 let schema = state.schemas.get_mut(&db).ok_or_else(|| {
@@ -593,14 +1046,42 @@ impl Executor {
                         ));
                     }
                     schema.tables.remove(&table);
-                    t.name = new;
+                    t.name = new.clone();
+                    // Foreign keys follow a renamed parent, as in MySQL.
+                    for schema in state.schemas.values_mut() {
+                        for child in schema.tables.values_mut() {
+                            if child
+                                .foreign_keys
+                                .iter()
+                                .any(|f| f.ref_db == db && f.ref_table == table)
+                            {
+                                for f in &mut Arc::make_mut(child).foreign_keys {
+                                    if f.ref_db == db && f.ref_table == table {
+                                        f.ref_table = new.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for f in &mut t.foreign_keys {
+                        if f.ref_db == db && f.ref_table == table {
+                            f.ref_table = new.clone();
+                        }
+                    }
                 }
+                let Some(schema) = state.schemas.get_mut(&db) else {
+                    return Err(MySqlError::new(1049, "42000", format!("Unknown database '{db}'")));
+                };
                 schema.tables.insert(t.name.clone(), Arc::new(t));
                 Ok(vec![])
             }
             Plan::Insert { db, table, columns, rows, mode } => {
                 let mut work = self.load_table(&db, &table)?;
                 let counter_before = work.next_auto_increment;
+                let before_rows = self.fk_relevant(&db, &work).then(|| work.rows.clone());
+                // Rows REPLACE deleted: a delete, as far as foreign keys go,
+                // even when the same row goes back in.
+                let mut replaced: Vec<Vec<Value>> = Vec::new();
                 let result = (|| -> Result<Vec<Vec<Value>>, MySqlError> {
                     let keys = work.keys();
                     let mut affected = 0u64;
@@ -712,7 +1193,7 @@ impl Executor {
                                 while let Some((i, _)) =
                                     find_key_conflict(&work, &keys, &new_row, None)
                                 {
-                                    work.rows.remove(i);
+                                    replaced.push(work.rows.remove(i));
                                     affected += 1;
                                 }
                                 work.rows.push(new_row);
@@ -744,7 +1225,17 @@ impl Executor {
                         }
                     }
 
-                    self.store_table(&db, work.clone())?;
+                    match &before_rows {
+                        Some(before) => {
+                            // REPLACE deletes rows (cascading like a DELETE);
+                            // every new or changed row must have its parent.
+                            let (removed, added) = row_diff(before, &work.rows);
+                            let gone = if replaced.is_empty() { removed } else { replaced.clone() };
+                            let changes = gone.into_iter().map(|r| (r, None)).collect();
+                            self.finish_write(&db, work.clone(), changes, &added)?;
+                        }
+                        None => self.store_table(&db, work.clone())?,
+                    }
                     self.last_affected_rows = affected;
                     self.last_insert_id = first_generated_id.map(|v| v as u64).unwrap_or(0);
                     Ok(vec![])
@@ -767,6 +1258,9 @@ impl Executor {
                 let targets =
                     self.dml_targets(&work, selection.as_ref(), &order, limit.as_ref())?;
                 let mut changed = 0u64;
+                let fk = self.fk_relevant(&db, &work);
+                let mut changes = Vec::new();
+                let mut to_check = Vec::new();
                 for &i in &targets {
                     let before = work.rows[i].clone();
                     self.apply_assignments(&mut work, i, &assignments)?;
@@ -775,9 +1269,33 @@ impl Executor {
                     }
                     if work.rows[i] != before {
                         changed += 1;
+                        if fk {
+                            // Only a changed foreign key is checked against
+                            // its parent, as in MySQL.
+                            // InnoDB re-checks a row's foreign keys when they
+                            // change, and when its primary key does (that
+                            // moves the row).
+                            let pk_changed =
+                                work.columns.iter().enumerate().any(|(c, col)| {
+                                    col.primary_key && before[c] != work.rows[i][c]
+                                });
+                            if pk_changed
+                                || work.foreign_keys.iter().any(|f| {
+                                    fk_values(&work, &before, &f.columns)
+                                        != fk_values(&work, &work.rows[i], &f.columns)
+                                })
+                            {
+                                to_check.push(work.rows[i].clone());
+                            }
+                            changes.push((before, Some(work.rows[i].clone())));
+                        }
                     }
                 }
-                self.store_table(&db, work)?;
+                if fk {
+                    self.finish_write(&db, work, changes, &to_check)?;
+                } else {
+                    self.store_table(&db, work)?;
+                }
                 // MySQL reports the rows an UPDATE changed; with the
                 // client's FOUND_ROWS flag, the rows it matched.
                 self.last_affected_rows =
@@ -792,9 +1310,19 @@ impl Executor {
                 for &i in &targets {
                     keep[i] = false;
                 }
+                let removed: Vec<Vec<Value>> = if self.fk_relevant(&db, &work) {
+                    targets.iter().map(|&i| work.rows[i].clone()).collect()
+                } else {
+                    Vec::new()
+                };
                 let mut k = keep.iter();
                 work.rows.retain(|_| *k.next().unwrap());
-                self.store_table(&db, work)?;
+                if removed.is_empty() {
+                    self.store_table(&db, work)?;
+                } else {
+                    let changes = removed.into_iter().map(|r| (r, None)).collect();
+                    self.finish_write(&db, work, changes, &[])?;
+                }
                 self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
@@ -1393,6 +1921,9 @@ impl Executor {
                 }
                 if bare.eq_ignore_ascii_case("autocommit") {
                     return Ok(Value::Int(i64::from(self.autocommit)));
+                }
+                if bare.eq_ignore_ascii_case("foreign_key_checks") {
+                    return Ok(Value::Int(i64::from(self.fk_checks)));
                 }
                 if name.eq_ignore_ascii_case("version") {
                     Ok(Value::Text("8.0.33".to_string()))
@@ -2607,6 +3138,66 @@ fn set_op(
     }
 }
 
+/// The values of `cols` in `row` of `t`; None if a column is missing.
+fn fk_values(t: &Table, row: &[Value], cols: &[String]) -> Option<Vec<Value>> {
+    cols.iter()
+        .map(|c| {
+            resolve_column_index(&t.columns, c).map(|i| row.get(i).cloned().unwrap_or(Value::Null))
+        })
+        .collect()
+}
+
+/// `` `db`.`child`, CONSTRAINT `fk` FOREIGN KEY (`a`) REFERENCES `p` (`id`) ``
+/// as MySQL's foreign key errors print it.
+fn fk_description(db: &str, child: &str, fk: &ForeignKey) -> String {
+    let q = |cs: &[String]| cs.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ");
+    let parent = if fk.ref_db == db {
+        format!("`{}`", fk.ref_table)
+    } else {
+        format!("`{}`.`{}`", fk.ref_db, fk.ref_table)
+    };
+    let mut s = format!(
+        "`{db}`.`{child}`, CONSTRAINT `{}` FOREIGN KEY ({}) REFERENCES {parent} ({})",
+        fk.name,
+        q(&fk.columns),
+        q(&fk.ref_columns)
+    );
+    for (what, a) in [("DELETE", fk.on_delete), ("UPDATE", fk.on_update)] {
+        if matches!(a, FkAction::Cascade | FkAction::SetNull) {
+            s.push_str(&format!(" ON {what} {}", a.sql()));
+        }
+    }
+    s
+}
+
+fn child_row_error(db: &str, child: &str, fk: &ForeignKey) -> MySqlError {
+    MySqlError::new(
+        1452,
+        "23000",
+        format!(
+            "Cannot add or update a child row: a foreign key constraint fails ({})",
+            fk_description(db, child, fk)
+        ),
+    )
+}
+
+/// The rows only in `before` and the rows only in `after` (multisets).
+fn row_diff(before: &[Vec<Value>], after: &[Vec<Value>]) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+    let mut counts: std::collections::HashMap<String, Vec<usize>> = Default::default();
+    for (i, r) in before.iter().enumerate() {
+        counts.entry(format!("{r:?}")).or_default().push(i);
+    }
+    let mut added = Vec::new();
+    for r in after {
+        match counts.get_mut(&format!("{r:?}")).and_then(|v| v.pop()) {
+            Some(_) => {}
+            None => added.push(r.clone()),
+        }
+    }
+    let removed = counts.into_values().flatten().map(|i| before[i].clone()).collect();
+    (removed, added)
+}
+
 /// Window partition/peer keys: equal values, NULL equal to NULL.
 fn keys_equal(a: &[Value], b: &[Value]) -> bool {
     a.iter().zip(b).all(|(x, y)| match (x.is_null(), y.is_null()) {
@@ -2986,6 +3577,8 @@ fn alter_table(
         }
         AlterOp::AutoIncrement(n) => t.next_auto_increment = t.next_auto_increment.max(n),
         AlterOp::Noop => {}
+        // Handled by the executor, which can see the referenced tables.
+        AlterOp::AddForeignKey(_) | AlterOp::DropForeignKey(_) => {}
     }
     Ok(())
 }

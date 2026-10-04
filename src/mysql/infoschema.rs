@@ -328,6 +328,24 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         ]);
                     }
                 }
+                for fk in &t.foreign_keys {
+                    for (seq, c) in fk.columns.iter().enumerate() {
+                        rows.push(vec![
+                            text("def"),
+                            text(db),
+                            text(&fk.name),
+                            text("def"),
+                            text(db),
+                            text(&t.name),
+                            text(c),
+                            Value::Int(seq as i64 + 1),
+                            Value::Int(seq as i64 + 1),
+                            text(&fk.ref_db),
+                            text(&fk.ref_table),
+                            text(fk.ref_columns.get(seq).map(String::as_str).unwrap_or("")),
+                        ]);
+                    }
+                }
             }
             table_of(
                 name,
@@ -361,8 +379,12 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
             ],
             user_tables(state)
                 .flat_map(|(db, t)| {
-                    t.keys().into_iter().map(move |(key, _)| {
+                    let keys = t.keys().into_iter().map(move |(key, _)| {
                         let ty = if key == "PRIMARY" { "PRIMARY KEY" } else { "UNIQUE" };
+                        (key, ty)
+                    });
+                    let fks = t.foreign_keys.iter().map(|f| (f.name.clone(), "FOREIGN KEY"));
+                    keys.chain(fks).map(move |(key, ty)| {
                         vec![
                             text("def"),
                             text(db),
@@ -376,7 +398,7 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 })
                 .collect(),
         ),
-        // Foreign keys, views, routines and triggers don't exist here.
+        // Views, routines and triggers don't exist here.
         "REFERENTIAL_CONSTRAINTS" => table_of(
             name,
             &[
@@ -392,7 +414,42 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 "TABLE_NAME",
                 "REFERENCED_TABLE_NAME",
             ],
-            vec![],
+            user_tables(state)
+                .flat_map(|(db, t)| {
+                    t.foreign_keys.iter().map(move |fk| {
+                        // The parent key the foreign key points at.
+                        let unique = crate::mysql::infoschema::lookup_table(
+                            state,
+                            &fk.ref_db,
+                            &fk.ref_table,
+                        )
+                        .and_then(|p| {
+                            p.keys().into_iter().find(|(_, cols)| {
+                                cols.len() == fk.ref_columns.len()
+                                    && cols
+                                        .iter()
+                                        .zip(&fk.ref_columns)
+                                        .all(|(&c, r)| p.columns[c].name.eq_ignore_ascii_case(r))
+                            })
+                        })
+                        .map(|(name, _)| text(&name))
+                        .unwrap_or(Value::Null);
+                        vec![
+                            text("def"),
+                            text(db),
+                            text(&fk.name),
+                            text("def"),
+                            text(&fk.ref_db),
+                            unique,
+                            text("NONE"),
+                            text(fk.on_update.sql()),
+                            text(fk.on_delete.sql()),
+                            text(&t.name),
+                            text(&fk.ref_table),
+                        ]
+                    })
+                })
+                .collect(),
         ),
         "VIEWS" => table_of(
             name,

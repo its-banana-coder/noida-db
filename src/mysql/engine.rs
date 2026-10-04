@@ -50,6 +50,9 @@ pub struct Engine {
     /// The session's `sql_mode` (MySQL 8's strict default until a
     /// `SET sql_mode = '...'`, which WordPress sends on every connection).
     pub sql_mode: crate::mysql::sqlmode::SqlMode,
+    /// `foreign_key_checks` (on by default; dump files and migrations turn
+    /// it off while loading tables in any order).
+    pub fk_checks: bool,
     /// The client connected with `CLIENT_FOUND_ROWS` (see `Executor`).
     pub found_rows: bool,
     /// Whether a transaction is open (explicit BEGIN, or implicit).
@@ -78,6 +81,7 @@ impl Default for Engine {
             autocommit: true,
             sql_mode: crate::mysql::sqlmode::SqlMode::default(),
             found_rows: false,
+            fk_checks: true,
             in_tx: false,
             savepoints: Vec::new(),
         }
@@ -218,7 +222,7 @@ impl Engine {
     /// transaction first (MySQL's implicit commit); a write opens one when
     /// `autocommit` is off and records the table's pre-image. Returns the
     /// table a write targets, for `after_plan`.
-    pub fn before_plan(&mut self, plan: &Plan) -> Option<(String, String)> {
+    pub fn before_plan(&mut self, plan: &Plan) -> Vec<(String, String)> {
         match plan {
             Plan::InsertSelect { insert, .. } => self.before_plan(insert),
             Plan::CreateTable { .. }
@@ -229,7 +233,7 @@ impl Engine {
             | Plan::DropDatabase { .. }
             | Plan::CreateIndex { .. } => {
                 self.commit();
-                None
+                vec![]
             }
             Plan::Insert { db, table, .. }
             | Plan::Update { db, table, .. }
@@ -238,32 +242,39 @@ impl Engine {
                     self.in_tx = true;
                 }
                 if !self.in_tx {
-                    return None;
+                    return vec![];
                 }
-                let key = (db.clone(), table.clone());
+                // A write can cascade (ON DELETE/UPDATE CASCADE, SET NULL)
+                // into every table referencing this one.
                 let mut state = self.db.lock().unwrap();
-                let current = state.schemas.get(db).and_then(|s| s.tables.get(table)).cloned();
-                let undo = state.open_txns.entry(self.conn_id).or_default();
-                if let Some(t) = current {
-                    undo.tables.entry(key.clone()).or_insert_with(|| (t.clone(), t));
+                let keys = state.cascade_reach(db, table);
+                for key in &keys {
+                    let current =
+                        state.schemas.get(&key.0).and_then(|s| s.tables.get(&key.1)).cloned();
+                    let undo = state.open_txns.entry(self.conn_id).or_default();
+                    if let Some(t) = current {
+                        undo.tables.entry(key.clone()).or_insert_with(|| (t.clone(), t));
+                    }
                 }
-                Some(key)
+                keys
             }
-            _ => None,
+            _ => vec![],
         }
     }
 
     /// Records the table a transactional write left behind (see `before_plan`).
-    pub fn after_plan(&mut self, written: Option<(String, String)>) {
-        let Some((db, table)) = written else { return };
+    pub fn after_plan(&mut self, written: Vec<(String, String)>) {
         let mut state = self.db.lock().unwrap();
-        let Some(now) = state.schemas.get(&db).and_then(|s| s.tables.get(&table)).cloned() else {
-            return;
-        };
-        if let Some(entry) =
-            state.open_txns.get_mut(&self.conn_id).and_then(|u| u.tables.get_mut(&(db, table)))
-        {
-            entry.1 = now;
+        for (db, table) in written {
+            let Some(now) = state.schemas.get(&db).and_then(|s| s.tables.get(&table)).cloned()
+            else {
+                continue;
+            };
+            if let Some(entry) =
+                state.open_txns.get_mut(&self.conn_id).and_then(|u| u.tables.get_mut(&(db, table)))
+            {
+                entry.1 = now;
+            }
         }
     }
 
@@ -311,11 +322,14 @@ impl Engine {
             Statement::Set(set) => {
                 // `SET autocommit = 0|1` is the one setting with an effect:
                 // turning it back on commits an open transaction.
-                if let Some(on) = autocommit_assignment(set) {
+                if let Some(on) = bool_assignment(set, "autocommit") {
                     if on && !self.autocommit {
                         self.commit();
                     }
                     self.autocommit = on;
+                }
+                if let Some(on) = bool_assignment(set, "foreign_key_checks") {
+                    self.fk_checks = on;
                 }
                 if let Some(mode) = sql_mode_assignment(set) {
                     self.sql_mode = mode;
@@ -335,6 +349,9 @@ impl Engine {
                         Value::Text(n) if n == "sql_mode" => row[1] = Value::Text(mode.clone()),
                         Value::Text(n) if n == "autocommit" => {
                             row[1] = Value::Text(autocommit.into())
+                        }
+                        Value::Text(n) if n == "foreign_key_checks" => {
+                            row[1] = Value::Text(if self.fk_checks { "ON" } else { "OFF" }.into())
                         }
                         _ => {}
                     }
@@ -479,6 +496,7 @@ impl Engine {
         executor.sql_mode = self.sql_mode.clone();
         executor.autocommit = self.autocommit;
         executor.found_rows = self.found_rows;
+        executor.fk_checks = self.fk_checks;
         let written = self.before_plan(&plan);
         let res = executor.execute_plan(plan)?;
         self.after_plan(written);
@@ -517,6 +535,7 @@ pub(crate) const SESSION_VARIABLES: &[(&str, &str)] = &[
     ("collation_connection", "utf8mb4_0900_ai_ci"),
     ("collation_database", "utf8mb4_0900_ai_ci"),
     ("collation_server", "utf8mb4_0900_ai_ci"),
+    ("foreign_key_checks", "ON"),
     ("have_ssl", "DISABLED"),
     ("init_connect", ""),
     ("interactive_timeout", "28800"),
@@ -608,7 +627,7 @@ fn sql_mode_assignment(set: &sqlparser::ast::Set) -> Option<crate::mysql::sqlmod
 
 /// `Some(on)` if `set` assigns `autocommit` (`SET autocommit = 0`,
 /// `SET @@autocommit = 1`, `SET SESSION autocommit = OFF`, ...).
-fn autocommit_assignment(set: &sqlparser::ast::Set) -> Option<bool> {
+fn bool_assignment(set: &sqlparser::ast::Set, var: &str) -> Option<bool> {
     use sqlparser::ast::{Expr as E, Set, Value as V};
     let pairs: Vec<(String, &E)> = match set {
         Set::SingleAssignment { variable, values, .. } => {
@@ -622,7 +641,7 @@ fn autocommit_assignment(set: &sqlparser::ast::Set) -> Option<bool> {
     let mut out = None;
     for (name, value) in pairs {
         let name = name.trim_start_matches('@').to_ascii_lowercase();
-        if name.rsplit('.').next() != Some("autocommit") {
+        if name.rsplit('.').next() != Some(var) {
             continue;
         }
         out = match value {

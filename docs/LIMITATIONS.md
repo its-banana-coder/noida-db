@@ -629,7 +629,7 @@ never a silent NULL.
 DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `ALTER TABLE`
 (`ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME COLUMN`, `RENAME TO`, `ADD`/`DROP`
 `UNIQUE`/`PRIMARY KEY`/`INDEX`, `ALTER COLUMN SET`/`DROP DEFAULT`,
-`AUTO_INCREMENT =`; foreign keys accepted, not enforced), `CREATE [UNIQUE]
+`AUTO_INCREMENT =`; foreign keys, enforced (below)), `CREATE [UNIQUE]
 INDEX`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
 [LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
 DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
@@ -654,6 +654,22 @@ so they're as slow as the nested loop they describe. A recursive CTE's
 columns are not narrowed to the anchor's types (MySQL would truncate a
 string that grows past the anchor's width).
 
+Foreign keys are enforced like InnoDB's: a child row needs its parent
+(1452), a referenced parent row can't be deleted or have its key changed
+(1451) unless the key says `ON DELETE`/`ON UPDATE` `CASCADE` or `SET
+NULL` (cascading through further tables and self-references, up to
+MySQL's depth of 15), and `REPLACE` counts as a delete. `SET
+FOREIGN_KEY_CHECKS = 0` turns all of it off (as dump files do). DDL
+follows: a missing referenced table or column is 1824/3734, `DROP TABLE`
+and `TRUNCATE` of a referenced table are 3730/1701, a column a foreign key
+uses can't be dropped (1828/1829), renamed columns and tables stay
+referenced, and `ALTER TABLE ... ADD/DROP FOREIGN KEY` work, checking
+existing rows. Unnamed keys get MySQL's `<table>_ibfk_<n>` names, and
+`SHOW CREATE TABLE`, `information_schema.KEY_COLUMN_USAGE`,
+`TABLE_CONSTRAINTS` and `REFERENTIAL_CONSTRAINTS` report them the way MySQL
+does. Writes a cascade makes are rolled back with the transaction. An
+inline column `REFERENCES` is ignored, as in MySQL.
+
 `UPDATE` reports the rows it changed (the rows it matched when the client
 connects with `CLIENT_FOUND_ROWS`, as Django does), and an
 `ON UPDATE CURRENT_TIMESTAMP` column only moves when the row changed.
@@ -677,9 +693,11 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   `DISTINCT` inside a window aggregate (MySQL doesn't support it either),
   `LATERAL` derived tables, and `REGEXP`.
 - Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
-- `FOREIGN KEY` constraints are accepted but not enforced (no
-  referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
-  `FULLTEXT` declarations are accepted and ignored; nothing is indexed.
+- Plain `KEY`/`INDEX`/`FULLTEXT` declarations are accepted and ignored;
+  nothing is indexed, so a foreign key may reference any column (MySQL
+  requires an index there, error 1822).
+- `ON UPDATE`/`ON DELETE SET DEFAULT` (InnoDB rejects it too) and checks
+  that a foreign key's column types are compatible (3780).
 - Isolation levels: other connections see a transaction's uncommitted
   writes immediately (a rollback still undoes them).
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the

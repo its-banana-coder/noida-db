@@ -479,9 +479,23 @@ async fn alter_table_savepoints_and_django_probes() {
     c.query_drop("ALTER TABLE a DROP INDEX uq_title").await.unwrap();
     c.query_drop("INSERT INTO a (quantity, title) VALUES (1, 'x')").await.unwrap();
     c.query_drop("ALTER TABLE a ALTER COLUMN quantity SET DEFAULT 9").await.unwrap();
+    // As in MySQL: the referenced table must exist (foreign keys are
+    // enforced), and a column a foreign key uses can't be dropped.
+    assert_eq!(
+        err_code(
+            &mut c,
+            "ALTER TABLE a ADD CONSTRAINT fk FOREIGN KEY (quantity) REFERENCES b (id)"
+        )
+        .await,
+        1824
+    );
+    c.query_drop("CREATE TABLE b (id BIGINT PRIMARY KEY)").await.unwrap();
+    c.query_drop("INSERT INTO b VALUES (1), (5), (9)").await.unwrap();
     c.query_drop("ALTER TABLE a ADD CONSTRAINT fk FOREIGN KEY (quantity) REFERENCES b (id)")
         .await
         .unwrap();
+    assert_eq!(err_code(&mut c, "ALTER TABLE a DROP COLUMN quantity").await, 1828);
+    c.query_drop("ALTER TABLE a DROP FOREIGN KEY fk").await.unwrap();
     c.query_drop("ALTER TABLE a DROP COLUMN quantity").await.unwrap();
     c.query_drop("ALTER TABLE a RENAME TO items").await.unwrap();
     assert_eq!(
@@ -737,6 +751,35 @@ async fn subqueries_unions_and_ctes_with_parameters() {
         .await
         .unwrap();
     assert_eq!(ranked, vec![(10, 2), (11, 1), (12, 3)]);
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
+
+/// Foreign keys are enforced (expected values from MySQL 8.0.46).
+#[tokio::test]
+async fn foreign_keys_are_enforced() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE p (id INT PRIMARY KEY)").await.unwrap();
+    c.query_drop(
+        "CREATE TABLE c (id INT PRIMARY KEY, pid INT, \
+         FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE)",
+    )
+    .await
+    .unwrap();
+    c.query_drop("CREATE TABLE r (pid INT, FOREIGN KEY (pid) REFERENCES p (id))").await.unwrap();
+    c.query_drop("INSERT INTO p VALUES (1), (2)").await.unwrap();
+    assert_eq!(err_code(&mut c, "INSERT INTO c VALUES (1, 3)").await, 1452);
+    c.query_drop("INSERT INTO c VALUES (1, 1), (2, 2)").await.unwrap();
+    c.query_drop("INSERT INTO r VALUES (2)").await.unwrap();
+    assert_eq!(err_code(&mut c, "DELETE FROM p WHERE id = 2").await, 1451);
+    assert_eq!(affected(&mut c, "DELETE FROM p WHERE id = 1").await, 1);
+    assert_eq!(rows(&mut c, "SELECT id FROM c").await, vec![vec![s("2")]]);
+    assert_eq!(err_code(&mut c, "DROP TABLE p").await, 3730);
+    // Loading a dump in any order.
+    c.query_drop("SET FOREIGN_KEY_CHECKS = 0").await.unwrap();
+    c.query_drop("INSERT INTO c VALUES (3, 99)").await.unwrap();
+    c.query_drop("SET FOREIGN_KEY_CHECKS = 1").await.unwrap();
+    assert_eq!(one(&mut c, "SELECT @@foreign_key_checks").await, s("1"));
     drop(c);
     pool.disconnect().await.unwrap();
 }

@@ -610,13 +610,16 @@ impl Binder {
                         AlterOp::AddUnique(UniqueKey { name, columns })
                     }
                     TableConstraint::PrimaryKey(pk) => AlterOp::AddPrimaryKey(idents(&pk.columns)),
-                    // FOREIGN KEY, INDEX, CHECK: accepted, not enforced.
+                    TableConstraint::ForeignKey(fk) => {
+                        AlterOp::AddForeignKey(self.bind_foreign_key(&fk)?)
+                    }
+                    // INDEX, CHECK: accepted, not enforced.
                     _ => AlterOp::Noop,
                 },
                 A::DropIndex { name } | A::DropConstraint { name, .. } => {
                     AlterOp::DropKey(name.value)
                 }
-                A::DropForeignKey { .. } => AlterOp::Noop,
+                A::DropForeignKey { name, .. } => AlterOp::DropForeignKey(name.value),
                 A::DropPrimaryKey { .. } => AlterOp::DropPrimaryKey,
                 A::AlterColumn { column_name, op } => match op {
                     Acol::SetDefault { value } => {
@@ -715,7 +718,23 @@ impl Binder {
             }
         }
 
-        Ok(Plan::CreateTable { db, table, columns: cols, unique_keys, if_not_exists: false })
+        // Table-level FOREIGN KEY clauses (an inline column `REFERENCES` is
+        // parsed and ignored, as in MySQL).
+        let mut foreign_keys = Vec::new();
+        for constraint in &constraints {
+            if let TableConstraint::ForeignKey(fk) = constraint {
+                foreign_keys.push(self.bind_foreign_key(fk)?);
+            }
+        }
+
+        Ok(Plan::CreateTable {
+            db,
+            table,
+            columns: cols,
+            unique_keys,
+            foreign_keys,
+            if_not_exists: false,
+        })
     }
 
     fn bind_insert(&mut self, insert: sqlparser::ast::Insert) -> Result<Plan, MySqlError> {
@@ -2119,6 +2138,42 @@ impl Binder {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => self.bind_expr(e.clone()),
             _ => Err(MySqlError::unsupported("function argument form")),
         }
+    }
+
+    fn bind_foreign_key(
+        &self,
+        fk: &sqlparser::ast::ForeignKeyConstraint,
+    ) -> Result<crate::mysql::catalog::ForeignKey, MySqlError> {
+        use crate::mysql::catalog::FkAction;
+        use sqlparser::ast::ReferentialAction as R;
+        let (ref_db, ref_table) = self.resolve_table_name(&fk.foreign_table)?;
+        let action = |a: &Option<R>| -> Result<FkAction, MySqlError> {
+            Ok(match a {
+                None | Some(R::NoAction) => FkAction::NoAction,
+                Some(R::Restrict) => FkAction::Restrict,
+                Some(R::Cascade) => FkAction::Cascade,
+                Some(R::SetNull) => FkAction::SetNull,
+                Some(R::SetDefault) => {
+                    return Err(MySqlError::unsupported("SET DEFAULT foreign key action"));
+                }
+            })
+        };
+        Ok(crate::mysql::catalog::ForeignKey {
+            name: fk.name.as_ref().map(|n| n.value.clone()).unwrap_or_default(),
+            columns: fk.columns.iter().map(|c| c.value.clone()).collect(),
+            ref_db,
+            ref_table,
+            ref_columns: fk.referred_columns.iter().map(|c| c.value.clone()).collect(),
+            on_delete: action(&fk.on_delete)?,
+            on_update: action(&fk.on_update)?,
+            // MySQL names the index after the CONSTRAINT symbol first.
+            index: fk
+                .name
+                .as_ref()
+                .or(fk.index_name.as_ref())
+                .map(|n| n.value.clone())
+                .unwrap_or_default(),
+        })
     }
 
     fn resolve_table_name(&self, name: &ObjectName) -> Result<(String, String), MySqlError> {
