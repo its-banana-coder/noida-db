@@ -168,15 +168,107 @@ pub struct DbState {
     /// uncommitted writes. Never serialized.
     #[serde(skip)]
     pub open_txns: HashMap<u64, TxUndo>,
+    /// Which connection each blocked connection is waiting for, to detect
+    /// deadlocks. Never serialized.
+    #[serde(skip)]
+    pub waits: HashMap<u64, u64>,
 }
 
 /// One open transaction's undo log; see `DbState::open_txns`.
 #[derive(Clone, Debug, Default)]
 pub struct TxUndo {
     pub tables: BTreeMap<(String, String), (Arc<Table>, Arc<Table>)>,
+    /// Rows locked by `SELECT ... FOR UPDATE` / `FOR SHARE` (rows the
+    /// transaction wrote are locked implicitly; see `DbState::locked_rows`).
+    pub locks: Vec<RowLock>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RowLock {
+    pub db: String,
+    pub table: String,
+    pub key: String,
+    pub exclusive: bool,
+}
+
+/// A row's identity for locking: its primary key, else the whole row.
+pub fn row_key(t: &Table, row: &[Value]) -> String {
+    let pk: Vec<&Value> =
+        t.columns.iter().enumerate().filter(|(_, c)| c.primary_key).map(|(i, _)| &row[i]).collect();
+    if pk.is_empty() { format!("{row:?}") } else { format!("{pk:?}") }
+}
+
+/// The rows only in `before` and the rows only in `after` (multisets).
+pub fn row_diff(before: &[Row], after: &[Row]) -> (Vec<Row>, Vec<Row>) {
+    let mut counts: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, r) in before.iter().enumerate() {
+        counts.entry(format!("{r:?}")).or_default().push(i);
+    }
+    let mut added = Vec::new();
+    for r in after {
+        if counts.get_mut(&format!("{r:?}")).and_then(|v| v.pop()).is_none() {
+            added.push(r.clone());
+        }
+    }
+    let mut removed: Vec<usize> = counts.into_values().flatten().collect();
+    removed.sort_unstable();
+    (removed.into_iter().map(|i| before[i].clone()).collect(), added)
 }
 
 impl DbState {
+    /// The row keys of `db`.`table` other connections' open transactions
+    /// hold, with the holder and whether the lock is exclusive: every row
+    /// a transaction inserted, changed or deleted, and every row it locked
+    /// with `FOR UPDATE`/`FOR SHARE`.
+    pub fn locked_rows(&self, me: u64, db: &str, table: &str) -> Vec<(u64, String, bool)> {
+        let mut out = Vec::new();
+        for (&conn, undo) in &self.open_txns {
+            if conn == me {
+                continue;
+            }
+            if let Some((before, ours)) = undo.tables.get(&(db.to_string(), table.to_string())) {
+                let (removed, added) = row_diff(&before.rows, &ours.rows);
+                for r in removed.iter().chain(&added) {
+                    out.push((conn, row_key(ours, r), true));
+                }
+            }
+            for l in &undo.locks {
+                if l.db == db && l.table == table {
+                    out.push((conn, l.key.clone(), l.exclusive));
+                }
+            }
+        }
+        out
+    }
+
+    /// `db`.`table` as connection `me` should read it: without other
+    /// connections' uncommitted changes. None when nobody else has any.
+    pub fn committed_view(&self, me: u64, db: &str, table: &str) -> Option<Table> {
+        let key = (db.to_string(), table.to_string());
+        let others: Vec<&(Arc<Table>, Arc<Table>)> = self
+            .open_txns
+            .iter()
+            .filter(|(c, _)| **c != me)
+            .filter_map(|(_, u)| u.tables.get(&key))
+            .filter(|(before, ours)| !Arc::ptr_eq(before, ours))
+            .collect();
+        if others.is_empty() {
+            return None;
+        }
+        let current = self.schemas.get(db)?.tables.get(table)?;
+        let mut rows = current.rows.clone();
+        for (before, ours) in others {
+            let (removed, added) = row_diff(&before.rows, &ours.rows);
+            for r in added {
+                if let Some(i) = rows.iter().position(|x| *x == r) {
+                    rows.remove(i);
+                }
+            }
+            rows.extend(removed);
+        }
+        Some(Table { rows, ..(**current).clone() })
+    }
+
     /// Every foreign key that references `db`.`table`, with the database
     /// and name of the table that declares it.
     pub fn referencing(&self, db: &str, table: &str) -> Vec<(String, String, ForeignKey)> {
@@ -254,6 +346,6 @@ impl Default for DbState {
                 Schema { name: name.to_string(), tables: BTreeMap::new() },
             );
         }
-        Self { schemas, open_txns: HashMap::new() }
+        Self { schemas, open_txns: HashMap::new(), waits: HashMap::new() }
     }
 }

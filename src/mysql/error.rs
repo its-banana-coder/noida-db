@@ -28,6 +28,17 @@ impl MySqlError {
         Self::new(1064, "42000", format!("You have an error in your SQL syntax; {}", msg))
     }
 
+    /// Internal, never sent: the statement must wait for connection
+    /// `holder`'s transaction to release a row it needs (see
+    /// `Engine::execute`, which retries it).
+    pub fn lock_wait(holder: u64) -> Self {
+        Self::new(0, "LOCKW", holder.to_string())
+    }
+
+    pub fn lock_holder(&self) -> Option<u64> {
+        if self.code == 0 && self.sql_state == "LOCKW" { self.message.parse().ok() } else { None }
+    }
+
     pub fn unsupported(msg: &str) -> Self {
         Self::new(1235, "42000", format!("This version of MySQL doesn't yet support '{}'", msg))
     }

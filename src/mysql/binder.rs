@@ -913,6 +913,8 @@ impl Binder {
     }
 
     fn bind_query_scoped(&mut self, query: Query) -> Result<Plan, MySqlError> {
+        // A locking read also needs the full rows it reads, to lock them.
+        let key_query = (!query.locks.is_empty()).then(|| row_query(&query)).flatten();
         let scope = self.ctes.len();
         let res = (|| {
             if let Some(with) = query.with {
@@ -920,7 +922,25 @@ impl Binder {
                     self.bind_cte(cte, with.recursive)?;
                 }
             }
-            self.bind_body(*query.body, query.order_by, query.limit_clause)
+            let plan = self.bind_body(*query.body, query.order_by, query.limit_clause)?;
+            let Some(lock) = query.locks.first() else { return Ok(plan) };
+            use sqlparser::ast::{LockType, NonBlock};
+            let target = match (key_query, locking_table(&plan)) {
+                (Some(q), Some((db, table))) => {
+                    let saved = self.param_counter;
+                    let key_plan = self.bind_body(*q.body, q.order_by, q.limit_clause);
+                    self.param_counter = saved;
+                    Some((db, table, Box::new(key_plan?)))
+                }
+                _ => None,
+            };
+            Ok(Plan::Locking {
+                target,
+                source: Box::new(plan),
+                exclusive: matches!(lock.lock_type, LockType::Update),
+                nowait: matches!(lock.nonblock, Some(NonBlock::Nowait)),
+                skip_locked: matches!(lock.nonblock, Some(NonBlock::SkipLocked)),
+            })
         })();
         self.ctes.truncate(scope);
         res
@@ -1260,10 +1280,47 @@ impl Binder {
                 let calc_found_rows =
                     select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
 
-                let is_aggregate = !group_exprs.is_empty()
+                // SELECT DISTINCT can only sort by what it selects (3065).
+                if distinct && !has_wildcard {
+                    for (k, h) in hidden_exprs.iter().enumerate() {
+                        if exprs.contains(h) || contains_agg(h) {
+                            continue;
+                        }
+                        let mut missing = None;
+                        crate::mysql::plan::for_each_colname(h, &mut |n| {
+                            let bare = n.rsplit('.').next().unwrap_or(n);
+                            let selected = exprs.iter().any(|e| {
+                                matches!(e, Expr::ColName(x)
+                                    if x.rsplit('.').next().unwrap_or(x).eq_ignore_ascii_case(bare))
+                            });
+                            if !selected && missing.is_none() {
+                                missing = Some(n.to_string());
+                            }
+                        });
+                        if let Some(col) = missing {
+                            return Err(MySqlError::new(
+                                3065,
+                                "HY000",
+                                format!(
+                                    "Expression #{} of ORDER BY clause is not in SELECT list, references column '{col}' which is not in SELECT list; this is incompatible with DISTINCT",
+                                    k + 1
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let mut having = having;
+                let has_agg = !group_exprs.is_empty()
                     || exprs.iter().any(contains_agg)
                     || hidden_exprs.iter().any(contains_agg)
-                    || having.is_some();
+                    || having.as_ref().is_some_and(contains_agg);
+                // HAVING in a query with no GROUP BY or aggregate filters its
+                // rows like WHERE (over the select list's aliases), as in
+                // MySQL; JDBC's metadata queries rely on it.
+                if !has_agg && let Some(h) = having.take() {
+                    source = Plan::Filter { source: Box::new(source), predicate: h };
+                }
+                let is_aggregate = has_agg || having.is_some();
                 let hidden = hidden_exprs.len();
                 exprs.extend(hidden_exprs);
                 let plan = if is_aggregate {
@@ -2111,14 +2168,14 @@ impl Binder {
                 Ok(Expr::Call { name: upper, args: vec![Expr::Const(Value::Text(unit)), a, b] })
             }
             "CONCAT" | "UPPER" | "LOWER" | "LENGTH" | "SUBSTRING" | "SUBSTR" | "COALESCE"
-            | "IFNULL" | "DATABASE" | "SCHEMA" | "USER" | "CURRENT_USER" | "SESSION_USER"
-            | "SYSTEM_USER" | "CONNECTION_ID" | "VERSION" | "NOW" | "CURRENT_TIMESTAMP"
-            | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" | "CURDATE" | "CURRENT_DATE" | "IF"
-            | "NULLIF" | "GREATEST" | "LEAST" | "ROUND" | "TRUNCATE" | "ABS" | "CEIL"
-            | "CEILING" | "FLOOR" | "MOD" | "POW" | "POWER" | "SQRT" | "SIGN" | "CHAR_LENGTH"
-            | "CHARACTER_LENGTH" | "CONCAT_WS" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
-            | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "LOCATE" | "INSTR"
-            | "UCASE" | "LCASE" | "MID" | "DATE" | "TIME" | "YEAR" | "MONTH" | "DAY"
+            | "ANY_VALUE" | "IFNULL" | "DATABASE" | "SCHEMA" | "USER" | "CURRENT_USER"
+            | "SESSION_USER" | "SYSTEM_USER" | "CONNECTION_ID" | "VERSION" | "NOW"
+            | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" | "CURDATE"
+            | "CURRENT_DATE" | "IF" | "NULLIF" | "GREATEST" | "LEAST" | "ROUND" | "TRUNCATE"
+            | "ABS" | "CEIL" | "CEILING" | "FLOOR" | "MOD" | "POW" | "POWER" | "SQRT" | "SIGN"
+            | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "CONCAT_WS" | "TRIM" | "LTRIM" | "RTRIM"
+            | "REPLACE" | "LEFT" | "RIGHT" | "LPAD" | "RPAD" | "REPEAT" | "REVERSE" | "LOCATE"
+            | "INSTR" | "UCASE" | "LCASE" | "MID" | "DATE" | "TIME" | "YEAR" | "MONTH" | "DAY"
             | "DAYOFMONTH" | "HOUR" | "MINUTE" | "SECOND" | "DAYOFWEEK" | "DAYOFYEAR"
             | "WEEKDAY" | "DATE_FORMAT" | "DATEDIFF" | "UNIX_TIMESTAMP" | "FROM_UNIXTIME"
             | "UTC_TIMESTAMP" | "UTC_DATE" | "LAST_DAY" | "JSON_EXTRACT" | "JSON_UNQUOTE"
@@ -2329,4 +2386,27 @@ fn options_with_names(
         .into_iter()
         .map(|option| sqlparser::ast::ColumnOptionDef { name: None, option })
         .collect()
+}
+
+/// The one table a locking read locks rows of: only for a single-table
+/// query without GROUP BY (joins and aggregates read without locking).
+fn locking_table(plan: &Plan) -> Option<(String, String)> {
+    match plan {
+        Plan::Finish { source, .. }
+        | Plan::Project { source, .. }
+        | Plan::Filter { source, .. } => locking_table(source),
+        Plan::Scan { db, table, .. } => Some((db.clone(), table.clone())),
+        _ => None,
+    }
+}
+
+/// `query` reading whole rows (`SELECT *`, no DISTINCT), same FROM, WHERE,
+/// ORDER BY and LIMIT: the rows a locking read locks.
+fn row_query(query: &Query) -> Option<Query> {
+    let mut q = query.clone();
+    q.locks.clear();
+    let SetExpr::Select(select) = &mut *q.body else { return None };
+    select.projection = vec![SelectItem::Wildcard(Default::default())];
+    select.distinct = None;
+    Some(q)
 }

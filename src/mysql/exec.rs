@@ -57,6 +57,11 @@ pub struct Executor {
     /// The client set `CLIENT_FOUND_ROWS` (Django does): an UPDATE reports
     /// the rows it matched, not only the ones it changed.
     pub found_rows: bool,
+    /// This connection's id, so reads skip other connections' uncommitted
+    /// changes and writes wait for the rows they hold.
+    pub conn_id: u64,
+    /// SKIP LOCKED: rows of (db, table) to leave out of the scan.
+    skip_rows: Option<(String, String, std::collections::HashSet<String>)>,
     /// The session's `foreign_key_checks`.
     pub fk_checks: bool,
     /// A recursive CTE's rows from the previous round, by name, for its
@@ -84,6 +89,8 @@ impl Executor {
             writing: std::cell::Cell::new(false),
             outer: Vec::new(),
             found_rows: false,
+            conn_id: 0,
+            skip_rows: None,
             fk_checks: true,
             cte_rows: std::collections::HashMap::new(),
             win_vals: Default::default(),
@@ -145,6 +152,7 @@ impl Executor {
         child.sql_mode = self.sql_mode.clone();
         child.autocommit = self.autocommit;
         child.session_insert_id = self.session_insert_id;
+        child.conn_id = self.conn_id;
         child.cte_rows = self.cte_rows.clone();
         child.outer = self.outer.clone();
         if let Some(t) = table {
@@ -363,6 +371,9 @@ impl Executor {
         let name = work.name.clone();
         pending.insert((db.to_string(), name.clone()), work);
         self.on_parent_change(&mut pending, db, &name, changes, 0)?;
+        for ((d, _), t) in &pending {
+            self.check_write_locks(d, t)?;
+        }
         for ((d, _), t) in pending {
             self.store_table(&d, t)?;
         }
@@ -499,6 +510,285 @@ impl Executor {
                 }
             }
             self.on_parent_change(pending, &cdb, &ct, child_changes, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// ONLY_FULL_GROUP_BY: every non-aggregated column in the select list
+    /// (and, with GROUP BY, ORDER BY) must be functionally dependent on the
+    /// GROUP BY columns: grouped itself, fixed by `col = constant` or an
+    /// equality with a dependent column, or in a table whose primary key
+    /// (or a NOT NULL unique key) is dependent. Errors 1055/1140 as MySQL.
+    /// Columns of derived tables are not checked (MySQL can see through
+    /// them; this doesn't), so this only ever under-reports.
+    fn check_full_group_by(
+        &self,
+        source: &Plan,
+        group_exprs: &[Expr],
+        exprs: &[Expr],
+        visible: usize,
+    ) -> Result<(), MySqlError> {
+        struct Src {
+            alias: String,
+            db: String,
+            table: Option<Table>,
+            cols: Vec<String>,
+        }
+        let mut srcs: Vec<Src> = Vec::new();
+        let mut preds: Vec<Expr> = Vec::new();
+        fn walk(
+            ex: &Executor,
+            p: &Plan,
+            srcs: &mut Vec<Src>,
+            preds: &mut Vec<Expr>,
+        ) -> Result<(), MySqlError> {
+            match p {
+                Plan::Scan { db, table, alias } => {
+                    let t = ex.load_table(db, table)?;
+                    srcs.push(Src {
+                        alias: alias.clone().unwrap_or_else(|| table.clone()),
+                        db: db.clone(),
+                        cols: t.columns.iter().map(|c| c.name.clone()).collect(),
+                        table: Some(t),
+                    });
+                }
+                Plan::Derived { alias, .. } | Plan::CteRef { alias, .. } => {
+                    let cols = {
+                        let state = ex.db.lock().unwrap();
+                        crate::mysql::plan::column_names(p, &state)
+                    };
+                    srcs.push(Src { alias: alias.clone(), db: String::new(), table: None, cols });
+                }
+                Plan::Filter { source, predicate } => {
+                    preds.push(predicate.clone());
+                    walk(ex, source, srcs, preds)?;
+                }
+                Plan::Join { left, right, op } => {
+                    walk(ex, left, srcs, preds)?;
+                    walk(ex, right, srcs, preds)?;
+                    if let JoinOp::Inner(e) | JoinOp::Left(e) = op {
+                        preds.push(e.clone());
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        walk(self, source, &mut srcs, &mut preds)?;
+        let resolve = |name: &str| -> Option<(usize, usize)> {
+            let find = |s: &Src, c: &str| s.cols.iter().position(|x| x.eq_ignore_ascii_case(c));
+            match name.rsplit_once('.') {
+                Some((q, c)) => {
+                    let q = q.rsplit('.').next().unwrap_or(q);
+                    srcs.iter().enumerate().find_map(|(i, s)| {
+                        if s.alias.eq_ignore_ascii_case(q) {
+                            find(s, c).map(|j| (i, j))
+                        } else {
+                            None
+                        }
+                    })
+                }
+                None => {
+                    let hits: Vec<(usize, usize)> = srcs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, s)| find(s, name).map(|j| (i, j)))
+                        .collect();
+                    if hits.len() == 1 { Some(hits[0]) } else { None }
+                }
+            }
+        };
+        let mut dep: std::collections::HashSet<(usize, usize)> = Default::default();
+        for g in group_exprs {
+            if let Expr::ColName(n) = g
+                && let Some(c) = resolve(n)
+            {
+                dep.insert(c);
+            }
+        }
+        // Equalities from WHERE and ON: AND-ed `col = const` / `col = col`.
+        type Col = Option<(usize, usize)>;
+        let mut eqs: Vec<(Col, Col, bool)> = Vec::new();
+        fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+            match e {
+                Expr::And(v) => v.iter().for_each(|x| conjuncts(x, out)),
+                other => out.push(other),
+            }
+        }
+        let mut cs = Vec::new();
+        for p in &preds {
+            conjuncts(p, &mut cs);
+        }
+        for c in cs {
+            if let Expr::Compare { op: CmpOp::Eq, left, right } = c {
+                let side = |e: &Expr| match e {
+                    Expr::ColName(n) => (resolve(n), false),
+                    Expr::Const(_) | Expr::Param(_) => (None, true),
+                    _ => (None, false),
+                };
+                let ((l, lc), (r, rc)) = (side(left), side(right));
+                if l.is_some() && rc {
+                    eqs.push((l, None, true));
+                } else if r.is_some() && lc {
+                    eqs.push((r, None, true));
+                } else if l.is_some() && r.is_some() {
+                    eqs.push((l, r, false));
+                }
+            }
+        }
+        loop {
+            let before = dep.len();
+            for (a, b, constant) in &eqs {
+                match (a, b, constant) {
+                    (Some(a), None, true) => {
+                        dep.insert(*a);
+                    }
+                    (Some(a), Some(b), false) => {
+                        if dep.contains(a) {
+                            dep.insert(*b);
+                        }
+                        if dep.contains(b) {
+                            dep.insert(*a);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (i, s) in srcs.iter().enumerate() {
+                let Some(t) = &s.table else { continue };
+                let keys = t.keys();
+                let determined = keys.iter().any(|(name, cols)| {
+                    (name == "PRIMARY" || cols.iter().all(|&c| t.columns[c].not_null))
+                        && !cols.is_empty()
+                        && cols.iter().all(|&c| dep.contains(&(i, c)))
+                });
+                if determined {
+                    for c in 0..t.columns.len() {
+                        dep.insert((i, c));
+                    }
+                }
+            }
+            if dep.len() == before {
+                break;
+            }
+        }
+        // The first non-aggregated, non-dependent base-table column in `e`.
+        fn offending(
+            e: &Expr,
+            resolve: &dyn Fn(&str) -> Option<(usize, usize)>,
+            ok: &dyn Fn((usize, usize)) -> bool,
+        ) -> Option<(usize, usize)> {
+            let mut found = None;
+            let mut stack = vec![e];
+            while let Some(x) = stack.pop() {
+                match x {
+                    Expr::ColName(n) => {
+                        if let Some(c) = resolve(n)
+                            && !ok(c)
+                        {
+                            found = Some(c);
+                        }
+                    }
+                    Expr::Agg { .. } | Expr::Subquery(_) | Expr::Exists { .. } => {}
+                    Expr::Call { name, .. } if name.eq_ignore_ascii_case("ANY_VALUE") => {}
+                    Expr::And(v) | Expr::Or(v) | Expr::Call { args: v, .. } => {
+                        stack.extend(v.iter().rev())
+                    }
+                    Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+                        stack.push(right);
+                        stack.push(left);
+                    }
+                    Expr::InList { expr, list, .. } => {
+                        stack.extend(list.iter().rev());
+                        stack.push(expr);
+                    }
+                    Expr::InSubquery { expr, .. } | Expr::Quantified { expr, .. } => {
+                        stack.push(expr)
+                    }
+                    Expr::Not(e) | Expr::IsNull(e, _) => stack.push(e),
+                    Expr::Like { expr, pattern, escape, .. } => {
+                        stack.push(escape);
+                        stack.push(pattern);
+                        stack.push(expr);
+                    }
+                    Expr::Case { conditions, else_result } => {
+                        if let Some(e) = else_result {
+                            stack.push(e);
+                        }
+                        for (c, r) in conditions.iter().rev() {
+                            stack.push(r);
+                            stack.push(c);
+                        }
+                    }
+                    Expr::Window { args, spec, .. } => stack.extend(
+                        crate::mysql::plan::window_exprs(args, spec)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev(),
+                    ),
+                    _ => {}
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            found
+        }
+        let is_base = |c: (usize, usize)| srcs[c.0].table.is_some();
+        let ok = |c: (usize, usize)| !is_base(c) || dep.contains(&c);
+        let label = |c: (usize, usize)| {
+            let s = &srcs[c.0];
+            format!("{}.{}.{}", s.db, s.alias, s.cols[c.1])
+        };
+        let grouped = !group_exprs.is_empty();
+        let mut pos = 0usize;
+        for (i, e) in exprs.iter().enumerate() {
+            let in_select = i < visible;
+            if !in_select && !grouped {
+                break;
+            }
+            let bad = if matches!(e, Expr::Wildcard) {
+                let mut first = None;
+                'outer: for (si, s) in srcs.iter().enumerate() {
+                    for ci in 0..s.cols.len() {
+                        pos += 1;
+                        if !ok((si, ci)) {
+                            first = Some((si, ci));
+                            break 'outer;
+                        }
+                    }
+                }
+                first
+            } else {
+                pos += 1;
+                if group_exprs.iter().any(|g| g == e) { None } else { offending(e, &resolve, &ok) }
+            };
+            if let Some(c) = bad {
+                return Err(if !grouped {
+                    MySqlError::new(
+                        1140,
+                        "42000",
+                        format!(
+                            "In aggregated query without GROUP BY, expression #{pos} of SELECT list contains nonaggregated column '{}'; this is incompatible with sql_mode=only_full_group_by",
+                            label(c)
+                        ),
+                    )
+                } else {
+                    let (n, clause) = if in_select {
+                        (pos, "SELECT list")
+                    } else {
+                        (i - visible + 1, "ORDER BY clause")
+                    };
+                    MySqlError::new(
+                        1055,
+                        "42000",
+                        format!(
+                            "Expression #{n} of {clause} is not in GROUP BY clause and contains nonaggregated column '{}' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by",
+                            label(c)
+                        ),
+                    )
+                });
+            }
         }
         Ok(())
     }
@@ -1180,6 +1470,11 @@ impl Executor {
                         }
 
                         let conflict = find_key_conflict(&work, &keys, &new_row, None);
+                        // A duplicate of another transaction's uncommitted
+                        // row waits for it (and is then a duplicate or not).
+                        if let Some((i, _)) = conflict {
+                            self.wait_if_locked(&db, &work, &[work.rows[i].clone()])?;
+                        }
                         match (&mode, conflict) {
                             (_, None) => {
                                 work.rows.push(new_row);
@@ -1242,7 +1537,8 @@ impl Executor {
                 })();
                 // A failed INSERT still consumes the AUTO_INCREMENT ids it
                 // generated, as in InnoDB (the next row doesn't reuse them).
-                if result.is_err() && work.next_auto_increment > counter_before {
+                let waiting = result.as_ref().err().is_some_and(|e| e.lock_holder().is_some());
+                if result.is_err() && !waiting && work.next_auto_increment > counter_before {
                     let mut state = self.db.lock().unwrap();
                     if let Some(t) =
                         state.schemas.get_mut(&db).and_then(|s| s.tables.get_mut(&table))
@@ -1326,7 +1622,75 @@ impl Executor {
                 self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
-            Plan::Scan { db, table, .. } => Ok(self.load_table(&db, &table)?.rows),
+            Plan::Scan { db, table, .. } => {
+                let t = self.read_table(&db, &table)?;
+                match &self.skip_rows {
+                    Some((d, n, keys)) if *d == db && *n == table => Ok(t
+                        .rows
+                        .iter()
+                        .filter(|r| !keys.contains(&crate::mysql::catalog::row_key(&t, r)))
+                        .cloned()
+                        .collect()),
+                    _ => Ok(t.rows),
+                }
+            }
+            Plan::Locking { source, target, exclusive, nowait, skip_locked } => {
+                if let Some((db, table, key_plan)) = target {
+                    let t = self.load_table(&db, &table)?;
+                    let held = self.db.lock().unwrap().locked_rows(self.conn_id, &db, &table);
+                    // SKIP LOCKED leaves out rows it can't lock before LIMIT
+                    // applies, as InnoDB does.
+                    if skip_locked {
+                        let skip = held
+                            .iter()
+                            .filter(|(_, _, ex)| exclusive || *ex)
+                            .map(|(_, k, _)| k.clone())
+                            .collect();
+                        self.skip_rows = Some((db.clone(), table.clone(), skip));
+                    }
+                    let rows = self.execute_plan(*key_plan);
+                    // The query itself skips the same rows.
+                    let skip_all = self.skip_rows.take();
+                    let keys: Vec<String> =
+                        rows?.iter().map(|r| crate::mysql::catalog::row_key(&t, r)).collect();
+                    // Shared locks only conflict with exclusive ones.
+                    let blocked: Vec<&(u64, String, bool)> = held
+                        .iter()
+                        .filter(|(_, k, ex)| (exclusive || *ex) && keys.contains(k))
+                        .collect();
+                    if let Some((holder, _, _)) = blocked.first() {
+                        if nowait {
+                            return Err(MySqlError::new(
+                                3572,
+                                "HY000",
+                                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.",
+                            ));
+                        }
+                        if !skip_locked {
+                            return Err(MySqlError::lock_wait(*holder));
+                        }
+                    }
+                    let skipped: std::collections::HashSet<String> =
+                        blocked.iter().map(|(_, k, _)| k.clone()).collect();
+                    {
+                        let mut state = self.db.lock().unwrap();
+                        if let Some(undo) = state.open_txns.get_mut(&self.conn_id) {
+                            for k in keys.iter().filter(|k| !skipped.contains(*k)) {
+                                undo.locks.push(crate::mysql::catalog::RowLock {
+                                    db: db.clone(),
+                                    table: table.clone(),
+                                    key: k.clone(),
+                                    exclusive,
+                                });
+                            }
+                        }
+                    }
+                    self.skip_rows = skip_all;
+                }
+                let res = self.execute_plan(*source);
+                self.skip_rows = None;
+                res
+            }
             Plan::Derived { plan, .. } => self.execute_plan(*plan),
             Plan::InsertSelect { insert, query } => {
                 // The SELECT runs first, over the table as it was (so
@@ -1440,7 +1804,17 @@ impl Executor {
                 }
                 Ok(out_rows)
             }
-            Plan::Aggregate { source, group_exprs, exprs, having, .. } => {
+            Plan::Aggregate { source, group_exprs, exprs, having, names } => {
+                if self.sql_mode.only_full_group_by() {
+                    // HAVING without GROUP BY or any aggregate (JDBC's
+                    // metadata queries) doesn't make a query aggregated.
+                    let aggregated = !group_exprs.is_empty()
+                        || exprs.iter().any(crate::mysql::plan::contains_agg)
+                        || having.as_ref().is_some_and(crate::mysql::plan::contains_agg);
+                    if aggregated {
+                        self.check_full_group_by(&source, &group_exprs, &exprs, names.len())?;
+                    }
+                }
                 let table_context = self.resolve_table_context(&source)?;
                 let rows = self.execute_plan(*source)?;
                 if rows.is_empty() {
@@ -1491,6 +1865,12 @@ impl Executor {
                     self.win_row.set(i);
                     let mut out_row = Vec::new();
                     for expr in &exprs {
+                        if matches!(expr, Expr::Wildcard) {
+                            // `SELECT t.*, COUNT(*) ... GROUP BY t.id`: the
+                            // group's (first) row.
+                            out_row.extend(group_rows.first().cloned().unwrap_or_default());
+                            continue;
+                        }
                         out_row.push(self.eval_group_expr(
                             expr,
                             group_rows,
@@ -1654,6 +2034,54 @@ impl Executor {
         Err(MySqlError::unknown_table(table))
     }
 
+    /// A table as this connection reads it: other connections'
+    /// uncommitted changes left out.
+    fn read_table(&self, db: &str, table: &str) -> Result<Table, MySqlError> {
+        let view = self.db.lock().unwrap().committed_view(self.conn_id, db, table);
+        match view {
+            Some(t) => Ok(t),
+            None => self.load_table(db, table),
+        }
+    }
+
+    /// Error `lock_wait` if any of `rows` of `t` is held by another
+    /// connection's open transaction.
+    fn wait_if_locked(&self, db: &str, t: &Table, rows: &[Vec<Value>]) -> Result<(), MySqlError> {
+        let locked = self.db.lock().unwrap().locked_rows(self.conn_id, db, &t.name);
+        if locked.is_empty() {
+            return Ok(());
+        }
+        for r in rows {
+            let k = crate::mysql::catalog::row_key(t, r);
+            if let Some((holder, _, _)) = locked.iter().find(|(_, lk, _)| *lk == k) {
+                return Err(MySqlError::lock_wait(*holder));
+            }
+        }
+        Ok(())
+    }
+
+    /// Before writing `t`: wait for every row the write changes that
+    /// another transaction holds.
+    fn check_write_locks(&self, db: &str, t: &Table) -> Result<(), MySqlError> {
+        let (locked, current) = {
+            let state = self.db.lock().unwrap();
+            let locked = state.locked_rows(self.conn_id, db, &t.name);
+            if locked.is_empty() {
+                return Ok(());
+            }
+            (locked, state.schemas.get(db).and_then(|s| s.tables.get(&t.name)).cloned())
+        };
+        let Some(current) = current else { return Ok(()) };
+        let (removed, added) = crate::mysql::catalog::row_diff(&current.rows, &t.rows);
+        for r in removed.iter().chain(&added) {
+            let k = crate::mysql::catalog::row_key(t, r);
+            if let Some((holder, _, _)) = locked.iter().find(|(_, lk, _)| *lk == k) {
+                return Err(MySqlError::lock_wait(*holder));
+            }
+        }
+        Ok(())
+    }
+
     fn store_table(&self, db: &str, t: Table) -> Result<(), MySqlError> {
         if db.eq_ignore_ascii_case("information_schema") {
             return Err(MySqlError::new(
@@ -1662,6 +2090,7 @@ impl Executor {
                 "Access denied for user 'root'@'localhost' to database 'information_schema'",
             ));
         }
+        self.check_write_locks(db, &t)?;
         let mut state = self.db.lock().unwrap();
         let schema = state
             .schemas
@@ -2538,6 +2967,8 @@ pub(crate) fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError>
             }
             Ok(Value::Null)
         }
+        // Exempts its argument from ONLY_FULL_GROUP_BY; any row's value.
+        "ANY_VALUE" => Ok(args.first().cloned().unwrap_or(Value::Null)),
         "IFNULL" => {
             let Some(a) = args.first() else { return Ok(Value::Null) };
             if !a.is_null() {

@@ -53,6 +53,9 @@ pub struct Engine {
     /// `foreign_key_checks` (on by default; dump files and migrations turn
     /// it off while loading tables in any order).
     pub fk_checks: bool,
+    /// `innodb_lock_wait_timeout`: how long a statement waits for a row
+    /// another transaction holds before error 1205.
+    pub lock_wait_timeout: u64,
     /// The client connected with `CLIENT_FOUND_ROWS` (see `Executor`).
     pub found_rows: bool,
     /// Whether a transaction is open (explicit BEGIN, or implicit).
@@ -82,6 +85,7 @@ impl Default for Engine {
             sql_mode: crate::mysql::sqlmode::SqlMode::default(),
             found_rows: false,
             fk_checks: true,
+            lock_wait_timeout: 50,
             in_tx: false,
             savepoints: Vec::new(),
         }
@@ -194,6 +198,7 @@ impl Engine {
         // then; tables first written after it, to their pre-transaction
         // image (and leave the undo log).
         let partial = TxUndo {
+            locks: Vec::new(),
             tables: undo
                 .tables
                 .iter()
@@ -225,6 +230,17 @@ impl Engine {
     pub fn before_plan(&mut self, plan: &Plan) -> Vec<(String, String)> {
         match plan {
             Plan::InsertSelect { insert, .. } => self.before_plan(insert),
+            // A locking read inside a transaction holds its locks until the
+            // transaction ends.
+            Plan::Locking { .. } => {
+                if !self.in_tx && !self.autocommit {
+                    self.in_tx = true;
+                }
+                if self.in_tx {
+                    self.db.lock().unwrap().open_txns.entry(self.conn_id).or_default();
+                }
+                vec![]
+            }
             Plan::CreateTable { .. }
             | Plan::DropTable { .. }
             | Plan::Truncate { .. }
@@ -327,6 +343,9 @@ impl Engine {
                         self.commit();
                     }
                     self.autocommit = on;
+                }
+                if let Some(n) = int_assignment(set, "innodb_lock_wait_timeout") {
+                    self.lock_wait_timeout = n.max(1) as u64;
                 }
                 if let Some(on) = bool_assignment(set, "foreign_key_checks") {
                     self.fk_checks = on;
@@ -490,16 +509,8 @@ impl Engine {
             plan::column_names(&plan, &state)
         };
 
-        let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
-        executor.last_found_rows = self.last_found_rows;
-        executor.session_insert_id = self.session_insert_id;
-        executor.sql_mode = self.sql_mode.clone();
-        executor.autocommit = self.autocommit;
-        executor.found_rows = self.found_rows;
-        executor.fk_checks = self.fk_checks;
-        let written = self.before_plan(&plan);
-        let res = executor.execute_plan(plan)?;
-        self.after_plan(written);
+        let (res, executor) = self.run_plan(plan, Vec::new());
+        let res = res?;
         self.last_affected_rows = executor.last_affected_rows;
         self.last_insert_id = executor.last_insert_id;
         if executor.last_insert_id != 0 {
@@ -512,6 +523,90 @@ impl Engine {
         self.current_db = executor.current_db;
 
         Ok(res)
+    }
+
+    /// A new executor carrying this session's settings.
+    pub fn executor(&self) -> Executor {
+        let mut executor = Executor::new(self.db.clone(), self.current_db.clone());
+        executor.last_found_rows = self.last_found_rows;
+        executor.session_insert_id = self.session_insert_id;
+        executor.sql_mode = self.sql_mode.clone();
+        executor.autocommit = self.autocommit;
+        executor.found_rows = self.found_rows;
+        executor.fk_checks = self.fk_checks;
+        executor.conn_id = self.conn_id;
+        executor
+    }
+
+    /// Runs a bound statement (with `params` for a prepared one). A
+    /// statement that needs a row another transaction holds waits for it,
+    /// as InnoDB does: until that transaction ends, error 1205 after
+    /// `innodb_lock_wait_timeout` seconds, or error 1213 (rolling this
+    /// transaction back) if the two are waiting for each other.
+    pub fn run_plan(
+        &mut self,
+        plan: Plan,
+        params: Vec<Value>,
+    ) -> (Result<Vec<Vec<Value>>, MySqlError>, Executor) {
+        let written = self.before_plan(&plan);
+        let started = std::time::Instant::now();
+        loop {
+            let mut executor = self.executor();
+            executor.params = params.clone();
+            let res = executor.execute_plan(plan.clone());
+            let Some(holder) = res.as_ref().err().and_then(|e| e.lock_holder()) else {
+                self.db.lock().unwrap().waits.remove(&self.conn_id);
+                if res.is_ok() {
+                    self.after_plan(written);
+                }
+                return (res, executor);
+            };
+            let deadlock = {
+                let mut state = self.db.lock().unwrap();
+                state.waits.insert(self.conn_id, holder);
+                // Follow who the holder is waiting for, and so on.
+                let mut at = holder;
+                let mut cycle = false;
+                for _ in 0..state.waits.len() + 1 {
+                    match state.waits.get(&at) {
+                        Some(&next) if next == self.conn_id => {
+                            cycle = true;
+                            break;
+                        }
+                        Some(&next) => at = next,
+                        None => break,
+                    }
+                }
+                if cycle {
+                    state.waits.remove(&self.conn_id);
+                }
+                cycle
+            };
+            if deadlock {
+                self.rollback();
+                self.savepoints.clear();
+                return (
+                    Err(MySqlError::new(
+                        1213,
+                        "40001",
+                        "Deadlock found when trying to get lock; try restarting transaction",
+                    )),
+                    executor,
+                );
+            }
+            if started.elapsed().as_secs() >= self.lock_wait_timeout {
+                self.db.lock().unwrap().waits.remove(&self.conn_id);
+                return (
+                    Err(MySqlError::new(
+                        1205,
+                        "HY000",
+                        "Lock wait timeout exceeded; try restarting transaction",
+                    )),
+                    executor,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     pub fn use_db(&mut self, db: &str) {
@@ -627,6 +722,33 @@ fn sql_mode_assignment(set: &sqlparser::ast::Set) -> Option<crate::mysql::sqlmod
 
 /// `Some(on)` if `set` assigns `autocommit` (`SET autocommit = 0`,
 /// `SET @@autocommit = 1`, `SET SESSION autocommit = OFF`, ...).
+/// `Some(n)` if `set` assigns the integer variable `var`.
+fn int_assignment(set: &sqlparser::ast::Set, var: &str) -> Option<i64> {
+    use sqlparser::ast::{Expr as E, Set, Value as V};
+    let pairs: Vec<(String, &E)> = match set {
+        Set::SingleAssignment { variable, values, .. } => {
+            values.first().map(|v| vec![(variable.to_string(), v)]).unwrap_or_default()
+        }
+        Set::MultipleAssignments { assignments } => {
+            assignments.iter().map(|a| (a.name.to_string(), &a.value)).collect()
+        }
+        _ => vec![],
+    };
+    pairs.into_iter().rev().find_map(|(name, value)| {
+        let name = name.trim_start_matches('@').to_ascii_lowercase();
+        if name.rsplit('.').next() != Some(var) {
+            return None;
+        }
+        match value {
+            E::Value(v) => match &v.value {
+                V::Number(n, _) => n.parse().ok(),
+                _ => None,
+            },
+            _ => None,
+        }
+    })
+}
+
 fn bool_assignment(set: &sqlparser::ast::Set, var: &str) -> Option<bool> {
     use sqlparser::ast::{Expr as E, Set, Value as V};
     let pairs: Vec<(String, &E)> = match set {

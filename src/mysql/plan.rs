@@ -499,6 +499,18 @@ pub enum Plan {
         insert: Box<Plan>,
         query: Box<Plan>,
     },
+    /// `SELECT ... FOR UPDATE | FOR SHARE [NOWAIT | SKIP LOCKED]`: locks
+    /// the rows of `table` matching `predicate` (single-table queries)
+    /// before reading.
+    Locking {
+        source: Box<Plan>,
+        /// The locked table and a plan reading the whole rows the query
+        /// reads (its FROM, WHERE, ORDER BY and LIMIT, `SELECT *`).
+        target: Option<(String, String, Box<Plan>)>,
+        exclusive: bool,
+        nowait: bool,
+        skip_locked: bool,
+    },
     /// The recursive step's reference to its own CTE.
     CteRef {
         name: String,
@@ -652,6 +664,7 @@ pub fn count_params(plan: &Plan) -> usize {
                 limit.iter().chain(offset.iter()).for_each(|e| expr_max(e, max));
             }
             Plan::Derived { plan, .. } => plan_max(plan, max),
+            Plan::Locking { source, .. } => plan_max(source, max),
             Plan::InsertSelect { insert, query } => {
                 plan_max(insert, max);
                 plan_max(query, max);
@@ -695,7 +708,9 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
             }
             out
         }
-        Plan::Filter { source, .. } | Plan::Finish { source, .. } => column_names(source, db),
+        Plan::Filter { source, .. }
+        | Plan::Finish { source, .. }
+        | Plan::Locking { source, .. } => column_names(source, db),
         Plan::SetOp { left, .. } => column_names(left, db),
         Plan::Derived { plan, columns, .. } => {
             if columns.is_empty() {
@@ -758,7 +773,9 @@ pub fn static_names(plan: &Plan) -> Option<Vec<String>> {
         Plan::Project { exprs, names, .. } | Plan::Aggregate { exprs, names, .. } => {
             (!exprs.iter().any(|e| matches!(e, Expr::Wildcard))).then(|| names.clone())
         }
-        Plan::Filter { source, .. } | Plan::Finish { source, .. } => static_names(source),
+        Plan::Filter { source, .. }
+        | Plan::Finish { source, .. }
+        | Plan::Locking { source, .. } => static_names(source),
         Plan::SetOp { left, .. } => static_names(left),
         Plan::Derived { plan, columns, .. } => {
             if columns.is_empty() {

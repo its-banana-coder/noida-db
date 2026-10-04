@@ -12,6 +12,8 @@ they're printed every run but don't fail it, and a known gap that starts
 matching is reported so the list can shrink.
 """
 import sys
+import threading
+import time
 
 KIND, NOIDA_PORT, REF_PORT = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 
@@ -60,9 +62,36 @@ def run(port, scenario):
     for s in DB_SETUP:
         setup.cursor().execute(s)
     trace = []
+    pending = {}  # conn name -> (thread, result holder) for ("async", sql)
     for step in scenario:
         who, action = step[0], step[1]
         c = conn(who)
+        if isinstance(action, tuple) and action[0] == "sleep":
+            time.sleep(action[1])
+            continue
+        if isinstance(action, tuple) and action[0] == "async":
+            # Runs on its own thread, so a statement that blocks on a lock
+            # doesn't stop the scenario; ("join",) collects its result.
+            holder = {}
+
+            def go(c=c, sql=action[1], holder=holder):
+                try:
+                    cur = c.cursor()
+                    cur.execute(sql)
+                    rows = [tuple(r) for r in cur.fetchall()] if cur.description else None
+                    holder["r"] = ("rows", rows) if rows is not None else ("ok", cur.rowcount)
+                except Exception as e:  # noqa: BLE001
+                    holder["r"] = ("error", err_code(e))
+
+            t = threading.Thread(target=go)
+            t.start()
+            pending[who] = (t, holder, action[1])
+            continue
+        if isinstance(action, tuple) and action[0] == "join":
+            t, holder, sql = pending.pop(who)
+            t.join(timeout=30)
+            trace.append((who, sql, holder.get("r", ("still blocked",))))
+            continue
         try:
             if action == "state":
                 trace.append((who, "state", tx_state(c)))
@@ -226,11 +255,6 @@ MYSQL = {
         (A, "INSERT INTO u VALUES (1)"),
         (B, "SELECT COUNT(*) FROM u"),
         (A, "rollback"),
-    ],
-    "ONLY_FULL_GROUP_BY": [
-        (A, "CREATE TABLE t (id INT, g INT)"),
-        (A, "INSERT INTO t VALUES (1, 1), (2, 1)"),
-        (A, "SELECT id, COUNT(*) FROM t GROUP BY g"),
     ],
 }
 
@@ -437,6 +461,126 @@ MYSQL_QUERIES = {
         (A, "ALTER TABLE c DROP FOREIGN KEY fk"),
         (A, "ALTER TABLE c DROP COLUMN parent"),
     ],
+    "ONLY_FULL_GROUP_BY": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, u INT NOT NULL UNIQUE, nu INT UNIQUE)"),
+        (A, "CREATE TABLE s (id INT PRIMARY KEY, tid INT, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 1, 10, 1, 1), (2, 1, 20, 2, NULL), (3, 2, 30, 3, 3)"),
+        (A, "INSERT INTO s VALUES (1, 1, 5), (2, 1, 6)"),
+        (A, "SELECT a, b FROM t GROUP BY a"),
+        (A, "SELECT a, COUNT(*) FROM t"),
+        (A, "SELECT id, b FROM t GROUP BY id"),
+        (A, "SELECT u, b FROM t GROUP BY u"),
+        (A, "SELECT nu, b FROM t GROUP BY nu"),
+        (A, "SELECT a, b FROM t WHERE b = 1 GROUP BY a"),
+        (A, "SELECT a, COUNT(*) FROM t WHERE a = 1"),
+        (A, "SELECT a FROM t GROUP BY a ORDER BY b"),
+        (A, "SELECT a+1, COUNT(*) FROM t GROUP BY a+1"),
+        (A, "SELECT a+1 FROM t GROUP BY a"),
+        (A, "SELECT ANY_VALUE(b), a FROM t GROUP BY a"),
+        (A, "SELECT t.id, s.v FROM t JOIN s ON s.id = t.id GROUP BY t.id"),
+        (A, "SELECT t.id, s.v FROM t JOIN s ON s.tid = t.id GROUP BY t.id"),
+        (A, "SELECT s.id, t.b FROM t JOIN s ON s.tid = t.id GROUP BY s.id"),
+        (A, "SELECT a AS x, COUNT(*) FROM t GROUP BY x"),
+        (A, "SELECT a, b FROM t GROUP BY a, b ORDER BY COUNT(*)"),
+        (A, "SELECT DISTINCT a FROM t ORDER BY b"),
+        (A, "SELECT DISTINCT a, b FROM t ORDER BY b DESC, a"),
+        (A, "SELECT a, b FROM t WHERE a = b GROUP BY a"),
+        (A, "SELECT COUNT(*) FROM t ORDER BY b"),
+        (A, "SELECT a FROM t GROUP BY a HAVING COUNT(*) > 1 ORDER BY MAX(b)"),
+        (A, "SELECT t.*, COUNT(*) FROM t GROUP BY t.id"),
+        (A, "SELECT * FROM t GROUP BY a"),
+        (A, "SELECT x.a, x.b FROM t AS x GROUP BY x.a"),
+        (A, "SELECT a, RANK() OVER (ORDER BY b) FROM t GROUP BY a"),
+        (A, "SELECT a, SUM(b), RANK() OVER (ORDER BY SUM(b)) FROM t GROUP BY a ORDER BY a"),
+        (A, "SELECT a, b AS bb FROM t HAVING bb > 15 ORDER BY a, bb"),
+        (A, "SELECT a FROM t HAVING COUNT(*) > 1"),
+        (A, "SET SESSION sql_mode = ''"),
+        (A, "SELECT a, b FROM t GROUP BY a ORDER BY a"),
+        (A, "SELECT a, COUNT(*) FROM t"),
+    ],
+    "isolation: reads see committed data only": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 10), (2, 20)"),
+        (A, "autocommit", False),
+        (A, "INSERT INTO t VALUES (3, 30)"),
+        (A, "UPDATE t SET v = 11 WHERE id = 1"),
+        (A, "DELETE FROM t WHERE id = 2"),
+        (B, "SELECT id, v FROM t ORDER BY id"),
+        (A, "SELECT id, v FROM t ORDER BY id"),
+        (B, "SELECT COUNT(*), SUM(v) FROM t"),
+        (A, "commit"),
+        (B, "SELECT id, v FROM t ORDER BY id"),
+    ],
+    "isolation: a write waits for the row's transaction": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 10), (2, 20)"),
+        (A, "autocommit", False),
+        (A, "UPDATE t SET v = v + 1 WHERE id = 1"),
+        (B, "UPDATE t SET v = v + 100 WHERE id = 2"),
+        (B, ("async", "UPDATE t SET v = v * 2 WHERE id = 1")),
+        (A, ("sleep", 0.5)),
+        (A, "commit"),
+        (B, ("join",)),
+        (A, "SELECT id, v FROM t ORDER BY id"),
+    ],
+    "isolation: lock wait timeout": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 10)"),
+        (B, "SET SESSION innodb_lock_wait_timeout = 1"),
+        (A, "autocommit", False),
+        (A, "UPDATE t SET v = 11 WHERE id = 1"),
+        (B, "UPDATE t SET v = 12 WHERE id = 1"),
+        (B, "DELETE FROM t WHERE id = 1"),
+        (A, "rollback"),
+        (B, "UPDATE t SET v = 12 WHERE id = 1"),
+        (A, "SELECT v FROM t"),
+    ],
+    "isolation: an uncommitted duplicate key waits": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, v INT)"),
+        (A, "autocommit", False),
+        (A, "INSERT INTO t VALUES (5, 1)"),
+        (B, ("async", "INSERT INTO t VALUES (5, 2)")),
+        (A, ("sleep", 0.5)),
+        (A, "rollback"),
+        (B, ("join",)),
+        (A, "INSERT INTO t VALUES (6, 1)"),
+        (B, ("async", "INSERT INTO t VALUES (6, 2)")),
+        (A, ("sleep", 0.5)),
+        (A, "commit"),
+        (B, ("join",)),
+        (A, "SELECT id, v FROM t ORDER BY id"),
+    ],
+    "isolation: SKIP LOCKED and NOWAIT job queue": [
+        (A, "CREATE TABLE jobs (id INT PRIMARY KEY, done INT NOT NULL DEFAULT 0)"),
+        (A, "INSERT INTO jobs (id) VALUES (1), (2), (3)"),
+        (A, "autocommit", False),
+        (B, "autocommit", False),
+        (A, "SELECT id FROM jobs WHERE done = 0 ORDER BY id LIMIT 1 FOR UPDATE"),
+        (B, "SELECT id FROM jobs WHERE done = 0 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED"),
+        (B, "SELECT id FROM jobs WHERE id = 1 FOR UPDATE NOWAIT"),
+        (B, "SELECT id FROM jobs WHERE id = 1 FOR SHARE NOWAIT"),
+        (B, "SELECT id FROM jobs WHERE done = 0 ORDER BY id FOR UPDATE SKIP LOCKED"),
+        (A, "UPDATE jobs SET done = 1 WHERE id = 1"),
+        (A, "commit"),
+        (B, "UPDATE jobs SET done = 1 WHERE id = 2"),
+        (B, "commit"),
+        (A, "SELECT id, done FROM jobs ORDER BY id"),
+    ],
+    "isolation: deadlock": [
+        (A, "CREATE TABLE t (id INT PRIMARY KEY, v INT)"),
+        (A, "INSERT INTO t VALUES (1, 0), (2, 0)"),
+        (A, "autocommit", False),
+        (B, "autocommit", False),
+        (A, "UPDATE t SET v = 1 WHERE id = 1"),
+        (B, "UPDATE t SET v = 2 WHERE id = 2"),
+        (B, ("async", "UPDATE t SET v = 2 WHERE id = 1")),
+        (A, ("sleep", 0.5)),
+        (A, "UPDATE t SET v = 1 WHERE id = 2"),
+        (B, ("join",)),
+        (A, "commit"),
+        (B, "commit"),
+        (A, "SELECT id, v FROM t ORDER BY id"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 
@@ -531,8 +675,6 @@ POSTGRES = {
 # Documented gaps (docs/LIMITATIONS.md): reported, not failed.
 KNOWN = {
     "mysql": {
-        "uncommitted writes are invisible to other connections": "no isolation between MySQL connections",
-        "ONLY_FULL_GROUP_BY": "ONLY_FULL_GROUP_BY is not enforced",
     },
     "postgres": {},
 }

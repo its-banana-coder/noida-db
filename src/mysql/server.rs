@@ -363,26 +363,11 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                     &mut session,
                 ) {
                     Ok(params) => {
-                        let mut executor = crate::mysql::exec::Executor::new(
-                            session.engine.db.clone(),
-                            session.engine.current_db.clone(),
-                        );
-                        executor.params = params;
-                        executor.last_found_rows = session.engine.last_found_rows;
-                        executor.session_insert_id = session.engine.session_insert_id;
-                        executor.sql_mode = session.engine.sql_mode.clone();
-                        executor.autocommit = session.engine.autocommit;
-                        executor.found_rows = session.engine.found_rows;
-                        executor.fk_checks = session.engine.fk_checks;
                         let names = {
                             let state = session.engine.db.lock().unwrap();
                             plan::column_names(&stmt_plan, &state)
                         };
-                        let written = session.engine.before_plan(&stmt_plan);
-                        let result = executor.execute_plan(stmt_plan);
-                        if result.is_ok() {
-                            session.engine.after_plan(written);
-                        }
+                        let (result, executor) = session.engine.run_plan(stmt_plan, params);
                         STATUS.with(|s| s.set(session.engine.status_flags()));
                         match result {
                             Ok(rows) => {
