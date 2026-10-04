@@ -122,8 +122,8 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
     // real, measured ~1000x latency regression on simple point queries
     // (50ms vs Redis's ~65us for the same shape of request) -- found via
     // benchmarks/noidadb_bench.py, not a micro-optimization guess. Every
-    // other service's own server that already had this (Postgres, Redis,
-    // Memcached) doesn't show this problem.
+    // other service's own server that already had this (Postgres,
+    // Redis) doesn't show this problem.
     stream.set_nodelay(true)?;
     let mut session = Session {
         engine,

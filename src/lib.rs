@@ -1,5 +1,5 @@
 //! noida-db: one tiny local binary standing in for Postgres, MySQL, Redis,
-//! Kafka, Elasticsearch, ClickHouse, Memcached, MongoDB and RabbitMQ during
+//! Kafka, Elasticsearch, ClickHouse and MongoDB during
 //! development.
 //!
 //! Each service is a module behind its own Cargo feature.
@@ -23,8 +23,6 @@ pub mod postgres;
 #[cfg(feature = "kafka")]
 pub mod kafka;
 
-#[cfg(feature = "memcached")]
-pub mod memcached;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
 
@@ -33,6 +31,3 @@ pub mod elasticsearch;
 
 #[cfg(feature = "clickhouse")]
 pub mod clickhouse;
-
-#[cfg(feature = "rabbitmq")]
-pub mod rabbitmq;

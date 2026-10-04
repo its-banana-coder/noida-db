@@ -18,10 +18,8 @@ but not identical to the real server.
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
 | MySQL | tables with enforced keys, upserts, `ALTER TABLE`, joins, aggregates, JSON/ENUM, ~90 functions, transactions (incl. `autocommit=0`) and savepoints, prepared statements (text and binary protocol), `information_schema`, subqueries, `UNION`/`INTERSECT`/`EXCEPT`, CTEs (incl. recursive), `INSERT ... SELECT`, `sql_mode`; no window functions yet (see below) | yes: mysql_async, pymysql, SQLAlchemy, Django, mysql2, Go + GORM, JDBC, WordPress |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
-| Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
 | Elasticsearch | HTTP layer, CRUD/bulk, match/term/range/bool search with BM25, aggregations (see below) | yes, for the query types implemented |
-| RabbitMQ | AMQP 0-9-1 core (exchanges/queues/bindings, publish/consume/get, QoS, publisher confirms, dead-lettering, TTLs, nack/reject with requeue), a stub management HTTP API (see below) | yes, for `lapin` |
 
 ## By design, for every service
 
@@ -674,47 +672,6 @@ connects with `CLIENT_FOUND_ROWS`, as Django does), and an
 - JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions
   (`JSON_SET`, `JSON_INSERT`, ...).
 - Authentication (every password is currently accepted).
-
-## Memcached
-
-The text protocol is implemented and verified against real un-modified applications. Verified against Django (`6.x`) using its built-in `django.core.cache.backends.memcached.PyMemcacheCache` and `pymemcache` (`4.x`), successfully exercising real code paths for `set`, `get`, `delete`, `incr`, `decr`, `add`, `set_many`, `get_many`, `touch` and `clear`.
-
-The modern binary/meta protocol is not implemented. Given that most major client libraries (including `pymemcache` in Django) still use or default to the text protocol, staying text-protocol-only is sufficient for the common "cache backend" use-case.
-
-## RabbitMQ
-
-AMQP 0-9-1 core over the native binary protocol: exchange/queue declare,
-binding, `basic.publish`/`basic.get`/`basic.consume`, QoS (prefetch),
-publisher confirms (`confirm.select` + a real `basic.ack` after every
-publish on a confirming channel), dead-lettering (`x-dead-letter-exchange`/
-`x-dead-letter-routing-key` queue arguments, triggered by both TTL
-expiry and a `basic.nack`/`basic.reject` with `requeue=false`), message
-TTLs (per-queue `x-message-ttl` and the per-message `expiration`
-property — the queue's TTL and the message's own take whichever expires
-first), and `basic.nack`/`basic.reject` with real requeue behavior (a
-requeued message goes back to the head of the queue with `redelivered`
-set on the next delivery). Verified against the real `lapin` client
-(`tests/rabbitmq_client.rs`): connect/declare, publish/consume, get, QoS,
-publisher confirms, nack+requeue-then-redeliver, reject-to-dead-letter,
-and the management HTTP API's basic shape. `tests/rabbitmq_diff.rs` is a
-real differential test against a reference server (`NOIDA_RABBITMQ_REF`,
-or `127.0.0.1:5672` if reachable; skips cleanly otherwise) — currently
-covers basic declare/publish/get. The management HTTP API (port 15672)
-is a fixed-response stub — enough for tooling that just probes
-`/api/whoami`/`/api/overview`/`/api/nodes` for liveness, not a real
-reflection of declared exchanges/queues/connections.
-
-**Not yet**
-- Fanout and topic exchange routing: the default `""` exchange and
-  `"amq.direct"` are both hardcoded to `kind: "direct"` — declaring a
-  `fanout` or `topic` exchange is accepted, but routing still behaves
-  like `direct` (exact routing-key match), not fan-out-to-all or
-  wildcard (`*`/`#`) matching.
-- Transactions (`tx.select`/`tx.commit`/`tx.rollback`).
-- `tests/rabbitmq_diff.rs` only covers basic declare/publish/get so far —
-  dead-lettering, TTLs, and nack/reject aren't yet compared against a
-  real server, only exercised via the `lapin` client tests above.
-- The management HTTP API doesn't reflect real server state (see above).
 
 ## Elasticsearch
 
