@@ -16,7 +16,7 @@ but not identical to the real server.
 | Redis | most commands done (see below) | yes |
 | Postgres | wire protocol, catalogs, ORMs (see below) | yes, for the drivers tested |
 | Kafka | native binary protocol, topics, consumer groups, configs, transactions with real read_committed isolation and producer fencing | yes |
-| MySQL | tables with enforced keys, upserts, `ALTER TABLE`, joins, aggregates, JSON/ENUM, ~90 functions, transactions (incl. `autocommit=0`) and savepoints, prepared statements (text and binary protocol), `information_schema`, strict-mode errors; no subqueries/UNION/CTEs/window functions yet (see below) | yes: mysql_async, pymysql, SQLAlchemy, Django, mysql2, Go + GORM, JDBC, WordPress |
+| MySQL | tables with enforced keys, upserts, `ALTER TABLE`, joins, aggregates, JSON/ENUM, ~90 functions, transactions (incl. `autocommit=0`) and savepoints, prepared statements (text and binary protocol), `information_schema`, subqueries, `UNION`/`INTERSECT`/`EXCEPT`, CTEs (incl. recursive), `INSERT ... SELECT`, `sql_mode`; no window functions yet (see below) | yes: mysql_async, pymysql, SQLAlchemy, Django, mysql2, Go + GORM, JDBC, WordPress |
 | ClickHouse | HTTP interface, `CREATE`/`INSERT`/`SELECT` on `Memory`/`MergeTree`/`ReplacingMergeTree`/`SummingMergeTree` tables with real `FINAL`/`OPTIMIZE` merge semantics, materialized views (`TO` form), `Nullable(...)` columns, `WHERE`/`GROUP BY`/`ORDER BY`/`LIMIT`, ~25 functions, TSV/JSON/JSONEachRow/RowBinary, chunked request bodies, errors (see below) | yes, for these — the official Rust client works end to end |
 | Memcached | text protocol: set/add/replace/append/prepend/cas/get/gets/gat/gats/delete/incr/decr/touch/flush_all/stats/version/verbosity/quit | yes |
 | MongoDB | OP_MSG wire protocol, CRUD, unique indexes (see below) | yes, for the official Rust driver |
@@ -641,13 +641,34 @@ DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `ALTER TABLE`
 INDEX`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
 [LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
 DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
-`SET` (accepted, no effect), and `information_schema.SCHEMATA`/`TABLES`/
+`SET` (`sql_mode` and `autocommit` take effect; other variables are
+accepted with no effect), and `information_schema.SCHEMATA`/`TABLES`/
 `COLUMNS`/`STATISTICS`/`KEY_COLUMN_USAGE`, which is what ORMs and
 migration tools query.
 
+Subqueries: derived tables (`FROM (SELECT ...) AS d (a, b)`; 1248
+without an alias), scalar subqueries (NULL with no rows, 1242 with more
+than one, 1241 with more than one column), `[NOT] IN (SELECT ...)` with
+`IN`'s NULL semantics, `[NOT] EXISTS`, and `op ALL|ANY|SOME (SELECT ...)`,
+anywhere an expression is allowed (`SELECT`, `WHERE`, `HAVING`,
+`ORDER BY`, `UPDATE ... SET`, `DELETE ... WHERE`), correlated with the
+enclosing row. `UNION [ALL]`, `INTERSECT` and `EXCEPT`, with `ORDER BY`
+(output column name or position) and `LIMIT`, parenthesized branches,
+and 1222 on a column-count mismatch. `WITH` and `WITH RECURSIVE` (a
+recursive CTE stops with 3636 after 1000 rounds, MySQL's default
+`cte_max_recursion_depth`). `INSERT ... SELECT`. Subqueries are
+re-run for every row of the enclosing query (no caching or decorrelation),
+so they're as slow as the nested loop they describe. A recursive CTE's
+columns are not narrowed to the anchor's types (MySQL would truncate a
+string that grows past the anchor's width).
+
+`UPDATE` reports the rows it changed (the rows it matched when the client
+connects with `CLIENT_FOUND_ROWS`, as Django does), and an
+`ON UPDATE CURRENT_TIMESTAMP` column only moves when the row changed.
+
 **Not yet**
-- Subqueries (`IN (SELECT ...)`, `EXISTS`, scalar subqueries, derived
-  tables), CTEs (`WITH`), `UNION`, window functions, and `REGEXP`.
+- Window functions (`... OVER (...)`: an explicit 1235 error), `LATERAL`
+  derived tables, and `REGEXP`.
 - Multi-table `UPDATE`/`DELETE` (`UPDATE a JOIN b`).
 - `FOREIGN KEY` constraints are accepted but not enforced (no
   referential integrity, no `ON DELETE CASCADE`). Plain `KEY`/`INDEX`/
