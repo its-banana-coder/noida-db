@@ -9,7 +9,7 @@ use kafka_protocol::messages::produce_request::{
 };
 use kafka_protocol::protocol::StrBytes;
 
-use super::{START_MS, T};
+use super::{T, record_batch, record_values};
 
 #[test]
 fn test_produce_and_fetch_happy_path() {
@@ -30,7 +30,7 @@ fn test_produce_and_fetch_happy_path() {
     topic_data1.name = TopicName::from(StrBytes::from_static_str("logs"));
     let mut part_data1 = PartitionProduceData::default();
     part_data1.index = 0;
-    part_data1.records = Some(bytes::Bytes::from("msg-1-payload"));
+    part_data1.records = Some(bytes::Bytes::from(record_batch(&[b"msg-1-payload"], -1, -1, -1)));
     topic_data1.partition_data.push(part_data1);
     prod_req1.topic_data.push(topic_data1);
 
@@ -38,7 +38,9 @@ fn test_produce_and_fetch_happy_path() {
     let p_res1 = &prod_resp1.responses[0].partition_responses[0];
     assert_eq!(p_res1.error_code, 0);
     assert_eq!(p_res1.base_offset, 0);
-    assert_eq!(p_res1.log_append_time_ms, START_MS as i64);
+    // -1 unless the topic uses message.timestamp.type=LogAppendTime, as in
+    // Kafka.
+    assert_eq!(p_res1.log_append_time_ms, -1);
 
     // Advance clock by 500ms and produce second record
     t.advance(500);
@@ -48,7 +50,7 @@ fn test_produce_and_fetch_happy_path() {
     topic_data2.name = TopicName::from(StrBytes::from_static_str("logs"));
     let mut part_data2 = PartitionProduceData::default();
     part_data2.index = 0;
-    part_data2.records = Some(bytes::Bytes::from("msg-2-payload"));
+    part_data2.records = Some(bytes::Bytes::from(record_batch(&[b"msg-2-payload"], -1, -1, -1)));
     topic_data2.partition_data.push(part_data2);
     prod_req2.topic_data.push(topic_data2);
 
@@ -56,7 +58,7 @@ fn test_produce_and_fetch_happy_path() {
     let p_res2 = &prod_resp2.responses[0].partition_responses[0];
     assert_eq!(p_res2.error_code, 0);
     assert_eq!(p_res2.base_offset, 1);
-    assert_eq!(p_res2.log_append_time_ms, (START_MS + 500) as i64);
+    assert_eq!(p_res2.log_append_time_ms, -1);
 
     // Fetch offset 0
     let mut fetch_req1 = FetchRequest::default();
@@ -75,7 +77,10 @@ fn test_produce_and_fetch_happy_path() {
     let f_part1 = &fetch_resp1.responses[0].partitions[0];
     assert_eq!(f_part1.error_code, 0);
     assert_eq!(f_part1.high_watermark, 2);
-    assert_eq!(f_part1.records.as_deref(), Some(b"msg-1-payloadmsg-2-payload".as_ref()));
+    assert_eq!(
+        record_values(f_part1.records.as_ref()),
+        vec![b"msg-1-payload".to_vec(), b"msg-2-payload".to_vec()]
+    );
 
     // Fetch offset 1
     let mut fetch_req2 = FetchRequest::default();
@@ -91,7 +96,7 @@ fn test_produce_and_fetch_happy_path() {
     let f_part2 = &fetch_resp2.responses[0].partitions[0];
     assert_eq!(f_part2.error_code, 0);
     assert_eq!(f_part2.high_watermark, 2);
-    assert_eq!(f_part2.records.as_deref(), Some(b"msg-2-payload".as_ref()));
+    assert_eq!(record_values(f_part2.records.as_ref()), vec![b"msg-2-payload".to_vec()]);
 }
 
 #[test]
@@ -192,7 +197,8 @@ fn test_list_offsets() {
         topic_data.name = TopicName::from(StrBytes::from_static_str("offsets-test"));
         let mut part_data = PartitionProduceData::default();
         part_data.index = 0;
-        part_data.records = Some(bytes::Bytes::from(format!("msg-{}", i)));
+        part_data.records =
+            Some(bytes::Bytes::from(record_batch(&[format!("msg-{i}").as_bytes()], -1, -1, -1)));
         topic_data.partition_data.push(part_data);
         prod_req.topic_data.push(topic_data);
         t.engine.handle_produce(&prod_req, 8);
@@ -240,13 +246,8 @@ fn test_list_offsets() {
 }
 
 fn produce_multi_record_batch(t: &T, topic: &'static str, num_records: i32, producer_id: i64) {
-    // A synthetic v2 record batch: magic byte (offset 16) = 2,
-    // last_offset_delta (offset 23..27, BE i32) = num_records - 1,
-    // producer_id (offset 43..51, BE i64).
-    let mut batch = vec![0u8; 70];
-    batch[16] = 2;
-    batch[23..27].copy_from_slice(&(num_records - 1).to_be_bytes());
-    batch[43..51].copy_from_slice(&producer_id.to_be_bytes());
+    let values: Vec<&[u8]> = (0..num_records).map(|_| b"record".as_ref()).collect();
+    let batch = record_batch(&values, producer_id, -1, -1);
 
     let mut prod_req = ProduceRequest::default();
     let mut topic_data = TopicProduceData::default();

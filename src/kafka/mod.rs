@@ -3,6 +3,7 @@
 pub mod codec;
 pub mod connection;
 pub mod engine;
+pub mod log;
 
 #[cfg(test)]
 mod tests;
@@ -19,6 +20,7 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let local_addr = listener.local_addr()?;
 
     let engine = Engine::new(local_addr.ip().to_string(), local_addr.port() as i32);
+    engine.spawn_log_cleaner();
 
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
@@ -63,6 +65,7 @@ pub fn spawn_persistent_for_test(
         Engine::new(local_addr.ip().to_string(), local_addr.port() as i32)
     };
 
+    engine.spawn_log_cleaner();
     let save_engine = engine.clone();
     let save = move || {
         let snapshot = save_engine.snapshot();

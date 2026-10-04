@@ -205,10 +205,13 @@ Kafka Streams needs transactions (EOS v2), internal topic creation
 (`*-changelog`, `*-repartition`) with configs like `cleanup.policy=compact`,
 and DeleteRecords on repartition topics.
 
+Done since: log compaction (`cleanup.policy=compact`, latest per key,
+tombstones), retention by time/bytes over segments, real DeleteRecords and
+log start offset, topic-config validation — `src/kafka/log.rs`.
+
 ### P2
-KIP-848 consumer group protocol (ConsumerGroupHeartbeat, 68), log
-compaction honouring `cleanup.policy=compact` (keep latest per key,
-tombstones), retention by time/bytes, quotas APIs (describe → empty), SCRAM
+KIP-848 consumer group protocol (ConsumerGroupHeartbeat, 68), quotas APIs
+(describe → empty), SCRAM
 auth, KRaft controller APIs (answer as a broker without controller
 listener).
 

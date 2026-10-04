@@ -186,6 +186,7 @@ fn read_committed_hides_aborted_records_and_reveals_committed_ones() {
         &{
             let mut r = InitProducerIdRequest::default();
             r.transactional_id = Some(TransactionalId(StrBytes::from_static_str("tx-a")));
+            r.transaction_timeout_ms = 60_000;
             r
         },
         4,
@@ -256,6 +257,7 @@ fn read_committed_hides_aborted_records_and_reveals_committed_ones() {
         &{
             let mut r = InitProducerIdRequest::default();
             r.transactional_id = Some(TransactionalId(StrBytes::from_static_str("tx-b")));
+            r.transaction_timeout_ms = 60_000;
             r
         },
         4,
@@ -322,6 +324,7 @@ fn stale_producer_epoch_is_fenced() {
 
     let mut init_req = InitProducerIdRequest::default();
     init_req.transactional_id = Some(TransactionalId(StrBytes::from_static_str("tx-zombie")));
+    init_req.transaction_timeout_ms = 60_000;
     let init1 = t.engine.handle_init_producer_id(&init_req, 4);
     assert_eq!(init1.producer_epoch, 0);
 

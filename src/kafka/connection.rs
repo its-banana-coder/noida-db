@@ -59,17 +59,48 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
 
         let response_buf = match api_key {
             ApiKey::ApiVersions => {
-                let _req = match ApiVersionsRequest::decode(&mut buf, header.request_api_version) {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                let resp = engine.handle_api_versions(header.request_api_version);
-                encode_response(
-                    &header,
-                    &resp,
-                    resp_header_version(api_key, header.request_api_version),
-                    header.request_api_version,
-                )
+                use kafka_protocol::messages::api_versions_response::ApiVersion;
+                let version = header.request_api_version;
+                // A version this broker doesn't speak: like Kafka, answer
+                // UNSUPPORTED_VERSION in the v0 format every client can
+                // read, listing the ApiVersions versions it does speak so
+                // the client can retry with one of them.
+                if !(0..=3).contains(&version) {
+                    let mut resp = kafka_protocol::messages::ApiVersionsResponse::default();
+                    resp.error_code = 35; // UNSUPPORTED_VERSION
+                    let mut v = ApiVersion::default();
+                    v.api_key = ApiKey::ApiVersions as i16;
+                    v.min_version = 0;
+                    v.max_version = 3;
+                    resp.api_keys.push(v);
+                    encode_response(&header, &resp, 0, 0)
+                } else {
+                    let req = match ApiVersionsRequest::decode(&mut buf, version) {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    // v3+ names the client software; Kafka rejects a name
+                    // or version that isn't [a-zA-Z0-9](?:[a-zA-Z0-9\-.]*[a-zA-Z0-9])?.
+                    let valid = |s: &str| {
+                        let b = s.as_bytes();
+                        !b.is_empty()
+                            && b[0].is_ascii_alphanumeric()
+                            && b[b.len() - 1].is_ascii_alphanumeric()
+                            && b.iter()
+                                .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'.')
+                    };
+                    let resp = if version >= 3
+                        && !(valid(req.client_software_name.as_str())
+                            && valid(req.client_software_version.as_str()))
+                    {
+                        let mut resp = kafka_protocol::messages::ApiVersionsResponse::default();
+                        resp.error_code = 42; // INVALID_REQUEST
+                        resp
+                    } else {
+                        engine.handle_api_versions(version)
+                    };
+                    encode_response(&header, &resp, resp_header_version(api_key, version), version)
+                }
             }
             ApiKey::Metadata => {
                 let req = match MetadataRequest::decode(&mut buf, header.request_api_version) {

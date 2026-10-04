@@ -263,7 +263,11 @@ The transaction APIs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`,
  
 Storage is now persistent (on-disk) and is saved to `<data_dir>/kafka.json` upon a clean process exit (SIGINT/SIGTERM), with no incremental autosave -- see `src/persistence.rs`. Topics, record batches, committed consumer group offsets, and idempotent producer sequence state survive a clean restart; open in-flight transactions are resolved to aborted at save time, and live consumer group membership is reset (members transparently rejoin on restart). A hard kill (`kill -9`) loses whatever changed since the last clean shutdown but never corrupts the on-disk snapshot.
 
+Retention and compaction are real, segment by segment as in Kafka (segments are bookkeeping over the stored batches, rolled by `segment.ms`/`segment.bytes`): `cleanup.policy=delete` drops the oldest segments past `retention.ms` (by their newest record timestamp) or while the log is over `retention.bytes`; `cleanup.policy=compact` keeps the newest record per key in closed segments once `min.cleanable.dirty.ratio` is reached, honours `min.compaction.lag.ms`, keeps a tombstone through its first clean and drops it on the first clean after `delete.retention.ms`, and never moves offsets or touches the active segment. `DeleteRecords` moves the log start offset (`POLICY_VIOLATION` on a compact-only topic), and `Fetch`/`ListOffsets` honour it. Topic configs are validated like the broker's (`INVALID_CONFIG` with Kafka's message for an unknown name or bad value; `AlterConfigs` replaces the override set, `IncrementalAlterConfigs` supports `APPEND`/`SUBTRACT` on list configs), `DescribeConfigs` lists every topic config, `message.timestamp.type=LogAppendTime` and `max.message.bytes` are enforced, a compacted topic rejects keyless records (`INVALID_RECORD`), topic names follow Kafka's rules, and a produce payload must be a well-formed v2 batch with a valid CRC (`CORRUPT_MESSAGE` otherwise). All of this is compared against a real Kafka 3.8 broker by `tests/failure-diff/kafka_edges.py` and `tests/kafka_diff.rs`.
+
 **Differs**
+- The log cleaner runs every second (a broker checks retention every 5 minutes and backs off the compactor 15 seconds by default), so retention and compaction show up quickly on a dev box.
+- Compaction leaves transactional batches and transaction markers as they are, rather than removing aborted records and old markers.
 - Real Kafka's client discards an aborted batch's bytes itself using the `aborted_transactions` list (the bytes are still on the wire either way); this server simplifies to never serving an aborted batch to a `read_committed` fetch in the first place. Same observable behavior for any real consumer, simpler to implement.
 - Consumer group membership reset across restarts: real Kafka can, in some configurations, preserve group membership across a graceful controlled shutdown via static group membership (`group.instance.id`); this engine always resets live membership to empty and relies on the normal consumer rejoin flow.
 
@@ -271,7 +275,7 @@ Storage is now persistent (on-disk) and is saved to `<data_dir>/kafka.json` upon
 - Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
 
 **Not yet**
-- Real log segment files and retention/compaction policies — data persists as an on-disk JSON snapshot on clean shutdown, not Kafka's log segment format.
+- Kafka's on-disk log segment format — data persists as a JSON snapshot on clean shutdown.
 
 ## ClickHouse
 

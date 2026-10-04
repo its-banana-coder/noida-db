@@ -64,6 +64,11 @@ fn test_join_group_unknown_member_and_inconsistent_protocol() {
 
     // Joining with an unrecognized member_id -> UNKNOWN_MEMBER_ID (25)
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id = GroupId(StrBytes::from_static_str("test-grp"));
     join_req.member_id = StrBytes::from_static_str("completely-bogus-member-id");
     join_req.protocol_type = StrBytes::from_static_str("consumer");
@@ -72,6 +77,11 @@ fn test_join_group_unknown_member_and_inconsistent_protocol() {
 
     // Join valid member with protocol_type "consumer"
     let mut valid_req = JoinGroupRequest::default();
+    valid_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    valid_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     valid_req.group_id = GroupId(StrBytes::from_static_str("proto-grp"));
     valid_req.protocol_type = StrBytes::from_static_str("consumer");
     let step1 = t.engine.handle_join_group(&valid_req, 5);
@@ -82,6 +92,11 @@ fn test_join_group_unknown_member_and_inconsistent_protocol() {
 
     // Now try to join with protocol_type "connect" -> INCONSISTENT_GROUP_PROTOCOL (23)
     let mut bad_proto_req = JoinGroupRequest::default();
+    bad_proto_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    bad_proto_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     bad_proto_req.group_id = GroupId(StrBytes::from_static_str("proto-grp"));
     bad_proto_req.protocol_type = StrBytes::from_static_str("connect");
     let step1_bad = t.engine.handle_join_group(&bad_proto_req, 5);
@@ -97,6 +112,10 @@ fn test_sync_group_and_heartbeat_happy_path() {
 
     // 1. Join
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
     join_req.group_id = GroupId(StrBytes::from_static_str("sync-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
     join_req.session_timeout_ms = 10000;
@@ -136,6 +155,11 @@ fn test_sync_group_errors() {
 
     // Join
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id = GroupId(StrBytes::from_static_str("sync-err-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
     let step1 = t.engine.handle_join_group(&join_req, 5);
@@ -165,11 +189,15 @@ fn test_sync_group_errors() {
 fn test_heartbeat_clock_session_timeout() {
     let t = T::new();
 
-    // Join with session timeout = 5000 ms
+    // Join with session timeout = 6000 ms (the broker's minimum)
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
     join_req.group_id = GroupId(StrBytes::from_static_str("timeout-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
-    join_req.session_timeout_ms = 5000;
+    join_req.session_timeout_ms = 6000;
     let step1 = t.engine.handle_join_group(&join_req, 5);
     join_req.member_id = step1.member_id.clone();
     let step2 = t.engine.handle_join_group(&join_req, 5);
@@ -192,8 +220,8 @@ fn test_heartbeat_clock_session_timeout() {
     let hb_resp1 = t.engine.handle_heartbeat(&hb_req, 4);
     assert_eq!(hb_resp1.error_code, 0);
 
-    // Advance clock past session timeout (> 5000ms since last heartbeat)
-    t.advance(6000);
+    // Advance clock past session timeout (> 6000ms since last heartbeat)
+    t.advance(7000);
     let hb_resp2 = t.engine.handle_heartbeat(&hb_req, 4);
     assert_eq!(hb_resp2.error_code, 25); // UNKNOWN_MEMBER_ID (expired)
 }
@@ -204,6 +232,11 @@ fn test_leave_group() {
 
     // Join
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id = GroupId(StrBytes::from_static_str("leave-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
     let step1 = t.engine.handle_join_group(&join_req, 5);
@@ -233,6 +266,11 @@ fn test_rebalance_trigger_returns_rebalance_in_progress() {
 
     // Consumer 1 joins and syncs
     let mut c1_join = JoinGroupRequest::default();
+    c1_join.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    c1_join.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     c1_join.group_id = GroupId(StrBytes::from_static_str("dynamic-rebalance-grp"));
     c1_join.protocol_type = StrBytes::from_static_str("consumer");
     let c1_step1 = t.engine.handle_join_group(&c1_join, 5);
@@ -252,6 +290,11 @@ fn test_rebalance_trigger_returns_rebalance_in_progress() {
 
     // Group is now Stable. Now Consumer 2 joins with empty member_id
     let mut c2_join = JoinGroupRequest::default();
+    c2_join.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    c2_join.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     c2_join.group_id = GroupId(StrBytes::from_static_str("dynamic-rebalance-grp"));
     c2_join.protocol_type = StrBytes::from_static_str("consumer");
     let c2_step1 = t.engine.handle_join_group(&c2_join, 5);
@@ -276,6 +319,11 @@ fn test_concurrent_join_blocks_until_rebalance_completes() {
     let t = T::new();
 
     let mut c1_join = JoinGroupRequest::default();
+    c1_join.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    c1_join.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     c1_join.group_id = GroupId(StrBytes::from_static_str("wait-grp"));
     c1_join.protocol_type = StrBytes::from_static_str("consumer");
     c1_join.rebalance_timeout_ms = 500;
@@ -283,6 +331,11 @@ fn test_concurrent_join_blocks_until_rebalance_completes() {
     c1_join.member_id = c1_step1.member_id.clone();
 
     let mut c2_join = JoinGroupRequest::default();
+    c2_join.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    c2_join.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     c2_join.group_id = GroupId(StrBytes::from_static_str("wait-grp"));
     c2_join.protocol_type = StrBytes::from_static_str("consumer");
     c2_join.rebalance_timeout_ms = 500;

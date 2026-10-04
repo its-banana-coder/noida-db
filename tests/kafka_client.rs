@@ -57,8 +57,10 @@ fn test_kafka_milestone_1_and_2() {
     let addr = noida::kafka::spawn("127.0.0.1:0").unwrap();
     let mut stream = TcpStream::connect(addr).unwrap();
 
-    // 1. ApiVersions
-    let api_ver_req = ApiVersionsRequest::default();
+    // 1. ApiVersions (v3 must name the client software, as on a broker)
+    let mut api_ver_req = ApiVersionsRequest::default();
+    api_ver_req.client_software_name = StrBytes::from_static_str("noida-test");
+    api_ver_req.client_software_version = StrBytes::from_static_str("1.0");
     let api_ver_resp: ApiVersionsResponse =
         send_request(&mut stream, ApiKey::ApiVersions, 3, 1, Some("test-client"), &api_ver_req);
     assert_eq!(api_ver_resp.error_code, 0);
@@ -89,7 +91,8 @@ fn test_kafka_milestone_1_and_2() {
     assert_eq!(meta_resp.brokers.len(), 1);
 
     // 4. InitProducerId
-    let init_pid_req = InitProducerIdRequest::default();
+    let mut init_pid_req = InitProducerIdRequest::default();
+    init_pid_req.transactional_id = None; // the crate defaults to Some("")
     let init_pid_resp: InitProducerIdResponse =
         send_request(&mut stream, ApiKey::InitProducerId, 4, 4, Some("test-client"), &init_pid_req);
     assert_eq!(init_pid_resp.error_code, 0);
@@ -103,7 +106,8 @@ fn test_kafka_milestone_1_and_2() {
     topic_prod.name = topic_name.clone();
     let mut part_prod = PartitionProduceData::default();
     part_prod.index = 0;
-    part_prod.records = Some(bytes::Bytes::from("hello kafka record batch payload"));
+    part_prod.records =
+        Some(bytes::Bytes::from(record_batch(&[b"hello kafka record batch payload"], -1, -1, -1)));
     topic_prod.partition_data.push(part_prod);
     produce_req.topic_data.push(topic_prod);
 
@@ -195,6 +199,11 @@ fn test_kafka_milestone_1_and_2() {
 
     // 11. JoinGroup
     let mut join_req = kafka_protocol::messages::JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id =
         kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
     join_req.protocol_type = StrBytes::from_string("consumer".to_string());
@@ -389,7 +398,9 @@ fn test_kafka_milestone_1_and_2() {
 
     let del_recs_resp: kafka_protocol::messages::DeleteRecordsResponse =
         send_request(&mut stream, ApiKey::DeleteRecords, 2, 23, Some("test-client"), &del_recs_req);
-    assert_eq!(del_recs_resp.topics[0].partitions[0].error_code, 0);
+    // The topic was deleted in step 9: UNKNOWN_TOPIC_OR_PARTITION, as on a
+    // real broker.
+    assert_eq!(del_recs_resp.topics[0].partitions[0].error_code, 3);
 
     // 18. LogDirs & SASL Handshake
     let desc_log_dirs_req = kafka_protocol::messages::DescribeLogDirsRequest::default();
@@ -416,23 +427,50 @@ fn make_v2_batch(
     base_sequence: i32,
     records_count: i32,
 ) -> Vec<u8> {
-    let mut buf = vec![0u8; 61];
-    buf[0..8].copy_from_slice(&0i64.to_be_bytes());
-    buf[8..12].copy_from_slice(&50i32.to_be_bytes());
-    buf[12..16].copy_from_slice(&0i32.to_be_bytes());
-    buf[16] = 2; // magic 2
-    buf[17..21].copy_from_slice(&0u32.to_be_bytes());
-    buf[21..23].copy_from_slice(&0i16.to_be_bytes());
-    let delta = (records_count - 1).max(0);
-    buf[23..27].copy_from_slice(&delta.to_be_bytes());
-    buf[27..35].copy_from_slice(&0i64.to_be_bytes());
-    buf[35..43].copy_from_slice(&0i64.to_be_bytes());
-    buf[43..51].copy_from_slice(&producer_id.to_be_bytes());
-    buf[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
-    buf[53..57].copy_from_slice(&base_sequence.to_be_bytes());
-    buf[57..61].copy_from_slice(&records_count.to_be_bytes());
-    buf.extend_from_slice(b"sample-payload");
-    buf
+    let values: Vec<&[u8]> = (0..records_count).map(|_| b"payload".as_ref()).collect();
+    record_batch(&values, producer_id, producer_epoch, base_sequence)
+}
+
+/// A real v2 record batch holding `values` (kafka-protocol's own encoder,
+/// so the CRC and lengths are right: noida-db, like a broker, rejects
+/// anything else with CORRUPT_MESSAGE). `producer_id` -1 is a plain,
+/// non-idempotent producer.
+fn record_batch(
+    values: &[&[u8]],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+) -> Vec<u8> {
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    };
+    let records: Vec<Record> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: 0,
+            producer_id,
+            producer_epoch,
+            timestamp_type: TimestampType::Creation,
+            offset: i as i64,
+            sequence: base_sequence + i as i32,
+            // Now: a timestamp days old would fall to the 7-day retention.
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            key: None,
+            value: Some(bytes::Bytes::copy_from_slice(v)),
+            headers: Default::default(),
+        })
+        .collect();
+    let mut buf = bytes::BytesMut::new();
+    let options = RecordEncodeOptions { version: 2, compression: Compression::None };
+    RecordBatchEncoder::encode(&mut buf, records.iter(), &options).unwrap();
+    buf.to_vec()
 }
 
 #[test]
@@ -452,7 +490,8 @@ fn test_kafka_idempotent_producer_network() {
     assert_eq!(create_resp.topics[0].error_code, 0);
 
     // 2. InitProducerId
-    let init_req = InitProducerIdRequest::default();
+    let mut init_req = InitProducerIdRequest::default();
+    init_req.transactional_id = None;
     let init_resp: InitProducerIdResponse =
         send_request(&mut stream, ApiKey::InitProducerId, 4, 2, Some("idemp-client"), &init_req);
     assert_eq!(init_resp.error_code, 0);
@@ -534,6 +573,7 @@ fn test_kafka_consumer_group_scenario_b_rebalance() {
 
     // 2. Consumer 1 joins
     let mut c1_join = kafka_protocol::messages::JoinGroupRequest::default();
+    c1_join.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     c1_join.group_id = kafka_protocol::messages::GroupId(StrBytes::from_static_str("scen-b-group"));
     c1_join.protocol_type = StrBytes::from_static_str("consumer");
     let mut proto =
@@ -593,6 +633,7 @@ fn test_kafka_consumer_group_scenario_b_rebalance() {
 
     // 5. Consumer 2 joins the group (triggers rebalance)
     let mut c2_join = kafka_protocol::messages::JoinGroupRequest::default();
+    c2_join.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     c2_join.group_id = kafka_protocol::messages::GroupId(StrBytes::from_static_str("scen-b-group"));
     c2_join.protocol_type = StrBytes::from_static_str("consumer");
     let mut proto2 =
@@ -722,21 +763,15 @@ fn partition_for_key(key: &str, num_partitions: i32) -> i32 {
     (key.bytes().map(u32::from).sum::<u32>() % num_partitions as u32) as i32
 }
 
-/// Produces one record (raw bytes, same convention `test_kafka_milestone_1_and_2`
-/// already uses rather than a real encoded RecordBatch) prefixed with its
-/// own 4-byte big-endian length, so many records fetched back
-/// concatenated in one Fetch response can be split apart again
-/// unambiguously.
-fn produce_length_prefixed(
+/// Produces one record holding `payload` as a real one-record batch.
+fn produce_record(
     stream: &mut TcpStream,
     correlation_id: i32,
     topic_name: &TopicName,
     partition: i32,
     payload: &[u8],
 ) {
-    let mut framed = Vec::with_capacity(4 + payload.len());
-    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    framed.extend_from_slice(payload);
+    let framed = record_batch(&[payload], -1, -1, -1);
 
     let mut produce_req = ProduceRequest::default();
     produce_req.acks = 1;
@@ -762,18 +797,16 @@ fn produce_length_prefixed(
 }
 
 /// Splits a Fetch response's concatenated length-prefixed records back
-/// into the individual payloads `produce_length_prefixed` wrote.
-fn split_length_prefixed(mut buf: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    while buf.len() >= 4 {
-        let len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
-        if buf.len() < 4 + len {
-            break;
-        }
-        out.push(buf[4..4 + len].to_vec());
-        buf = &buf[4 + len..];
-    }
-    out
+/// into the individual payloads `produce_record` wrote.
+/// The record values in a fetch response's `records`.
+fn record_values(buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut buf = bytes::Bytes::copy_from_slice(buf);
+    kafka_protocol::records::RecordBatchDecoder::decode_all(&mut buf)
+        .unwrap()
+        .into_iter()
+        .flat_map(|set| set.records)
+        .filter_map(|r| r.value.map(|v| v.to_vec()))
+        .collect()
 }
 
 /// This is the single invariant the whole Kafka wire protocol exists to
@@ -825,7 +858,7 @@ fn test_kafka_per_key_ordering_under_concurrent_production() {
                     let partition = partition_for_key(order_id, NUM_PARTITIONS);
                     for (seq, event) in EVENTS.iter().enumerate() {
                         let payload = format!("{order_id}|{seq}|{event}");
-                        produce_length_prefixed(
+                        produce_record(
                             &mut stream,
                             correlation_id,
                             &topic_name,
@@ -869,7 +902,7 @@ fn test_kafka_per_key_ordering_under_concurrent_production() {
         let part_data = &fetch_resp.responses[0].partitions[0];
         assert_eq!(part_data.error_code, 0, "fetch failed for partition {partition}");
         let Some(records) = &part_data.records else { continue };
-        for payload in split_length_prefixed(records) {
+        for payload in record_values(records) {
             let text = String::from_utf8(payload).unwrap();
             let mut parts = text.splitn(3, '|');
             let order_id = parts.next().unwrap().to_string();

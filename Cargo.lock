@@ -1788,6 +1788,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clickhouse",
+ "crc32c",
  "kafka-protocol",
  "mlua",
  "mongodb",
