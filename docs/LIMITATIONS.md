@@ -558,14 +558,8 @@ prepared-statement, `GROUP BY`, transaction, `affected_rows` and
 suite shared with Postgres and translated to MySQL's own dialect
 (`tests/ecommerce_mysql_diff.rs`), and a differential test against a real
 MySQL server (`tests/mysql_diff.rs`, `NOIDA_MYSQL_REF=host:port`). CI
-runs a `mysql:5.7` service for this — 5.7, not 8, because MySQL 8's
-default `caching_sha2_password` auth plugin isn't supported by
-`mysql_async` (`Driver(UnknownAuthPlugin { name: "caching_sha2_password" })`,
-same underlying gap as `sha256_password`), a pre-existing limitation in
-the test's own client dependency, not something noida-db does. Locally,
-a server reachable on the default port that uses either of those auth
-plugins will cause the same SKIPPED/connection-error behavior — point
-`NOIDA_MYSQL_REF` at a `mysql_native_password`-configured server instead.
+runs both against a `mysql:8.0` service (root, empty password), the same
+server `tests/failure-diff/` compares failure paths against.
 
 `HAVING`, `GROUP BY` and `ORDER BY` accept `SELECT`-list aliases and
 positions (`GROUP BY 1`, `HAVING total > 5`, `ORDER BY 2 DESC`), and

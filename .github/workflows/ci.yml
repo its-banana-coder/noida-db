@@ -29,21 +29,9 @@ jobs:
           ES_JAVA_OPTS: -Xms512m -Xmx512m
         options: >-
           --health-cmd "curl -fs http://localhost:9200" --health-interval 10s --health-timeout 5s --health-retries 30
-      # 5.7, not 8: MySQL 8's default caching_sha2_password auth plugin
-      # isn't supported by mysql_async (the client this project's own
-      # differential tests use) -- see docs/LIMITATIONS.md's MySQL
-      # section. 5.7 defaults to mysql_native_password, which it does
-      # support.
-      mysql:
-        image: mysql:5.7
-        ports: ["3306:3306"]
-        env:
-          MYSQL_ALLOW_EMPTY_PASSWORD: yes
-          MYSQL_ROOT_HOST: "%"
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 --silent" --health-interval 5s --health-timeout 5s --health-retries 20
-      # MySQL 8 for the failure-path differential (pymysql handles its
-      # auth plugin): strict sql_mode is 8's default.
+      # MySQL 8, the reference for every MySQL differential (strict
+      # sql_mode, CTEs, window functions). An empty root password works
+      # with 8's default caching_sha2_password auth for mysql_async too.
       mysql8:
         image: mysql:8.0
         ports: ["3307:3306"]
@@ -57,7 +45,7 @@ jobs:
       NOIDA_POSTGRES_REF: 127.0.0.1:5432
       NOIDA_POSTGRES_REF_PASSWORD: postgres
       NOIDA_ELASTICSEARCH_REF: http://127.0.0.1:9200
-      NOIDA_MYSQL_REF: 127.0.0.1:3306
+      NOIDA_MYSQL_REF: 127.0.0.1:3307
       PGTZ: UTC
     steps:
       - uses: actions/checkout@v4
