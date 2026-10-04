@@ -34,6 +34,7 @@ fn table_of(name: &str, cols: &[&str], rows: Vec<Vec<Value>>) -> Table {
             primary_key: false,
             default_now: false,
             on_update_now: false,
+            unsigned: false,
         })
         .collect();
     let mut t = Table::new(name.to_string(), columns);
@@ -148,6 +149,9 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         ),
                         ColumnType::Int => (Value::Null, Value::Int(10), Value::Int(0)),
                         ColumnType::BigInt => (Value::Null, Value::Int(19), Value::Int(0)),
+                        ColumnType::TinyInt => (Value::Null, Value::Int(3), Value::Int(0)),
+                        ColumnType::SmallInt => (Value::Null, Value::Int(5), Value::Int(0)),
+                        ColumnType::MediumInt => (Value::Null, Value::Int(7), Value::Int(0)),
                         ColumnType::Boolean => (Value::Null, Value::Int(3), Value::Int(0)),
                         ColumnType::Decimal(p, s) => {
                             (Value::Null, Value::Int(*p as i64), Value::Int(*s as i64))

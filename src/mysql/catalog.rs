@@ -7,6 +7,8 @@ pub type Row = Vec<Value>;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ColumnType {
+    /// `INT` (32-bit). `TINYINT`/`SMALLINT`/`MEDIUMINT` have their own
+    /// variants so each column enforces its own range.
     Int,
     BigInt,
     Varchar(usize),
@@ -23,6 +25,9 @@ pub enum ColumnType {
     Json,
     /// `BLOB`/`BINARY`/`VARBINARY` and friends.
     Blob,
+    TinyInt,
+    SmallInt,
+    MediumInt,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +47,9 @@ pub struct Column {
     /// column itself sets it to the update time.
     #[serde(default)]
     pub on_update_now: bool,
+    /// `UNSIGNED` integer: its range starts at 0.
+    #[serde(default)]
+    pub unsigned: bool,
 }
 
 /// A `UNIQUE` key: a column-level `UNIQUE` (named after its column) or a

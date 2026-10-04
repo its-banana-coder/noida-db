@@ -139,6 +139,42 @@ pub fn contains_agg(expr: &Expr) -> bool {
     }
 }
 
+/// Calls `f` on every column name `expr` references, so a query can
+/// reject an unknown column before reading any rows (MySQL does, even when
+/// the table is empty).
+pub fn for_each_colname<'a>(expr: &'a Expr, f: &mut dyn FnMut(&'a str)) {
+    match expr {
+        Expr::ColName(n) => f(n),
+        Expr::And(v) | Expr::Or(v) => v.iter().for_each(|e| for_each_colname(e, f)),
+        Expr::Compare { left, right, .. } | Expr::Arith { left, right, .. } => {
+            for_each_colname(left, f);
+            for_each_colname(right, f);
+        }
+        Expr::Call { args, .. } => args.iter().for_each(|e| for_each_colname(e, f)),
+        Expr::Agg { arg: Some(a), .. } => for_each_colname(a, f),
+        Expr::InList { expr, list, .. } => {
+            for_each_colname(expr, f);
+            list.iter().for_each(|e| for_each_colname(e, f));
+        }
+        Expr::Not(e) | Expr::IsNull(e, _) => for_each_colname(e, f),
+        Expr::Like { expr, pattern, escape, .. } => {
+            for_each_colname(expr, f);
+            for_each_colname(pattern, f);
+            for_each_colname(escape, f);
+        }
+        Expr::Case { conditions, else_result } => {
+            for (c, r) in conditions {
+                for_each_colname(c, f);
+                for_each_colname(r, f);
+            }
+            if let Some(e) = else_result {
+                for_each_colname(e, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Where a `Plan::Finish` sort key's value lives in an output row.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SortKey {
@@ -235,6 +271,11 @@ pub enum Plan {
     Truncate {
         db: String,
         table: String,
+    },
+    /// `DROP {DATABASE|SCHEMA} [IF EXISTS] name`.
+    DropDatabase {
+        name: String,
+        if_exists: bool,
     },
     CreateDatabase {
         name: String,

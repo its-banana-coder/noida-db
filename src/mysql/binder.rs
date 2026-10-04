@@ -234,6 +234,22 @@ impl Binder {
                 Ok(plan)
             }
             Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            // Found via testing: DROP DATABASE was unsupported, which broke
+            // test runners (Django's among them) that create and drop a
+            // test database on every run.
+            Statement::Drop {
+                object_type:
+                    sqlparser::ast::ObjectType::Database | sqlparser::ast::ObjectType::Schema,
+                if_exists,
+                names,
+                ..
+            } => {
+                let name = names
+                    .first()
+                    .map(|n| n.to_string().trim_matches('`').to_string())
+                    .ok_or_else(|| MySqlError::syntax_error("DROP DATABASE needs a name"))?;
+                Ok(Plan::DropDatabase { name, if_exists })
+            }
             Statement::Drop {
                 object_type: sqlparser::ast::ObjectType::Table,
                 if_exists,
@@ -321,22 +337,19 @@ impl Binder {
     ) -> Result<Column, MySqlError> {
         let col_name = col_def.name.value.clone();
         let col_type = match &col_def.data_type {
+            // Every integer type keeps its own range (and UNSIGNED), so an
+            // out-of-range value is rejected or clamped exactly as MySQL
+            // would. Found via a differential test against real MySQL: they
+            // all used to be one unbounded integer.
             DataType::Int(_)
             | DataType::Integer(_)
             | DataType::IntUnsigned(_)
-            | DataType::IntegerUnsigned(_)
-            | DataType::TinyInt(_)
-            | DataType::TinyIntUnsigned(_)
-            | DataType::UTinyInt
-            | DataType::SmallInt(_)
-            | DataType::SmallIntUnsigned(_)
-            | DataType::MediumInt(_)
-            | DataType::MediumIntUnsigned(_) => ColumnType::Int,
-            // No dedicated unsigned/width-limited storage type -- values
-            // are stored as a plain i64 either way (see "simple over
-            // performant" in the project's own philosophy), so UNSIGNED
-            // and the various display-width variants are accepted but
-            // not distinguished from their signed/plain counterparts.
+            | DataType::IntegerUnsigned(_) => ColumnType::Int,
+            DataType::TinyInt(_) | DataType::TinyIntUnsigned(_) | DataType::UTinyInt => {
+                ColumnType::TinyInt
+            }
+            DataType::SmallInt(_) | DataType::SmallIntUnsigned(_) => ColumnType::SmallInt,
+            DataType::MediumInt(_) | DataType::MediumIntUnsigned(_) => ColumnType::MediumInt,
             DataType::BigInt(_) | DataType::BigIntUnsigned(_) => ColumnType::BigInt,
             DataType::Varchar(len) => {
                 let l = len
@@ -479,6 +492,16 @@ impl Binder {
             primary_key,
             default_now,
             on_update_now,
+            unsigned: matches!(
+                col_def.data_type,
+                DataType::IntUnsigned(_)
+                    | DataType::IntegerUnsigned(_)
+                    | DataType::TinyIntUnsigned(_)
+                    | DataType::UTinyInt
+                    | DataType::SmallIntUnsigned(_)
+                    | DataType::MediumIntUnsigned(_)
+                    | DataType::BigIntUnsigned(_)
+            ),
         })
     }
 

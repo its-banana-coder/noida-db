@@ -597,7 +597,7 @@ pub(crate) fn truthy(v: &Value) -> bool {
 }
 
 /// The longest numeric prefix of a string, as MySQL reads `'12abc'` (12).
-fn leading_f64(s: &str) -> f64 {
+pub(crate) fn leading_f64(s: &str) -> f64 {
     let s = s.trim_start();
     let mut end = 0;
     for (i, c) in s.char_indices() {

@@ -518,3 +518,164 @@ async fn alter_table_savepoints_and_django_probes() {
     drop(c);
     pool.disconnect().await.unwrap();
 }
+
+/// Strict mode (MySQL 8's default) rejects bad values; a session that turns
+/// it off (WordPress does) gets MySQL's adjusted values instead. Expected
+/// values captured from MySQL 8.0.46.
+#[tokio::test]
+async fn sql_mode_strict_and_lenient_writes() {
+    let (pool, mut c) = connect().await;
+    assert_eq!(
+        one(&mut c, "SELECT @@sql_mode").await,
+        s(
+            "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+        )
+    );
+    c.query_drop(
+        "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, i INT, ti TINYINT UNSIGNED, \
+         si SMALLINT, v VARCHAR(3), d DATE, e ENUM('a','b'), n INT NOT NULL, x DECIMAL(4,1))",
+    )
+    .await
+    .unwrap();
+    // Strict.
+    assert_eq!(err_code(&mut c, "INSERT INTO t (i, n) VALUES (99999999999, 1)").await, 1264);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (ti, n) VALUES (-5, 1)").await, 1264);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (si, n) VALUES (40000, 1)").await, 1264);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (v, n) VALUES ('abcdef', 1)").await, 1406);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (d, n) VALUES ('2024-13-45', 1)").await, 1292);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (e, n) VALUES ('zzz', 1)").await, 1265);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (i) VALUES (7)").await, 1364);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (x, n) VALUES (12345.67, 1)").await, 1264);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (i, n) VALUES ('12abc', 1)").await, 1366);
+    assert_eq!(err_code(&mut c, "INSERT INTO t (i, n) VALUES (1/0, 1)").await, 1365);
+    // Division by zero outside a write is NULL even in strict mode.
+    assert_eq!(one(&mut c, "SELECT 1/0").await, None);
+    assert_eq!(one(&mut c, "SELECT COUNT(*) FROM t").await, s("0"));
+
+    // Lenient.
+    c.query_drop("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'").await.unwrap();
+    assert_eq!(one(&mut c, "SELECT @@sql_mode").await, s("NO_ENGINE_SUBSTITUTION"));
+    for sql in [
+        "INSERT INTO t (i, n) VALUES (99999999999, 1)",
+        "INSERT INTO t (ti, si, n) VALUES (-5, 40000, 1)",
+        "INSERT INTO t (v, n) VALUES ('abcdef', 1)",
+        "INSERT INTO t (d, n) VALUES ('2024-13-45', 1)",
+        "INSERT INTO t (e, n) VALUES ('zzz', 1)",
+        "INSERT INTO t (i) VALUES (7)",
+        "INSERT INTO t (x, n) VALUES (12345.67, 1)",
+        "INSERT INTO t (i, n) VALUES ('12abc', 1)",
+        "INSERT INTO t (i, n) VALUES (1/0, 1)",
+    ] {
+        c.query_drop(sql).await.unwrap();
+    }
+    let n = None;
+    assert_eq!(
+        rows(&mut c, "SELECT i, ti, si, v, d, e, n, x FROM t ORDER BY id").await,
+        vec![
+            vec![
+                s("2147483647"),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                s("1"),
+                n.clone()
+            ],
+            vec![n.clone(), s("0"), s("32767"), n.clone(), n.clone(), n.clone(), s("1"), n.clone()],
+            vec![
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                s("abc"),
+                n.clone(),
+                n.clone(),
+                s("1"),
+                n.clone()
+            ],
+            vec![
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                s("0000-00-00"),
+                n.clone(),
+                s("1"),
+                n.clone()
+            ],
+            vec![n.clone(), n.clone(), n.clone(), n.clone(), n.clone(), s(""), s("1"), n.clone()],
+            vec![s("7"), n.clone(), n.clone(), n.clone(), n.clone(), n.clone(), s("0"), n.clone()],
+            vec![
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                s("1"),
+                s("999.9")
+            ],
+            vec![s("12"), n.clone(), n.clone(), n.clone(), n.clone(), n.clone(), s("1"), n.clone()],
+            vec![
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                n.clone(),
+                s("1"),
+                n.clone()
+            ],
+        ]
+    );
+    // Back to the default: strict again.
+    c.query_drop("SET SESSION sql_mode = DEFAULT").await.unwrap();
+    assert_eq!(err_code(&mut c, "INSERT INTO t (ti, n) VALUES (-5, 1)").await, 1264);
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
+
+/// InnoDB doesn't hand out an AUTO_INCREMENT id twice, even when the INSERT
+/// that took it failed.
+#[tokio::test]
+async fn failed_insert_consumes_auto_increment() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, u INT UNIQUE)").await.unwrap();
+    c.query_drop("INSERT INTO t (u) VALUES (1)").await.unwrap();
+    assert_eq!(err_code(&mut c, "INSERT INTO t (u) VALUES (1)").await, 1062);
+    c.query_drop("INSERT INTO t (u) VALUES (2)").await.unwrap();
+    assert_eq!(
+        rows(&mut c, "SELECT id FROM t ORDER BY id").await,
+        vec![vec![s("1")], vec![s("3")]]
+    );
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
+
+/// An unknown column is an error even when there are no rows to evaluate.
+#[tokio::test]
+async fn unknown_column_on_empty_table() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE TABLE t (a INT)").await.unwrap();
+    assert_eq!(err_code(&mut c, "SELECT nosuch FROM t").await, 1054);
+    assert_eq!(err_code(&mut c, "SELECT a FROM t WHERE nosuch = 1").await, 1054);
+    assert_eq!(err_code(&mut c, "SELECT COUNT(nosuch) FROM t").await, 1054);
+    assert!(rows(&mut c, "SELECT a FROM t WHERE a = 1").await.is_empty());
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn drop_database() {
+    let (pool, mut c) = connect().await;
+    c.query_drop("CREATE DATABASE scratch").await.unwrap();
+    c.query_drop("USE scratch").await.unwrap();
+    c.query_drop("CREATE TABLE t (a INT)").await.unwrap();
+    c.query_drop("DROP DATABASE scratch").await.unwrap();
+    assert_eq!(one(&mut c, "SELECT DATABASE()").await, None);
+    assert_eq!(err_code(&mut c, "DROP DATABASE scratch").await, 1008);
+    c.query_drop("DROP DATABASE IF EXISTS scratch").await.unwrap();
+    assert_eq!(err_code(&mut c, "DROP DATABASE information_schema").await, 1044);
+    drop(c);
+    pool.disconnect().await.unwrap();
+}
