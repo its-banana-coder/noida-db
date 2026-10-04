@@ -71,11 +71,51 @@ pub struct Table {
     /// still loads (with no UNIQUE keys, as it always behaved).
     #[serde(default)]
     pub unique_keys: Vec<UniqueKey>,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
+/// A `FOREIGN KEY (columns) REFERENCES ref_db.ref_table (ref_columns)`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_db: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum FkAction {
+    Restrict,
+    Cascade,
+    SetNull,
+    NoAction,
+}
+
+impl FkAction {
+    pub fn sql(self) -> &'static str {
+        match self {
+            FkAction::Restrict => "RESTRICT",
+            FkAction::Cascade => "CASCADE",
+            FkAction::SetNull => "SET NULL",
+            FkAction::NoAction => "NO ACTION",
+        }
+    }
 }
 
 impl Table {
     pub fn new(name: String, columns: Vec<Column>) -> Self {
-        Self { name, columns, rows: Vec::new(), next_auto_increment: 1, unique_keys: Vec::new() }
+        Self {
+            name,
+            columns,
+            rows: Vec::new(),
+            next_auto_increment: 1,
+            unique_keys: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
     }
 
     /// Every key that must hold unique values, as `(name, column indices)`:
@@ -134,6 +174,38 @@ pub struct TxUndo {
 }
 
 impl DbState {
+    /// Every foreign key that references `db`.`table`, with the database
+    /// and name of the table that declares it.
+    pub fn referencing(&self, db: &str, table: &str) -> Vec<(String, String, ForeignKey)> {
+        let mut out = Vec::new();
+        for (sname, schema) in &self.schemas {
+            for (tname, t) in &schema.tables {
+                for fk in &t.foreign_keys {
+                    if fk.ref_db == db && fk.ref_table.eq_ignore_ascii_case(table) {
+                        out.push((sname.clone(), tname.clone(), fk.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// `db`.`table` and every table a cascading write to it can reach.
+    pub fn cascade_reach(&self, db: &str, table: &str) -> Vec<(String, String)> {
+        let mut out = vec![(db.to_string(), table.to_string())];
+        let mut i = 0;
+        while i < out.len() {
+            let (d, t) = out[i].clone();
+            for (cd, ct, _) in self.referencing(&d, &t) {
+                if !out.contains(&(cd.clone(), ct.clone())) {
+                    out.push((cd, ct));
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Undoes one transaction's writes. A table nobody else has written
     /// since gets its pre-transaction image back exactly; one that another
     /// connection has also changed meanwhile gets only this transaction's

@@ -369,6 +369,7 @@ pub enum Plan {
         table: String,
         columns: Vec<Column>,
         unique_keys: Vec<UniqueKey>,
+        foreign_keys: Vec<crate::mysql::catalog::ForeignKey>,
         if_not_exists: bool,
     },
     /// `DROP TABLE [IF EXISTS] a, b`.
@@ -848,6 +849,9 @@ pub enum AlterOp {
     },
     RenameTable(String),
     AddUnique(UniqueKey),
+    /// A foreign key; an empty name gets MySQL's `<table>_ibfk_<n>`.
+    AddForeignKey(crate::mysql::catalog::ForeignKey),
+    DropForeignKey(String),
     AddPrimaryKey(Vec<String>),
     DropKey(String),
     DropPrimaryKey,
