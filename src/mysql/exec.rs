@@ -57,6 +57,11 @@ pub struct Executor {
     /// The client set `CLIENT_FOUND_ROWS` (Django does): an UPDATE reports
     /// the rows it matched, not only the ones it changed.
     pub found_rows: bool,
+    /// This connection's id, so reads skip other connections' uncommitted
+    /// changes and writes wait for the rows they hold.
+    pub conn_id: u64,
+    /// SKIP LOCKED: rows of (db, table) to leave out of the scan.
+    skip_rows: Option<(String, String, std::collections::HashSet<String>)>,
     /// The session's `foreign_key_checks`.
     pub fk_checks: bool,
     /// A recursive CTE's rows from the previous round, by name, for its
@@ -84,6 +89,8 @@ impl Executor {
             writing: std::cell::Cell::new(false),
             outer: Vec::new(),
             found_rows: false,
+            conn_id: 0,
+            skip_rows: None,
             fk_checks: true,
             cte_rows: std::collections::HashMap::new(),
             win_vals: Default::default(),
@@ -145,6 +152,7 @@ impl Executor {
         child.sql_mode = self.sql_mode.clone();
         child.autocommit = self.autocommit;
         child.session_insert_id = self.session_insert_id;
+        child.conn_id = self.conn_id;
         child.cte_rows = self.cte_rows.clone();
         child.outer = self.outer.clone();
         if let Some(t) = table {
@@ -363,6 +371,9 @@ impl Executor {
         let name = work.name.clone();
         pending.insert((db.to_string(), name.clone()), work);
         self.on_parent_change(&mut pending, db, &name, changes, 0)?;
+        for ((d, _), t) in &pending {
+            self.check_write_locks(d, t)?;
+        }
         for ((d, _), t) in pending {
             self.store_table(&d, t)?;
         }
@@ -1459,6 +1470,11 @@ impl Executor {
                         }
 
                         let conflict = find_key_conflict(&work, &keys, &new_row, None);
+                        // A duplicate of another transaction's uncommitted
+                        // row waits for it (and is then a duplicate or not).
+                        if let Some((i, _)) = conflict {
+                            self.wait_if_locked(&db, &work, &[work.rows[i].clone()])?;
+                        }
                         match (&mode, conflict) {
                             (_, None) => {
                                 work.rows.push(new_row);
@@ -1521,7 +1537,8 @@ impl Executor {
                 })();
                 // A failed INSERT still consumes the AUTO_INCREMENT ids it
                 // generated, as in InnoDB (the next row doesn't reuse them).
-                if result.is_err() && work.next_auto_increment > counter_before {
+                let waiting = result.as_ref().err().is_some_and(|e| e.lock_holder().is_some());
+                if result.is_err() && !waiting && work.next_auto_increment > counter_before {
                     let mut state = self.db.lock().unwrap();
                     if let Some(t) =
                         state.schemas.get_mut(&db).and_then(|s| s.tables.get_mut(&table))
@@ -1605,7 +1622,75 @@ impl Executor {
                 self.last_affected_rows = targets.len() as u64;
                 Ok(vec![])
             }
-            Plan::Scan { db, table, .. } => Ok(self.load_table(&db, &table)?.rows),
+            Plan::Scan { db, table, .. } => {
+                let t = self.read_table(&db, &table)?;
+                match &self.skip_rows {
+                    Some((d, n, keys)) if *d == db && *n == table => Ok(t
+                        .rows
+                        .iter()
+                        .filter(|r| !keys.contains(&crate::mysql::catalog::row_key(&t, r)))
+                        .cloned()
+                        .collect()),
+                    _ => Ok(t.rows),
+                }
+            }
+            Plan::Locking { source, target, exclusive, nowait, skip_locked } => {
+                if let Some((db, table, key_plan)) = target {
+                    let t = self.load_table(&db, &table)?;
+                    let held = self.db.lock().unwrap().locked_rows(self.conn_id, &db, &table);
+                    // SKIP LOCKED leaves out rows it can't lock before LIMIT
+                    // applies, as InnoDB does.
+                    if skip_locked {
+                        let skip = held
+                            .iter()
+                            .filter(|(_, _, ex)| exclusive || *ex)
+                            .map(|(_, k, _)| k.clone())
+                            .collect();
+                        self.skip_rows = Some((db.clone(), table.clone(), skip));
+                    }
+                    let rows = self.execute_plan(*key_plan);
+                    // The query itself skips the same rows.
+                    let skip_all = self.skip_rows.take();
+                    let keys: Vec<String> =
+                        rows?.iter().map(|r| crate::mysql::catalog::row_key(&t, r)).collect();
+                    // Shared locks only conflict with exclusive ones.
+                    let blocked: Vec<&(u64, String, bool)> = held
+                        .iter()
+                        .filter(|(_, k, ex)| (exclusive || *ex) && keys.contains(k))
+                        .collect();
+                    if let Some((holder, _, _)) = blocked.first() {
+                        if nowait {
+                            return Err(MySqlError::new(
+                                3572,
+                                "HY000",
+                                "Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set.",
+                            ));
+                        }
+                        if !skip_locked {
+                            return Err(MySqlError::lock_wait(*holder));
+                        }
+                    }
+                    let skipped: std::collections::HashSet<String> =
+                        blocked.iter().map(|(_, k, _)| k.clone()).collect();
+                    {
+                        let mut state = self.db.lock().unwrap();
+                        if let Some(undo) = state.open_txns.get_mut(&self.conn_id) {
+                            for k in keys.iter().filter(|k| !skipped.contains(*k)) {
+                                undo.locks.push(crate::mysql::catalog::RowLock {
+                                    db: db.clone(),
+                                    table: table.clone(),
+                                    key: k.clone(),
+                                    exclusive,
+                                });
+                            }
+                        }
+                    }
+                    self.skip_rows = skip_all;
+                }
+                let res = self.execute_plan(*source);
+                self.skip_rows = None;
+                res
+            }
             Plan::Derived { plan, .. } => self.execute_plan(*plan),
             Plan::InsertSelect { insert, query } => {
                 // The SELECT runs first, over the table as it was (so
@@ -1949,6 +2034,54 @@ impl Executor {
         Err(MySqlError::unknown_table(table))
     }
 
+    /// A table as this connection reads it: other connections'
+    /// uncommitted changes left out.
+    fn read_table(&self, db: &str, table: &str) -> Result<Table, MySqlError> {
+        let view = self.db.lock().unwrap().committed_view(self.conn_id, db, table);
+        match view {
+            Some(t) => Ok(t),
+            None => self.load_table(db, table),
+        }
+    }
+
+    /// Error `lock_wait` if any of `rows` of `t` is held by another
+    /// connection's open transaction.
+    fn wait_if_locked(&self, db: &str, t: &Table, rows: &[Vec<Value>]) -> Result<(), MySqlError> {
+        let locked = self.db.lock().unwrap().locked_rows(self.conn_id, db, &t.name);
+        if locked.is_empty() {
+            return Ok(());
+        }
+        for r in rows {
+            let k = crate::mysql::catalog::row_key(t, r);
+            if let Some((holder, _, _)) = locked.iter().find(|(_, lk, _)| *lk == k) {
+                return Err(MySqlError::lock_wait(*holder));
+            }
+        }
+        Ok(())
+    }
+
+    /// Before writing `t`: wait for every row the write changes that
+    /// another transaction holds.
+    fn check_write_locks(&self, db: &str, t: &Table) -> Result<(), MySqlError> {
+        let (locked, current) = {
+            let state = self.db.lock().unwrap();
+            let locked = state.locked_rows(self.conn_id, db, &t.name);
+            if locked.is_empty() {
+                return Ok(());
+            }
+            (locked, state.schemas.get(db).and_then(|s| s.tables.get(&t.name)).cloned())
+        };
+        let Some(current) = current else { return Ok(()) };
+        let (removed, added) = crate::mysql::catalog::row_diff(&current.rows, &t.rows);
+        for r in removed.iter().chain(&added) {
+            let k = crate::mysql::catalog::row_key(t, r);
+            if let Some((holder, _, _)) = locked.iter().find(|(_, lk, _)| *lk == k) {
+                return Err(MySqlError::lock_wait(*holder));
+            }
+        }
+        Ok(())
+    }
+
     fn store_table(&self, db: &str, t: Table) -> Result<(), MySqlError> {
         if db.eq_ignore_ascii_case("information_schema") {
             return Err(MySqlError::new(
@@ -1957,6 +2090,7 @@ impl Executor {
                 "Access denied for user 'root'@'localhost' to database 'information_schema'",
             ));
         }
+        self.check_write_locks(db, &t)?;
         let mut state = self.db.lock().unwrap();
         let schema = state
             .schemas

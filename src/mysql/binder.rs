@@ -913,6 +913,8 @@ impl Binder {
     }
 
     fn bind_query_scoped(&mut self, query: Query) -> Result<Plan, MySqlError> {
+        // A locking read also needs the full rows it reads, to lock them.
+        let key_query = (!query.locks.is_empty()).then(|| row_query(&query)).flatten();
         let scope = self.ctes.len();
         let res = (|| {
             if let Some(with) = query.with {
@@ -920,7 +922,25 @@ impl Binder {
                     self.bind_cte(cte, with.recursive)?;
                 }
             }
-            self.bind_body(*query.body, query.order_by, query.limit_clause)
+            let plan = self.bind_body(*query.body, query.order_by, query.limit_clause)?;
+            let Some(lock) = query.locks.first() else { return Ok(plan) };
+            use sqlparser::ast::{LockType, NonBlock};
+            let target = match (key_query, locking_table(&plan)) {
+                (Some(q), Some((db, table))) => {
+                    let saved = self.param_counter;
+                    let key_plan = self.bind_body(*q.body, q.order_by, q.limit_clause);
+                    self.param_counter = saved;
+                    Some((db, table, Box::new(key_plan?)))
+                }
+                _ => None,
+            };
+            Ok(Plan::Locking {
+                target,
+                source: Box::new(plan),
+                exclusive: matches!(lock.lock_type, LockType::Update),
+                nowait: matches!(lock.nonblock, Some(NonBlock::Nowait)),
+                skip_locked: matches!(lock.nonblock, Some(NonBlock::SkipLocked)),
+            })
         })();
         self.ctes.truncate(scope);
         res
@@ -2366,4 +2386,27 @@ fn options_with_names(
         .into_iter()
         .map(|option| sqlparser::ast::ColumnOptionDef { name: None, option })
         .collect()
+}
+
+/// The one table a locking read locks rows of: only for a single-table
+/// query without GROUP BY (joins and aggregates read without locking).
+fn locking_table(plan: &Plan) -> Option<(String, String)> {
+    match plan {
+        Plan::Finish { source, .. }
+        | Plan::Project { source, .. }
+        | Plan::Filter { source, .. } => locking_table(source),
+        Plan::Scan { db, table, .. } => Some((db.clone(), table.clone())),
+        _ => None,
+    }
+}
+
+/// `query` reading whole rows (`SELECT *`, no DISTINCT), same FROM, WHERE,
+/// ORDER BY and LIMIT: the rows a locking read locks.
+fn row_query(query: &Query) -> Option<Query> {
+    let mut q = query.clone();
+    q.locks.clear();
+    let SetExpr::Select(select) = &mut *q.body else { return None };
+    select.projection = vec![SelectItem::Wildcard(Default::default())];
+    select.distinct = None;
+    Some(q)
 }

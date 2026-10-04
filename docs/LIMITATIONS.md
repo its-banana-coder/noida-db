@@ -676,6 +676,15 @@ existing rows. Unnamed keys get MySQL's `<table>_ibfk_<n>` names, and
 does. Writes a cascade makes are rolled back with the transaction. An
 inline column `REFERENCES` is ignored, as in MySQL.
 
+Connections are isolated like InnoDB's: a transaction's uncommitted
+writes are invisible to other connections, and a write to a row another
+transaction has changed (or locked with `SELECT ... FOR UPDATE`/
+`FOR SHARE`/`LOCK IN SHARE MODE`) waits until that transaction ends, error
+1205 after `innodb_lock_wait_timeout` (50 s, settable per session), or 1213
+when two transactions wait for each other (the one that closes the cycle
+is rolled back). `NOWAIT` (3572) and `SKIP LOCKED` (job queues) work, and
+an INSERT duplicating another transaction's uncommitted key waits for it.
+
 `UPDATE` reports the rows it changed (the rows it matched when the client
 connects with `CLIENT_FOUND_ROWS`, as Django does), and an
 `ON UPDATE CURRENT_TIMESTAMP` column only moves when the row changed.
@@ -704,8 +713,12 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   requires an index there, error 1822).
 - `ON UPDATE`/`ON DELETE SET DEFAULT` (InnoDB rejects it too) and checks
   that a foreign key's column types are compatible (3780).
-- Isolation levels: other connections see a transaction's uncommitted
-  writes immediately (a rollback still undoes them).
+- `REPEATABLE READ` snapshots: every statement reads the latest committed
+  data (as `READ COMMITTED` does), so a transaction that reads the same rows
+  twice can see another connection's commit in between. Gap and next-key
+  locks aren't taken (an INSERT into a range another transaction read
+  `FOR UPDATE` doesn't wait), and locking reads over joins or `GROUP BY`
+  don't lock.
 - Multiple semicolon-separated statements in one `COM_QUERY` (only the
   first is executed).
 - JSON path wildcards (`$[*]`, `$**`) and the JSON modification functions
