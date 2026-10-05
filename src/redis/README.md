@@ -9,8 +9,8 @@ noida-db start --redis-port 6380       # another port
 ```
 
 Status (from `cargo test --test redis_coverage -- --nocapture`): of Redis
-7.2's 242 commands, **217 are implemented**, **22 are out of scope by design**
-and **3 are not built yet**. Subcommands are counted separately below.
+7.2's 242 commands, **222 are implemented**, **20 are out of scope by design**
+and **none are left to build**. Subcommands are counted separately below.
 
 ## What works
 
@@ -26,7 +26,10 @@ and **3 are not built yet**. Subcommands are counted separately below.
 | Sorting | `SORT`, `SORT_RO` with `BY`, `GET`, `LIMIT`, `STORE`, `ALPHA` |
 | Pub/sub | channels, patterns, sharded channels, RESP3 push messages |
 | Transactions | `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` |
-| Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`, `cmsgpack`), with Redis's error positions |
+| Scripting | `EVAL`, `EVALSHA`, `SCRIPT` (Lua 5.1, `redis.call`/`pcall`, `cjson`, `cmsgpack`, `bit`, `struct`), with Redis's error positions |
+| Functions | `FUNCTION LOAD/LIST/DELETE/FLUSH/DUMP/RESTORE/STATS`, `FCALL`, `FCALL_RO`; libraries persist, and `FUNCTION DUMP` payloads move to and from a real Redis |
+| `DUMP` / `RESTORE` | the real RDB serialization: payloads move both ways between noida-db and Redis 7.2 (listpack, ziplist, intset, quicklist and LZF-compressed values read; streams not supported) |
+| `maxmemory` | enforced, with every eviction policy (exact LRU/LFU rather than Redis's sampled approximation) and Redis's OOM error |
 | Connection | `HELLO` (RESP3), `CLIENT` (id, name, info, list, kill, pause, reply, no-evict...), `RESET`, `AUTH`. `requirepass` is enforced (`CONFIG SET requirepass x`, or `NOIDA_REDIS_PASSWORD` at startup); there is one user, `default` |
 | Debugging | `MONITOR` (a live stream of every command), `COMMAND` (info, docs, getkeys, list), `INFO`, `CONFIG GET/SET` |
 | Tool probes | `SLOWLOG`, `LATENCY`, `MEMORY`, `MODULE LIST`, read-only `ACL`. These return empty or estimated data (noida-db does no performance analysis) |

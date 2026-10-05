@@ -260,10 +260,13 @@ fn bitop(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     let dst = a[2].clone();
     let now = ctx.now;
-    ctx.db().remove(&dst, now);
+    let existed = ctx.db().remove(&dst, now).is_some();
     let len = out.len();
     if len > 0 {
-        ctx.db().insert(dst, Entry::new(Data::Str(out)));
+        ctx.db().insert(dst.clone(), Entry::new(Data::Str(out)));
+        ctx.notify_keyspace_event('$', "set", &dst);
+    } else if existed {
+        ctx.notify_keyspace_event('g', "del", &dst);
     }
     Ok(Value::Integer(len as i64))
 }
