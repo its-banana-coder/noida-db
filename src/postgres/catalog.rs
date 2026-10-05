@@ -171,6 +171,26 @@ pub struct Table {
 }
 
 impl Table {
+    /// A copy of everything but the rows (cheap: what per-row checks need).
+    pub fn without_rows(&self) -> Table {
+        Table {
+            oid: self.oid,
+            name: self.name.clone(),
+            schema: self.schema,
+            kind: self.kind.clone(),
+            columns: self.columns.clone(),
+            rows: Vec::new(),
+            constraints: self.constraints.clone(),
+            indexes: self.indexes.clone(),
+            view_sql: self.view_sql.clone(),
+            comment: self.comment.clone(),
+            type_oid: self.type_oid,
+            temp: self.temp,
+            owner_session: self.owner_session,
+            matview_populated: self.matview_populated,
+        }
+    }
+
     pub fn col_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| !c.dropped && c.name == name)
     }
