@@ -11,13 +11,14 @@ the number of differing steps.
 
 import gzip
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 
 REAL, OURS = sys.argv[1], sys.argv[2]
 ONLY = set(sys.argv[3:])
-VOLATILE = {"took", "_shards", "pit_id", "_scroll_id", "uuid", "creation_date", "id"}
+VOLATILE = {"took", "_shards", "pit_id", "_scroll_id", "uuid", "index_uuid", "creation_date", "id"}
 
 
 def call(base, method, path, body=None, headers=None, raw=False):
@@ -87,6 +88,10 @@ class Ctx:
 
 
 def run_step(ctx, step):
+    if step[0] == "sleep":
+        import time
+        time.sleep(step[1])
+        return {"slept": step[1]}
     method, path, body = step[0], step[1], step[2] if len(step) > 2 else None
     opts = step[3] if len(step) > 3 else {}
     status, resp, _ = call(
@@ -113,7 +118,12 @@ DOCS = [
      "tags": ["animal", "hunt"], "date": "2024-03-11T00:00:01Z", "status": "pending"},
 ]
 
+# Periodic refresh off: Elasticsearch's 1s refresh (and its search-idle
+# refresh) would make near-real-time steps depend on timing.
+STATIC = {"index": {"refresh_interval": "-1"}}
+
 MAPPING = {
+    "settings": STATIC,
     "mappings": {
         "properties": {
             "title": {"type": "text", "fields": {"raw": {"type": "keyword"}}},
@@ -255,7 +265,7 @@ LONG_DOCS = [
      "tags": ["search", "engine", "json"], "title": "Search engines"},
     {"text": "Nothing to see here", "tags": ["misc"], "title": "Other"},
 ]
-LONG_MAPPING = {"mappings": {"properties": {"text": {"type": "text"}, "tags": {"type": "keyword"},
+LONG_MAPPING = {"settings": STATIC, "mappings": {"properties": {"text": {"type": "text"}, "tags": {"type": "keyword"},
                                             "title": {"type": "text"}}}}
 HL = lambda r: [(h["_id"], h.get("highlight")) for h in r["hits"]["hits"]]
 L = "/long/_search"
@@ -317,7 +327,7 @@ scenario("date_histogram", setup() + [
      {"pick": lambda r: r["aggregations"]}),
 ])
 
-NESTED_MAPPING = {"mappings": {"properties": {
+NESTED_MAPPING = {"settings": STATIC, "mappings": {"properties": {
     "name": {"type": "keyword"},
     "comments": {"type": "nested", "properties": {
         "author": {"type": "keyword"}, "stars": {"type": "integer"}, "text": {"type": "text"}}},
@@ -373,6 +383,65 @@ scenario("painless_update", setup() + [
     ("POST", S, {"query": {"term": {"status": "active"}}, "sort": ["price"]}, {"pick": lambda r: [h["_source"]["price"] for h in r["hits"]["hits"]]}),
 ])
 
+SRC = lambda r: r.get("_source")
+scenario("painless_more", setup() + [
+    ("POST", "/edge/_update/1", {"doc": {"price": 10}}),
+    ("POST", "/edge/_update/1", {"doc": {"price": 10}, "detect_noop": False}),
+    ("POST", "/edge/_update/1", {"doc": {"extra": {"a": 1}}}),
+    ("POST", "/edge/_update/1", {"doc": {"extra": {"b": 2}}}),
+    ("GET", "/edge/_doc/1", None, {"pick": SRC}),
+    ("POST", "/edge/_update/1", {"script": {"source": """
+        int total = 0;
+        for (def t : ctx._source.tags) { total += t.length(); }
+        ctx._source.tag_len = total;
+        ctx._source.counts = new HashMap();
+        for (int i = 0; i < 3; i++) { ctx._source.counts.put('k' + i, i * i); }
+        ctx._source.ratio = ctx._source.price / 4;
+        ctx._source.fratio = ctx._source.price / 4.0;
+        ctx._source.tags.removeIf(x -> x == 'fast');
+        ctx._source.flag = ctx._source.containsKey('missing') ? 'yes' : 'no';
+    """}}),
+    ("GET", "/edge/_doc/1", None, {"pick": SRC}),
+    ("POST", "/edge/_update/88", {"scripted_upsert": True, "script": {"source": "ctx._source.hits = params.n * 2", "params": {"n": 21}}, "upsert": {}}),
+    ("GET", "/edge/_doc/88", None, {"pick": SRC}),
+    ("POST", "/edge/_update/89", {"doc": {"a": 1}, "doc_as_upsert": True}),
+    ("GET", "/edge/_doc/89", None, {"pick": SRC}),
+    ("POST", "/edge/_update/90", {"doc": {"a": 1}}),
+    ("POST", "/edge/_update/1", {}),
+    ("POST", "/edge/_update/1", {"script": {"source": "ctx._source.x = params.missing.y"}}),
+    ("POST", "/edge/_update/1", {"script": {"source": "ctx._source.x = 1 / 0"}}),
+    ("POST", "/edge/_update/1", {"script": {"source": "ctx.op = 'banana'"}}),
+    ("POST", "/edge/_update/1?if_seq_no=0&if_primary_term=1", {"doc": {"z": 1}}),
+    ("POST", "/edge/_update/2?refresh=true", {"doc": {"status": "active"}}),
+    ("POST", "/edge/_search", {"query": {"term": {"status": "active"}}}, {"pick": ids}),
+    ("POST", "/_bulk?refresh=true", [{"update": {"_index": "edge", "_id": "3"}},
+                                      {"script": {"source": "ctx._source.price += 1000"}}],
+     {"pick": lambda r: [(list(i)[0], i[list(i)[0]]["result"]) for i in r["items"]]}),
+    ("GET", "/edge/_doc/3", None, {"pick": lambda r: r["_source"]["price"]}),
+    ("POST", "/edge/_refresh"),
+    ("POST", "/edge/_update/4", {"doc": {"price": 41}}),
+    ("POST", "/edge/_delete_by_query", {"query": {"range": {"price": {"gte": 30}}}}),
+    ("POST", "/edge/_delete_by_query?conflicts=proceed&refresh=true", {"query": {"range": {"price": {"gte": 30}}}}),
+    ("POST", "/edge/_update_by_query?refresh=true", {"query": {"match_all": {}},
+        "script": {"source": "if (ctx._source.price != null && ctx._source.price > 20) { ctx.op = 'noop' } else { ctx._source.cheap = true }"}}),
+    ("POST", "/edge/_search", {"query": {"exists": {"field": "cheap"}}}, {"pick": ids}),
+])
+
+scenario("auto_refresh", [
+    ("DELETE", "/auto"),
+    ("PUT", "/auto", {"settings": {"index": {"refresh_interval": "1s"}}}),
+    ("POST", "/auto/_search", {}, {"pick": ids}),
+    ("POST", "/auto/_doc/1", {"a": 1}),
+    ("sleep", 2),
+    ("POST", "/auto/_search", {}, {"pick": ids}),
+    ("PUT", "/auto/_settings", {"index": {"refresh_interval": "-1"}}),
+    ("POST", "/auto/_doc/2", {"a": 2}),
+    ("sleep", 2),
+    ("POST", "/auto/_search", {}, {"pick": ids}),
+    ("POST", "/auto/_refresh"),
+    ("POST", "/auto/_search", {}, {"pick": ids}),
+])
+
 scenario("cat_cluster", setup() + [
     ("GET", "/_cluster/health", None, {"pick": lambda r: (r["status"], r["number_of_nodes"], r["timed_out"])}),
     ("GET", "/_cluster/health/edge", None, {"pick": lambda r: (r["status"], r["active_primary_shards"])}),
@@ -383,7 +452,18 @@ scenario("cat_cluster", setup() + [
     ("GET", "/_cat/aliases?format=json", None),
     ("GET", "/_cluster/settings", None),
     ("GET", "/_nodes", None, {"pick": lambda r: r["_nodes"]}),
-    ("GET", "/edge/_stats", None, {"pick": lambda r: r["indices"]["edge"]["primaries"]["docs"]}),
+    ("GET", "/edge/_stats", None, {"pick": lambda r: {k: v for k, v in r["indices"]["edge"]["primaries"]["docs"].items() if k != "total_size_in_bytes"}}),
+])
+
+scenario("uri_search", setup() + [
+    ("GET", "/edge/_search?q=quick", None, {"pick": ids}),
+    ("GET", "/edge/_search?q=title:quick+AND+status:active", None, {"pick": ids}),
+    ("GET", "/edge/_search?q=brown&df=title&sort=price:desc&size=2", None, {"pick": hits}),
+    ("GET", "/edge/_search?q=%22quick%20brown%22&df=title", None, {"pick": ids}),
+    ("GET", "/edge/_search?q=price:%5B10+TO+20%5D", None, {"pick": ids}),
+    ("GET", "/edge/_count?q=status:active", None),
+    ("GET", "/edge/_search?q=quick&_source_includes=title,price&size=1", None, {"pick": lambda r: [h["_source"] for h in r["hits"]["hits"]]}),
+    ("GET", "/edge/_search?q=title:(quick", None),
 ])
 
 scenario("gzip", setup() + [
@@ -423,6 +503,8 @@ for name, steps in SCENARIOS.items():
             label += " " + json.dumps(step[2])[:150]
         if a == b:
             print(f"  ok   {i:2} {label}")
+            if os.environ.get("ES_EDGES_VERBOSE"):
+                print(f"         both: {json.dumps(a)[:600]}")
         else:
             failures += 1
             print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:600]}\n        noida: {json.dumps(b)[:600]}")

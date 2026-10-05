@@ -149,10 +149,19 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         let head = method == "HEAD";
         let (status, payload) =
             if head && status == 200 { (200, Value::Null) } else { (status, payload) };
+        let raw_text =
+            payload.get(super::cat::RAW_TEXT).and_then(Value::as_str).map(str::to_string);
         let bytes = if head {
             Vec::new()
+        } else if let Some(text) = &raw_text {
+            text.as_bytes().to_vec()
         } else {
             serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())
+        };
+        let content_type = if raw_text.is_some() {
+            "text/plain; charset=UTF-8"
+        } else {
+            "application/json; charset=UTF-8"
         };
         let reason = match status {
             200 => "OK",
@@ -160,6 +169,7 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
             400 => "Bad Request",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            408 => "Request Timeout",
             409 => "Conflict",
             _ => "Internal Server Error",
         };
@@ -181,7 +191,7 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         let w = reader.get_mut();
         write!(
             w,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\nX-Elastic-Product: Elasticsearch\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Elastic-Client-Meta\r\n{}{}\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Elastic-Product: Elasticsearch\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Elastic-Client-Meta\r\n{}{}\r\n",
             bytes.len(),
             if gzip_out { "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" } else { "" },
             if connection_close { "Connection: close\r\n" } else { "" }

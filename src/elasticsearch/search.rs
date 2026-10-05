@@ -84,6 +84,9 @@ pub struct CommittedDoc {
     /// `_search`.
     #[allow(dead_code)]
     pub version: i64,
+    /// The `_seq_no` as of the refresh (update/delete by query treat a
+    /// document changed since as a version conflict).
+    pub seq: i64,
     /// The full source when `source` is a root-level view with nested
     /// objects removed (a nested object's fields aren't visible to
     /// queries outside a `nested` query, as in Elasticsearch).
@@ -189,6 +192,7 @@ fn nested_children(
                 id: d.id.clone(),
                 source: wrapped,
                 version: d.version,
+                seq: d.seq,
                 full_source: None,
             });
             owners.push((p, offset));
@@ -2223,6 +2227,17 @@ pub fn search_with(
     Ok(resp)
 }
 
+/// Evaluates `query` over the root-level view of `docs` (nested objects
+/// hidden), as `_search` does.
+pub fn eval_root(
+    query: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let view = root_view(mappings, docs);
+    eval(query, mappings, view.as_deref().unwrap_or(docs))
+}
+
 /// `POST/GET _count`: the number of matching documents.
 pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u64, EsError> {
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
@@ -2245,6 +2260,7 @@ mod tests {
             id: id.to_string(),
             source,
             version: 1,
+            seq: 0,
             full_source: None,
         }
     }
