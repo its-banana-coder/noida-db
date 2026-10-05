@@ -125,6 +125,8 @@ pub struct Settings {
     /// Values at session start (RESET goes back here).
     session_defaults: BTreeMap<String, String>,
     pub zone: Zone,
+    /// This session's temporary schema (`pg_temp_N`).
+    pub temp_schema: String,
 }
 
 fn canonical(name: &str) -> Option<&'static str> {
@@ -136,7 +138,12 @@ impl Default for Settings {
     fn default() -> Self {
         let values: BTreeMap<String, String> =
             DEFAULTS.iter().map(|(n, v, _)| (n.to_string(), v.to_string())).collect();
-        let mut s = Settings { session_defaults: values.clone(), values, zone: Zone::utc() };
+        let mut s = Settings {
+            session_defaults: values.clone(),
+            values,
+            zone: Zone::utc(),
+            temp_schema: String::new(),
+        };
         s.values.insert(
             "server_version_full".into(),
             format!("PostgreSQL {SERVER_VERSION} (noida-db)"),
@@ -414,13 +421,28 @@ impl Settings {
         }
     }
 
-    /// Schemas named by search_path (with `$user` expanded, missing ones kept).
+    /// Schemas named by search_path (with `$user` and `pg_temp` expanded,
+    /// missing ones kept): where new objects go, and current_schema().
     pub fn search_path(&self, user: &str) -> Vec<String> {
         let sp = self.values.get("search_path").cloned().unwrap_or_default();
         split_path(&sp)
             .into_iter()
-            .map(|s| if s == "$user" { user.to_string() } else { s })
+            .map(|s| match s.as_str() {
+                "$user" => user.to_string(),
+                "pg_temp" if !self.temp_schema.is_empty() => self.temp_schema.clone(),
+                _ => s,
+            })
             .collect()
+    }
+
+    /// The schemas a relation name is looked up in: search_path, with the
+    /// session's temporary schema first unless search_path places it.
+    pub fn lookup_path(&self, user: &str) -> Vec<String> {
+        let mut path = self.search_path(user);
+        if !self.temp_schema.is_empty() && !path.contains(&self.temp_schema) {
+            path.insert(0, self.temp_schema.clone());
+        }
+        path
     }
 }
 
