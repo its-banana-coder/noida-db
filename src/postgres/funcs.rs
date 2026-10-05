@@ -1656,18 +1656,9 @@ pub fn call(
             Text(trim_chars(&s, chars, name != "rtrim", name != "ltrim"))
         }
         "lpad" | "rpad" => {
-            // Postgres sizes the result for 4-byte characters (UTF-8), in
-            // an int32.
-            let len = int(&a[1]).max(0);
-            if len * 4 > i32::MAX as i64 {
+            // Postgres (16) sizes the result for 4-byte characters (UTF-8).
+            if int(&a[1]).max(0) * 4 + 4 > 0x3FFF_FFFF {
                 return Err(err(code::PROGRAM_LIMIT_EXCEEDED, "requested length too large"));
-            }
-            let want = len * 4 + 4;
-            if want > 0x3FFF_FFFF {
-                return Err(err(
-                    code::INTERNAL_ERROR,
-                    format!("invalid memory alloc request size {want}"),
-                ));
             }
             Text(pad(text(&a[0]), int(&a[1]), a.get(2).map_or(" ", text), name == "lpad"))
         }

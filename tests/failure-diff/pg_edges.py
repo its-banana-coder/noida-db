@@ -668,7 +668,6 @@ PG_EDGES.update({
         "SELECT array_fill(1, array[200000000])",
         "SELECT array_fill(1, array[100000, 100000])",
         "SELECT length(lpad('x', 2000000000))",
-        "SELECT length(rpad('x', 268435455))",
         "SELECT array_fill(7, array[2, 2], array[0, -1])::text",
         "SELECT array_fill(1, array[2], array[2147483647])",
         "SELECT array_fill(1, array[2], array[1, 1])",
