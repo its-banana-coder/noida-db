@@ -669,7 +669,8 @@ MYSQL_QUERIES = {
         (A, "SELECT v FROM t ORDER BY id"),
     ],
     "rails migrations: indexes, renames, bare keywords": [
-        (A, "SELECT DATABASE(), CURRENT_USER, CURRENT_USER(), current_date = curdate(), curtime() = current_time"),
+        # CURRENT_USER is left out: the account's host differs by environment.
+        (A, "SELECT DATABASE(), CURRENT_USER = CURRENT_USER(), current_date = curdate(), curtime() = current_time"),
         (A, "SELECT nosuchcol"),
         (A, "CREATE TABLE ra (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, a int, b varchar(10), KEY index_ra_on_a (a), INDEX (b), KEY (b))"),
         (A, "CREATE INDEX index_ra_on_a_b ON ra (a, b)"),
