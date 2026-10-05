@@ -650,7 +650,8 @@ PG_EDGES.update({
         "SET statement_timeout = 200",
         "SHOW statement_timeout",
         "SELECT pg_sleep(2)",
-        "SELECT count(*) FROM generate_series(1, 3000) a, generate_series(1, 3000) b WHERE a + b < 0",
+        # Slow on any server: a sleep per row, interrupted mid-scan.
+        "SELECT count(*) FROM generate_series(1, 10) g WHERE pg_sleep(0.1) IS NOT NULL",
         "SET statement_timeout = '1.5s'",
         "SHOW statement_timeout",
         "SET statement_timeout = '10 x'",
