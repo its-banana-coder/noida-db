@@ -1298,6 +1298,11 @@ pub(crate) fn run_one(
             let tag = d.create_enum(name, labels)?;
             Ok(StmtResult::tag(tag))
         }
+        S::AlterType(at) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.alter_type(&at.name, &at.operation)?;
+            Ok(StmtResult::tag(tag))
+        }
         S::AlterTable(at) => {
             let mut d = ddl(ctx, info);
             let tag = d.alter_table(&at.name, &at.operations, at.if_exists)?;

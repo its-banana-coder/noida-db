@@ -854,6 +854,94 @@ impl Ddl<'_, '_> {
         Ok("CREATE TYPE".into())
     }
 
+    /// `ALTER TYPE <enum> ADD VALUE [IF NOT EXISTS] 'v' [BEFORE|AFTER 'x']`
+    /// and `RENAME VALUE 'a' TO 'b'`.
+    pub fn alter_type(
+        &mut self,
+        name: &a::ObjectName,
+        op: &a::AlterTypeOperation,
+    ) -> PgResult<String> {
+        let parts = name_parts(name);
+        let (schema, n) = self.target(&parts)?;
+        let oid = self
+            .ctx
+            .db
+            .find_enum(schema, &n)
+            .or_else(|| {
+                (parts.len() == 1)
+                    .then(|| self.ctx.db.enums.values().find(|e| e.name == n))
+                    .flatten()
+            })
+            .map(|e| e.oid)
+            .ok_or_else(|| {
+                PgError::new(code::UNDEFINED_OBJECT, format!("type \"{n}\" does not exist"))
+            })?;
+        match op {
+            a::AlterTypeOperation::AddValue(add) => {
+                let label = add.value.value.clone();
+                let e = &self.ctx.db.enums[&oid];
+                if e.labels.iter().any(|(_, l, _)| *l == label) {
+                    if add.if_not_exists {
+                        return Ok("ALTER TYPE".into());
+                    }
+                    return Err(PgError::new(
+                        code::DUPLICATE_OBJECT,
+                        format!("enum label \"{label}\" already exists"),
+                    ));
+                }
+                let mut sorted = e.labels.clone();
+                sorted.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+                let order = match &add.position {
+                    None => sorted.last().map_or(1.0, |l| l.0 + 1.0),
+                    Some(pos) => {
+                        let (nb, before) = match pos {
+                            a::AlterTypeAddValuePosition::Before(x) => (&x.value, true),
+                            a::AlterTypeAddValuePosition::After(x) => (&x.value, false),
+                        };
+                        let Some(i) = sorted.iter().position(|(_, l, _)| l == nb) else {
+                            return Err(PgError::new(
+                                code::INVALID_PARAMETER_VALUE,
+                                format!("\"{nb}\" is not an existing enum label"),
+                            ));
+                        };
+                        let here = sorted[i].0;
+                        if before {
+                            let prev = if i == 0 { here - 1.0 } else { sorted[i - 1].0 };
+                            (prev + here) / 2.0
+                        } else {
+                            let next = sorted.get(i + 1).map_or(here + 1.0, |l| l.0);
+                            (here + next) / 2.0
+                        }
+                    }
+                };
+                let loid = self.ctx.db.alloc_oid();
+                self.ctx.db.enums.get_mut(&oid).unwrap().labels.push((order, label, loid));
+                Ok("ALTER TYPE".into())
+            }
+            a::AlterTypeOperation::RenameValue(r) => {
+                let e = self.ctx.db.enums.get_mut(&oid).unwrap();
+                if e.labels.iter().any(|(_, l, _)| *l == r.to.value) {
+                    return Err(PgError::new(
+                        code::DUPLICATE_OBJECT,
+                        format!("enum label \"{}\" already exists", r.to.value),
+                    ));
+                }
+                let Some(slot) = e.labels.iter_mut().find(|(_, l, _)| *l == r.from.value) else {
+                    return Err(PgError::new(
+                        code::INVALID_PARAMETER_VALUE,
+                        format!("\"{}\" is not an existing enum label", r.from.value),
+                    ));
+                };
+                slot.1 = r.to.value.clone();
+                Ok("ALTER TYPE".into())
+            }
+            a::AlterTypeOperation::Rename(r) => {
+                self.ctx.db.enums.get_mut(&oid).unwrap().name = r.new_name.value.clone();
+                Ok("ALTER TYPE".into())
+            }
+        }
+    }
+
     pub fn drop(&mut self, d: &a::Statement) -> PgResult<String> {
         let a::Statement::Drop { object_type, if_exists, names, cascade, .. } = d else {
             return Err(unsupported("DROP"));

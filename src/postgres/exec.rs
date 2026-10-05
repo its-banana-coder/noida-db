@@ -773,6 +773,56 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             ctx.rt.lastval = Some(oid);
             Value::Int(v)
         }
+        "__enum_sortorder" => {
+            let oid = a[0].as_int().unwrap_or(0) as u32;
+            match (&a[1], ctx.db.enums.get(&oid)) {
+                (Value::Text(label), Some(e)) => e
+                    .labels
+                    .iter()
+                    .find(|(_, l, _)| l == label)
+                    .map_or(Value::Null, |(o, _, _)| Value::Float(*o as f64)),
+                _ => Value::Null,
+            }
+        }
+        "__enum_key" => {
+            let rank = system_call("__enum_sortorder", a, tys, Type::FLOAT8, ctx)?;
+            Value::Record(vec![rank, a[1].clone()])
+        }
+        "enum_range" | "enum_first" | "enum_last" => {
+            let Some(Base::Enum(oid)) = tys.first().map(|t| t.base) else {
+                return Err(PgError::new(
+                    code::INVALID_PARAMETER_VALUE,
+                    "could not determine actual enum type",
+                ));
+            };
+            let Some(e) = ctx.db.enums.get(&oid) else { return Ok(Value::Null) };
+            let mut labels = e.labels.clone();
+            labels.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(Ordering::Equal));
+            let names: Vec<String> = labels.into_iter().map(|(_, l, _)| l).collect();
+            match name {
+                "enum_first" => names.first().cloned().map_or(Value::Null, Value::Text),
+                "enum_last" => names.last().cloned().map_or(Value::Null, Value::Text),
+                _ => {
+                    // enum_range(lo, hi): the labels between them (NULL = open end).
+                    let pos = |v: Option<&Value>| match v {
+                        Some(Value::Text(l)) => names.iter().position(|n| n == l),
+                        _ => None,
+                    };
+                    let lo = if a.len() > 1 { pos(a.first()).unwrap_or(0) } else { 0 };
+                    let hi = if a.len() > 1 {
+                        pos(a.get(1)).unwrap_or(names.len().saturating_sub(1))
+                    } else {
+                        names.len().saturating_sub(1)
+                    };
+                    let items: Vec<Value> = if names.is_empty() || lo > hi {
+                        vec![]
+                    } else {
+                        names[lo..=hi].iter().cloned().map(Value::Text).collect()
+                    };
+                    Value::Array(Box::new(types::Array::new(items)))
+                }
+            }
+        }
         "record_field" => {
             let idx = a[1].as_int().unwrap_or(0) as usize;
             match &a[0] {

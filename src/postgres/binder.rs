@@ -882,6 +882,13 @@ impl<'a> Binder<'a> {
         let mut exprs: Vec<Expr> = proj.iter().map(|p| p.e.clone()).collect();
         let mut order = vec![];
         for (te, desc, nulls_first, existing) in order_specs {
+            // Enums sort by declaration order: sort on a hidden column of
+            // their sort positions.
+            if let (Base::Enum(_), false) = (te.ty.base, te.ty.array) {
+                exprs.push(enum_order(te.e, te.ty));
+                order.push(SortKey { col: exprs.len() - 1, desc, nulls_first });
+                continue;
+            }
             let col = match existing {
                 Some(i) => i,
                 None => {
@@ -2531,6 +2538,8 @@ impl<'a> Binder<'a> {
             .map_err(|_| no_operator(op.symbol(), l.ty, r.ty))?;
         let le = self.coerce(l, ty, -1, CastCtx::Implicit, "comparison")?;
         let re = self.coerce(r, ty, -1, CastCtx::Implicit, "comparison")?;
+        // Enums compare by declaration order, not by label.
+        let (le, re) = (enum_order(le, ty), enum_order(re, ty));
         Ok(Expr::Compare {
             op,
             left: Box::new(le),
@@ -3288,10 +3297,29 @@ impl<'a> Binder<'a> {
             None => None,
         };
         let order = order_te.into_iter().map(|(te, d, n)| (te.e, d, n)).collect();
+        // min/max over an enum: compare (sort position, label) records,
+        // then take the label back out.
+        let enum_minmax = matches!(r.sig.name, "min" | "max")
+            && r.arg_tys.first().is_some_and(|t| matches!(t.base, Base::Enum(_)) && !t.array);
+        let (out, arg_tys) = if enum_minmax {
+            let t = r.arg_tys[0];
+            let arg = out.into_iter().next().unwrap();
+            let Base::Enum(oid) = t.base else { unreachable!() };
+            // Strict: a NULL label stays NULL, so the aggregate skips it.
+            let key = Expr::Call {
+                name: "__enum_key",
+                args: vec![Expr::Const(Value::Int(oid as i64)), arg],
+                ty: Type::RECORD,
+                arg_tys: vec![Type::INT4, t],
+            };
+            (vec![key], vec![Type::RECORD])
+        } else {
+            (out, r.arg_tys.clone())
+        };
         let call = AggCall {
             name: r.sig.name,
             args: out,
-            arg_tys: r.arg_tys.clone(),
+            arg_tys,
             ty: r.ret,
             distinct,
             filter: filter_e,
@@ -3307,6 +3335,17 @@ impl<'a> Binder<'a> {
                 frame.aggs.len() - 1
             }
         };
+        if enum_minmax {
+            return Ok(TE::new(
+                Expr::Call {
+                    name: "record_field",
+                    args: vec![Expr::AggRef(idx), Expr::Const(Value::Int(1))],
+                    ty: r.ret,
+                    arg_tys: vec![Type::RECORD, Type::INT4],
+                },
+                r.ret,
+            ));
+        }
         Ok(TE::new(Expr::AggRef(idx), r.ret))
     }
 
@@ -5187,5 +5226,19 @@ fn source_width(q: &a::Query) -> Option<usize> {
             Some(sel.projection.len())
         }
         _ => None,
+    }
+}
+
+/// An enum-typed expression as its label's sort position (enums order by
+/// declaration, not alphabetically); anything else unchanged.
+fn enum_order(e: Expr, ty: Type) -> Expr {
+    match (ty.base, ty.array) {
+        (Base::Enum(oid), false) => Expr::Call {
+            name: "__enum_sortorder",
+            args: vec![Expr::Const(Value::Int(oid as i64)), e],
+            ty: Type::FLOAT8,
+            arg_tys: vec![Type::INT4, ty],
+        },
+        _ => e,
     }
 }

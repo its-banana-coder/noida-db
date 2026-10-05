@@ -122,6 +122,8 @@ s:_pg_expandarray(anyarray)(x anyelement,n int4)
 _pg_char_max_length(oid,int4)int4 _pg_numeric_precision(oid,int4)int4 _pg_numeric_scale(oid,int4)int4
 _pg_datetime_precision(oid,int4)int4 _pg_truetypid(pg_node_tree,oid)oid _pg_truetypmod(pg_node_tree,oid)int4
 record_field(record,int4)anyelement
+!enum_range(anyelement)anyarray !enum_range(anyelement,anyelement)anyarray !enum_first(anyelement)anyelement !enum_last(anyelement)anyelement
+__enum_sortorder(int4,text)float8 __enum_key(int4,text)record
 array_length(anyarray,int4)int4 array_upper(anyarray,int4)int4 array_lower(anyarray,int4)int4 cardinality(anyarray)int4
 array_ndims(anyarray)int4 array_dims(anyarray)text
 !array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
