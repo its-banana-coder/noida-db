@@ -536,7 +536,16 @@ fn apply_generated(ctx: &mut Ctx, table: u32, row: &mut Row) -> PgResult<()> {
 
 /// Checks NOT NULL, unique/primary key, CHECK and foreign keys.
 pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> PgResult<()> {
-    let t = table_of(ctx, table)?.clone();
+    // The table's definition only: copying its rows for every row checked
+    // made bulk INSERT/COPY quadratic. Uniqueness checks read the rows
+    // in place below; only a unique index that isn't a constraint's
+    // (it may evaluate expressions against the row) needs a full copy.
+    let full = table_of(ctx, table)?;
+    let needs_rows = full
+        .indexes
+        .iter()
+        .any(|i| i.unique && !full.constraints.iter().any(|c| c.index_oid == Some(i.oid)));
+    let t = if needs_rows { full.clone() } else { full.without_rows() };
     let schema = ctx.db.schema_name(t.schema).to_string();
     for (i, c) in t.live_columns() {
         if c.not_null && row[i].is_null() {
@@ -584,7 +593,7 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
                     .and_then(|o| t.indexes.iter().find(|i| i.oid == o))
                     .is_some_and(|i| i.nulls_not_distinct);
                 if let Some(other) = super::catalog::check_unique_violation(
-                    &t,
+                    table_of(ctx, table)?,
                     &cons.cols,
                     row,
                     skip,
