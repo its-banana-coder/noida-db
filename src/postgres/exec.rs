@@ -1228,6 +1228,14 @@ fn run_query_inner(q: &Query, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     dedup_rows(&mut next);
                 }
                 result.extend(next.clone());
+                // Rows are held (and copied) in memory, where Postgres
+                // streams them: a runaway recursion stops here instead of
+                // exhausting memory.
+                if result.len() > MAX_RECURSIVE_ROWS {
+                    return Err(PgError::new(code::OUT_OF_MEMORY, "out of memory").detail(format!(
+                        "recursive query would return more than {MAX_RECURSIVE_ROWS} rows; noida-db materializes recursive queries"
+                    )));
+                }
                 working = next;
             }
             ctx.ctes[*slot] = Some(result.clone());
@@ -1812,6 +1820,10 @@ fn equi_join_index(
     }
     Some((lk, map))
 }
+
+/// The most rows a recursive CTE may accumulate (it keeps copies of its
+/// working set, so lower than `MAX_SRF_ROWS`).
+const MAX_RECURSIVE_ROWS: usize = 1_000_000;
 
 /// The most rows a set-returning function may produce: noida-db builds its
 /// result in memory, where Postgres streams it.

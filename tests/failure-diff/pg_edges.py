@@ -719,4 +719,8 @@ PG_EDGES.update({
         "WITH c AS (SELECT * FROM vc_2) SELECT * FROM c",
         "SELECT 1",
     ),
+    "pg edge: recursive CTEs that terminate": steps(
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000) SELECT count(*), sum(n) FROM t",
+        "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n % 5 + 1 FROM t) SELECT count(*) FROM t",
+    ),
 })

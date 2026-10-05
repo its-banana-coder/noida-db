@@ -221,8 +221,9 @@ constraints.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
 - Results are built in memory, not streamed: `generate_series` past
-  10,000,000 rows fails with `53200 out of memory` (Postgres would stream
-  it).
+  10,000,000 rows, or a recursive CTE past 1,000,000, fails with `53200
+  out of memory` (Postgres would stream it, so `LIMIT` would stop a
+  non-terminating recursion there).
 
 - A set-returning user function in a select list (it works in `FROM`).
 - `BETWEEN SYMMETRIC` (the SQL parser rejects it) and the `GROUPING()`
@@ -747,6 +748,10 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   `regex` syntax, which covers ICU's common subset (classes, POSIX
   `[[:alpha:]]`, anchors, groups, repetition) but not look-around or
   backreferences in the pattern.
+- Views (`CREATE VIEW`) aren't supported yet; nor are `JOIN ... USING`
+  and `NATURAL JOIN` (`JOIN ... ON` and a bare `JOIN` are).
+- A recursive CTE is held in memory: past 1,000,000 rows it fails with
+  1114 "The table ... is full" (MySQL would spill to disk).
 - Plain `KEY`/`INDEX` declarations are recorded (SHOW INDEX, SHOW CREATE
   TABLE, `information_schema.STATISTICS`, renames and drops) but not used
   for lookups; `FULLTEXT`/`SPATIAL` are accepted and ignored. A foreign key
