@@ -2055,6 +2055,15 @@ impl Executor {
                         new.retain(|n| !rows.iter().any(|r| rows_distinct_equal(r, n)));
                     }
                     rows.extend(new.iter().cloned());
+                    // Held in memory (MySQL would spill to disk): a
+                    // runaway recursion stops before exhausting it.
+                    if rows.len() > 1_000_000 {
+                        return Err(MySqlError::new(
+                            1114,
+                            "HY000",
+                            format!("The table '{name}' is full"),
+                        ));
+                    }
                     frontier = new;
                 }
                 self.cte_rows.remove(&name);

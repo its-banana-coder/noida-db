@@ -1600,7 +1600,9 @@ impl Binder {
             // both are at least as common as the forms that were already
             // handled, if not more so.
             let (op, swap_sides) = match &join.join_operator {
-                JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+                JoinOperator::Join(constraint)
+                | JoinOperator::Inner(constraint)
+                | JoinOperator::StraightJoin(constraint) => {
                     (JoinOp::Inner(self.bind_join_constraint(constraint)?), false)
                 }
                 JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
@@ -1940,7 +1942,9 @@ impl Binder {
     fn bind_join_constraint(&mut self, c: &JoinConstraint) -> Result<Expr, MySqlError> {
         match c {
             JoinConstraint::On(expr) => self.bind_expr(expr.clone()),
-            _ => Err(MySqlError::unsupported("join constraint")),
+            // `a JOIN b` with no ON: every pair, as CROSS JOIN.
+            JoinConstraint::None => Ok(Expr::Const(Value::Int(1))),
+            _ => Err(MySqlError::unsupported("JOIN ... USING / NATURAL JOIN")),
         }
     }
 
