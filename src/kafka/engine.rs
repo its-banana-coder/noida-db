@@ -49,6 +49,15 @@ pub struct PartitionState {
     // aborted_transactions so they know to skip those records even
     // though they're physically still in the log.
     pub aborted_txns: Vec<(i64, i64)>,
+    // The earliest offset still readable: moved forward by retention and
+    // DeleteRecords, never by compaction (see log.rs).
+    pub log_start_offset: i64,
+    pub segments: Vec<super::log::Segment>,
+    // Tombstone offset -> when the cleaner may drop it (set on the first
+    // clean that sees it, `delete.retention.ms` later).
+    pub tombstone_horizons: std::collections::BTreeMap<i64, i64>,
+    // Everything below this offset has already been compacted.
+    pub clean_offset: i64,
 }
 
 impl PartitionState {
@@ -61,6 +70,10 @@ impl PartitionState {
             producer_seqs: HashMap::new(),
             active_txns: HashMap::new(),
             aborted_txns: Vec::new(),
+            log_start_offset: 0,
+            segments: Vec::new(),
+            tombstone_horizons: Default::default(),
+            clean_offset: 0,
         }
     }
 }
@@ -462,9 +475,17 @@ impl EngineState {
             topic_res.name = topic.name.clone();
 
             let topic_name_str = topic.name.as_str();
+            let config_error = topic.configs.iter().find_map(|c| {
+                let value = c.value.as_ref().map_or("", |v| v.as_str());
+                super::log::validate_topic_config(c.name.as_str(), value).err()
+            });
 
-            if topic_name_str.is_empty() {
+            if let Err(msg) = super::log::validate_topic_name(topic_name_str) {
                 topic_res.error_code = 17; // INVALID_TOPIC_EXCEPTION
+                topic_res.error_message = Some(StrBytes::from_string(msg));
+            } else if let Some(msg) = config_error {
+                topic_res.error_code = 40; // INVALID_CONFIG
+                topic_res.error_message = Some(StrBytes::from_string(msg));
             } else if topic.num_partitions <= 0 {
                 topic_res.error_code = 37; // INVALID_PARTITIONS
             } else if topic.replication_factor > 1 {
@@ -565,13 +586,24 @@ impl EngineState {
     ) -> InitProducerIdResponse {
         let mut res = InitProducerIdResponse::default();
 
-        // A null *or* empty transactional.id both mean "no transactional
-        // id" on the wire (NULLABLE_STRING encodes absence as either) —
-        // treating "" as a real transactional.id would make every
-        // non-transactional producer share one fake transaction and
-        // fence each other's producer_id assignments.
-        let tx_id =
-            req.transactional_id.as_ref().map(|t| t.as_str().to_string()).filter(|s| !s.is_empty());
+        // As a broker validates it (observed against Kafka 3.8): a
+        // transactional.id is null or non-empty ("" is INVALID_REQUEST, not
+        // "no id" — clients send null), a transactional producer's timeout
+        // is within (0, transaction.max.timeout.ms = 15 minutes], and a
+        // producer id and epoch are given together or not at all.
+        let tx_id = req.transactional_id.as_ref().map(|t| t.as_str().to_string());
+        if tx_id.as_deref() == Some("") || (req.producer_id.0 == -1) != (req.producer_epoch == -1) {
+            res.error_code = 42; // INVALID_REQUEST
+            res.producer_id = ProducerId(-1);
+            res.producer_epoch = -1;
+            return res;
+        }
+        if tx_id.is_some() && !(1..=900_000).contains(&req.transaction_timeout_ms) {
+            res.error_code = 50; // INVALID_TRANSACTION_TIMEOUT
+            res.producer_id = ProducerId(-1);
+            res.producer_epoch = -1;
+            return res;
+        }
         let (pid, epoch) = match &tx_id {
             Some(tid) => {
                 // A new InitProducerId for a known transactional.id fences
@@ -605,6 +637,20 @@ impl EngineState {
         res
     }
 
+    pub fn run_log_cleaner(&mut self) {
+        let now = self.now_ms();
+        for topic in self.topics.values_mut() {
+            if topic.is_internal {
+                continue;
+            }
+            let cfg = super::log::LogConfig::of(&topic.configs);
+            for part in topic.partitions.values_mut() {
+                part.compact(&cfg, now);
+                part.apply_retention(&cfg, now);
+            }
+        }
+    }
+
     pub fn handle_produce(&mut self, req: &ProduceRequest, _version: i16) -> ProduceResponse {
         let mut res = ProduceResponse::default();
         let now = self.now_ms();
@@ -619,10 +665,58 @@ impl EngineState {
                 part_res.index = partition.index;
 
                 if let Some(topic_state) = self.topics.get_mut(topic_name) {
+                    let cfg = super::log::LogConfig::of(&topic_state.configs);
                     if let Some(part_state) = topic_state.partitions.get_mut(&partition.index) {
                         if let Some(records) = &partition.records {
-                            // Check if this is a Kafka record batch v2
-                            let is_batch_v2 = records.len() >= 61 && records[16] == 2;
+                            // Like a broker, accept only well-formed v2
+                            // record batches: one batch whose length field
+                            // covers the payload exactly, with a valid CRC.
+                            if !is_valid_v2_batch(records) {
+                                part_res.error_code = 2; // CORRUPT_MESSAGE
+                                part_res.base_offset = -1;
+                                part_res.log_append_time_ms = -1;
+                                topic_res.partition_responses.push(part_res);
+                                continue;
+                            }
+                            let is_batch_v2 = true;
+                            if records.len() as i64 > cfg.max_message_bytes {
+                                part_res.error_code = 10; // MESSAGE_TOO_LARGE
+                                topic_res.partition_responses.push(part_res);
+                                continue;
+                            }
+                            // A compacted topic keeps the latest record per
+                            // key, so a record without one is rejected.
+                            if cfg.compact && is_batch_v2 {
+                                let mut buf = records.clone();
+                                let keyless =
+                                    kafka_protocol::records::RecordBatchDecoder::decode(&mut buf)
+                                        .map(|set| {
+                                            set.records
+                                                .iter()
+                                                .position(|r| r.key.is_none() && !r.control)
+                                        })
+                                        .unwrap_or(None);
+                                if let Some(index) = keyless {
+                                    use kafka_protocol::messages::produce_response::BatchIndexAndErrorMessage;
+                                    let msg = format!(
+                                        "Compacted topic cannot accept message without key in \
+                                         topic partition {}-{}.",
+                                        topic_name, partition.index
+                                    );
+                                    part_res.error_code = 87; // INVALID_RECORD
+                                    part_res.error_message =
+                                        Some(StrBytes::from_string(msg.clone()));
+                                    let mut rec_err = BatchIndexAndErrorMessage::default();
+                                    rec_err.batch_index = index as i32;
+                                    rec_err.batch_index_error_message =
+                                        Some(StrBytes::from_string(msg));
+                                    part_res.record_errors.push(rec_err);
+                                    part_res.base_offset = -1;
+                                    part_res.log_append_time_ms = -1;
+                                    topic_res.partition_responses.push(part_res);
+                                    continue;
+                                }
+                            }
                             // `lastOffsetDelta` = number of records in the batch minus
                             // one; every batch (idempotent or not) needs it to advance
                             // the high watermark by the right amount, not just to track
@@ -669,7 +763,8 @@ impl EngineState {
                                             // Duplicate batch acknowledged without re-append
                                             part_res.error_code = 0;
                                             part_res.base_offset = prev_base_offset;
-                                            part_res.log_append_time_ms = now;
+                                            part_res.log_append_time_ms =
+                                                if cfg.log_append_time { now } else { -1 };
                                             topic_res.partition_responses.push(part_res);
                                             continue;
                                         } else if base_sequence > last_seq + 1 {
@@ -720,21 +815,25 @@ impl EngineState {
                             } else {
                                 1
                             };
-                            let base_offset = part_state.high_watermark;
                             let mut batch_bytes = records.to_vec();
-                            if is_batch_v2 && batch_bytes.len() >= 8 {
-                                batch_bytes[0..8].copy_from_slice(&base_offset.to_be_bytes());
+                            // `message.timestamp.type=LogAppendTime`: the
+                            // broker stamps every record with its own clock.
+                            if cfg.log_append_time && is_batch_v2 {
+                                batch_bytes =
+                                    stamp_log_append_time(&batch_bytes, now).unwrap_or(batch_bytes);
                             }
-                            part_state.record_batches.push((base_offset, batch_bytes));
-                            part_state.high_watermark += delta;
+                            let base_offset =
+                                part_state.append_batch(batch_bytes, delta, now, Some(&cfg));
 
                             part_res.error_code = 0;
                             part_res.base_offset = base_offset;
-                            part_res.log_append_time_ms = now;
+                            part_res.log_append_time_ms =
+                                if cfg.log_append_time { now } else { -1 };
+                            part_res.log_start_offset = part_state.log_start_offset;
                         } else {
                             part_res.error_code = 0;
                             part_res.base_offset = part_state.high_watermark;
-                            part_res.log_append_time_ms = now;
+                            part_res.log_append_time_ms = -1;
                         }
                     } else {
                         part_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
@@ -774,6 +873,7 @@ impl EngineState {
                     if let Some(part_state) = topic_state.partitions.get(&partition.partition) {
                         part_res.error_code = 0;
                         part_res.high_watermark = part_state.high_watermark;
+                        part_res.log_start_offset = part_state.log_start_offset;
 
                         // Last-stable-offset: the high watermark, capped to
                         // just before the earliest still-open transaction
@@ -793,7 +893,9 @@ impl EngineState {
                         part_res.last_stable_offset = lso;
 
                         let fetch_offset = partition.fetch_offset;
-                        if fetch_offset < 0 || fetch_offset > part_state.high_watermark {
+                        if fetch_offset < part_state.log_start_offset
+                            || fetch_offset > part_state.high_watermark
+                        {
                             part_res.error_code = 1; // OFFSET_OUT_OF_RANGE
                         } else if fetch_offset < visible_up_to {
                             // Batches aren't one record each: find the batch
@@ -808,10 +910,13 @@ impl EngineState {
                             // afford (this is what made the transactional
                             // producer integration test flaky/incomplete,
                             // not a transactions bug: see docs/specs/kafka.md).
-                            let start = part_state
-                                .record_batches
-                                .iter()
-                                .rposition(|(base, _)| *base <= fetch_offset);
+                            // The first batch that still has records at or
+                            // past fetch_offset — compaction leaves gaps, so
+                            // the batch covering it may be gone and the next
+                            // one is where the log continues.
+                            let start = part_state.record_batches.iter().position(|(base, b)| {
+                                super::log::batch_last_offset(*base, b) >= fetch_offset
+                            });
                             if let Some(start) = start {
                                 let mut out = Vec::new();
                                 for (base, batch) in &part_state.record_batches[start..] {
@@ -908,7 +1013,7 @@ impl EngineState {
                         let end =
                             if req.isolation_level == 1 { lso } else { part_state.high_watermark };
                         match partition.timestamp {
-                            -2 => part_res.offset = 0,
+                            -2 => part_res.offset = part_state.log_start_offset,
                             -1 => part_res.offset = end,
                             // A timestamp (or -3, the record with the largest
                             // timestamp). Found via testing before a public
@@ -977,6 +1082,26 @@ impl EngineState {
     ) -> kafka_protocol::messages::JoinGroupResponse {
         let mut res = kafka_protocol::messages::JoinGroupResponse::default();
         let group_id = req.group_id.as_str().to_string();
+
+        // The coordinator's request checks, in Kafka's order: a group id,
+        // a session timeout within group.min/max.session.timeout.ms
+        // (6s..30min by default), and at least one protocol of a named type.
+        let reject = |code: i16| {
+            let mut res = kafka_protocol::messages::JoinGroupResponse::default();
+            res.error_code = code;
+            res.generation_id = -1;
+            res.member_id = req.member_id.clone();
+            res
+        };
+        if group_id.is_empty() {
+            return reject(24); // INVALID_GROUP_ID
+        }
+        if !(6_000..=1_800_000).contains(&req.session_timeout_ms) {
+            return reject(26); // INVALID_SESSION_TIMEOUT
+        }
+        if req.protocol_type.is_empty() || req.protocols.is_empty() {
+            return reject(23); // INCONSISTENT_GROUP_PROTOCOL
+        }
 
         let now = self.now_ms();
         let group = self
@@ -1306,21 +1431,37 @@ impl EngineState {
         let mut res = kafka_protocol::messages::OffsetCommitResponse::default();
         let group_id = req.group_id.as_str().to_string();
 
-        let mut err = 0;
-        if req.generation_id_or_member_epoch >= 0 {
-            if let Some(group) = self.groups.get(&group_id) {
-                let m_id = req.member_id.as_str().to_string();
-                if !group.members.contains_key(&m_id) {
-                    err = 25; // UNKNOWN_MEMBER_ID
-                } else if req.generation_id_or_member_epoch != group.generation_id {
-                    err = 22; // ILLEGAL_GENERATION
-                } else if group.state == GroupLifecycleState::PreparingRebalance {
-                    err = 27; // REBALANCE_IN_PROGRESS
+        // Kafka's GroupCoordinator.validateOffsetCommit: a commit naming
+        // a member or generation must come from a current member of the
+        // current generation; an anonymous one (generation -1, no member,
+        // as an admin client or a consumer with manual assignment sends)
+        // only goes into a group with no members.
+        let generation = req.generation_id_or_member_epoch;
+        let m_id = req.member_id.as_str();
+        let group = self.groups.get(&group_id).filter(|g| g.state != GroupLifecycleState::Dead);
+        let err = if group_id.is_empty() {
+            24 // INVALID_GROUP_ID
+        } else {
+            match group {
+                None if generation < 0 => 0,
+                None => 22, // ILLEGAL_GENERATION
+                Some(g)
+                    if generation >= 0 || !m_id.is_empty() || req.group_instance_id.is_some() =>
+                {
+                    if !g.members.contains_key(m_id) {
+                        25 // UNKNOWN_MEMBER_ID
+                    } else if generation != g.generation_id {
+                        22 // ILLEGAL_GENERATION
+                    } else if g.state == GroupLifecycleState::CompletingRebalance {
+                        27 // REBALANCE_IN_PROGRESS
+                    } else {
+                        0
+                    }
                 }
-            } else {
-                err = 25; // UNKNOWN_MEMBER_ID
+                Some(g) if !g.members.is_empty() => 25, // UNKNOWN_MEMBER_ID
+                Some(_) => 0,
             }
-        }
+        };
 
         for topic in &req.topics {
             let mut topic_res = OffsetCommitResponseTopic::default();
@@ -1612,19 +1753,21 @@ impl EngineState {
                 if let Some(topic_state) = self.topics.get(topic_name) {
                     result.error_code = 0;
 
-                    let mut configs_map: HashMap<String, (String, i8)> = [
-                        ("cleanup.policy".to_string(), ("delete".to_string(), DEFAULT_CONFIG)),
-                        ("retention.ms".to_string(), ("604800000".to_string(), DEFAULT_CONFIG)),
-                        ("segment.bytes".to_string(), ("1073741824".to_string(), DEFAULT_CONFIG)),
-                    ]
-                    .into_iter()
-                    .collect();
-
-                    for (k, v) in &topic_state.configs {
-                        configs_map.insert(k.clone(), (v.clone(), DYNAMIC_TOPIC_CONFIG));
+                    let mut configs: Vec<(String, String, i8)> =
+                        super::log::topic_config_defaults()
+                            .map(|(k, d)| match topic_state.configs.get(k) {
+                                Some(v) => (k.to_string(), v.clone(), DYNAMIC_TOPIC_CONFIG),
+                                None => (k.to_string(), d.to_string(), DEFAULT_CONFIG),
+                            })
+                            .collect();
+                    // Only the keys asked for, when the request names any.
+                    if let Some(keys) =
+                        resource.configuration_keys.as_ref().filter(|k| !k.is_empty())
+                    {
+                        configs.retain(|(k, _, _)| keys.iter().any(|q| q.as_str() == k));
                     }
 
-                    for (k, (v, source)) in configs_map {
+                    for (k, v, source) in configs {
                         let mut conf = DescribeConfigsResourceResult::default();
                         conf.name = StrBytes::from_string(k);
                         conf.value = Some(StrBytes::from_string(v));
@@ -1814,8 +1957,7 @@ impl EngineState {
                         req.committed,
                         now,
                     );
-                    part_state.record_batches.push((base_offset, control_batch));
-                    part_state.high_watermark += 1;
+                    part_state.append_batch(control_batch, 1, now, None);
                 } else if req.committed
                     && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
                 {
@@ -1882,12 +2024,28 @@ impl EngineState {
             if resource.resource_type == 2 {
                 let topic_name = resource.resource_name.as_str();
                 if let Some(topic_state) = self.topics.get_mut(topic_name) {
-                    for entry in &resource.configs {
-                        if let Some(val) = &entry.value {
-                            topic_state.configs.insert(entry.name.to_string(), val.to_string());
+                    // AlterConfigs (unlike the incremental one) replaces the
+                    // topic's whole set of overrides: anything not in the
+                    // request goes back to its default.
+                    let invalid = resource.configs.iter().find_map(|e| {
+                        let value = e.value.as_ref().map_or("", |v| v.as_str());
+                        super::log::validate_topic_config(e.name.as_str(), value).err()
+                    });
+                    if let Some(msg) = invalid {
+                        resource_res.error_code = 40; // INVALID_CONFIG
+                        resource_res.error_message = Some(StrBytes::from_string(msg));
+                    } else {
+                        if !req.validate_only {
+                            topic_state.configs = resource
+                                .configs
+                                .iter()
+                                .filter_map(|e| {
+                                    e.value.as_ref().map(|v| (e.name.to_string(), v.to_string()))
+                                })
+                                .collect();
                         }
+                        resource_res.error_code = 0;
                     }
-                    resource_res.error_code = 0;
                 } else {
                     resource_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
                 }
@@ -1922,18 +2080,78 @@ impl EngineState {
             if resource.resource_type == 2 {
                 let topic_name = resource.resource_name.as_str();
                 if let Some(topic_state) = self.topics.get_mut(topic_name) {
+                    // Applied to a copy and committed only if every entry
+                    // is valid: a request either changes all it names or
+                    // nothing.
+                    let mut configs = topic_state.configs.clone();
+                    let mut error = None;
                     for entry in &resource.configs {
-                        if entry.config_operation == 0 {
-                            // SET
-                            if let Some(val) = &entry.value {
-                                topic_state.configs.insert(entry.name.to_string(), val.to_string());
+                        let name = entry.name.as_str();
+                        let value = entry.value.as_ref().map_or("", |v| v.as_str());
+                        let current = configs.get(name).cloned().or_else(|| {
+                            super::log::topic_config_defaults()
+                                .find(|(n, _)| *n == name)
+                                .map(|(_, d)| d.to_string())
+                        });
+                        let new_value = match entry.config_operation {
+                            0 => Some(value.to_string()), // SET
+                            1 => None,                    // DELETE
+                            op @ (2 | 3) => {
+                                // APPEND / SUBTRACT, list configs only.
+                                if !super::log::is_list_config(name) {
+                                    error = Some(format!(
+                                        "Config value append is not allowed for config key: {name}"
+                                    ));
+                                    break;
+                                }
+                                let mut items: Vec<String> =
+                                    super::log::split_list(current.as_deref().unwrap_or(""))
+                                        .map(str::to_string)
+                                        .collect();
+                                for item in super::log::split_list(value) {
+                                    if op == 2 {
+                                        if !items.iter().any(|i| i == item) {
+                                            items.push(item.to_string());
+                                        }
+                                    } else {
+                                        items.retain(|i| i != item);
+                                    }
+                                }
+                                Some(items.join(","))
                             }
-                        } else if entry.config_operation == 1 {
-                            // DELETE
-                            topic_state.configs.remove(entry.name.as_str());
+                            _ => {
+                                error = Some(format!("Unknown config operation for {name}"));
+                                break;
+                            }
+                        };
+                        match new_value {
+                            Some(v) => {
+                                if let Err(msg) = super::log::validate_topic_config(name, &v) {
+                                    error = Some(msg);
+                                    break;
+                                }
+                                configs.insert(name.to_string(), v);
+                            }
+                            None => {
+                                if let Err(msg) = super::log::validate_topic_config(name, "")
+                                    && msg.starts_with("Unknown")
+                                {
+                                    error = Some(msg);
+                                    break;
+                                }
+                                configs.remove(name);
+                            }
                         }
                     }
-                    resource_res.error_code = 0;
+                    if let Some(msg) = error {
+                        resource_res.error_code = 40; // INVALID_CONFIG
+                        resource_res.error_message = Some(StrBytes::from_string(msg));
+                    } else {
+                        if !req.validate_only {
+                            topic_state.configs = configs;
+                        }
+                        resource_res.error_code = 0;
+                    }
                 } else {
                     resource_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
                 }
@@ -1965,16 +2183,38 @@ impl EngineState {
             DeleteRecordsPartitionResult, DeleteRecordsTopicResult,
         };
         let mut res = kafka_protocol::messages::DeleteRecordsResponse::default();
+        let now = self.now_ms();
 
         for topic in &req.topics {
             let mut topic_res = DeleteRecordsTopicResult::default();
             topic_res.name = topic.name.clone();
+            let topic_state = self.topics.get_mut(topic.name.as_str());
+            let cfg = topic_state.as_ref().map(|t| super::log::LogConfig::of(&t.configs));
+            let mut topic_state = topic_state;
 
             for part in &topic.partitions {
                 let mut part_res = DeleteRecordsPartitionResult::default();
                 part_res.partition_index = part.partition_index;
-                part_res.low_watermark = part.offset;
-                part_res.error_code = 0;
+                part_res.low_watermark = -1;
+                let part_state = topic_state
+                    .as_deref_mut()
+                    .and_then(|t| t.partitions.get_mut(&part.partition_index));
+                match (part_state, &cfg) {
+                    (Some(ps), Some(cfg)) => {
+                        // -1 means "up to the high watermark".
+                        let offset =
+                            if part.offset == -1 { ps.high_watermark } else { part.offset };
+                        if !cfg.delete {
+                            part_res.error_code = 44; // POLICY_VIOLATION
+                        } else if offset < 0 || offset > ps.high_watermark {
+                            part_res.error_code = 1; // OFFSET_OUT_OF_RANGE
+                        } else {
+                            ps.truncate_front(offset, now);
+                            part_res.low_watermark = ps.log_start_offset;
+                        }
+                    }
+                    _ => part_res.error_code = 3, // UNKNOWN_TOPIC_OR_PARTITION
+                }
                 topic_res.partitions.push(part_res);
             }
 
@@ -2099,10 +2339,10 @@ impl EngineState {
             t_dir.name =
                 kafka_protocol::messages::TopicName(StrBytes::from_string(topic_name.clone()));
 
-            for &p_id in topic_state.partitions.keys() {
+            for (&p_id, p_state) in &topic_state.partitions {
                 let mut p_dir = DescribeLogDirsPartition::default();
                 p_dir.partition_index = p_id;
-                p_dir.partition_size = 1024;
+                p_dir.partition_size = p_state.size_bytes();
                 p_dir.offset_lag = 0;
                 p_dir.is_future_key = false;
                 t_dir.partitions.push(p_dir);
@@ -2165,6 +2405,30 @@ impl Engine {
 
     pub fn handle_api_versions(&self, version: i16) -> ApiVersionsResponse {
         self.state.lock().unwrap().handle_api_versions(version)
+    }
+
+    pub fn now_ms(&self) -> i64 {
+        self.state.lock().unwrap().now_ms()
+    }
+
+    /// One pass of compaction and retention over every partition.
+    pub fn run_log_cleaner(&self) {
+        self.state.lock().unwrap().run_log_cleaner();
+    }
+
+    /// Runs the log cleaner once a second in the background (a broker
+    /// checks every 5 minutes by default; a dev server shouldn't make
+    /// anyone wait that long to see retention work). Stops once the engine
+    /// is dropped.
+    pub fn spawn_log_cleaner(&self) {
+        let weak = Arc::downgrade(&self.state);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(state) = weak.upgrade() else { break };
+                state.lock().unwrap().run_log_cleaner();
+            }
+        });
     }
 
     pub fn handle_metadata(&self, req: &MetadataRequest, version: i16) -> MetadataResponse {
@@ -2587,6 +2851,14 @@ pub struct PartitionSnapshot {
     /// serde_json limitation (§4).
     pub producer_seqs: Vec<((i64, i16), (i32, i64))>,
     pub aborted_txns: Vec<(i64, i64)>,
+    #[serde(default)]
+    pub log_start_offset: i64,
+    #[serde(default)]
+    pub segments: Vec<super::log::Segment>,
+    #[serde(default)]
+    pub tombstone_horizons: Vec<(i64, i64)>,
+    #[serde(default)]
+    pub clean_offset: i64,
     // active_txns intentionally absent — resolved to empty at save time (§5).
 }
 
@@ -2634,8 +2906,7 @@ impl EngineState {
                     let base_offset = part_state.high_watermark;
                     let control_batch =
                         encode_control_batch(producer_id, epoch, base_offset, false, now);
-                    part_state.record_batches.push((base_offset, control_batch));
-                    part_state.high_watermark += 1;
+                    part_state.append_batch(control_batch, 1, now, None);
                     part_state.aborted_txns.push((producer_id, first_offset));
                 }
             }
@@ -2663,6 +2934,14 @@ impl EngineState {
                                 high_watermark: ps.high_watermark,
                                 producer_seqs,
                                 aborted_txns: ps.aborted_txns.clone(),
+                                log_start_offset: ps.log_start_offset,
+                                segments: ps.segments.clone(),
+                                tombstone_horizons: ps
+                                    .tombstone_horizons
+                                    .iter()
+                                    .map(|(&k, &v)| (k, v))
+                                    .collect(),
+                                clean_offset: ps.clean_offset,
                             },
                         )
                     })
@@ -2716,6 +2995,10 @@ impl EngineState {
                                 producer_seqs,
                                 active_txns: HashMap::new(), // always empty after save (§5)
                                 aborted_txns: ps.aborted_txns,
+                                log_start_offset: ps.log_start_offset,
+                                segments: ps.segments,
+                                tombstone_horizons: ps.tombstone_horizons.into_iter().collect(),
+                                clean_offset: ps.clean_offset,
                             },
                         )
                     })
@@ -2770,6 +3053,38 @@ impl EngineState {
     }
 }
 
+/// One complete v2 record batch: a length field matching the payload, magic
+/// 2, and a CRC-32C over everything after the CRC field that checks out.
+fn is_valid_v2_batch(records: &[u8]) -> bool {
+    if records.len() < 61 || records[16] != 2 {
+        return false;
+    }
+    let len = i32::from_be_bytes(records[8..12].try_into().unwrap());
+    if len < 0 || len as usize + 12 != records.len() {
+        return false;
+    }
+    let crc = u32::from_be_bytes(records[17..21].try_into().unwrap());
+    crc32c::crc32c(&records[21..]) == crc
+}
+
+/// Re-encodes a v2 batch with every record's timestamp set to `now` and the
+/// LogAppendTime flag on, as a broker does for a LogAppendTime topic.
+fn stamp_log_append_time(batch: &[u8], now: i64) -> Option<Vec<u8>> {
+    use kafka_protocol::records::RecordBatchDecoder;
+    let mut buf = bytes::Bytes::copy_from_slice(batch);
+    let mut set = RecordBatchDecoder::decode(&mut buf).ok()?;
+    for r in &mut set.records {
+        r.timestamp = now;
+        r.timestamp_type = TimestampType::LogAppend;
+    }
+    let mut out = bytes::BytesMut::new();
+    let options = RecordEncodeOptions { version: 2, compression: set.compression };
+    RecordBatchEncoder::encode(&mut out, set.records.iter(), &options).ok()?;
+    let mut out = out.to_vec();
+    super::log::set_log_append_time_flag(&mut out);
+    Some(out)
+}
+
 /// Kafka's ListOffsets-by-timestamp: the earliest offset (below `end`)
 /// whose record timestamp is >= `target`, with that timestamp; for -3
 /// (`MAX_TIMESTAMP`), the record with the largest timestamp. `(-1, -1)` when
@@ -2791,7 +3106,7 @@ fn offset_for_timestamp(part: &PartitionState, target: i64, end: i64) -> (i64, i
         let Ok(set) = RecordBatchDecoder::decode(&mut buf) else { continue };
         for r in set.records {
             let offset = base + (r.offset - header_base);
-            if r.control || offset >= end {
+            if r.control || offset >= end || offset < part.log_start_offset {
                 continue;
             }
             if target == -3 {

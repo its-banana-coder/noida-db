@@ -315,8 +315,12 @@ fn lmove_generic(ctx: &mut Ctx, src: &[u8], dst: &[u8], from: End, to: End) -> R
     ctx.get_list(dst)?;
     let l = ctx.get_list(src)?.expect("checked above");
     let v = pop(l, from).expect("lists are never empty");
-    ctx.drop_if_empty(src);
+    // Redis's order: the push on `dst`, then the pop on `src`, then `src`'s
+    // deletion if it emptied.
     push(ctx.list_or_create(dst)?, v.clone(), to);
+    ctx.notify_keyspace_event('l', if matches!(to, End::Head) { "lpush" } else { "rpush" }, dst);
+    ctx.notify_keyspace_event('l', if matches!(from, End::Head) { "lpop" } else { "rpop" }, src);
+    ctx.drop_if_empty(src);
     Ok(Value::Bulk(v))
 }
 

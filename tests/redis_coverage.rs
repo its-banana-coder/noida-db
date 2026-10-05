@@ -7,7 +7,7 @@
 const COMMANDS: &str = include_str!("data/redis-7.2-commands.txt");
 
 /// Raise this as commands are implemented. Never lower it.
-const IMPLEMENTED_FLOOR: usize = 217;
+const IMPLEMENTED_FLOOR: usize = 222;
 
 fn commands() -> Vec<(&'static str, &'static str)> {
     COMMANDS
@@ -24,9 +24,7 @@ fn commands() -> Vec<(&'static str, &'static str)> {
 /// (see the scope filter in docs/specs/README.md). They answer as unknown.
 /// The same list, with the reasons, is in docs/LIMITATIONS.md.
 const OUT_OF_SCOPE: &[&str] = &[
-    // RDB payloads and key migration
-    "dump",
-    "restore",
+    // key migration between servers
     "restore-asking",
     "migrate",
     // replication, failover, sentinel, cluster

@@ -38,6 +38,11 @@ fn test_describe_and_list_and_delete_groups() {
 
     // 1. Join group to make it active (Stable)
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id = GroupId(StrBytes::from_static_str("admin-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
     let step1 = t.engine.handle_join_group(&join_req, 5);
@@ -197,7 +202,7 @@ fn test_describe_cluster_and_offset_for_leader_epoch() {
     td.name = TopicName::from(StrBytes::from_static_str("cluster-test"));
     let mut pd = PartitionProduceData::default();
     pd.index = 0;
-    pd.records = Some(bytes::Bytes::from("hello"));
+    pd.records = Some(bytes::Bytes::from(super::record_batch(&[b"hello"], -1, -1, -1)));
     td.partition_data.push(pd);
     prod_req.topic_data.push(td);
     t.engine.handle_produce(&prod_req, 8);
@@ -239,9 +244,10 @@ fn test_delete_records_and_log_dirs_and_producers_and_sasl() {
     dr_topic.partitions.push(dr_part);
     dr_req.topics.push(dr_topic);
 
+    // The topic doesn't exist (src/kafka/tests/log.rs covers real deletes).
     let dr_resp = t.engine.handle_delete_records(&dr_req, 2);
-    assert_eq!(dr_resp.topics[0].partitions[0].error_code, 0);
-    assert_eq!(dr_resp.topics[0].partitions[0].low_watermark, 10);
+    assert_eq!(dr_resp.topics[0].partitions[0].error_code, 3);
+    assert_eq!(dr_resp.topics[0].partitions[0].low_watermark, -1);
 
     // DescribeLogDirs
     let log_req = DescribeLogDirsRequest::default();

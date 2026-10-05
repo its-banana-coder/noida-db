@@ -76,9 +76,7 @@ mod tests {
         send_request(stream, ApiKey::CreateTopics, 5, 1, &req)
     }
 
-    /// Produce raw bytes as a record batch payload (no encoding — the
-    /// engine stores whatever bytes are sent; this matches how the existing
-    /// kafka_client.rs tests work).
+    /// Produces `payload` as a one-record batch.
     fn produce(
         stream: &mut TcpStream,
         topic: &str,
@@ -92,7 +90,7 @@ mod tests {
         tdata.name = TopicName(StrBytes::from_string(topic.to_string()));
         let mut pdata = PartitionProduceData::default();
         pdata.index = partition;
-        pdata.records = Some(bytes::Bytes::copy_from_slice(payload));
+        pdata.records = Some(bytes::Bytes::from(super::record_batch(&[payload], -1, -1, -1)));
         tdata.partition_data.push(pdata);
         req.topic_data.push(tdata);
         send_request(stream, ApiKey::Produce, 8, 2, &req)
@@ -368,4 +366,47 @@ mod tests {
             "EndTxn must return INVALID_TXN_STATE (48) when transaction was force-aborted"
         );
     }
+}
+
+#[cfg(feature = "kafka")]
+/// A real v2 record batch holding `values` (kafka-protocol's own encoder,
+/// so the CRC and lengths are right: noida-db, like a broker, rejects
+/// anything else with CORRUPT_MESSAGE). `producer_id` -1 is a plain,
+/// non-idempotent producer.
+fn record_batch(
+    values: &[&[u8]],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+) -> Vec<u8> {
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    };
+    let records: Vec<Record> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| Record {
+            transactional: false,
+            control: false,
+            delete_horizon: false,
+            partition_leader_epoch: 0,
+            producer_id,
+            producer_epoch,
+            timestamp_type: TimestampType::Creation,
+            offset: i as i64,
+            sequence: base_sequence + i as i32,
+            // Now: a timestamp days old would fall to the 7-day retention.
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+            key: None,
+            value: Some(bytes::Bytes::copy_from_slice(v)),
+            headers: Default::default(),
+        })
+        .collect();
+    let mut buf = bytes::BytesMut::new();
+    let options = RecordEncodeOptions { version: 2, compression: Compression::None };
+    RecordBatchEncoder::encode(&mut buf, records.iter(), &options).unwrap();
+    buf.to_vec()
 }

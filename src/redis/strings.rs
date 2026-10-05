@@ -126,6 +126,9 @@ fn set(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     };
     ctx.db().insert(a[1].clone(), Entry { data: Data::Str(a[2].clone()), expires_at });
     ctx.notify_keyspace_event('$', "set", &a[1]);
+    if o.expire_at.is_some() {
+        ctx.notify_keyspace_event('g', "expire", &a[1]);
+    }
     Ok(old.map_or(Value::ok(), |o| o.map_or(Value::Null, Value::Bulk)))
 }
 
@@ -151,6 +154,7 @@ fn setex_generic(ctx: &mut Ctx, a: &[Vec<u8>], millis: bool, cmd: &str) -> Reply
     let at = ms.checked_add(ctx.now as i64).ok_or_else(|| invalid_expire(cmd))?;
     set_str(ctx, &a[1], a[3].clone(), Some(at as u64));
     ctx.notify_keyspace_event('$', "set", &a[1]);
+    ctx.notify_keyspace_event('g', "expire", &a[1]);
     Ok(Value::ok())
 }
 
@@ -189,9 +193,19 @@ fn getex(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     match o.expire_at {
         Some(at) if at <= now => {
             ctx.db().remove(&a[1], now as u64);
+            ctx.notify_keyspace_event('g', "del", &a[1]);
         }
-        Some(at) => ctx.lookup(&a[1]).unwrap().expires_at = Some(at as u64),
-        None if o.persist => ctx.lookup(&a[1]).unwrap().expires_at = None,
+        Some(at) => {
+            ctx.lookup(&a[1]).unwrap().expires_at = Some(at as u64);
+            ctx.notify_keyspace_event('g', "expire", &a[1]);
+        }
+        None if o.persist => {
+            let entry = ctx.lookup(&a[1]).unwrap();
+            // Only a key that had a TTL is "persisted".
+            if entry.expires_at.take().is_some() {
+                ctx.notify_keyspace_event('g', "persist", &a[1]);
+            }
+        }
         None => {}
     }
     Ok(value)
@@ -215,6 +229,7 @@ fn mset(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     for pair in a[1..].chunks(2) {
         set_str(ctx, &pair[0], pair[1].clone(), None);
+        ctx.notify_keyspace_event('$', "set", &pair[0]);
     }
     Ok(Value::ok())
 }
@@ -228,6 +243,7 @@ fn msetnx(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     }
     for pair in a[1..].chunks(2) {
         set_str(ctx, &pair[0], pair[1].clone(), None);
+        ctx.notify_keyspace_event('$', "set", &pair[0]);
     }
     Ok(Value::Integer(1))
 }

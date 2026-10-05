@@ -93,6 +93,9 @@ impl Entry {
 #[derive(Default)]
 pub struct Db {
     map: HashMap<Vec<u8>, Entry>,
+    /// Each key's last access (unix ms) and access count, for LRU/LFU
+    /// eviction and OBJECT IDLETIME/FREQ. Not persisted.
+    pub(crate) access: HashMap<Vec<u8>, (u64, u8)>,
     /// Keys added since the engine last looked, in order: they may wake
     /// blocked clients (Redis's `signalKeyAsReady` from `dbAdd`).
     pub(crate) added: Vec<Vec<u8>>,
@@ -114,7 +117,7 @@ impl Serialize for Db {
 impl<'de> Deserialize<'de> for Db {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let entries: Vec<(Vec<u8>, Entry)> = Vec::deserialize(d)?;
-        Ok(Db { map: entries.into_iter().collect(), added: Vec::new() })
+        Ok(Db { map: entries.into_iter().collect(), added: Vec::new(), access: HashMap::new() })
     }
 }
 
@@ -122,9 +125,23 @@ impl Db {
     pub fn get(&mut self, key: &[u8], now: u64) -> Option<&mut Entry> {
         if self.map.get(key).is_some_and(|e| e.is_expired(now)) {
             self.map.remove(key);
-            // NOTE: Expired event usually sent by purge or on access, handled separately for simplicity here?
+            self.access.remove(key);
+        }
+        if self.map.contains_key(key) {
+            let a = self.access.entry(key.to_vec()).or_insert((now, 0));
+            *a = (now, a.1.saturating_add(1));
         }
         self.map.get_mut(key)
+    }
+
+    /// A key's (last access, access count) without touching it.
+    pub fn access_of(&self, key: &[u8]) -> Option<(u64, u8)> {
+        self.map.contains_key(key).then(|| self.access.get(key).copied().unwrap_or((0, 0)))
+    }
+
+    /// Every live key with its entry, for eviction.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&Vec<u8>, &Entry)> {
+        self.map.iter()
     }
 
     pub fn contains(&mut self, key: &[u8], now: u64) -> bool {
@@ -132,11 +149,17 @@ impl Db {
     }
 
     pub fn remove(&mut self, key: &[u8], now: u64) -> Option<Entry> {
+        self.access.remove(key);
         self.map.remove(key).filter(|e| !e.is_expired(now))
     }
 
     pub fn insert(&mut self, key: Vec<u8>, entry: Entry) {
         self.added.push(key.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let count = self.access.get(&key).map_or(0, |a| a.1);
+        self.access.insert(key.clone(), (now, count.saturating_add(1)));
         self.map.insert(key, entry);
     }
 
@@ -262,6 +285,8 @@ pub struct Engine {
     next_client_id: u64,
     clock: Clock,
     rng: u64,
+    /// Keys evicted for maxmemory (INFO stats `evicted_keys`).
+    pub evicted_keys: u64,
 }
 
 pub type Reply = Result<Value, Value>;
@@ -299,6 +324,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .chain(lists::COMMANDS)
         .chain(sets::COMMANDS)
         .chain(scripting::COMMANDS)
+        .chain(super::functions::COMMANDS)
         .chain(zsets::COMMANDS)
         .chain(multi::COMMANDS)
         .chain(pubsub::COMMANDS)
@@ -369,10 +395,6 @@ impl Ctx<'_> {
 
     pub fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry> {
         let now = self.now;
-        let expired = self.db().map.get(key).is_some_and(|e| e.is_expired(now));
-        if expired {
-            self.notify_keyspace_event('g', "expired", key);
-        }
         let expired = self.db().map.get(key).is_some_and(|e| e.is_expired(now));
         if expired {
             self.notify_keyspace_event('g', "expired", key);
@@ -481,6 +503,7 @@ impl Engine {
             started: now,
             last_save: now / 1000,
             scripts: Default::default(),
+            evicted_keys: 0,
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
             watchers: HashMap::new(),
@@ -595,6 +618,62 @@ impl Engine {
             .is_some_and(|m| m.has_flag("write") || m.has_flag("may_replicate"))
     }
 
+    /// Approximate memory in use: a fixed base (what an empty Redis uses)
+    /// plus each key's estimated size.
+    pub fn used_memory(&self) -> u64 {
+        const BASE: u64 = 1_000_000;
+        BASE + self
+            .dbs
+            .iter()
+            .flat_map(|db| db.entries())
+            .map(|(k, e)| super::devtools::estimate(k, e) as u64)
+            .sum::<u64>()
+    }
+
+    /// Evicts keys by `maxmemory-policy` until memory is under `maxmemory`
+    /// (Redis's `performEvictions`). False if it can't get there.
+    fn perform_evictions(&mut self, maxmemory: u64) -> bool {
+        let policy = self.config.get("maxmemory-policy").unwrap_or_else(|| "noeviction".into());
+        let mut used = self.used_memory();
+        while used > maxmemory {
+            if policy == "noeviction" {
+                return false;
+            }
+            let volatile = policy.starts_with("volatile");
+            let mut best: Option<(usize, Vec<u8>, (u64, u64))> = None;
+            let mut nth = 0u64;
+            for (i, db) in self.dbs.iter().enumerate() {
+                for (k, e) in db.entries() {
+                    if volatile && e.expires_at.is_none() {
+                        continue;
+                    }
+                    let (last, count) = db.access_of(k).unwrap_or((0, 0));
+                    nth += 1;
+                    // Lower is evicted first.
+                    let rank = match policy.rsplit('-').next().unwrap_or("") {
+                        "lru" => (last, 0),
+                        "lfu" => (count as u64, last),
+                        "ttl" => (e.expires_at.unwrap_or(u64::MAX), 0),
+                        _ => (nth.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ used, 0),
+                    };
+                    if best.as_ref().is_none_or(|b| rank < b.2) {
+                        best = Some((i, k.clone(), rank));
+                    }
+                }
+            }
+            let Some((i, key, _)) = best else { return false };
+            let size = self.dbs[i]
+                .entries()
+                .find(|(k, _)| **k == key)
+                .map_or(0, |(k, e)| super::devtools::estimate(k, e));
+            self.dbs[i].remove(&key, 0);
+            self.evicted_keys += 1;
+            self.notify_keyspace_event_engine(i, 'e', "evicted", &key);
+            used = used.saturating_sub(size as u64);
+        }
+        true
+    }
+
     pub fn execute(&mut self, session: &mut Session, args: &[Vec<u8>]) -> Value {
         if !self.clients.contains_key(&session.id) {
             // Killed by another client: the connection is going away.
@@ -619,7 +698,7 @@ impl Engine {
         let now = self.now();
         let client = self.clients.get_mut(&session.id).unwrap();
         client.last_interaction = now;
-        client.last_cmd = Some(fullname);
+        client.last_cmd = Some(fullname.clone());
         let c = &self.clients[&session.id];
         if c.subs.active() && c.resp == 2 && !super::pubsub::allowed_while_subscribed(&name) {
             let shown = self.clients[&session.id].last_cmd.clone().unwrap_or_default();
@@ -627,6 +706,16 @@ impl Engine {
                 "ERR Can't execute '{shown}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT \
                  / RESET are allowed in this context"
             ));
+            return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
+        }
+        // maxmemory: evict first; a command that may grow memory is refused
+        // if that wasn't enough (`processCommand`'s OOM check).
+        let maxmemory = self.config_num("maxmemory");
+        if maxmemory > 0
+            && !self.perform_evictions(maxmemory as u64)
+            && command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("denyoom"))
+        {
+            let e = Value::err("OOM command not allowed when used memory > 'maxmemory'.");
             return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
         }
         if in_multi && !super::multi::runs_in_multi(&name) {
