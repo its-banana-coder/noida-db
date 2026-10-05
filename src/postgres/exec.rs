@@ -95,7 +95,7 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
             if to.is_reg()
                 && let Value::Text(s) = &v
             {
-                let path = ctx.rt.settings.search_path(&ctx.rt.user);
+                let path = ctx.rt.settings.lookup_path(&ctx.rt.user);
                 let oid = pgcatalog::resolve_reg(ctx.db, &path, &ctx.rt.user, to.base, s)
                     .ok_or_else(|| pgcatalog::undefined_reg(to.base, s))?;
                 return Ok(Value::Int(oid));
@@ -421,7 +421,7 @@ fn run_subquery(q: &Query, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
 
 /// Names for reg* values, built from the live catalog.
 fn reg_names(ctx: &Ctx) -> types::RegNames {
-    build_reg_names(ctx.db, &ctx.rt.user, &ctx.rt.settings.search_path(&ctx.rt.user))
+    build_reg_names(ctx.db, &ctx.rt.user, &ctx.rt.settings.lookup_path(&ctx.rt.user))
 }
 
 /// Names `reg*` values print as: identifiers quoted the way Postgres does.
@@ -545,7 +545,7 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
                 Some(t) => Value::text(t.display(typmod)),
                 None => match ctx.db.enums.get(&oid) {
                     Some(e) => {
-                        let path = ctx.rt.settings.search_path(&ctx.rt.user);
+                        let path = ctx.rt.settings.lookup_path(&ctx.rt.user);
                         Value::text(ctx.db.regclass_text(e.schema, &e.name, &path))
                     }
                     None => Value::text(format!("???({oid})")),
@@ -576,7 +576,7 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             match super::pgcatalog::relation_namespace(ctx.db, a[0].as_int().unwrap_or(0) as u32) {
                 None => Value::Null,
                 Some(ns) => {
-                    let path = ctx.rt.settings.search_path(&ctx.rt.user);
+                    let path = ctx.rt.settings.lookup_path(&ctx.rt.user);
                     Value::Bool(
                         ns == super::catalog::PG_CATALOG_NS
                             || path.iter().any(|s| ctx.db.schema_by_name(s) == Some(ns)),
@@ -673,7 +673,7 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
         }
         "pg_get_constraintdef" => {
             let oid = a[0].as_int().unwrap_or(0) as u32;
-            pgcatalog::constraint_def(ctx.db, oid, &ctx.rt.settings.search_path(&ctx.rt.user))
+            pgcatalog::constraint_def(ctx.db, oid, &ctx.rt.settings.lookup_path(&ctx.rt.user))
                 .map_or(Value::Null, Value::text)
         }
         "pg_get_indexdef" => {
@@ -731,7 +731,7 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
                 "to_regrole" => Base::Regrole,
                 _ => Base::Regclass,
             };
-            let path = ctx.rt.settings.search_path(&ctx.rt.user);
+            let path = ctx.rt.settings.lookup_path(&ctx.rt.user);
             pgcatalog::resolve_reg(ctx.db, &path, &ctx.rt.user, base, &n)
                 .map_or(Value::Null, Value::Int)
         }

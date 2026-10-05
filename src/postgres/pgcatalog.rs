@@ -455,6 +455,9 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     tb.type_oid,
                 );
                 row[20] = b(has_triggers);
+                if tb.temp {
+                    row[15] = ch('t');
+                }
                 out.push(row);
                 for idx in &tb.indexes {
                     out.push(pg_class_row(

@@ -495,7 +495,7 @@ pub fn session_info(ctx: &Ctx) -> SessionInfo {
     SessionInfo {
         user: ctx.rt.user.clone(),
         database: ctx.rt.database.clone(),
-        search_path: ctx.rt.settings.search_path(&ctx.rt.user),
+        search_path: ctx.rt.settings.lookup_path(&ctx.rt.user),
         fmt: ctx.rt.settings.fmt(),
         now: ctx.rt.now,
     }

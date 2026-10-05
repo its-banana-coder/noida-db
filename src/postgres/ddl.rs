@@ -25,16 +25,26 @@ fn ident(id: &a::Ident) -> String {
 
 impl Ddl<'_, '_> {
     /// The schema a new object goes into, and its name.
-    fn target(&self, parts: &[String]) -> PgResult<(u32, String)> {
+    fn target(&mut self, parts: &[String]) -> PgResult<(u32, String)> {
         let name = parts.last().cloned().unwrap_or_default();
         let schema = if parts.len() > 1 {
             let s = &parts[parts.len() - 2];
-            self.ctx.db.schema_by_name(s).ok_or_else(|| {
-                PgError::new(code::INVALID_SCHEMA_NAME, format!("schema \"{s}\" does not exist"))
-            })?
+            if s == "pg_temp" {
+                self.temp_schema()
+            } else {
+                self.ctx.db.schema_by_name(s).ok_or_else(|| {
+                    PgError::new(code::INVALID_SCHEMA_NAME, format!("schema \"{s}\" does not exist"))
+                })?
+            }
         } else {
+            // The explicit search_path: the temporary schema is a creation
+            // target only when search_path names it.
             let mut found = None;
-            for s in &self.info.search_path {
+            for s in &self.ctx.rt.settings.search_path(&self.ctx.rt.user) {
+                if s == &self.ctx.rt.settings.temp_schema {
+                    found = Some(self.temp_schema());
+                    break;
+                }
                 if let Some(oid) = self.ctx.db.schema_by_name(s) {
                     found = Some(oid);
                     break;
@@ -45,6 +55,21 @@ impl Ddl<'_, '_> {
             })?
         };
         Ok((schema, types::truncate_name(&name)))
+    }
+
+    /// This session's temporary schema, created on first use.
+    fn temp_schema(&mut self) -> u32 {
+        let name = self.ctx.rt.settings.temp_schema.clone();
+        if let Some(oid) = self.ctx.db.schemas.values().find(|s| s.name == name).map(|s| s.oid) {
+            return oid;
+        }
+        let oid = self.ctx.db.alloc_oid();
+        self.ctx.db.schemas.insert(oid, Schema { oid, name, owner: BOOTSTRAP_SUPERUSER, comment: None });
+        oid
+    }
+
+    fn is_temp_schema(&self, oid: u32) -> bool {
+        super::catalog::is_temp_schema(self.ctx.db.schema_name(oid))
     }
 
     fn binder(&self) -> (DbState, SessionInfo) {
@@ -62,10 +87,27 @@ impl Ddl<'_, '_> {
 
     pub fn create_table(&mut self, ct: &a::CreateTable) -> PgResult<String> {
         let parts = name_parts(&ct.name);
-        let (schema, name) = self.target(&parts)?;
+        let (mut schema, name) = self.target(&parts)?;
         if ct.temporary {
-            // Temporary tables live in the session's own schema; noida-db keeps
-            // them in the normal one, which is fine for a single connection.
+            if parts.len() > 1 && !self.is_temp_schema(schema) {
+                return Err(PgError::new(
+                    code::INVALID_TABLE_DEFINITION,
+                    "cannot create temporary relation in non-temporary schema",
+                ));
+            }
+            schema = self.temp_schema();
+        }
+        let temp = self.is_temp_schema(schema);
+        let on_commit = match ct.on_commit {
+            None | Some(a::OnCommit::PreserveRows) => super::catalog::OnCommit::PreserveRows,
+            Some(a::OnCommit::DeleteRows) => super::catalog::OnCommit::DeleteRows,
+            Some(a::OnCommit::Drop) => super::catalog::OnCommit::Drop,
+        };
+        if ct.on_commit.is_some() && !temp {
+            return Err(PgError::new(
+                code::INVALID_TABLE_DEFINITION,
+                "ON COMMIT can only be used on temporary tables",
+            ));
         }
         if self.ctx.db.relation_exists(schema, &name) {
             if ct.if_not_exists {
@@ -90,9 +132,10 @@ impl Ddl<'_, '_> {
             view_sql: None,
             comment: None,
             type_oid,
-            temp: ct.temporary,
+            temp,
             owner_session: None,
             matview_populated: true,
+            on_commit,
         };
         // CREATE TABLE AS SELECT
         if let Some(q) = &ct.query {
@@ -654,9 +697,13 @@ impl Ddl<'_, '_> {
         columns: &[a::ViewColumnDef],
         or_replace: bool,
         materialized: bool,
+        temporary: bool,
     ) -> PgResult<String> {
         let parts = name_parts(name);
-        let (schema, vname) = self.target(&parts)?;
+        let (mut schema, vname) = self.target(&parts)?;
+        if temporary {
+            schema = self.temp_schema();
+        }
         let (db, info) = self.binder();
         let mut b = Binder::new(&db, &info, &[]);
         let (_, cols) = b.bind_query(query)?;
@@ -690,6 +737,7 @@ impl Ddl<'_, '_> {
             temp: false,
             owner_session: None,
             matview_populated: true,
+            on_commit: Default::default(),
         };
         self.ctx.db.tables.insert(oid, std::sync::Arc::new(table));
         if materialized {

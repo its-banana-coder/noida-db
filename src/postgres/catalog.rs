@@ -168,6 +168,40 @@ pub struct Table {
     /// A materialized view populated by its own `CREATE`/`REFRESH`
     /// (always `true` for an ordinary table or view).
     pub matview_populated: bool,
+    /// A temporary table's `ON COMMIT` action.
+    #[serde(default)]
+    pub on_commit: OnCommit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum OnCommit {
+    #[default]
+    PreserveRows,
+    DeleteRows,
+    Drop,
+}
+
+thread_local! {
+    /// The temporary schema of the session running on this thread, which
+    /// `pg_temp` names.
+    static TEMP_SCHEMA: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+pub fn set_session_temp_schema(name: &str) {
+    TEMP_SCHEMA.with(|t| {
+        if *t.borrow() != name {
+            *t.borrow_mut() = name.to_string();
+        }
+    });
+}
+
+pub fn session_temp_schema() -> String {
+    TEMP_SCHEMA.with(|t| t.borrow().clone())
+}
+
+/// A session's temporary schema (`pg_temp_N`).
+pub fn is_temp_schema(name: &str) -> bool {
+    name.starts_with("pg_temp_")
 }
 
 impl Table {
@@ -188,6 +222,7 @@ impl Table {
             temp: self.temp,
             owner_session: self.owner_session,
             matview_populated: self.matview_populated,
+            on_commit: self.on_commit,
         }
     }
 
@@ -406,7 +441,36 @@ impl DbState {
     }
 
     pub fn schema_by_name(&self, name: &str) -> Option<u32> {
+        if name == "pg_temp" {
+            let own = session_temp_schema();
+            return self.schemas.values().find(|s| !own.is_empty() && s.name == own).map(|s| s.oid);
+        }
         self.schemas.values().find(|s| s.name == name).map(|s| s.oid)
+    }
+
+    /// Drops schema `name` and everything in it (a temporary schema at
+    /// session end).
+    pub fn drop_schema_objects(&mut self, name: &str) {
+        let Some(oid) = self.schemas.values().find(|s| s.name == name).map(|s| s.oid) else {
+            return;
+        };
+        let tables: Vec<u32> = self.tables.values().filter(|t| t.schema == oid).map(|t| t.oid).collect();
+        self.tables.retain(|_, t| t.schema != oid);
+        self.triggers.retain(|_, tr| !tables.contains(&tr.table));
+        self.sequences.retain(|_, s| s.schema != oid);
+        self.enums.retain(|_, e| e.schema != oid);
+        self.domains.retain(|_, d| d.schema != oid);
+        self.functions.retain(|_, f| f.schema != oid);
+        self.schemas.remove(&oid);
+    }
+
+    /// Drops every session's temporary schema (they don't outlive a restart).
+    pub fn drop_temp_schemas(&mut self) {
+        let names: Vec<String> =
+            self.schemas.values().filter(|s| is_temp_schema(&s.name)).map(|s| s.name.clone()).collect();
+        for n in names {
+            self.drop_schema_objects(&n);
+        }
     }
 
     /// How a relation prints as a `regclass`: schema-qualified unless its

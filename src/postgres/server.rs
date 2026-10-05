@@ -954,7 +954,7 @@ fn do_bind(
         )
     })?;
     let formats = &b.parameter_format_codes;
-    let search_path = session.rt.settings.search_path(&session.rt.user);
+    let search_path = session.rt.settings.lookup_path(&session.rt.user);
     let mut values = vec![];
     for (i, raw) in b.parameters.iter().enumerate() {
         let ty = prep.param_types.get(i).copied().unwrap_or(Type::TEXT);
