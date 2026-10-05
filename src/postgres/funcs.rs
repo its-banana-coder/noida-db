@@ -477,6 +477,23 @@ fn numeric_power(x: &Numeric, y: &Numeric) -> PgResult<Numeric> {
         if e == 0 {
             return Ok(Numeric::from_i64(1).round(rscale));
         }
+        // The result's size in decimal digits, before computing it: one
+        // that can't fit numeric's 131072 integer digits overflows, one
+        // smaller than the result scale rounds to zero (Postgres does the
+        // same estimate; computing these exactly never finishes).
+        let ax = x.abs().to_f64();
+        if ax > 0.0 && ax.is_finite() {
+            let digits = e as f64 * ax.log10();
+            if digits > 131_072.0 {
+                return Err(err(
+                    code::NUMERIC_VALUE_OUT_OF_RANGE,
+                    "value overflows numeric format",
+                ));
+            }
+            if digits < -(rscale as f64) - 2.0 {
+                return Ok(Numeric::zero().round(rscale));
+            }
+        }
         let mut result = Numeric::from_i64(1);
         let mut base = x.clone();
         let mut n = e.unsigned_abs();
