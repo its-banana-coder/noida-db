@@ -9,31 +9,38 @@
 /// with `'` and internal `.`/`,` inside numbers not splitting a token
 /// (e.g. "don't", "3.14"), everything else is a separator.
 pub fn standard(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
+    standard_with_offsets(text).into_iter().map(|(t, _, _)| t).collect()
+}
+
+/// `standard` tokens with the byte range each came from in `text` (what a
+/// highlighter needs to put tags back around the original words).
+pub fn standard_with_offsets(text: &str) -> Vec<(String, usize, usize)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let byte_at = |i: usize| chars.get(i).map_or(text.len(), |c| c.0);
     let mut tokens = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        if !is_word_char(chars[i]) {
+        if !is_word_char(chars[i].1) {
             i += 1;
             continue;
         }
         let start = i;
         while i < chars.len()
-            && (is_word_char(chars[i])
-                || (is_word_glue(chars[i])
+            && (is_word_char(chars[i].1)
+                || (is_word_glue(chars[i].1)
                     && i + 1 < chars.len()
-                    && is_word_char(chars[i + 1])
+                    && is_word_char(chars[i + 1].1)
                     && i > start))
         {
             i += 1;
         }
-        let token: String = chars[start..i]
-            .iter()
-            .collect::<String>()
-            .trim_end_matches(|c: char| !c.is_alphanumeric())
-            .to_string();
-        if !token.is_empty() {
-            tokens.push(token.to_lowercase());
+        let mut end = i;
+        while end > start && !chars[end - 1].1.is_alphanumeric() {
+            end -= 1;
+        }
+        if end > start {
+            let token: String = chars[start..end].iter().map(|c| c.1).collect();
+            tokens.push((token.to_lowercase(), byte_at(start), byte_at(end)));
         }
     }
     tokens

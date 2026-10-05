@@ -11,7 +11,66 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::analysis;
+use super::dates;
+use super::highlight;
+use super::query_string;
 use super::scoring;
+use super::sorting;
+
+/// A search failure, shaped the way Elasticsearch reports it: most are a
+/// plain `{"error": {"type": ...}}`, but a failure while executing the
+/// query on a shard is wrapped in `search_phase_execution_exception`
+/// (`all shards failed`) with the real cause as the root cause.
+#[derive(Debug)]
+pub struct EsError {
+    pub status: u16,
+    pub kind: String,
+    pub reason: String,
+    pub shard: bool,
+}
+
+impl EsError {
+    pub fn new(status: u16, kind: &str, reason: &str) -> Self {
+        Self { status, kind: kind.to_string(), reason: reason.to_string(), shard: false }
+    }
+
+    pub fn parsing(reason: &str) -> Self {
+        Self::new(400, "parsing_exception", reason)
+    }
+
+    pub fn shard_failure(kind: &str, reason: &str) -> Self {
+        Self { status: 400, kind: kind.to_string(), reason: reason.to_string(), shard: true }
+    }
+
+    pub fn to_json(&self) -> Value {
+        let cause = json!({"type": self.kind, "reason": self.reason});
+        if self.shard {
+            json!({
+                "error": {
+                    "root_cause": [cause.clone()],
+                    "type": "search_phase_execution_exception",
+                    "reason": "all shards failed",
+                    "phase": "query",
+                    "grouped": true,
+                    "failed_shards": [{"shard": 0, "node": "noida", "reason": cause.clone()}],
+                    "caused_by": cause,
+                },
+                "status": self.status,
+            })
+        } else {
+            json!({
+                "error": {"root_cause": [cause], "type": self.kind, "reason": self.reason},
+                "status": self.status,
+            })
+        }
+    }
+}
+
+impl From<String> for EsError {
+    fn from(reason: String) -> Self {
+        Self::parsing(&reason)
+    }
+}
 
 /// A refreshed, searchable copy of one document. Docs written since the
 /// last refresh are not included here, matching Elasticsearch's
@@ -25,6 +84,253 @@ pub struct CommittedDoc {
     /// `_search`.
     #[allow(dead_code)]
     pub version: i64,
+    /// The `_seq_no` as of the refresh (update/delete by query treat a
+    /// document changed since as a version conflict).
+    pub seq: i64,
+    /// The full source when `source` is a root-level view with nested
+    /// objects removed (a nested object's fields aren't visible to
+    /// queries outside a `nested` query, as in Elasticsearch).
+    pub full_source: Option<Value>,
+}
+
+impl CommittedDoc {
+    fn full(&self) -> &Value {
+        self.full_source.as_ref().unwrap_or(&self.source)
+    }
+}
+
+/// The `nested`-typed object paths in a mapping (`comments`, `a.b`).
+pub(crate) fn nested_paths(mappings: &Value) -> Vec<String> {
+    fn walk(props: Option<&Value>, prefix: &str, out: &mut Vec<String>) {
+        let Some(obj) = props.and_then(Value::as_object) else { return };
+        for (k, v) in obj {
+            let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            if v.get("type").and_then(Value::as_str) == Some("nested") {
+                out.push(full.clone());
+            }
+            walk(v.get("properties"), &full, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(mappings.get("properties"), "", &mut out);
+    out
+}
+
+fn strip_path(v: &mut Value, path: &[&str]) {
+    match v {
+        Value::Object(m) => {
+            if path.len() == 1 {
+                m.remove(path[0]);
+            } else if let Some(child) = m.get_mut(path[0]) {
+                strip_path(child, &path[1..]);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|e| strip_path(e, path)),
+        _ => {}
+    }
+}
+
+/// Root-level views of `docs`: nested objects removed from what queries
+/// and aggregations see, the full source kept for hits and `nested`.
+fn root_view(mappings: &Value, docs: &[CommittedDoc]) -> Option<Vec<CommittedDoc>> {
+    let paths = nested_paths(mappings);
+    if paths.is_empty() {
+        return None;
+    }
+    Some(
+        docs.iter()
+            .map(|d| {
+                let mut source = d.full().clone();
+                for p in &paths {
+                    strip_path(&mut source, &p.split('.').collect::<Vec<_>>());
+                }
+                CommittedDoc { source, full_source: Some(d.full().clone()), ..d.clone() }
+            })
+            .collect(),
+    )
+}
+
+/// The nested documents under `path` of each of `parents`: child docs
+/// (sources shaped `{"comments": <element>}` so full field paths resolve)
+/// and, for each, its (parent, offset).
+fn nested_children(
+    docs: &[CommittedDoc],
+    parents: impl Iterator<Item = usize>,
+    path: &str,
+) -> (Vec<CommittedDoc>, Vec<(usize, usize)>) {
+    let segs: Vec<&str> = path.split('.').collect();
+    let mut children = Vec::new();
+    let mut owners = Vec::new();
+    for p in parents {
+        let d = &docs[p];
+        let mut node = d.full();
+        let mut ok = true;
+        for s in &segs {
+            match node.get(*s) {
+                Some(n) => node = n,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let elems: Vec<&Value> = match node {
+            Value::Array(a) => a.iter().collect(),
+            Value::Object(_) => vec![node],
+            _ => vec![],
+        };
+        for (offset, e) in elems.into_iter().enumerate() {
+            let mut wrapped = e.clone();
+            for s in segs.iter().rev() {
+                wrapped = json!({ *s: wrapped });
+            }
+            children.push(CommittedDoc {
+                index: d.index.clone(),
+                id: d.id.clone(),
+                source: wrapped,
+                version: d.version,
+                seq: d.seq,
+                full_source: None,
+            });
+            owners.push((p, offset));
+        }
+    }
+    (children, owners)
+}
+
+fn check_nested_path(mappings: &Value, v: &Value) -> Result<Option<String>, EsError> {
+    let path = v.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    if nested_paths(mappings).contains(&path) {
+        return Ok(Some(path));
+    }
+    if v.get("ignore_unmapped").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(None);
+    }
+    Err(EsError::shard_failure(
+        "query_shard_exception",
+        &format!(
+            "[nested] failed to create query: [nested] nested object under path [{path}] is not \
+             of nested type"
+        ),
+    ))
+}
+
+/// Per matching parent, its matching children: (offset, score, child).
+type InnerMatches = HashMap<usize, Vec<(usize, f32, usize)>>;
+
+fn nested_matches(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<Option<(Vec<CommittedDoc>, InnerMatches)>, EsError> {
+    let Some(path) = check_nested_path(mappings, v)? else { return Ok(None) };
+    let inner = v.get("query").cloned().unwrap_or_else(|| json!({"match_all": {}}));
+    let (children, owners) = nested_children(docs, 0..docs.len(), &path);
+    let mut per: InnerMatches = HashMap::new();
+    for (ci, score) in eval(&inner, mappings, &children)? {
+        let (parent, offset) = owners[ci];
+        per.entry(parent).or_default().push((offset, score, ci));
+    }
+    Ok(Some((children, per)))
+}
+
+/// `nested`: a parent matches when any of its nested objects does, scored
+/// by `score_mode` (`avg` by default).
+fn eval_nested(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let Some((_, per)) = nested_matches(v, mappings, docs)? else { return Ok(HashMap::new()) };
+    let mode = v.get("score_mode").and_then(Value::as_str).unwrap_or("avg");
+    let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    Ok(per
+        .into_iter()
+        .map(|(parent, ms)| {
+            let scores = ms.iter().map(|m| m.1);
+            let s = match mode {
+                "max" => scores.fold(f32::MIN, f32::max),
+                "min" => scores.fold(f32::MAX, f32::min),
+                "sum" => scores.sum(),
+                "none" => 0.0,
+                _ => scores.sum::<f32>() / ms.len() as f32,
+            };
+            (parent, s * boost)
+        })
+        .collect())
+}
+
+/// The `inner_hits` of every `nested` clause in `query` that asks for
+/// them: (name, per-parent hits object).
+fn inner_hits(
+    query: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    out: &mut Vec<(String, HashMap<usize, Value>)>,
+) -> Result<(), EsError> {
+    match query {
+        Value::Object(o) => {
+            if let Some(n) = o.get("nested")
+                && let Some(ih) = n.get("inner_hits")
+                && let Some((children, per)) = nested_matches(n, mappings, docs)?
+            {
+                let path = n.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                let name = ih.get("name").and_then(Value::as_str).unwrap_or(&path).to_string();
+                let size = ih.get("size").and_then(Value::as_u64).unwrap_or(3) as usize;
+                let from = ih.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let mut by_parent = HashMap::new();
+                for (parent, mut ms) in per {
+                    ms.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))
+                    });
+                    let max = ms.first().map(|m| m.1);
+                    let hits: Vec<Value> = ms
+                        .iter()
+                        .skip(from)
+                        .take(size)
+                        .map(|&(offset, score, ci)| {
+                            let c = &children[ci];
+                            let mut src = &c.source;
+                            for seg in path.split('.') {
+                                src = &src[seg];
+                            }
+                            json!({
+                                "_index": c.index,
+                                "_id": c.id,
+                                "_nested": {"field": path, "offset": offset},
+                                "_score": score,
+                                "_source": apply_source_filter(src, ih.get("_source")),
+                            })
+                        })
+                        .collect();
+                    by_parent.insert(
+                        parent,
+                        json!({"hits": {
+                            "total": {"value": ms.len(), "relation": "eq"},
+                            "max_score": max,
+                            "hits": hits,
+                        }}),
+                    );
+                }
+                out.push((name, by_parent));
+            }
+            for (k, v) in o {
+                if k != "nested" {
+                    inner_hits(v, mappings, docs, out)?;
+                }
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                inner_hits(v, mappings, docs, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Where a (possibly dotted) field name's values come from in `_source`,
@@ -34,7 +340,7 @@ pub struct CommittedDoc {
 /// before a public release: multi-fields weren't resolved at all, so
 /// `term: {"name.raw": ...}` and sorting/aggregating on a `.raw` sub-field
 /// silently matched nothing.
-fn resolve_field(mappings: &Value, field: &str) -> (String, Option<String>) {
+pub(crate) fn resolve_field(mappings: &Value, field: &str) -> (String, Option<String>) {
     let segs: Vec<&str> = field.split('.').collect();
     let mut props = mappings.get("properties");
     for (i, seg) in segs.iter().enumerate() {
@@ -79,7 +385,7 @@ fn navigate<'a>(v: &'a Value, path: &[&str]) -> Vec<&'a Value> {
     }
 }
 
-pub fn raw_values<'a>(source: &'a Value, field: &str) -> Vec<&'a Value> {
+pub(crate) fn raw_values<'a>(source: &'a Value, field: &str) -> Vec<&'a Value> {
     let segs: Vec<&str> = field.split('.').collect();
     navigate(source, &segs)
 }
@@ -215,21 +521,145 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
     out
 }
 
+/// A query string analyzed the way `field` is: `keyword` (and numeric,
+/// boolean, date) fields take it whole, text fields through `standard`.
+fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
+    match resolve_field(mappings, field).1.as_deref() {
+        None | Some("text") | Some("match_only_text") => analysis::standard(text),
+        Some(_) => vec![text.to_string()],
+    }
+}
+
+/// A query value as text: `"quick"`, `10`, `true`.
+fn query_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
 fn eval_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let (text, op) = if let Some(o) = spec.as_object() {
+    let (text, op, boost) = if let Some(o) = spec.as_object() {
         (
-            o.get("query").and_then(Value::as_str).unwrap_or("").to_string(),
+            query_text(o.get("query")),
             o.get("operator").and_then(Value::as_str).unwrap_or("or").to_string(),
+            o.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32,
         )
     } else {
-        (spec.as_str().unwrap_or("").to_string(), "or".to_string())
+        (query_text(Some(spec)), "or".to_string(), 1.0)
     };
-    let query_terms = analysis::standard(&text);
+    let query_terms = analyze_for(mappings, field, &text);
     if query_terms.is_empty() {
         return HashMap::new();
     }
-    bm25_scores(mappings, docs, field, &query_terms, op.eq_ignore_ascii_case("and"))
+    let mut scores =
+        bm25_scores(mappings, docs, field, &query_terms, op.eq_ignore_ascii_case("and"));
+    if boost != 1.0 {
+        scores.values_mut().for_each(|s| *s *= boost);
+    }
+    scores
+}
+
+/// Damerau-Levenshtein (optimal string alignment) distance.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// `fuzziness` as a maximum edit count for a term (`AUTO` = 0 below 3
+/// characters, 1 below 6, else 2).
+fn max_edits(fuzziness: Option<&Value>, term: &str) -> usize {
+    let len = term.chars().count();
+    match fuzziness {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0).min(2) as usize,
+        Some(Value::String(s)) if s.parse::<usize>().is_ok() => s.parse::<usize>().unwrap().min(2),
+        _ => {
+            if len < 3 {
+                0
+            } else if len < 6 {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// `fuzzy`: terms within the edit distance, scored like the terms they
+/// matched.
+fn eval_fuzzy(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
+    let (value, fuzziness, prefix_len, boost) = match spec {
+        Value::Object(o) => (
+            query_text(o.get("value")),
+            o.get("fuzziness").cloned(),
+            o.get("prefix_length").and_then(Value::as_u64).unwrap_or(0) as usize,
+            o.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+        ),
+        other => (query_text(Some(other)), None, 0, 1.0),
+    };
+    let edits = max_edits(fuzziness.as_ref(), &value);
+    let prefix: String = value.chars().take(prefix_len).collect();
+    let mut candidates: HashSet<String> = HashSet::new();
+    for d in docs {
+        for t in tokens_for(mappings, &d.source, field) {
+            if t.starts_with(&prefix) && edit_distance(&t, &value) <= edits {
+                candidates.insert(t);
+            }
+        }
+    }
+    let mut out: HashMap<usize, f32> = HashMap::new();
+    for term in candidates {
+        for (i, s) in bm25_scores(mappings, docs, field, std::slice::from_ref(&term), false) {
+            let e = out.entry(i).or_insert(0.0);
+            *e = e.max(s * boost);
+        }
+    }
+    out
+}
+
+/// `dis_max`: a document's best sub-query score, plus `tie_breaker` times
+/// the others.
+fn eval_dis_max(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let tie = v.get("tie_breaker").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    let mut per: HashMap<usize, Vec<f32>> = HashMap::new();
+    for q in v.get("queries").and_then(Value::as_array).cloned().unwrap_or_default() {
+        for (i, s) in eval(&q, mappings, docs)? {
+            per.entry(i).or_default().push(s);
+        }
+    }
+    Ok(per
+        .into_iter()
+        .map(|(i, ss)| {
+            let max = ss.iter().copied().fold(f32::MIN, f32::max);
+            let sum: f32 = ss.iter().sum();
+            (i, (max + tie * (sum - max)) * boost)
+        })
+        .collect())
 }
 
 /// Whether `query_terms` occurs in `doc_tokens` as a contiguous run at
@@ -245,18 +675,54 @@ fn phrase_matches(doc_tokens: &[String], query_terms: &[String]) -> bool {
     (0..=doc_tokens.len() - n).any(|start| doc_tokens[start..start + n] == query_terms[..])
 }
 
+/// A sloppy phrase match: some choice of positions for the query terms
+/// whose total displacement from consecutive order is at most `slop`
+/// (Lucene's edit-distance notion of phrase slop, reordering included).
+fn sloppy_phrase_matches(doc_tokens: &[String], query_terms: &[String], slop: usize) -> bool {
+    if slop == 0 {
+        return phrase_matches(doc_tokens, query_terms);
+    }
+    let positions: Vec<Vec<usize>> = query_terms
+        .iter()
+        .map(|t| doc_tokens.iter().enumerate().filter(|(_, d)| *d == t).map(|(i, _)| i).collect())
+        .collect();
+    if positions.iter().any(Vec::is_empty) {
+        return false;
+    }
+    fn search(positions: &[Vec<usize>], k: usize, chosen: &mut Vec<usize>, slop: usize) -> bool {
+        if k == positions.len() {
+            let offsets: Vec<i64> =
+                chosen.iter().enumerate().map(|(i, &p)| p as i64 - i as i64).collect();
+            let (lo, hi) = (offsets.iter().min().unwrap(), offsets.iter().max().unwrap());
+            return (hi - lo) as usize <= slop;
+        }
+        for &p in &positions[k] {
+            if chosen.contains(&p) {
+                continue;
+            }
+            chosen.push(p);
+            if search(positions, k + 1, chosen, slop) {
+                return true;
+            }
+            chosen.pop();
+        }
+        false
+    }
+    search(&positions, 0, &mut Vec::new(), slop)
+}
+
 /// `match_phrase`: like `match`, but the query's analyzed terms must appear
 /// in the document at consecutive positions, in order (slop 0 — the only
 /// slop value implemented; a non-zero `slop` option is accepted but
 /// currently treated as 0).
 fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let text = if let Some(o) = spec.as_object() {
-        o.get("query").and_then(Value::as_str).unwrap_or("").to_string()
+    let (text, slop) = if let Some(o) = spec.as_object() {
+        (query_text(o.get("query")), o.get("slop").and_then(Value::as_u64).unwrap_or(0) as usize)
     } else {
-        spec.as_str().unwrap_or("").to_string()
+        (query_text(Some(spec)), 0)
     };
-    let query_terms = analysis::standard(&text);
+    let query_terms = analyze_for(mappings, field, &text);
     if query_terms.is_empty() {
         return HashMap::new();
     }
@@ -264,7 +730,7 @@ fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Hash
     let matched: HashSet<usize> = per_doc
         .iter()
         .enumerate()
-        .filter(|(_, toks)| phrase_matches(toks, &query_terms))
+        .filter(|(_, toks)| sloppy_phrase_matches(toks, &query_terms, slop))
         .map(|(idx, _)| idx)
         .collect();
     // Score the same as an AND `match` (every term must be present, which a
@@ -427,15 +893,106 @@ fn in_range(v: &Value, cond: &Value) -> bool {
     true
 }
 
-fn eval_range(v: &Value, _mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
-    let Some((field, cond)) = field_and_spec(v) else { return HashMap::new() };
+fn eval_range(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let Some((field, cond)) = field_and_spec(v) else { return Ok(HashMap::new()) };
+    let (path, ty) = resolve_field(mappings, field);
+    let boost = cond.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let mut out = HashMap::new();
+    if matches!(ty.as_deref(), Some("date") | Some("date_nanos")) {
+        let bounds = date_bounds(cond, mappings, &path)?;
+        let field_format = date_field_format(mappings, &path);
+        for (idx, d) in docs.iter().enumerate() {
+            let hit = raw_values(&d.source, &path).into_iter().any(|val| {
+                let Some(t) = dates::value_millis(val, field_format.as_deref()) else {
+                    return false;
+                };
+                bounds.iter().all(|&(op, b)| match op {
+                    "gte" => t >= b,
+                    "gt" => t > b,
+                    "lte" => t <= b,
+                    _ => t < b,
+                })
+            });
+            if hit {
+                out.insert(idx, boost);
+            }
+        }
+        return Ok(out);
+    }
     for (idx, d) in docs.iter().enumerate() {
-        if raw_values(&d.source, field).into_iter().any(|val| in_range(val, cond)) {
-            out.insert(idx, 1.0);
+        if raw_values(&d.source, &path).into_iter().any(|val| in_range(val, cond)) {
+            out.insert(idx, boost);
         }
     }
-    out
+    Ok(out)
+}
+
+/// The `format` a date field is mapped with, if any.
+fn date_field_format(mappings: &Value, path: &str) -> Option<String> {
+    let mut node = mappings;
+    for seg in path.split('.') {
+        node = node.get("properties")?.get(seg)?;
+    }
+    node.get("format").and_then(Value::as_str).map(str::to_string)
+}
+
+/// A date `range`'s bounds as epoch millis: date math (`now-1d/d`,
+/// `2024-01-15||+1M/M`) with the request's `format` and `time_zone`;
+/// `/unit` rounds up for `gt` and `lte`, down for `gte` and `lt`, as in
+/// Elasticsearch.
+fn date_bounds(
+    cond: &Value,
+    mappings: &Value,
+    path: &str,
+) -> Result<Vec<(&'static str, i64)>, EsError> {
+    let format = cond
+        .get("format")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| date_field_format(mappings, path));
+    let tz = match cond.get("time_zone").and_then(Value::as_str) {
+        Some(z) => dates::parse_offset(z).ok_or_else(|| {
+            EsError::shard_failure(
+                "illegal_argument_exception",
+                &format!("Unknown time-zone ID: {z}"),
+            )
+        })?,
+        None => 0,
+    };
+    let now = dates::now_ms();
+    let mut out = Vec::new();
+    for (op, key) in
+        [("gte", "gte"), ("gt", "gt"), ("lte", "lte"), ("lt", "lt"), ("gte", "from"), ("lte", "to")]
+    {
+        let Some(b) = cond.get(key) else { continue };
+        if b.is_null() {
+            continue;
+        }
+        let round_up = op == "gt" || op == "lte";
+        let t = match b {
+            Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+            Value::String(s) => dates::parse_math(s, now, round_up, format.as_deref(), tz),
+            _ => None,
+        };
+        let Some(t) = t else {
+            let shown = b.as_str().map(str::to_string).unwrap_or_else(|| b.to_string());
+            let f =
+                format.clone().unwrap_or_else(|| "strict_date_optional_time||epoch_millis".into());
+            return Err(EsError::shard_failure(
+                "parse_exception",
+                &format!(
+                    "failed to parse date field [{shown}] with format [{f}]: [failed to parse \
+                     date field [{shown}] with format [{f}]]"
+                ),
+            ));
+        };
+        out.push((op, t));
+    }
+    Ok(out)
 }
 
 fn eval_exists(v: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
@@ -487,7 +1044,7 @@ fn eval_bool(
     v: &Value,
     mappings: &Value,
     docs: &[CommittedDoc],
-) -> Result<HashMap<usize, f32>, String> {
+) -> Result<HashMap<usize, f32>, EsError> {
     let must = clauses(v, "must");
     let should = clauses(v, "should");
     let filter = clauses(v, "filter");
@@ -531,6 +1088,9 @@ fn eval_bool(
     for i in &candidates {
         scores.entry(*i).or_insert(0.0);
     }
+    if let Some(b) = v.get("boost").and_then(Value::as_f64) {
+        scores.values_mut().for_each(|s| *s *= b as f32);
+    }
     Ok(scores)
 }
 
@@ -544,10 +1104,17 @@ pub fn eval(
     query: &Value,
     mappings: &Value,
     docs: &[CommittedDoc],
-) -> Result<HashMap<usize, f32>, String> {
+) -> Result<HashMap<usize, f32>, EsError> {
     let Some(obj) = query.as_object() else {
-        return Err("query must be an object".to_string());
+        return Err(EsError::parsing("query must be an object"));
     };
+    for k in ["term", "match", "match_phrase", "prefix", "wildcard", "regexp", "range", "fuzzy"] {
+        if obj.get(k).and_then(Value::as_object).is_some_and(|o| o.is_empty()) {
+            return Err(EsError::parsing(&format!(
+                "[{k}] query malformed, no start_object after query name"
+            )));
+        }
+    }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
     }
@@ -576,7 +1143,7 @@ pub fn eval(
         return Ok(eval_regexp(v, mappings, docs));
     }
     if let Some(v) = obj.get("range") {
-        return Ok(eval_range(v, mappings, docs));
+        return eval_range(v, mappings, docs);
     }
     if let Some(v) = obj.get("exists") {
         return Ok(eval_exists(v, docs));
@@ -589,6 +1156,23 @@ pub fn eval(
     }
     if let Some(v) = obj.get("bool") {
         return eval_bool(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("dis_max") {
+        return eval_dis_max(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("nested") {
+        return eval_nested(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("fuzzy") {
+        return Ok(eval_fuzzy(v, mappings, docs));
+    }
+    if let Some(v) = obj.get("query_string") {
+        let q = query_string::query_string(v, mappings)?;
+        return eval(&q, mappings, docs);
+    }
+    if let Some(v) = obj.get("simple_query_string") {
+        let q = query_string::simple_query_string(v, mappings)?;
+        return eval(&q, mappings, docs);
     }
     if let Some(v) = obj.get("constant_score") {
         let inner = v.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));
@@ -603,7 +1187,7 @@ pub fn eval(
     // unsupported. See `docs/specs/README.md`'s own stated principle:
     // "never silently wrong."
     let clause = obj.keys().next().map(String::as_str).unwrap_or("<empty>");
-    Err(format!("no [{clause}] query registered"))
+    Err(EsError::parsing(&format!("unknown query [{clause}]")))
 }
 
 fn parse_sort(s: &Value) -> (String, String) {
@@ -908,6 +1492,261 @@ fn histogram_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: 
     json!({"buckets": out})
 }
 
+/// A `date` field's values in a document, as epoch millis.
+fn date_values(mappings: &Value, source: &Value, field: &str) -> Vec<i64> {
+    let (path, _) = resolve_field(mappings, field);
+    let format = date_field_format(mappings, &path);
+    raw_values(source, &path)
+        .into_iter()
+        .filter_map(|v| dates::value_millis(v, format.as_deref()))
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Interval {
+    Calendar(char),
+    Fixed(i64),
+}
+
+impl Interval {
+    fn round(self, t: i64, tz: i64, offset: i64) -> i64 {
+        match self {
+            Interval::Calendar(u) => dates::round_down(t - offset, u, tz) + offset,
+            Interval::Fixed(ms) => (t + tz - offset).div_euclid(ms) * ms - tz + offset,
+        }
+    }
+
+    fn next(self, t: i64, tz: i64) -> i64 {
+        match self {
+            Interval::Calendar(u) => dates::add(t, 1, u, tz),
+            Interval::Fixed(ms) => t + ms,
+        }
+    }
+}
+
+fn parse_interval(inner: &Value) -> Result<Interval, EsError> {
+    let bad = |m: String| EsError::new(400, "x_content_parse_exception", &m);
+    if let Some(c) = inner.get("calendar_interval").and_then(Value::as_str) {
+        let unit = match c {
+            "minute" | "1m" => 'm',
+            "hour" | "1h" => 'h',
+            "day" | "1d" => 'd',
+            "week" | "1w" => 'w',
+            "month" | "1M" => 'M',
+            "quarter" | "1q" => 'q',
+            "year" | "1y" => 'y',
+            _ => {
+                return Err(bad(format!(
+                    "[date_histogram] failed to parse field [calendar_interval]: The supplied \
+                     interval [{c}] could not be parsed as a calendar interval."
+                )));
+            }
+        };
+        return Ok(Interval::Calendar(unit));
+    }
+    let fixed = inner
+        .get("fixed_interval")
+        .or_else(|| inner.get("interval"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            EsError::new(
+                400,
+                "illegal_argument_exception",
+                "Invalid interval specified, must be non-null and non-empty",
+            )
+        })?;
+    let split = fixed.find(|c: char| !c.is_ascii_digit()).unwrap_or(fixed.len());
+    let n: i64 = fixed[..split].parse().map_err(|_| {
+        bad(format!("failed to parse setting [date_histogram.fixedInterval] with value [{fixed}] as a time value"))
+    })?;
+    let ms = match &fixed[split..] {
+        "ms" => 1,
+        "s" => 1000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => {
+            return Err(bad(format!(
+                "failed to parse setting [date_histogram.fixedInterval] with value [{fixed}] as a \
+                 time value: unit is missing or unrecognized"
+            )));
+        }
+    };
+    Ok(Interval::Fixed(n * ms))
+}
+
+fn parse_tz(inner: &Value) -> i64 {
+    inner.get("time_zone").and_then(Value::as_str).and_then(dates::parse_offset).unwrap_or(0)
+}
+
+fn date_histogram_agg(
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+) -> Result<Value, EsError> {
+    let inner = spec.get("date_histogram").cloned().unwrap_or_default();
+    let field = agg_field(&inner);
+    let interval = parse_interval(&inner)?;
+    let tz = parse_tz(&inner);
+    let offset = match inner.get("offset") {
+        Some(Value::String(o)) => {
+            let neg = o.starts_with('-');
+            let body = o.trim_start_matches(['-', '+']);
+            let ms = match parse_interval(&json!({"fixed_interval": body}))? {
+                Interval::Fixed(ms) => ms,
+                Interval::Calendar(_) => 0,
+            };
+            if neg { -ms } else { ms }
+        }
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        _ => 0,
+    };
+    let format = inner.get("format").and_then(Value::as_str).map(str::to_string);
+    let min_doc_count = inner.get("min_doc_count").and_then(Value::as_u64).unwrap_or(0);
+    let mut buckets: std::collections::BTreeMap<i64, Vec<usize>> = Default::default();
+    for &idx in bucket {
+        let mut seen = HashSet::new();
+        for t in date_values(mappings, &docs[idx].source, field) {
+            let k = interval.round(t, tz, offset);
+            if seen.insert(k) {
+                buckets.entry(k).or_default().push(idx);
+            }
+        }
+    }
+    if min_doc_count == 0 {
+        let bound = |key: &str| -> Option<i64> {
+            let b = inner.get("extended_bounds")?.get(key)?;
+            match b {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => {
+                    dates::parse_math(s, dates::now_ms(), false, format.as_deref(), tz)
+                }
+                _ => None,
+            }
+        };
+        let lo =
+            [buckets.keys().next().copied(), bound("min").map(|t| interval.round(t, tz, offset))]
+                .into_iter()
+                .flatten()
+                .min();
+        let hi = [
+            buckets.keys().next_back().copied(),
+            bound("max").map(|t| interval.round(t, tz, offset)),
+        ]
+        .into_iter()
+        .flatten()
+        .max();
+        if let (Some(lo), Some(hi)) = (lo, hi) {
+            let mut k = lo;
+            let mut guard = 0;
+            while k <= hi && guard < 100_000 {
+                buckets.entry(k).or_default();
+                k = interval.next(k, tz);
+                guard += 1;
+            }
+        }
+    }
+    let mut out: Vec<(i64, Vec<usize>)> =
+        buckets.into_iter().filter(|(_, v)| v.len() as u64 >= min_doc_count).collect();
+    if let Some(order) = inner.get("order").and_then(Value::as_object)
+        && let Some((k, dir)) = order.iter().next()
+    {
+        let desc = dir.as_str() == Some("desc");
+        match k.as_str() {
+            "_count" => out.sort_by(|a, b| {
+                let o = a.1.len().cmp(&b.1.len());
+                (if desc { o.reverse() } else { o }).then(a.0.cmp(&b.0))
+            }),
+            "_key" if desc => out.reverse(),
+            _ => {}
+        }
+    }
+    let keyed = inner.get("keyed").and_then(Value::as_bool).unwrap_or(false);
+    let rendered: Vec<(String, Value)> = out
+        .into_iter()
+        .map(|(k, idxs)| {
+            let key_str = dates::format(k, format.as_deref(), tz);
+            let mut b = Map::new();
+            b.insert("key_as_string".to_string(), json!(key_str));
+            b.insert("key".to_string(), json!(k));
+            b.insert("doc_count".to_string(), json!(idxs.len()));
+            (key_str, with_sub_aggs(b, spec, mappings, docs, &idxs))
+        })
+        .collect();
+    Ok(if keyed {
+        json!({"buckets": rendered.into_iter().collect::<Map<String, Value>>()})
+    } else {
+        json!({"buckets": rendered.into_iter().map(|(_, v)| v).collect::<Vec<_>>()})
+    })
+}
+
+fn date_range_agg(
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    bucket: &[usize],
+) -> Result<Value, EsError> {
+    let inner = spec.get("date_range").cloned().unwrap_or_default();
+    let field = agg_field(&inner);
+    let format = inner.get("format").and_then(Value::as_str).map(str::to_string);
+    let tz = parse_tz(&inner);
+    let keyed = inner.get("keyed").and_then(Value::as_bool).unwrap_or(false);
+    let now = dates::now_ms();
+    let bound = |v: Option<&Value>| -> Result<Option<i64>, EsError> {
+        match v {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(n)) => Ok(n.as_i64()),
+            Some(Value::String(s)) => {
+                dates::parse_math(s, now, false, format.as_deref(), tz).map(Some).ok_or_else(|| {
+                    EsError::shard_failure(
+                        "parse_exception",
+                        &format!("failed to parse date field [{s}]"),
+                    )
+                })
+            }
+            Some(_) => Ok(None),
+        }
+    };
+    let mut named = Vec::new();
+    for r in inner.get("ranges").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let (from, to) = (bound(r.get("from"))?, bound(r.get("to"))?);
+        let idxs: Vec<usize> = bucket
+            .iter()
+            .copied()
+            .filter(|&i| {
+                date_values(mappings, &docs[i].source, field)
+                    .iter()
+                    .any(|&t| from.is_none_or(|f| t >= f) && to.is_none_or(|e| t < e))
+            })
+            .collect();
+        let s =
+            |t: Option<i64>| t.map_or("*".to_string(), |t| dates::format(t, format.as_deref(), tz));
+        let key = r
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{}-{}", s(from), s(to)));
+        let mut b = Map::new();
+        b.insert("key".to_string(), json!(key));
+        if let Some(f) = from {
+            b.insert("from".to_string(), json!(f as f64));
+            b.insert("from_as_string".to_string(), json!(s(Some(f))));
+        }
+        if let Some(t) = to {
+            b.insert("to".to_string(), json!(t as f64));
+            b.insert("to_as_string".to_string(), json!(s(Some(t))));
+        }
+        b.insert("doc_count".to_string(), json!(idxs.len()));
+        named.push((key, with_sub_aggs(b, spec, mappings, docs, &idxs)));
+    }
+    Ok(if keyed {
+        json!({"buckets": named.into_iter().collect::<Map<String, Value>>()})
+    } else {
+        json!({"buckets": named.into_iter().map(|(_, v)| v).collect::<Vec<_>>()})
+    })
+}
+
 fn filter_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
     let filter_query = spec.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));
     // The aggregation pipeline doesn't thread a `Result` the way the main
@@ -1054,8 +1893,22 @@ fn eval_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usi
     if spec.get("histogram").is_some() {
         return histogram_agg(spec, mappings, docs, bucket);
     }
+    // Their request errors were already reported by `validate_aggs`.
+    if spec.get("date_histogram").is_some() {
+        return date_histogram_agg(spec, mappings, docs, bucket).unwrap_or_else(|_| json!({}));
+    }
+    if spec.get("date_range").is_some() {
+        return date_range_agg(spec, mappings, docs, bucket).unwrap_or_else(|_| json!({}));
+    }
     if spec.get("filter").is_some() {
         return filter_agg(spec, mappings, docs, bucket);
+    }
+    if let Some(n) = spec.get("nested") {
+        let path = n.get("path").and_then(Value::as_str).unwrap_or("");
+        let (children, _) = nested_children(docs, bucket.iter().copied(), path);
+        let all: Vec<usize> = (0..children.len()).collect();
+        let b = Map::from_iter([("doc_count".to_string(), json!(children.len()))]);
+        return with_sub_aggs(b, spec, mappings, &children, &all);
     }
     if spec.get("filters").is_some() {
         return filters_agg(spec, mappings, docs, bucket);
@@ -1108,63 +1961,291 @@ pub fn eval_aggs(aggs: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: 
     Value::Object(out)
 }
 
+/// An integer request parameter (`size`, `from`), which Elasticsearch
+/// also accepts as a numeric string.
+fn int_param(body: &Value, key: &str, default: i64) -> Result<i64, EsError> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(n)) => n.as_i64().ok_or_else(|| {
+            EsError::new(400, "x_content_parse_exception", &format!("[{key}] must be an integer"))
+        }),
+        Some(Value::String(s)) => s.parse().map_err(|_| {
+            EsError::new(400, "x_content_parse_exception", &format!("[{key}] must be an integer"))
+        }),
+        Some(_) => Err(EsError::new(
+            400,
+            "x_content_parse_exception",
+            &format!("[{key}] must be an integer"),
+        )),
+    }
+}
+
+/// Rejects an aggregation tree with an unknown type, as Elasticsearch does
+/// when parsing the request (rather than silently returning `{}`).
+pub fn validate_aggs(aggs: &Value) -> Result<(), EsError> {
+    const KNOWN: &[&str] = &[
+        "terms",
+        "range",
+        "histogram",
+        "date_histogram",
+        "date_range",
+        "filter",
+        "filters",
+        "missing",
+        "avg",
+        "sum",
+        "min",
+        "max",
+        "stats",
+        "value_count",
+        "cardinality",
+        "top_hits",
+        "nested",
+    ];
+    let Some(obj) = aggs.as_object() else {
+        return Err(EsError::parsing("Expected [START_OBJECT] under [aggs]"));
+    };
+    for (name, spec) in obj {
+        let Some(spec_obj) = spec.as_object() else {
+            return Err(EsError::parsing(&format!("Expected [START_OBJECT] under [{name}]")));
+        };
+        let mut found = false;
+        for (k, v) in spec_obj {
+            match k.as_str() {
+                "aggs" | "aggregations" => validate_aggs(v)?,
+                "meta" => {}
+                "date_histogram" => {
+                    parse_interval(v)?;
+                    found = true;
+                }
+                t if KNOWN.contains(&t) => found = true,
+                t => {
+                    return Err(EsError::parsing(&format!(
+                        "Unknown aggregation type [{t}] did you mean [{}]?",
+                        KNOWN
+                            .iter()
+                            .find(|k| k.starts_with(&t[..1.min(t.len())]))
+                            .unwrap_or(&"terms")
+                    )));
+                }
+            }
+        }
+        if !found {
+            return Err(EsError::parsing(&format!("Missing definition for aggregation [{name}]")));
+        }
+    }
+    Ok(())
+}
+
+/// The `hits.total` object under `track_total_hits` (default: exact up to
+/// 10,000, then `"gte"`). `None` when it's turned off.
+fn total_hits(body: &Value, total: usize) -> Option<Value> {
+    let cap = match body.get("track_total_hits") {
+        Some(Value::Bool(false)) => return None,
+        Some(Value::Bool(true)) => usize::MAX,
+        Some(Value::Number(n)) => n.as_u64().map_or(usize::MAX, |n| n as usize),
+        _ => 10_000,
+    };
+    Some(if total > cap {
+        json!({"value": cap, "relation": "gte"})
+    } else {
+        json!({"value": total, "relation": "eq"})
+    })
+}
+
 /// `POST/GET _search`: runs the query, ranks and paginates the results,
 /// and computes any `aggs`/`aggregations` over the full matched set.
-pub fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<Value, String> {
+/// `typed` says `mappings` is a real mapping (a single index, or several
+/// merged), so sorting on an unmapped field is an error.
+pub fn search_typed(
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    body: &Value,
+    typed: bool,
+) -> Result<Value, EsError> {
+    search_with(mappings, docs, body, &SearchOptions { typed, ..Default::default() })
+}
+
+#[derive(Default)]
+pub struct SearchOptions {
+    /// `mappings` is a real mapping, so sorting on an unmapped field fails.
+    pub typed: bool,
+    /// Return every hit, ignoring `from`/`size` (a scroll pages through
+    /// them itself; the result window doesn't apply).
+    pub all_hits: bool,
+    /// A point-in-time search: a sorted one without `search_after` gets
+    /// Elasticsearch's implicit `_shard_doc` tiebreaker.
+    pub pit: bool,
+}
+
+pub fn search_with(
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    body: &Value,
+    opts: &SearchOptions,
+) -> Result<Value, EsError> {
+    let typed = opts.typed;
+    let size = int_param(body, "size", 10)?;
+    let from = int_param(body, "from", 0)?;
+    if size < 0 {
+        return Err(EsError::new(
+            400,
+            "illegal_argument_exception",
+            &format!("[size] parameter cannot be negative, found [{size}]"),
+        ));
+    }
+    if from < 0 {
+        return Err(EsError::new(
+            400,
+            "illegal_argument_exception",
+            &format!("[from] parameter cannot be negative, found [{from}]"),
+        ));
+    }
+    let search_after = body.get("search_after");
+    if search_after.is_some() && from > 0 {
+        return Err(EsError::new(
+            400,
+            "action_request_validation_exception",
+            "Validation Failed: 1: [from] parameter must be set to 0 when [search_after] is used;",
+        ));
+    }
+    if from + size > 10_000 && !opts.all_hits {
+        return Err(EsError::shard_failure(
+            "illegal_argument_exception",
+            &format!(
+                "Result window is too large, from + size must be less than or equal to: [10000] \
+                 but was [{}]. See the scroll api for a more efficient way to request large data \
+                 sets. This limit can be set by changing the [index.max_result_window] index \
+                 level setting.",
+                from + size
+            ),
+        ));
+    }
+    let agg_spec = body.get("aggs").or_else(|| body.get("aggregations"));
+    if let Some(a) = agg_spec {
+        validate_aggs(a)?;
+    }
+    let mut specs = match body.get("sort") {
+        Some(spec) => sorting::parse(spec, mappings, typed)?,
+        None => Vec::new(),
+    };
+    // The implicit `_shard_doc` tiebreaker of a point-in-time search; a
+    // `search_after` taken from such a hit carries its value too.
+    let after_len = search_after.map(|a| a.as_array().map_or(1, Vec::len));
+    if opts.pit && !specs.is_empty() && after_len.is_none_or(|n| n == specs.len() + 1) {
+        specs.extend(sorting::parse(&json!("_shard_doc"), mappings, typed)?);
+    }
+    if search_after.is_some() && specs.is_empty() {
+        return Err(EsError::shard_failure(
+            "illegal_argument_exception",
+            "Sort must contain at least one field.",
+        ));
+    }
+
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
+    // Queries and aggregations see the root-level view (no nested
+    // objects); hits are built from the originals.
+    let view = root_view(mappings, docs);
+    let originals = docs;
+    let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     let mut scores = eval(&query, mappings, docs)?;
+    let mut inner = Vec::new();
+    inner_hits(&query, mappings, docs, &mut inner)?;
     if let Some(min_score) = body.get("min_score").and_then(Value::as_f64) {
         let min_score = min_score as f32;
         scores.retain(|_, s| *s >= min_score);
     }
     let matched: Vec<usize> = scores.keys().copied().collect();
     let total = scores.len();
-    let from = body.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let size = body.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
 
-    let mut ranked: Vec<(usize, f32)> = scores.into_iter().collect();
-    match body.get("sort") {
-        Some(spec) => sort_ranked(&mut ranked, spec, mappings, docs),
-        None => ranked
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))),
+    let mut ranked: Vec<(usize, f32, Vec<Value>)> = scores
+        .into_iter()
+        .map(|(i, sc)| {
+            let keys = sorting::keys(&specs, &docs[i], i, sc);
+            (i, sc, keys)
+        })
+        .collect();
+    if specs.is_empty() {
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    } else {
+        ranked.sort_by(|a, b| sorting::compare_keys(&specs, &a.2, &b.2).then(a.0.cmp(&b.0)));
+    }
+    let max_of = |r: &[(usize, f32, Vec<Value>)]| {
+        r.iter().map(|h| h.1).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
+    };
+    let track_scores = body.get("track_scores").and_then(Value::as_bool).unwrap_or(false);
+    let shows_scores = specs.is_empty() || track_scores || specs.iter().any(|s| s.is_score());
+    let max_score =
+        if size == 0 || !(specs.is_empty() || track_scores) { None } else { max_of(&ranked) };
+    if let Some(after) = search_after {
+        let after = after.as_array().cloned().unwrap_or_else(|| vec![after.clone()]);
+        let after = sorting::after_keys(&specs, &after)?;
+        ranked.retain(|h| sorting::compare_keys(&specs, &h.2, &after) == Ordering::Greater);
     }
 
-    let max_score = ranked.first().map(|(_, s)| *s);
     let source_filter = body.get("_source");
+    let (from, size) = if opts.all_hits { (0, usize::MAX) } else { (from as usize, size as usize) };
     let hits: Vec<Value> = ranked
         .iter()
         .skip(from)
         .take(size)
-        .map(|(idx, score)| {
-            let d = &docs[*idx];
-            let mut hit = json!({"_index": d.index, "_id": d.id, "_score": score});
+        .map(|(idx, score, keys)| {
+            let d = &originals[*idx];
+            let mut hit = json!({"_index": d.index, "_id": d.id});
+            hit["_score"] = if shows_scores { json!(score) } else { Value::Null };
             // `"_source": false` omits the key, as Elasticsearch does.
             if !matches!(source_filter, Some(Value::Bool(false))) {
                 hit["_source"] = apply_source_filter(&d.source, source_filter);
+            }
+            if let Some(hl) = body.get("highlight")
+                && let Some(h) = highlight::highlight(hl, &query, mappings, &d.source)
+            {
+                hit["highlight"] = h;
+            }
+            if !specs.is_empty() {
+                hit["sort"] = Value::Array(keys.clone());
+            }
+            for (name, per) in &inner {
+                if let Some(h) = per.get(idx) {
+                    hit["inner_hits"][name.as_str()] = h.clone();
+                }
             }
             hit
         })
         .collect();
 
+    let mut hits_obj = json!({"max_score": max_score, "hits": hits});
+    if let Some(t) = total_hits(body, total) {
+        hits_obj["total"] = t;
+    }
     let mut resp = json!({
         "took": 0,
         "timed_out": false,
         "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
-        "hits": {
-            "total": {"value": total, "relation": "eq"},
-            "max_score": max_score,
-            "hits": hits,
-        }
+        "hits": hits_obj,
     });
-    if let Some(agg_spec) = body.get("aggs").or_else(|| body.get("aggregations")) {
+    if let Some(agg_spec) = agg_spec {
         resp["aggregations"] = eval_aggs(agg_spec, mappings, docs, &matched);
     }
     Ok(resp)
 }
 
+/// Evaluates `query` over the root-level view of `docs` (nested objects
+/// hidden), as `_search` does.
+pub fn eval_root(
+    query: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let view = root_view(mappings, docs);
+    eval(query, mappings, view.as_deref().unwrap_or(docs))
+}
+
 /// `POST/GET _count`: the number of matching documents.
-pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u64, String> {
+pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u64, EsError> {
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
+    let view = root_view(mappings, docs);
+    let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     Ok(eval(&query, mappings, docs)?.len() as u64)
 }
 
@@ -1172,8 +2253,19 @@ pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u6
 mod tests {
     use super::*;
 
+    fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<Value, EsError> {
+        search_typed(mappings, docs, body, false)
+    }
+
     fn doc(index: &str, id: &str, source: Value) -> CommittedDoc {
-        CommittedDoc { index: index.to_string(), id: id.to_string(), source, version: 1 }
+        CommittedDoc {
+            index: index.to_string(),
+            id: id.to_string(),
+            source,
+            version: 1,
+            seq: 0,
+            full_source: None,
+        }
     }
 
     fn mappings_with_text(field: &str) -> Value {

@@ -51,7 +51,8 @@ fn index_and_document_crud_preserve_elasticsearch_response_fields() {
     assert_eq!(deleted["result"], "deleted");
     assert_eq!(
         call(&engine, "GET", "/books/_doc/1", "").1,
-        json!({"_index":"books","_id":"1","found":false,"_source":null})
+        // As a real node answers: no `_source` key at all.
+        json!({"_index":"books","_id":"1","found":false})
     );
 }
 
@@ -324,8 +325,8 @@ fn regexp_query_matches_on_keyword_fields() {
 }
 
 /// Found via extensive real-client testing before a public release: an
-/// unrecognized query clause (`query_string`, `nested`, `fuzzy`,
-/// `function_score`, ...) used to silently fall through to "0 hits" --
+/// unrecognized query clause (`percolate`, ...) used to silently fall
+/// through to "0 hits" --
 /// a perfectly well-formed, confidently WRONG successful response rather
 /// than an error. Violates this project's own stated principle (see
 /// docs/specs/README.md: "never silently wrong"). Fixed to return a real
@@ -337,13 +338,21 @@ fn unsupported_query_type_errors_instead_of_silently_matching_nothing() {
     call(&engine, "PUT", "/docs/_doc/1", r#"{"name":"alice"}"#);
     call(&engine, "POST", "/docs/_refresh", "");
 
-    let (status, resp) =
-        call(&engine, "POST", "/docs/_search", r#"{"query":{"query_string":{"query":"alice"}}}"#);
+    let (status, resp) = call(
+        &engine,
+        "POST",
+        "/docs/_search",
+        r#"{"query":{"percolate":{"field":"q","document":{}}}}"#,
+    );
     assert_eq!(status, 400);
     assert_eq!(resp["error"]["type"], "parsing_exception");
 
-    let (status, _) =
-        call(&engine, "POST", "/docs/_count", r#"{"query":{"query_string":{"query":"alice"}}}"#);
+    let (status, _) = call(
+        &engine,
+        "POST",
+        "/docs/_count",
+        r#"{"query":{"percolate":{"field":"q","document":{}}}}"#,
+    );
     assert_eq!(status, 400);
 }
 
