@@ -512,3 +512,21 @@ PG_EDGES.update({
         "SELECT generate_series('2024-01-01'::timestamp, '2024-01-01 02:00'::timestamp, '1 hour')",
     ),
 })
+
+PG_EDGES.update({
+    "pg edge: ranking and headlines": steps(
+        "SELECT ts_rank(to_tsvector('english', 'cat dog cat'), to_tsquery('english', 'cat'))",
+        "SELECT ts_rank(to_tsvector('english', 'The quick brown fox jumps over the lazy dog'), to_tsquery('english', 'fox & dog'))",
+        "SELECT ts_rank(to_tsvector('english', 'fox dog'), to_tsquery('english', 'fox & dog')), ts_rank(to_tsvector('english', 'fox a b c d e f g dog'), to_tsquery('english', 'fox & dog'))",
+        "SELECT ts_rank(to_tsvector('english', 'fox dog'), to_tsquery('english', 'fox | cat'))",
+        "SELECT ts_rank(setweight(to_tsvector('english', 'fox'), 'A') || to_tsvector('english', 'dog'), to_tsquery('english', 'fox | dog'))",
+        "SELECT ts_rank('{0.1, 0.2, 0.4, 1.0}', to_tsvector('english', 'cats and dogs'), to_tsquery('english', 'cat'))",
+        "SELECT ts_rank(to_tsvector('english', 'cat dog cat bird'), to_tsquery('english', 'cat'), 1), ts_rank(to_tsvector('english', 'cat dog cat bird'), to_tsquery('english', 'cat'), 2), ts_rank(to_tsvector('english', 'cat dog cat bird'), to_tsquery('english', 'cat'), 32)",
+        "SELECT ts_rank(to_tsvector('english', 'nothing here'), to_tsquery('english', 'cat'))",
+        "SELECT ts_headline('english', 'The quick brown fox jumps over the lazy dog', to_tsquery('english', 'fox & dog'), 'StartSel=[, StopSel=]')",
+        "SELECT ts_headline('Running runners run', to_tsquery('english', 'run'))",
+        "SELECT ts_headline('english', 'no match at all', to_tsquery('english', 'zebra'))",
+        "SELECT ts_headline('english', 'x', to_tsquery('english', 'x'), 'MinWords=5, MaxWords=3')",
+        "SELECT numnode(to_tsquery('english', 'a & b | !c')), numnode(plainto_tsquery('english', 'the'))",
+    ),
+})

@@ -1743,10 +1743,48 @@ pub fn call(
             )));
         }
         "ts_rank" => {
-            let vec = fts::parse_vector(text(&a[0]))?;
-            let q = fts::parse_query_text(text(&a[1]))?
+            // ([weights,] vector, query [, normalization])
+            let (weights, rest) = match &a[0] {
+                Array(arr) => {
+                    let w: Vec<f32> = arr
+                        .items
+                        .iter()
+                        .map(|v| match v {
+                            Float(f) => *f as f32,
+                            Int(i) => *i as f32,
+                            Num(n) => n.to_f64() as f32,
+                            _ => 0.0,
+                        })
+                        .collect();
+                    if w.len() < 4 {
+                        return Err(err(
+                            code::ARRAY_SUBSCRIPT_ERROR,
+                            "array of weight is too short",
+                        ));
+                    }
+                    ([w[0], w[1], w[2], w[3]], &a[1..])
+                }
+                _ => (fts::DEFAULT_WEIGHTS, a),
+            };
+            let norm = rest.get(2).and_then(Value::as_int).unwrap_or(0) as i32;
+            let q = fts::parse_query_text(text(&rest[1]))?
                 .unwrap_or(fts::Query::Lexeme(String::new(), false));
-            return Ok(Some(Float(fts::rank(&vec, &q) as f64)));
+            return Ok(Some(Float(fts::ts_rank(text(&rest[0]), &q, weights, norm)? as f64)));
+        }
+        "numnode" => {
+            let q = fts::parse_query_text(text(&a[0]))?;
+            return Ok(Some(Int(q.as_ref().map_or(0, fts::numnode) as i64)));
+        }
+        "ts_headline" => {
+            // ([config,] document, query [, options])
+            let (config, rest) = if tys.get(2).is_some_and(|t| t.base == Base::Tsquery) {
+                (text(&a[0]).to_string(), &a[1..])
+            } else {
+                ("english".to_string(), a)
+            };
+            let q = fts::parse_query_text(text(&rest[1]))?;
+            let opts = rest.get(2).map_or("", text);
+            return Ok(Some(Text(fts::headline(text(&rest[0]), q.as_ref(), &config, opts)?)));
         }
         "setweight" => {
             let weight = text(&a[1]).chars().next().unwrap_or('\0');

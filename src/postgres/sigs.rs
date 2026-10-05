@@ -66,7 +66,9 @@ to_tsquery(text)tsquery to_tsquery(text,text)tsquery
 plainto_tsquery(text)tsquery plainto_tsquery(text,text)tsquery
 phraseto_tsquery(text)tsquery phraseto_tsquery(text,text)tsquery
 websearch_to_tsquery(text)tsquery websearch_to_tsquery(text,text)tsquery
-ts_rank(tsvector,tsquery)float4 setweight(tsvector,char)tsvector
+ts_rank(tsvector,tsquery)float4 ts_rank(tsvector,tsquery,int4)float4 ts_rank(_float4,tsvector,tsquery)float4 ts_rank(_float4,tsvector,tsquery,int4)float4
+ts_headline(text,tsquery)text ts_headline(text,text,tsquery)text ts_headline(text,tsquery,text)text ts_headline(text,text,tsquery,text)text numnode(tsquery)int4
+setweight(tsvector,char)tsvector
 int4range(int4,int4)int4range int4range(int4,int4,text)int4range
 int8range(int8,int8)int8range int8range(int8,int8,text)int8range
 numrange(numeric,numeric)numrange numrange(numeric,numeric,text)numrange
