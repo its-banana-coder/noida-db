@@ -1017,8 +1017,15 @@ impl Executor {
                 let schema = state.schemas.get(&db).ok_or_else(|| {
                     MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
                 })?;
+                let mut names: Vec<(&String, &str)> = schema
+                    .tables
+                    .keys()
+                    .map(|n| (n, "BASE TABLE"))
+                    .chain(schema.views.keys().map(|n| (n, "VIEW")))
+                    .collect();
+                names.sort();
                 let mut rows = Vec::new();
-                for table_name in schema.tables.keys() {
+                for (table_name, kind) in names {
                     if let Some(p) = &like
                         && !mysql_like(table_name, p, Some('\\'))
                     {
@@ -1026,11 +1033,139 @@ impl Executor {
                     }
                     let mut row = vec![Value::Text(table_name.clone())];
                     if full {
-                        row.push(Value::Text("BASE TABLE".into()));
+                        row.push(Value::Text(kind.into()));
                     }
                     rows.push(row);
                 }
                 Ok(rows)
+            }
+            Plan::CreateView { db, name, columns, sql, or_replace } => {
+                {
+                    let state = self.db.lock().unwrap();
+                    let schema = state.schemas.get(&db).ok_or_else(|| {
+                        MySqlError::new(1049, "42000", format!("Unknown database '{db}'"))
+                    })?;
+                    if schema.tables.contains_key(&name) {
+                        return Err(if or_replace {
+                            MySqlError::new(1347, "HY000", format!("'{db}.{name}' is not VIEW"))
+                        } else {
+                            MySqlError::new(1050, "42S01", format!("Table '{name}' already exists"))
+                        });
+                    }
+                    if schema.views.contains_key(&name) && !or_replace {
+                        return Err(MySqlError::new(
+                            1050,
+                            "42S01",
+                            format!("Table '{name}' already exists"),
+                        ));
+                    }
+                }
+                // MySQL checks the definition when the view is created: its
+                // tables and columns must exist, and it can't name itself.
+                let view = crate::mysql::catalog::View { name: name.clone(), sql, columns };
+                let mut defs = self.db.lock().unwrap().view_defs();
+                defs.insert((db.clone(), name.clone()), view.clone());
+                let stmt = sqlparser::parser::Parser::parse_sql(
+                    &sqlparser::dialect::MySqlDialect {},
+                    &format!("SELECT * FROM `{name}`"),
+                )
+                .map_err(|e| MySqlError::syntax_error(&e.to_string()))?
+                .remove(0);
+                let plan = crate::mysql::binder::Binder::new(Some(db.clone()))
+                    .with_views(std::sync::Arc::new(defs))
+                    .bind_statement(stmt)?;
+                let names = {
+                    let state = self.db.lock().unwrap();
+                    crate::mysql::plan::column_names(&plan, &state)
+                };
+                if !view.columns.is_empty() && view.columns.len() != names.len() {
+                    return Err(MySqlError::new(
+                        1353,
+                        "HY000",
+                        "In definition of view, derived table or common table expression, SELECT list and column names list have different column counts",
+                    ));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for n in &names {
+                    if !seen.insert(n.to_ascii_lowercase()) {
+                        return Err(MySqlError::new(
+                            1060,
+                            "42S21",
+                            format!("Duplicate column name '{n}'"),
+                        ));
+                    }
+                }
+                self.execute_plan(plan)?;
+                let mut state = self.db.lock().unwrap();
+                if let Some(schema) = state.schemas.get_mut(&db) {
+                    schema.views.insert(name, view);
+                }
+                Ok(vec![])
+            }
+            Plan::DropView { db, names, if_exists } => {
+                let mut state = self.db.lock().unwrap();
+                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
+                    MySqlError::new(1049, "42000", format!("Unknown database '{db}'"))
+                })?;
+                let mut missing = Vec::new();
+                for n in &names {
+                    if schema.tables.contains_key(n) {
+                        return Err(MySqlError::new(
+                            1347,
+                            "HY000",
+                            format!("'{db}.{n}' is not VIEW"),
+                        ));
+                    }
+                    if !schema.views.contains_key(n) {
+                        missing.push(format!("{db}.{n}"));
+                    }
+                }
+                if !missing.is_empty() && !if_exists {
+                    return Err(MySqlError::new(
+                        1051,
+                        "42S02",
+                        format!("Unknown table '{}'", missing.join(",")),
+                    ));
+                }
+                for n in &names {
+                    schema.views.remove(n);
+                }
+                Ok(vec![])
+            }
+            Plan::ShowCreateView { db, name } => {
+                let view = {
+                    let state = self.db.lock().unwrap();
+                    let schema = state.schemas.get(&db).ok_or_else(|| {
+                        MySqlError::new(1049, "42000", format!("Unknown database '{db}'"))
+                    })?;
+                    if schema.tables.contains_key(&name) {
+                        return Err(MySqlError::new(
+                            1347,
+                            "HY000",
+                            format!("'{db}.{name}' is not VIEW"),
+                        ));
+                    }
+                    schema.views.get(&name).cloned().ok_or_else(|| {
+                        MySqlError::new(1146, "42S02", format!("Table '{db}.{name}' doesn't exist"))
+                    })?
+                };
+                let cols = if view.columns.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({})",
+                        view.columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(",")
+                    )
+                };
+                Ok(vec![vec![
+                    Value::Text(name.clone()),
+                    Value::Text(format!(
+                        "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `{name}`{cols} AS {}",
+                        view.sql
+                    )),
+                    Value::Text("utf8mb4".into()),
+                    Value::Text("utf8mb4_0900_ai_ci".into()),
+                ]])
             }
             Plan::ShowColumns { db, table } => {
                 let t = self.load_table(&db, &table)?;

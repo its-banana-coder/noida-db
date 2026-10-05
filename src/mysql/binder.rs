@@ -1,4 +1,4 @@
-use crate::mysql::catalog::{Column, ColumnType, UniqueKey};
+use crate::mysql::catalog::{Column, ColumnType, UniqueKey, View};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{
     self as plan, AggFunc, AlterOp, ArithOp, CmpOp, ColumnPos, Expr, InsertMode, JoinOp, Plan,
@@ -11,10 +11,17 @@ use sqlparser::ast::{
     ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
     Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Binder {
+    /// Views by (database, name), expanded where a query names one.
+    views: Arc<HashMap<(String, String), View>>,
+    /// Views being expanded, innermost last.
+    view_stack: Vec<(String, String)>,
     pub current_db: Option<String>,
     pub prepared_types: HashMap<String, Vec<Value>>,
     /// Assigns each `?` placeholder encountered while binding an
@@ -48,8 +55,17 @@ pub struct Binder {
 }
 
 impl Binder {
+    /// Lets the binder expand the views in `views` ((database, name) ->
+    /// definition) where queries name them.
+    pub fn with_views(mut self, views: Arc<HashMap<(String, String), View>>) -> Self {
+        self.views = views;
+        self
+    }
+
     pub fn new(current_db: Option<String>) -> Self {
         Self {
+            views: Default::default(),
+            view_stack: Vec::new(),
             current_db,
             prepared_types: HashMap::new(),
             param_counter: 0,
@@ -218,6 +234,9 @@ impl Binder {
                 if let sqlparser::ast::ShowCreateObject::Table = obj_type {
                     let (db, table) = self.resolve_table_name(&obj_name)?;
                     Ok(Plan::ShowCreateTable { db, table })
+                } else if let sqlparser::ast::ShowCreateObject::View = obj_type {
+                    let (db, name) = self.resolve_table_name(&obj_name)?;
+                    Ok(Plan::ShowCreateView { db, name })
                 } else {
                     Err(MySqlError::unsupported("SHOW CREATE object type"))
                 }
@@ -253,6 +272,37 @@ impl Binder {
                 Ok(plan)
             }
             Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            Statement::CreateView(cv) => {
+                if cv.materialized {
+                    return Err(MySqlError::syntax_error("MATERIALIZED"));
+                }
+                let (db, name) = self.resolve_table_name(&cv.name)?;
+                let sql = cv.query.to_string();
+                // Bound now for its errors; bound again wherever it's used.
+                self.bind_query((*cv.query).clone())?;
+                Ok(Plan::CreateView {
+                    db,
+                    name,
+                    columns: cv.columns.iter().map(|c| c.name.value.clone()).collect(),
+                    sql,
+                    or_replace: cv.or_replace,
+                })
+            }
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::View,
+                if_exists,
+                names,
+                ..
+            } => {
+                let mut db = String::new();
+                let mut out = Vec::new();
+                for n in &names {
+                    let (d, name) = self.resolve_table_name(n)?;
+                    db = d;
+                    out.push(name);
+                }
+                Ok(Plan::DropView { db, names: out, if_exists })
+            }
             // `RENAME TABLE a TO b [, c TO d]` (Rails' rename_table).
             Statement::RenameTable(pairs) => {
                 let mut out = Vec::new();
@@ -1634,10 +1684,53 @@ impl Binder {
             TableFactor::Table { name, alias, .. } => {
                 let (db, table) = self.resolve_table_name(name)?;
                 let alias = alias.as_ref().map(|a| a.name.value.clone());
+                if let Some(view) = self.views.get(&(db.clone(), table.clone())).cloned() {
+                    return self.bind_view(&db, &view, alias);
+                }
                 Ok(Plan::Scan { db, table, alias })
             }
             _ => Err(MySqlError::unsupported("table factor")),
         }
+    }
+
+    /// A view used in FROM: its SELECT, as a derived table named after it.
+    fn bind_view(
+        &mut self,
+        db: &str,
+        view: &View,
+        alias: Option<String>,
+    ) -> Result<Plan, MySqlError> {
+        let key = (db.to_string(), view.name.clone());
+        if self.view_stack.contains(&key) {
+            return Err(MySqlError::new(
+                1462,
+                "HY000",
+                format!("`{db}`.`{}` contains view recursion", view.name),
+            ));
+        }
+        let stmts = Parser::parse_sql(&MySqlDialect {}, &view.sql)
+            .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
+        let Some(Statement::Query(q)) = stmts.into_iter().next() else {
+            return Err(MySqlError::new(
+                1356,
+                "HY000",
+                format!("View '{db}.{}' references invalid table(s) or column(s)", view.name),
+            ));
+        };
+        // The view's query sees its own database and none of the
+        // enclosing query's CTEs.
+        let saved_db = std::mem::replace(&mut self.current_db, Some(db.to_string()));
+        let saved_ctes = std::mem::take(&mut self.ctes);
+        self.view_stack.push(key);
+        let plan = self.bind_query(*q);
+        self.view_stack.pop();
+        self.ctes = saved_ctes;
+        self.current_db = saved_db;
+        Ok(Plan::Derived {
+            plan: Box::new(plan?),
+            alias: alias.unwrap_or_else(|| view.name.clone()),
+            columns: view.columns.clone(),
+        })
     }
 
     /// A window function call: `func(args) OVER (spec)` or `OVER name`.

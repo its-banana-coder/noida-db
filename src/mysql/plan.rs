@@ -417,6 +417,22 @@ pub enum Plan {
         /// The index's name (a plain index's too).
         name: String,
     },
+    CreateView {
+        db: String,
+        name: String,
+        columns: Vec<String>,
+        sql: String,
+        or_replace: bool,
+    },
+    DropView {
+        db: String,
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    ShowCreateView {
+        db: String,
+        name: String,
+    },
     /// `RENAME TABLE a TO b, c TO d`: (db, table, new name) each.
     RenameTables(Vec<(String, String, String)>),
     Insert {

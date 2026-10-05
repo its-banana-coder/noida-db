@@ -633,7 +633,8 @@ impl Engine {
             _ => {}
         }
 
-        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql);
+        let views = std::sync::Arc::new(self.db.lock().unwrap().view_defs());
+        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql).with_views(views);
         let plan = binder.bind_statement(stmt)?;
         self.last_column_names = {
             let state = self.db.lock().unwrap();
@@ -713,7 +714,8 @@ impl Engine {
 
     /// Evaluates a standalone expression (a `SET @x = ...` value).
     fn eval_scalar(&mut self, e: sqlparser::ast::Expr, sql: &str) -> Result<Value, MySqlError> {
-        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql);
+        let views = std::sync::Arc::new(self.db.lock().unwrap().view_defs());
+        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql).with_views(views);
         let expr = binder.bind_scalar(e)?;
         let plan =
             Plan::Project { source: Box::new(Plan::Dummy), exprs: vec![expr], names: vec![] };

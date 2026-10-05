@@ -291,8 +291,11 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             continue;
                         }
                         let stmt = asts.remove(0);
-                        let mut binder =
-                            Binder::new(session.engine.current_db.clone()).with_sql(&sql);
+                        let views =
+                            std::sync::Arc::new(session.engine.db.lock().unwrap().view_defs());
+                        let mut binder = Binder::new(session.engine.current_db.clone())
+                            .with_sql(&sql)
+                            .with_views(views);
                         match binder.bind_statement(stmt) {
                             Ok(plan) => {
                                 let stmt_id = session.stmt_id_counter;
