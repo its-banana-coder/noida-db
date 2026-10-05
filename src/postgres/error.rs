@@ -175,6 +175,7 @@ pub mod code {
     pub const DUPLICATE_TABLE: &str = "42P07";
     pub const DUPLICATE_ALIAS: &str = "42712";
     pub const DUPLICATE_OBJECT: &str = "42710";
+    pub const UNDEFINED_FILE: &str = "58P01";
     pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
     pub const AMBIGUOUS_COLUMN: &str = "42702";
