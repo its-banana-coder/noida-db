@@ -795,8 +795,6 @@ impl Engine {
             S::Revoke { .. } => Ok(StmtResult::tag("REVOKE")),
             S::Lock { .. } => Ok(StmtResult::tag("LOCK TABLE")),
             S::CreateRole { .. } => Ok(StmtResult::tag("CREATE ROLE")),
-            S::CreateExtension { .. } => Ok(StmtResult::tag("CREATE EXTENSION")),
-            S::DropExtension { .. } => Ok(StmtResult::tag("DROP EXTENSION")),
             other => self.run_data_statement(s, other, params, param_types),
         }
     }
@@ -1343,6 +1341,21 @@ pub(crate) fn run_one(
                 cv.materialized,
                 cv.temporary,
             )?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::AlterIndex { name, operation: a::AlterIndexOperation::RenameIndex { index_name } } => {
+            let mut d = ddl(ctx, info);
+            let tag = d.rename_index(name, index_name)?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::CreateExtension(ce) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.create_extension(ce)?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::DropExtension(de) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.drop_extension(de)?;
             Ok(StmtResult::tag(tag))
         }
         S::CreateIndex(ci) => {

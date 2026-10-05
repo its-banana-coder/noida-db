@@ -602,6 +602,7 @@ impl Ddl<'_, '_> {
             Err(e) => return Err(e),
         };
         let mut seq = self.ctx.db.sequences.get(&found).cloned().unwrap();
+        let old_text = self.ctx.db.regclass_text(seq.schema, &seq.name, &self.info.search_path);
         apply_seq_options(&mut seq, d, false)?;
         if let Some(new_name) = &d.rename_to {
             if self.ctx.db.relation_exists(seq.schema, new_name) {
@@ -619,6 +620,29 @@ impl Ddl<'_, '_> {
                     format!("schema \"{schema}\" does not exist"),
                 )
             })?;
+        }
+        // Defaults name the sequence as text (Postgres holds its OID):
+        // follow a rename or move.
+        let new_text = self.ctx.db.regclass_text(seq.schema, &seq.name, &self.info.search_path);
+        if new_text != old_text {
+            let (from, to) = (format!("'{old_text}'::regclass"), format!("'{new_text}'::regclass"));
+            let oids: Vec<u32> = self
+                .ctx
+                .db
+                .tables
+                .values()
+                .filter(|t| {
+                    t.columns.iter().any(|c| c.default.as_ref().is_some_and(|d| d.contains(&from)))
+                })
+                .map(|t| t.oid)
+                .collect();
+            for oid in oids {
+                for c in &mut self.ctx.db.table_mut(oid).unwrap().columns {
+                    if let Some(d) = &mut c.default {
+                        *d = d.replace(&from, &to);
+                    }
+                }
+            }
         }
         self.ctx.db.sequences.insert(found, seq);
         if let Some(restart) = d.restart {
@@ -793,6 +817,99 @@ impl Ddl<'_, '_> {
         t.rows = rows;
         t.matview_populated = true;
         Ok("REFRESH MATERIALIZED VIEW".into())
+    }
+
+    pub fn create_extension(&mut self, ce: &a::CreateExtension) -> PgResult<String> {
+        let name = ce.name.value.clone();
+        if !EXTENSIONS.iter().any(|(n, ..)| *n == name) {
+            return Err(PgError::new(
+                code::UNDEFINED_FILE,
+                format!(
+                    "could not open extension control file \"/usr/share/postgresql/16/extension/{name}.control\": No such file or directory"
+                ),
+            ));
+        }
+        if name == "plpgsql" || self.ctx.db.extensions.contains_key(&name) {
+            if ce.if_not_exists {
+                let msg = format!("extension \"{name}\" already exists, skipping");
+                self.ctx.rt.notices.push(PgError::notice(msg));
+                return Ok("CREATE EXTENSION".into());
+            }
+            return Err(PgError::new(
+                code::DUPLICATE_OBJECT,
+                format!("extension \"{name}\" already exists"),
+            ));
+        }
+        let schema = match &ce.schema {
+            Some(s) => self.ctx.db.schema_by_name(&s.value).ok_or_else(|| {
+                PgError::new(
+                    code::INVALID_SCHEMA_NAME,
+                    format!("schema \"{}\" does not exist", s.value),
+                )
+            })?,
+            None => self.target(std::slice::from_ref(&name))?.0,
+        };
+        let oid = self.ctx.db.alloc_oid();
+        self.ctx.db.extensions.insert(name, (oid, schema));
+        Ok("CREATE EXTENSION".into())
+    }
+
+    pub fn drop_extension(&mut self, de: &a::DropExtension) -> PgResult<String> {
+        for id in &de.names {
+            let name = &id.value;
+            if name == "plpgsql" || self.ctx.db.extensions.remove(name).is_some() {
+                continue;
+            }
+            if de.if_exists {
+                let msg = format!("extension \"{name}\" does not exist, skipping");
+                self.ctx.rt.notices.push(PgError::notice(msg));
+                continue;
+            }
+            return Err(PgError::new(
+                code::UNDEFINED_OBJECT,
+                format!("extension \"{name}\" does not exist"),
+            ));
+        }
+        Ok("DROP EXTENSION".into())
+    }
+
+    /// `ALTER INDEX name RENAME TO new`; a constraint's index renames the
+    /// constraint too, as in Postgres.
+    pub fn rename_index(&mut self, name: &a::ObjectName, new: &a::ObjectName) -> PgResult<String> {
+        let parts = name_parts(name);
+        let n = parts.last().cloned().unwrap_or_default();
+        let schemas: Vec<u32> = if parts.len() > 1 {
+            self.ctx.db.schema_by_name(&parts[parts.len() - 2]).into_iter().collect()
+        } else {
+            self.info.search_path.iter().filter_map(|s| self.ctx.db.schema_by_name(s)).collect()
+        };
+        let found =
+            schemas.iter().find_map(|&s| self.ctx.db.find_index(s, &n).map(|(t, i)| (s, t, i.oid)));
+        let Some((schema, table, idx_oid)) = found else {
+            return Err(PgError::new(
+                code::UNDEFINED_TABLE,
+                format!("relation \"{n}\" does not exist"),
+            ));
+        };
+        let new_name = types::truncate_name(&name_parts(new).pop().unwrap_or_default());
+        if self.ctx.db.relation_exists(schema, &new_name) {
+            return Err(PgError::new(
+                code::DUPLICATE_TABLE,
+                format!("relation \"{new_name}\" already exists"),
+            ));
+        }
+        let t = self.ctx.db.table_mut(table).unwrap();
+        for i in &mut t.indexes {
+            if i.oid == idx_oid {
+                i.name = new_name.clone();
+            }
+        }
+        for c in &mut t.constraints {
+            if c.index_oid == Some(idx_oid) {
+                c.name = new_name.clone();
+            }
+        }
+        Ok("ALTER INDEX".into())
     }
 
     pub fn create_index(&mut self, ci: &a::CreateIndex) -> PgResult<String> {
@@ -1243,6 +1360,36 @@ impl Ddl<'_, '_> {
         let schema = (parts.len() > 1).then(|| parts[parts.len() - 2].clone());
         let (db, info) = self.binder();
         let b = Binder::new(&db, &info, &[]);
+        // `ALTER TABLE` renames an index or a sequence as well.
+        if let [a::AlterTableOperation::RenameTable { table_name }] = ops {
+            let new = match table_name {
+                a::RenameTableNameKind::As(n) | a::RenameTableNameKind::To(n) => n,
+            };
+            let schemas: Vec<u32> = match &schema {
+                Some(s) => self.ctx.db.schema_by_name(s).into_iter().collect(),
+                None => self
+                    .info
+                    .search_path
+                    .iter()
+                    .filter_map(|s| self.ctx.db.schema_by_name(s))
+                    .collect(),
+            };
+            if b.lookup_table_oid(schema.as_deref(), &tname).is_err() {
+                if schemas.iter().any(|&s| self.ctx.db.find_index(s, &tname).is_some()) {
+                    self.rename_index(name, new)?;
+                    return Ok("ALTER TABLE".into());
+                }
+                if schemas.iter().any(|&s| self.ctx.db.find_sequence(s, &tname).is_some()) {
+                    let d = SeqDdl {
+                        name: name_parts(name),
+                        rename_to: name_parts(new).pop(),
+                        ..Default::default()
+                    };
+                    self.alter_sequence(&d)?;
+                    return Ok("ALTER TABLE".into());
+                }
+            }
+        }
         let oid = match b.lookup_table_oid(schema.as_deref(), &tname) {
             Ok(o) => o,
             Err(e) => {

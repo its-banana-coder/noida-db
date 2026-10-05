@@ -43,6 +43,10 @@ use sqlparser::parser::Parser;
 
 /// Parses a SQL string into statements.
 pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
+    let after_db = rewrite_create_database(sql)?;
+    let sql = after_db.as_deref().unwrap_or(sql);
+    let after_ext = rewrite_extension_schema(sql);
+    let sql = after_ext.as_deref().unwrap_or(sql);
     let after_seq = seqddl::rewrite(sql)?;
     let sql1 = after_seq.as_deref().unwrap_or(sql);
     let after_refresh = refresh::rewrite(sql1)?;
@@ -71,6 +75,122 @@ fn rewrite_overriding(sql: &str) -> Option<String> {
     let re_user = regex_lite::Regex::new(r"(?is)\boverriding\s+user\s+value\b").ok()?;
     let out = re_user.replace_all(&out, "").into_owned();
     (out != sql).then_some(out)
+}
+
+/// `CREATE DATABASE name [WITH] option [=] value ...`: sqlparser takes no
+/// options, and they don't change a noida-db database (always UTF8, C
+/// locale), so they're checked and dropped. An encoding other than UTF8 is
+/// an error rather than silently ignored.
+fn rewrite_create_database(sql: &str) -> PgResult<Option<String>> {
+    let re = regex_lite::Regex::new(
+        r#"(?is)^\s*create\s+database\s+("(?:[^"]|"")+"|[a-z_][a-z0-9_$]*)\s+(?:with\s+)?(.+?)\s*;?\s*$"#,
+    )
+    .expect("regex");
+    let Some(m) = re.captures(sql) else { return Ok(None) };
+    let opt = regex_lite::Regex::new(
+        r#"(?is)^\s*(connection\s+limit|[a-z_]+)\s*=?\s*('(?:[^']|'')*'|"(?:[^"]|"")*"|-?[a-z0-9_.]+)"#,
+    )
+    .expect("regex");
+    let mut rest = &m[2];
+    while !rest.trim().is_empty() {
+        let Some(o) = opt.captures(rest) else {
+            let near = rest.split_whitespace().next().unwrap_or("");
+            return Err(PgError::new(
+                code::SYNTAX_ERROR,
+                format!("syntax error at or near \"{near}\""),
+            ));
+        };
+        let key = o[1].to_ascii_lowercase();
+        let value = o[2].trim_matches(|c| c == '\'' || c == '"').to_string();
+        match key.split_whitespace().collect::<Vec<_>>().join(" ").as_str() {
+            "encoding" => {
+                let norm: String = value
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                if !matches!(norm.as_str(), "utf8" | "unicode" | "6" | "default") {
+                    let known = matches!(
+                        norm.as_str(),
+                        "sqlascii"
+                            | "latin1"
+                            | "latin2"
+                            | "latin3"
+                            | "latin4"
+                            | "latin5"
+                            | "latin6"
+                            | "latin7"
+                            | "latin8"
+                            | "latin9"
+                            | "latin10"
+                            | "win1250"
+                            | "win1251"
+                            | "win1252"
+                            | "win1253"
+                            | "win1254"
+                            | "win1255"
+                            | "win1256"
+                            | "win1257"
+                            | "win1258"
+                            | "win866"
+                            | "win874"
+                            | "koi8r"
+                            | "koi8u"
+                            | "eucjp"
+                            | "euccn"
+                            | "euckr"
+                            | "euctw"
+                            | "eucjis2004"
+                            | "iso88595"
+                            | "iso88596"
+                            | "iso88597"
+                            | "iso88598"
+                            | "mulecode"
+                            | "sjis"
+                            | "big5"
+                            | "gbk"
+                            | "uhc"
+                            | "gb18030"
+                            | "johab"
+                            | "shiftjis2004"
+                    ) || norm.chars().all(|c| c.is_ascii_digit());
+                    return Err(if known {
+                        PgError::new(
+                            code::FEATURE_NOT_SUPPORTED,
+                            format!(
+                                "encoding \"{value}\" is not supported: noida-db databases are UTF8"
+                            ),
+                        )
+                    } else {
+                        PgError::new(
+                            code::UNDEFINED_OBJECT,
+                            format!("{value} is not a valid encoding name"),
+                        )
+                    });
+                }
+            }
+            "owner" | "template" | "locale" | "lc_collate" | "lc_ctype" | "icu_locale"
+            | "locale_provider" | "collation_version" | "tablespace" | "allow_connections"
+            | "connection limit" | "is_template" | "oid" | "strategy" | "builtin_locale"
+            | "icu_rules" => {}
+            other => {
+                return Err(PgError::new(
+                    code::SYNTAX_ERROR,
+                    format!("option \"{other}\" not recognized"),
+                ));
+            }
+        }
+        rest = &rest[o[0].len()..];
+    }
+    Ok(Some(format!("CREATE DATABASE {}", &m[1])))
+}
+
+/// `CREATE EXTENSION x SCHEMA s`: sqlparser wants `WITH SCHEMA`, which
+/// Postgres treats the same.
+fn rewrite_extension_schema(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(r"(?is)^(\s*create\s+extension\s+(?:if\s+not\s+exists\s+)?(?:\x22[^\x22]+\x22|\S+))\s+schema\b")
+        .expect("regex");
+    re.is_match(sql).then(|| re.replace(sql, "$1 WITH SCHEMA").into_owned())
 }
 
 /// Parses a single SQL expression (defaults, check constraints).
