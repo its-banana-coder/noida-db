@@ -1526,6 +1526,14 @@ pub fn call(
                     "factorial of a negative number is undefined",
                 ));
             }
+            // 32177! is the largest that fits numeric's 131072 digits;
+            // computing beyond it (as Postgres refuses to) takes minutes.
+            if n > 32177 {
+                return Err(err(
+                    code::NUMERIC_VALUE_OUT_OF_RANGE,
+                    "value overflows numeric format",
+                ));
+            }
             let mut r = Numeric::from_i64(1);
             for i in 2..=n {
                 r = r.mul(&Numeric::from_i64(i));
