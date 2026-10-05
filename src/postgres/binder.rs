@@ -89,6 +89,9 @@ pub struct Binder<'a> {
     frames: Vec<AggFrame>,
     /// The current SELECT's `WINDOW name AS (...)` definitions.
     named_windows: Vec<a::NamedWindowDefinition>,
+    /// Views being expanded, innermost last (a cycle is an error, not a
+    /// stack overflow).
+    expanding_views: Vec<u32>,
 }
 
 fn ident(id: &a::Ident) -> String {
@@ -131,6 +134,7 @@ impl<'a> Binder<'a> {
             cte_slots: 0,
             frames: vec![],
             named_windows: vec![],
+            expanding_views: vec![],
         }
     }
 
@@ -1653,13 +1657,21 @@ impl<'a> Binder<'a> {
         };
         let t = self.db.table(oid).unwrap();
         if t.kind == RelKind::View {
+            if self.expanding_views.contains(&oid) {
+                return Err(PgError::new(
+                    code::INVALID_OBJECT_DEFINITION,
+                    format!("infinite recursion detected in rules for relation \"{}\"", t.name),
+                ));
+            }
             let sql = t.view_sql.clone().unwrap_or_default();
             let stmts = super::parse_sql(&sql)?;
             let a::Statement::Query(q) = &stmts[0] else {
                 return Err(PgError::new(code::INTERNAL_ERROR, "bad view definition"));
             };
             let saved = std::mem::take(&mut self.scopes);
+            self.expanding_views.push(oid);
             let bound = self.bind_query(q);
+            self.expanding_views.pop();
             self.scopes = saved;
             let (query, qcols) = bound?;
             let cols: Vec<OutCol> = t
