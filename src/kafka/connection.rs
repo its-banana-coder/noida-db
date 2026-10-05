@@ -57,6 +57,21 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
             Err(_) => break,
         };
 
+        if !matches!(
+            api_key,
+            ApiKey::ApiVersions
+                | ApiKey::Metadata
+                | ApiKey::Fetch
+                | ApiKey::ListOffsets
+                | ApiKey::FindCoordinator
+                | ApiKey::Heartbeat
+                | ApiKey::DescribeGroups
+                | ApiKey::ListGroups
+                | ApiKey::OffsetFetch
+                | ApiKey::DescribeConfigs
+        ) {
+            crate::persistence::mark("kafka");
+        }
         let response_buf = match api_key {
             ApiKey::ApiVersions => {
                 use kafka_protocol::messages::api_versions_response::ApiVersion;

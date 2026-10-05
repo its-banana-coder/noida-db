@@ -171,6 +171,22 @@ impl Engine {
 
 impl Engine {
     pub fn dispatch(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
+        let read = matches!(method, "GET" | "HEAD")
+            || [
+                "_search",
+                "_count",
+                "_msearch",
+                "_mget",
+                "_explain",
+                "_validate",
+                "_field_caps",
+                "_analyze",
+            ]
+            .iter()
+            .any(|p| path.contains(p));
+        if !read {
+            crate::persistence::mark("elasticsearch");
+        }
         let segments: Vec<&str> =
             path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
         let q = query_params(query);
