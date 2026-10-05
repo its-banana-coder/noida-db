@@ -3339,6 +3339,14 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Postgres's MaxArraySize error.
+fn array_too_big() -> PgError {
+    PgError::new(
+        code::PROGRAM_LIMIT_EXCEEDED,
+        format!("array size exceeds the maximum allowed ({})", types::MAX_ARRAY_SIZE),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3379,12 +3387,4 @@ mod tests {
         let s = to_char(&Value::Ts(t), Type::TIMESTAMP, "FMMonth FMDD, HH12 AM", &env).unwrap();
         assert_eq!(s.as_str(), Some("March 5, 02 PM"));
     }
-}
-
-/// Postgres's MaxArraySize error.
-fn array_too_big() -> PgError {
-    PgError::new(
-        code::PROGRAM_LIMIT_EXCEEDED,
-        format!("array size exceeds the maximum allowed ({})", types::MAX_ARRAY_SIZE),
-    )
 }
