@@ -693,4 +693,14 @@ PG_EDGES.update({
         'DROP EXTENSION "pgcrypto"',
         'DROP EXTENSION IF EXISTS "pgcrypto"',
     ),
+    "pg edge: a view cycle is an error, not a crash": steps(
+        "CREATE TABLE vc_t (a int)",
+        "CREATE VIEW vc_2 AS SELECT * FROM vc_t",
+        "CREATE VIEW vc_3 AS SELECT * FROM vc_2",
+        "CREATE OR REPLACE VIEW vc_2 AS SELECT * FROM vc_3",
+        "SELECT * FROM vc_2",
+        "SELECT * FROM (SELECT * FROM vc_3) s",
+        "WITH c AS (SELECT * FROM vc_2) SELECT * FROM c",
+        "SELECT 1",
+    ),
 })
