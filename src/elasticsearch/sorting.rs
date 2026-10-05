@@ -253,8 +253,7 @@ pub fn compare_keys(specs: &[SortSpec], a: &[Value], b: &[Value]) -> Ordering {
 /// may be given as strings).
 pub fn after_keys(specs: &[SortSpec], after: &[Value]) -> Result<Vec<Value>, EsError> {
     if after.len() != specs.len() {
-        return Err(EsError::new(
-            400,
+        return Err(EsError::shard_failure(
             "illegal_argument_exception",
             &format!("search_after has {} value(s) but sort has {}.", after.len(), specs.len()),
         ));

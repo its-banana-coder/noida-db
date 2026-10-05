@@ -204,6 +204,10 @@ scenario("pit", setup() + [
      {"pick": hits}),
     ("POST", "/_search", {"pit": {"id": "{pit}"}, "sort": [{"price": "asc"}], "size": 2, "search_after": [10]},
      {"pick": hits}),
+    # search_after carrying the implicit _shard_doc tiebreaker's value.
+    ("POST", "/_search", {"pit": {"id": "{pit}"}, "sort": [{"price": "asc"}], "size": 2, "search_after": [10, 0]},
+     {"pick": hits}),
+    ("POST", "/_search", {"pit": {"id": "{pit}"}, "sort": [{"price": "asc"}], "size": 2, "search_after": [10, 0, 1]}),
     ("POST", "/edge/_search", {"pit": {"id": "{pit}"}}),
     ("DELETE", "/_pit", {"id": "{pit}"}, {"pick": lambda r: r}),
     ("POST", "/_search", {"pit": {"id": "{pit}"}}),

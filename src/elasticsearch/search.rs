@@ -2129,7 +2129,10 @@ pub fn search_with(
         Some(spec) => sorting::parse(spec, mappings, typed)?,
         None => Vec::new(),
     };
-    if opts.pit && !specs.is_empty() && search_after.is_none() {
+    // The implicit `_shard_doc` tiebreaker of a point-in-time search; a
+    // `search_after` taken from such a hit carries its value too.
+    let after_len = search_after.map(|a| a.as_array().map_or(1, Vec::len));
+    if opts.pit && !specs.is_empty() && after_len.is_none_or(|n| n == specs.len() + 1) {
         specs.extend(sorting::parse(&json!("_shard_doc"), mappings, typed)?);
     }
     if search_after.is_some() && specs.is_empty() {
