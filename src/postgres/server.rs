@@ -362,10 +362,8 @@ fn startup_options(opts: &str) -> Vec<(String, String)> {
     while let Some(w) = it.next() {
         let kv = if w == "-c" {
             it.next()
-        } else if let Some(r) = w.strip_prefix("--").or_else(|| w.strip_prefix("-c")) {
-            Some(r.to_string())
         } else {
-            None
+            w.strip_prefix("--").or_else(|| w.strip_prefix("-c")).map(str::to_string)
         };
         if let Some((k, v)) = kv.as_deref().and_then(|kv| kv.split_once('=')) {
             out.push((k.replace('-', "_"), v.to_string()));
