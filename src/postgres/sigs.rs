@@ -135,7 +135,7 @@ array_ndims(anyarray)int4 array_dims(anyarray)text
 !array_set_element(anyarray,int4,anyelement)anyarray !array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
 !array_remove(anyarray,anyelement)anyarray !array_replace(anyarray,anyelement,anyelement)anyarray
 !array_position(anyarray,anyelement)int4 !array_positions(anyarray,anyelement)_int4
-array_fill(anyelement,_int4)anyarray trim_array(anyarray,int4)anyarray
+array_fill(anyelement,_int4)anyarray array_fill(anyelement,_int4,_int4)anyarray trim_array(anyarray,int4)anyarray
 s:unnest(anyarray)anyelement s:generate_subscripts(anyarray,int4)int4 s:pg_partition_ancestors(regclass)regclass
 s:generate_series(int4,int4)int4 s:generate_series(int4,int4,int4)int4
 s:generate_series(int8,int8)int8 s:generate_series(int8,int8,int8)int8

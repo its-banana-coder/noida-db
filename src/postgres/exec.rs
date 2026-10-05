@@ -1813,6 +1813,16 @@ fn equi_join_index(
     Some((lk, map))
 }
 
+/// The most rows a set-returning function may produce: noida-db builds its
+/// result in memory, where Postgres streams it.
+const MAX_SRF_ROWS: usize = 10_000_000;
+
+fn too_many_rows(func: &str) -> PgError {
+    PgError::new(code::OUT_OF_MEMORY, "out of memory").detail(format!(
+        "{func} would return more than {MAX_SRF_ROWS} rows; noida-db materializes set-returning functions"
+    ))
+}
+
 fn join_ok(on: &Option<Expr>, row: &[Value], ctx: &mut Ctx) -> PgResult<bool> {
     match on {
         None => Ok(true),
@@ -1849,6 +1859,10 @@ fn srf_rows(
                     }
                     let mut out = vec![];
                     let mut v = *from;
+                    let count = (*to as i128 - *from as i128) / step as i128 + 1;
+                    if count > MAX_SRF_ROWS as i128 {
+                        return Err(too_many_rows("generate_series"));
+                    }
                     while (step > 0 && v <= *to) || (step < 0 && v >= *to) {
                         ctx.rt.tick()?;
                         out.push(vec![Value::Int(v)]);
@@ -1880,8 +1894,8 @@ fn srf_rows(
                         }
                         out.push(vec![Value::Num(v.clone())]);
                         v = v.add(&step);
-                        if out.len() > 1_000_000 {
-                            break;
+                        if out.len() > MAX_SRF_ROWS {
+                            return Err(too_many_rows("generate_series"));
                         }
                     }
                     out
@@ -1917,8 +1931,8 @@ fn srf_rows(
                             Ok(n) if n != v => v = n,
                             _ => break,
                         }
-                        if out.len() > 1_000_000 {
-                            break;
+                        if out.len() > MAX_SRF_ROWS {
+                            return Err(too_many_rows("generate_series"));
                         }
                     }
                     out
