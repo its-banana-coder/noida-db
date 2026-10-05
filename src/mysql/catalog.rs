@@ -73,6 +73,10 @@ pub struct Table {
     pub unique_keys: Vec<UniqueKey>,
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
+    /// Plain (non-unique) `KEY`/`INDEX`es: not used for lookups, kept so
+    /// SHOW INDEX, SHOW CREATE TABLE and schema dumps see them.
+    #[serde(default)]
+    pub indexes: Vec<UniqueKey>,
 }
 
 /// A `FOREIGN KEY (columns) REFERENCES ref_db.ref_table (ref_columns)`.
@@ -118,7 +122,49 @@ impl Table {
             next_auto_increment: 1,
             unique_keys: Vec::new(),
             foreign_keys: Vec::new(),
+            indexes: Vec::new(),
         }
+    }
+
+    /// Every index as `(name, column indices, unique)`: PRIMARY, the UNIQUE
+    /// keys, then the plain ones, as MySQL lists them.
+    pub fn all_indexes(&self) -> Vec<(String, Vec<usize>, bool)> {
+        let mut out: Vec<_> = self.keys().into_iter().map(|(n, c)| (n, c, true)).collect();
+        for k in &self.indexes {
+            let idx: Vec<usize> = k
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    self.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c))
+                })
+                .collect();
+            if !idx.is_empty() {
+                out.push((k.name.clone(), idx, false));
+            }
+        }
+        out
+    }
+
+    /// Whether an index (of any kind) is named `name`.
+    pub fn has_index(&self, name: &str) -> bool {
+        (name.eq_ignore_ascii_case("PRIMARY") && self.columns.iter().any(|c| c.primary_key))
+            || self
+                .unique_keys
+                .iter()
+                .chain(&self.indexes)
+                .any(|k| k.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The name MySQL gives an unnamed index: its first column, then
+    /// `_2`, `_3`, ... while that's taken.
+    pub fn index_name_for(&self, first_col: &str) -> String {
+        let mut name = first_col.to_string();
+        let mut n = 2;
+        while self.has_index(&name) {
+            name = format!("{first_col}_{n}");
+            n += 1;
+        }
+        name
     }
 
     /// Every key that must hold unique values, as `(name, column indices)`:

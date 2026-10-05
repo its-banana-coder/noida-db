@@ -668,6 +668,36 @@ MYSQL_QUERIES = {
         (A, "UPDATE t SET v = @m + 1 WHERE id = 1"),
         (A, "SELECT v FROM t ORDER BY id"),
     ],
+    "rails migrations: indexes, renames, bare keywords": [
+        # CURRENT_USER is left out: the account's host differs by environment.
+        (A, "SELECT DATABASE(), CURRENT_USER = CURRENT_USER(), current_date = curdate(), curtime() = current_time"),
+        (A, "SELECT nosuchcol"),
+        (A, "CREATE TABLE ra (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, a int, b varchar(10), KEY index_ra_on_a (a), INDEX (b), KEY (b))"),
+        (A, "CREATE INDEX index_ra_on_a_b ON ra (a, b)"),
+        (A, "CREATE INDEX index_ra_on_a_b ON ra (b)"),
+        (A, "CREATE UNIQUE INDEX uq_ab ON ra (a, b)"),
+        (A, "ALTER TABLE ra ADD INDEX idx_x (b, a), ADD KEY (a)"),
+        (A, "SELECT index_name, non_unique, column_name, seq_in_index FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = 'ra' ORDER BY index_name, seq_in_index"),
+        (A, "INSERT INTO ra (a, b) VALUES (1, 'x'), (2, 'y')"),
+        (A, "SHOW CREATE TABLE ra"),
+        (A, "RENAME TABLE ra TO rb"),
+        (A, "ALTER TABLE rb RENAME INDEX index_ra_on_a TO index_rb_on_a, RENAME KEY index_ra_on_a_b TO index_rb_on_a_b"),
+        (A, "ALTER TABLE rb RENAME INDEX nope TO x"),
+        (A, "ALTER TABLE rb RENAME INDEX index_rb_on_a TO idx_x"),
+        (A, "DROP INDEX index_rb_on_a ON rb"),
+        (A, "ALTER TABLE rb DROP INDEX b"),
+        (A, "ALTER TABLE rb DROP INDEX nope"),
+        (A, "DROP INDEX nope ON rb"),
+        (A, "ALTER TABLE rb DROP COLUMN b"),
+        (A, "INSERT INTO rb (a) VALUES (3)"),
+        (A, "SELECT id, a FROM rb ORDER BY id"),
+        (A, "SHOW CREATE TABLE rb"),
+        (A, "RENAME TABLE rb TO rc, rc TO rd"),
+        (A, "CREATE TABLE d (id int AUTO_INCREMENT PRIMARY KEY, a int, b int, UNIQUE KEY uab (a, b))"),
+        (A, "INSERT INTO d (a, b) VALUES (1, 1), (1, 2)"),
+        (A, "ALTER TABLE d DROP COLUMN b"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

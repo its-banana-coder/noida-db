@@ -253,6 +253,33 @@ impl Binder {
                 Ok(plan)
             }
             Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            // `RENAME TABLE a TO b [, c TO d]` (Rails' rename_table).
+            Statement::RenameTable(pairs) => {
+                let mut out = Vec::new();
+                for p in pairs {
+                    let (db, table) = self.resolve_table_name(&p.old_name)?;
+                    let (new_db, new) = self.resolve_table_name(&p.new_name)?;
+                    if new_db != db {
+                        return Err(MySqlError::unsupported("RENAME TABLE across databases"));
+                    }
+                    out.push((db, table, new));
+                }
+                Ok(Plan::RenameTables(out))
+            }
+            // `DROP INDEX name ON t` (Rails' remove_index).
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::Index,
+                names,
+                table: Some(table),
+                ..
+            } => {
+                let (db, table) = self.resolve_table_name(&table)?;
+                let ops = names
+                    .iter()
+                    .map(|n| AlterOp::DropKey(n.to_string().trim_matches('`').to_string()))
+                    .collect();
+                Ok(Plan::AlterTable { db, table, ops })
+            }
             // Found via testing: DROP DATABASE was unsupported, which broke
             // test runners (Django's among them) that create and drop a
             // test database on every run.
@@ -320,12 +347,18 @@ impl Binder {
                         .map(|n| n.to_string().trim_matches('`').to_string())
                         .unwrap_or_default()
                 });
+                let name = ci
+                    .name
+                    .as_ref()
+                    .map(|n| n.to_string().trim_matches('`').to_string())
+                    .unwrap_or_default();
                 Ok(Plan::CreateIndex {
                     db,
                     table,
                     columns,
                     if_not_exists: ci.if_not_exists,
                     unique,
+                    name,
                 })
             }
             Statement::Insert(insert) => self.bind_insert(insert),
@@ -611,6 +644,16 @@ impl Binder {
                         pos: pos(column_position),
                     }
                 }
+                // `RENAME INDEX|KEY a TO b`, rewritten by the engine into a
+                // marked column rename (the SQL parser has no such clause).
+                A::RenameColumn { old_column_name, new_column_name }
+                    if old_column_name.value.starts_with(RENAME_KEY_MARKER) =>
+                {
+                    AlterOp::RenameKey {
+                        old: old_column_name.value[RENAME_KEY_MARKER.len()..].to_string(),
+                        new: new_column_name.value,
+                    }
+                }
                 A::RenameColumn { old_column_name, new_column_name } => {
                     AlterOp::RenameColumn { old: old_column_name.value, new: new_column_name.value }
                 }
@@ -636,7 +679,12 @@ impl Binder {
                     TableConstraint::ForeignKey(fk) => {
                         AlterOp::AddForeignKey(self.bind_foreign_key(&fk)?)
                     }
-                    // INDEX, CHECK: accepted, not enforced.
+                    TableConstraint::Index(ix) => {
+                        let columns = idents(&ix.columns);
+                        let name = ix.name.as_ref().map(|i| i.value.clone()).unwrap_or_default();
+                        AlterOp::AddIndex(UniqueKey { name, columns })
+                    }
+                    // CHECK, FULLTEXT, SPATIAL: accepted, not enforced.
                     _ => AlterOp::Noop,
                 },
                 A::DropIndex { name } | A::DropConstraint { name, .. } => {
@@ -692,6 +740,7 @@ impl Binder {
         let (db, table) = self.resolve_table_name(&name)?;
         let mut cols = Vec::new();
         let mut unique_keys: Vec<UniqueKey> = Vec::new();
+        let mut indexes: Vec<UniqueKey> = Vec::new();
 
         for col_def in columns {
             let col = self.bind_column_def(col_def, &mut unique_keys)?;
@@ -727,6 +776,37 @@ impl Binder {
                     unique_keys.push(UniqueKey { name, columns });
                 }
             }
+            if let TableConstraint::Index(ix) = constraint {
+                let columns: Vec<String> = ix
+                    .columns
+                    .iter()
+                    .filter_map(|c| match &c.column.expr {
+                        AstExpr::Identifier(i) => Some(i.value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(first) = columns.first().cloned() {
+                    let name = match &ix.name {
+                        Some(n) => n.value.clone(),
+                        None => {
+                            let taken = |n: &str| {
+                                unique_keys
+                                    .iter()
+                                    .chain(&indexes)
+                                    .any(|k: &UniqueKey| k.name.eq_ignore_ascii_case(n))
+                            };
+                            let mut name = first.clone();
+                            let mut n = 2;
+                            while taken(&name) {
+                                name = format!("{first}_{n}");
+                                n += 1;
+                            }
+                            name
+                        }
+                    };
+                    indexes.push(UniqueKey { name, columns });
+                }
+            }
             if let TableConstraint::PrimaryKey(pk) = constraint {
                 for idx_col in &pk.columns {
                     if let AstExpr::Identifier(ident) = &idx_col.column.expr {
@@ -755,6 +835,7 @@ impl Binder {
             table,
             columns: cols,
             unique_keys,
+            indexes,
             foreign_keys,
             if_not_exists: false,
         })
@@ -1832,7 +1913,15 @@ impl Binder {
                 if ident.quote_style.is_none()
                     && matches!(
                         ident.value.to_ascii_uppercase().as_str(),
-                        "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "LOCALTIMESTAMP" | "LOCALTIME"
+                        "CURRENT_TIMESTAMP"
+                            | "CURRENT_DATE"
+                            | "CURRENT_TIME"
+                            | "LOCALTIMESTAMP"
+                            | "LOCALTIME"
+                            | "CURRENT_USER"
+                            | "UTC_DATE"
+                            | "UTC_TIME"
+                            | "UTC_TIMESTAMP"
                     ) =>
             {
                 Ok(Expr::Call { name: ident.value.to_ascii_uppercase(), args: vec![] })
@@ -1870,6 +1959,13 @@ impl Binder {
             AstExpr::CompoundIdentifier(idents) => {
                 if idents.is_empty() {
                     return Err(MySqlError::unsupported("empty compound identifier"));
+                }
+                // `@@session.x` / `@@global.x` are system variables.
+                if let [scope, var] = &idents[..]
+                    && let Some(scope) = scope.value.strip_prefix("@@")
+                    && matches!(scope.to_ascii_lowercase().as_str(), "session" | "global" | "local")
+                {
+                    return Ok(Expr::SysVar(var.value.clone()));
                 }
                 let dotted = idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
                 Ok(Expr::ColName(dotted))
@@ -2299,6 +2395,9 @@ impl Binder {
             | "SCHEMA"
             | "USER"
             | "CURRENT_USER"
+            | "CURTIME"
+            | "CURRENT_TIME"
+            | "UTC_TIME"
             | "SESSION_USER"
             | "SYSTEM_USER"
             | "CONNECTION_ID"
@@ -2619,3 +2718,7 @@ fn row_query(query: &Query) -> Option<Query> {
     select.distinct = None;
     Some(q)
 }
+
+/// Marks a column rename that is really `RENAME INDEX|KEY old TO new`
+/// (see [`crate::mysql::engine::rewrite_rename_key`]).
+pub const RENAME_KEY_MARKER: &str = "\u{1}noida-rename-key:";

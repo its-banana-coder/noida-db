@@ -654,9 +654,9 @@ never a silent NULL.
 
 DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `ALTER TABLE`
 (`ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME COLUMN`, `RENAME TO`, `ADD`/`DROP`
-`UNIQUE`/`PRIMARY KEY`/`INDEX`, `ALTER COLUMN SET`/`DROP DEFAULT`,
+`UNIQUE`/`PRIMARY KEY`/`INDEX`, `RENAME INDEX`/`KEY`, `ALTER COLUMN SET`/`DROP DEFAULT`,
 `AUTO_INCREMENT =`; foreign keys, enforced (below)), `CREATE [UNIQUE]
-INDEX`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
+INDEX`, `DROP INDEX ... ON`, `RENAME TABLE`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
 [LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
 DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
 `SET` (`sql_mode` and `autocommit` take effect; other variables are
@@ -747,9 +747,11 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   `regex` syntax, which covers ICU's common subset (classes, POSIX
   `[[:alpha:]]`, anchors, groups, repetition) but not look-around or
   backreferences in the pattern.
-- Plain `KEY`/`INDEX`/`FULLTEXT` declarations are accepted and ignored;
-  nothing is indexed, so a foreign key may reference any column (MySQL
-  requires an index there, error 1822).
+- Plain `KEY`/`INDEX` declarations are recorded (SHOW INDEX, SHOW CREATE
+  TABLE, `information_schema.STATISTICS`, renames and drops) but not used
+  for lookups; `FULLTEXT`/`SPATIAL` are accepted and ignored. A foreign key
+  may reference an unindexed column (MySQL requires an index there, error
+  1822).
 - `ON UPDATE`/`ON DELETE SET DEFAULT` (InnoDB rejects it too) and checks
   that a foreign key's column types are compatible (3780).
 - `REPEATABLE READ` snapshots: every statement reads the latest committed
