@@ -698,6 +698,13 @@ MYSQL_QUERIES = {
         (A, "INSERT INTO d (a, b) VALUES (1, 1), (1, 2)"),
         (A, "ALTER TABLE d DROP COLUMN b"),
     ],
+    "joins without ON, recursion limits": [
+        (A, "SELECT count(*) FROM (SELECT 1 a UNION ALL SELECT 2) x JOIN (SELECT 1 b UNION ALL SELECT 2 UNION ALL SELECT 3) y"),
+        (A, "SELECT x.a, y.b FROM (SELECT 1 a UNION ALL SELECT 2) x JOIN (SELECT 5 b) y WHERE x.a = 2"),
+        (A, "SELECT count(*) FROM (SELECT 1 a) x STRAIGHT_JOIN (SELECT 2 b) y"),
+        (A, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000) SELECT count(*) FROM t"),
+        (A, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT count(*) FROM t"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 
