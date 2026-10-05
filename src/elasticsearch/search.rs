@@ -84,6 +84,249 @@ pub struct CommittedDoc {
     /// `_search`.
     #[allow(dead_code)]
     pub version: i64,
+    /// The full source when `source` is a root-level view with nested
+    /// objects removed (a nested object's fields aren't visible to
+    /// queries outside a `nested` query, as in Elasticsearch).
+    pub full_source: Option<Value>,
+}
+
+impl CommittedDoc {
+    fn full(&self) -> &Value {
+        self.full_source.as_ref().unwrap_or(&self.source)
+    }
+}
+
+/// The `nested`-typed object paths in a mapping (`comments`, `a.b`).
+pub(crate) fn nested_paths(mappings: &Value) -> Vec<String> {
+    fn walk(props: Option<&Value>, prefix: &str, out: &mut Vec<String>) {
+        let Some(obj) = props.and_then(Value::as_object) else { return };
+        for (k, v) in obj {
+            let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            if v.get("type").and_then(Value::as_str) == Some("nested") {
+                out.push(full.clone());
+            }
+            walk(v.get("properties"), &full, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(mappings.get("properties"), "", &mut out);
+    out
+}
+
+fn strip_path(v: &mut Value, path: &[&str]) {
+    match v {
+        Value::Object(m) => {
+            if path.len() == 1 {
+                m.remove(path[0]);
+            } else if let Some(child) = m.get_mut(path[0]) {
+                strip_path(child, &path[1..]);
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|e| strip_path(e, path)),
+        _ => {}
+    }
+}
+
+/// Root-level views of `docs`: nested objects removed from what queries
+/// and aggregations see, the full source kept for hits and `nested`.
+fn root_view(mappings: &Value, docs: &[CommittedDoc]) -> Option<Vec<CommittedDoc>> {
+    let paths = nested_paths(mappings);
+    if paths.is_empty() {
+        return None;
+    }
+    Some(
+        docs.iter()
+            .map(|d| {
+                let mut source = d.full().clone();
+                for p in &paths {
+                    strip_path(&mut source, &p.split('.').collect::<Vec<_>>());
+                }
+                CommittedDoc { source, full_source: Some(d.full().clone()), ..d.clone() }
+            })
+            .collect(),
+    )
+}
+
+/// The nested documents under `path` of each of `parents`: child docs
+/// (sources shaped `{"comments": <element>}` so full field paths resolve)
+/// and, for each, its (parent, offset).
+fn nested_children(
+    docs: &[CommittedDoc],
+    parents: impl Iterator<Item = usize>,
+    path: &str,
+) -> (Vec<CommittedDoc>, Vec<(usize, usize)>) {
+    let segs: Vec<&str> = path.split('.').collect();
+    let mut children = Vec::new();
+    let mut owners = Vec::new();
+    for p in parents {
+        let d = &docs[p];
+        let mut node = d.full();
+        let mut ok = true;
+        for s in &segs {
+            match node.get(*s) {
+                Some(n) => node = n,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let elems: Vec<&Value> = match node {
+            Value::Array(a) => a.iter().collect(),
+            Value::Object(_) => vec![node],
+            _ => vec![],
+        };
+        for (offset, e) in elems.into_iter().enumerate() {
+            let mut wrapped = e.clone();
+            for s in segs.iter().rev() {
+                wrapped = json!({ *s: wrapped });
+            }
+            children.push(CommittedDoc {
+                index: d.index.clone(),
+                id: d.id.clone(),
+                source: wrapped,
+                version: d.version,
+                full_source: None,
+            });
+            owners.push((p, offset));
+        }
+    }
+    (children, owners)
+}
+
+fn check_nested_path(mappings: &Value, v: &Value) -> Result<Option<String>, EsError> {
+    let path = v.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    if nested_paths(mappings).contains(&path) {
+        return Ok(Some(path));
+    }
+    if v.get("ignore_unmapped").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(None);
+    }
+    Err(EsError::shard_failure(
+        "query_shard_exception",
+        &format!(
+            "[nested] failed to create query: [nested] nested object under path [{path}] is not \
+             of nested type"
+        ),
+    ))
+}
+
+/// Per matching parent, its matching children: (offset, score, child).
+type InnerMatches = HashMap<usize, Vec<(usize, f32, usize)>>;
+
+fn nested_matches(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<Option<(Vec<CommittedDoc>, InnerMatches)>, EsError> {
+    let Some(path) = check_nested_path(mappings, v)? else { return Ok(None) };
+    let inner = v.get("query").cloned().unwrap_or_else(|| json!({"match_all": {}}));
+    let (children, owners) = nested_children(docs, 0..docs.len(), &path);
+    let mut per: InnerMatches = HashMap::new();
+    for (ci, score) in eval(&inner, mappings, &children)? {
+        let (parent, offset) = owners[ci];
+        per.entry(parent).or_default().push((offset, score, ci));
+    }
+    Ok(Some((children, per)))
+}
+
+/// `nested`: a parent matches when any of its nested objects does, scored
+/// by `score_mode` (`avg` by default).
+fn eval_nested(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let Some((_, per)) = nested_matches(v, mappings, docs)? else { return Ok(HashMap::new()) };
+    let mode = v.get("score_mode").and_then(Value::as_str).unwrap_or("avg");
+    let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    Ok(per
+        .into_iter()
+        .map(|(parent, ms)| {
+            let scores = ms.iter().map(|m| m.1);
+            let s = match mode {
+                "max" => scores.fold(f32::MIN, f32::max),
+                "min" => scores.fold(f32::MAX, f32::min),
+                "sum" => scores.sum(),
+                "none" => 0.0,
+                _ => scores.sum::<f32>() / ms.len() as f32,
+            };
+            (parent, s * boost)
+        })
+        .collect())
+}
+
+/// The `inner_hits` of every `nested` clause in `query` that asks for
+/// them: (name, per-parent hits object).
+fn inner_hits(
+    query: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    out: &mut Vec<(String, HashMap<usize, Value>)>,
+) -> Result<(), EsError> {
+    match query {
+        Value::Object(o) => {
+            if let Some(n) = o.get("nested")
+                && let Some(ih) = n.get("inner_hits")
+                && let Some((children, per)) = nested_matches(n, mappings, docs)?
+            {
+                let path = n.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+                let name = ih.get("name").and_then(Value::as_str).unwrap_or(&path).to_string();
+                let size = ih.get("size").and_then(Value::as_u64).unwrap_or(3) as usize;
+                let from = ih.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let mut by_parent = HashMap::new();
+                for (parent, mut ms) in per {
+                    ms.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))
+                    });
+                    let max = ms.first().map(|m| m.1);
+                    let hits: Vec<Value> = ms
+                        .iter()
+                        .skip(from)
+                        .take(size)
+                        .map(|&(offset, score, ci)| {
+                            let c = &children[ci];
+                            let mut src = &c.source;
+                            for seg in path.split('.') {
+                                src = &src[seg];
+                            }
+                            json!({
+                                "_index": c.index,
+                                "_id": c.id,
+                                "_nested": {"field": path, "offset": offset},
+                                "_score": score,
+                                "_source": apply_source_filter(src, ih.get("_source")),
+                            })
+                        })
+                        .collect();
+                    by_parent.insert(
+                        parent,
+                        json!({"hits": {
+                            "total": {"value": ms.len(), "relation": "eq"},
+                            "max_score": max,
+                            "hits": hits,
+                        }}),
+                    );
+                }
+                out.push((name, by_parent));
+            }
+            for (k, v) in o {
+                if k != "nested" {
+                    inner_hits(v, mappings, docs, out)?;
+                }
+            }
+        }
+        Value::Array(a) => {
+            for v in a {
+                inner_hits(v, mappings, docs, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Where a (possibly dotted) field name's values come from in `_source`,
@@ -913,6 +1156,9 @@ pub fn eval(
     if let Some(v) = obj.get("dis_max") {
         return eval_dis_max(v, mappings, docs);
     }
+    if let Some(v) = obj.get("nested") {
+        return eval_nested(v, mappings, docs);
+    }
     if let Some(v) = obj.get("fuzzy") {
         return Ok(eval_fuzzy(v, mappings, docs));
     }
@@ -1653,6 +1899,13 @@ fn eval_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usi
     if spec.get("filter").is_some() {
         return filter_agg(spec, mappings, docs, bucket);
     }
+    if let Some(n) = spec.get("nested") {
+        let path = n.get("path").and_then(Value::as_str).unwrap_or("");
+        let (children, _) = nested_children(docs, bucket.iter().copied(), path);
+        let all: Vec<usize> = (0..children.len()).collect();
+        let b = Map::from_iter([("doc_count".to_string(), json!(children.len()))]);
+        return with_sub_aggs(b, spec, mappings, &children, &all);
+    }
     if spec.get("filters").is_some() {
         return filters_agg(spec, mappings, docs, bucket);
     }
@@ -1740,14 +1993,10 @@ pub fn validate_aggs(aggs: &Value) -> Result<(), EsError> {
         "min",
         "max",
         "stats",
-        "extended_stats",
         "value_count",
         "cardinality",
         "top_hits",
         "nested",
-        "reverse_nested",
-        "percentiles",
-        "global",
     ];
     let Some(obj) = aggs.as_object() else {
         return Err(EsError::parsing("Expected [START_OBJECT] under [aggs]"));
@@ -1887,7 +2136,14 @@ pub fn search_with(
     }
 
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
+    // Queries and aggregations see the root-level view (no nested
+    // objects); hits are built from the originals.
+    let view = root_view(mappings, docs);
+    let originals = docs;
+    let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     let mut scores = eval(&query, mappings, docs)?;
+    let mut inner = Vec::new();
+    inner_hits(&query, mappings, docs, &mut inner)?;
     if let Some(min_score) = body.get("min_score").and_then(Value::as_f64) {
         let min_score = min_score as f32;
         scores.retain(|_, s| *s >= min_score);
@@ -1927,7 +2183,7 @@ pub fn search_with(
         .skip(from)
         .take(size)
         .map(|(idx, score, keys)| {
-            let d = &docs[*idx];
+            let d = &originals[*idx];
             let mut hit = json!({"_index": d.index, "_id": d.id});
             hit["_score"] = if shows_scores { json!(score) } else { Value::Null };
             // `"_source": false` omits the key, as Elasticsearch does.
@@ -1941,6 +2197,11 @@ pub fn search_with(
             }
             if !specs.is_empty() {
                 hit["sort"] = Value::Array(keys.clone());
+            }
+            for (name, per) in &inner {
+                if let Some(h) = per.get(idx) {
+                    hit["inner_hits"][name.as_str()] = h.clone();
+                }
             }
             hit
         })
@@ -1965,6 +2226,8 @@ pub fn search_with(
 /// `POST/GET _count`: the number of matching documents.
 pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u64, EsError> {
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
+    let view = root_view(mappings, docs);
+    let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     Ok(eval(&query, mappings, docs)?.len() as u64)
 }
 
@@ -1977,7 +2240,13 @@ mod tests {
     }
 
     fn doc(index: &str, id: &str, source: Value) -> CommittedDoc {
-        CommittedDoc { index: index.to_string(), id: id.to_string(), source, version: 1 }
+        CommittedDoc {
+            index: index.to_string(),
+            id: id.to_string(),
+            source,
+            version: 1,
+            full_source: None,
+        }
     }
 
     fn mappings_with_text(field: &str) -> Value {

@@ -82,6 +82,7 @@ impl Index {
                     id: id.clone(),
                     source: d.source.clone(),
                     version: d.version,
+                    full_source: None,
                 })
             })
             .collect();
