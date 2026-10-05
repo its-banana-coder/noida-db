@@ -26,6 +26,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUITE = os.environ.get("PG_SUITE", os.path.join(HERE, "../../../target/official/postgres/regress"))
 WORK = os.environ.get("PG_WORK", os.path.join(HERE, "../../../target/official/postgres/work"))
+TIMEOUT = int(os.environ.get("PG_TEST_TIMEOUT", "180"))
 
 
 def schedule():
@@ -86,13 +87,18 @@ def psql(port, db, sql, transform=True):
         sql = to_client_copy(sql)
     env = dict(os.environ, PGTZ="PST8PDT", PGDATESTYLE="Postgres, MDY", PGPASSWORD="postgres",
                PGAPPNAME="pg_regress", LC_MESSAGES="C", LANG="C", LC_ALL="C")
-    p = subprocess.run(
-        ["psql", "-X", "-a", "-q", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", db,
-         "-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"],
-        input=sql.encode(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, timeout=600,
-        cwd=WORK,
-    )
-    return p.stdout.decode("utf-8", "replace")
+    try:
+        p = subprocess.run(
+            ["psql", "-X", "-a", "-q", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", db,
+             "-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"],
+            input=sql.encode(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
+            timeout=TIMEOUT, cwd=WORK,
+        )
+        return p.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired as e:
+        # What ran before the stuck statement still counts.
+        out = (e.stdout or b"").decode("utf-8", "replace")
+        return out + f"\n<<noida-runner: timed out after {TIMEOUT}s>>\n"
 
 
 def untransform(out):

@@ -147,7 +147,7 @@ class Runner:
 
     def http(self, method, path, query, body, headers, ndjson):
         url = self.base + path + ("?" + urllib.parse.urlencode(query) if query else "")
-        hdrs = {"Accept": "application/json"}
+        hdrs = {}
         data = None
         if body is not None:
             if ndjson:
@@ -203,6 +203,9 @@ class Runner:
                 v = ",".join(str(x) for x in v)
             query[k] = v
         ndjson = "x-ndjson" in str(spec.get("headers", {}).get("content_type", ""))
+        # JSON unless the API's own default is text (`_cat`).
+        if not api.startswith("cat.") and not any(k.lower() == "accept" for k in headers):
+            headers = dict(headers, Accept="application/json")
         status, raw, rh = self.http(method, path, query, body, headers, ndjson)
         text = raw.decode("utf-8", "replace")
         if method == "HEAD":
@@ -246,6 +249,8 @@ class Runner:
         cur = self.response
         segs = re.split(r"(?<!\\)\.", path)
         for seg in segs:
+            if seg == "_arbitrary_key_" and isinstance(cur, dict) and cur:
+                return next(iter(cur))
             seg = seg.replace("\\.", ".")
             if seg.startswith("$") and seg[1:] in self.stash:
                 seg = str(self.stash[seg[1:]])
@@ -356,9 +361,8 @@ class Runner:
             return
         if kind in ("is_true", "is_false"):
             v = self.lookup(self.subst(arg))
-            truthy = v not in (None, False, "", "false", 0) and v != {} and v != []
-            if v == 0 and v is not False:
-                truthy = True if kind == "is_true" and isinstance(v, (int, float)) else truthy
+            # As the Java runner: only null, false, "", "false" and 0 are false.
+            truthy = not (v is None or v is False or v == "" or v == "false" or (type(v) in (int, float) and v == 0))
             if (kind == "is_true") != truthy:
                 raise Fail(f"{kind} {arg}: got {json.dumps(v)[:200]}")
             return
@@ -417,11 +421,24 @@ class Runner:
         for n in names:
             if not n.startswith("."):
                 calls.append(("DELETE", "/" + urllib.parse.quote(n), {"expand_wildcards": "all"}))
-        calls += [
-            ("DELETE", "/_index_template/*", {}),
-            ("DELETE", "/_component_template/*", {}),
-            ("DELETE", "/_template/*", {}),
-        ]
+        # Templates by name (wildcard deletes aren't accepted everywhere).
+        for listing, key, path in [
+            ("/_index_template", "index_templates", "/_index_template/"),
+            ("/_component_template", "component_templates", "/_component_template/"),
+        ]:
+            try:
+                status, raw, _ = self.http("GET", listing, {}, None, {}, False)
+                for t in json.loads(raw).get(key, []) if status == 200 else []:
+                    calls.append(("DELETE", path + urllib.parse.quote(t["name"]), {}))
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            status, raw, _ = self.http("GET", "/_template", {}, None, {}, False)
+            for name in json.loads(raw) if status == 200 else {}:
+                if not name.startswith("."):
+                    calls.append(("DELETE", "/_template/" + urllib.parse.quote(name), {}))
+        except Exception:  # noqa: BLE001
+            pass
         for method, path, q in calls:
             try:
                 self.http(method, path, q, None, {}, False)
