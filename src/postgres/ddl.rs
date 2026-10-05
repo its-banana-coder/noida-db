@@ -981,10 +981,16 @@ impl Ddl<'_, '_> {
                 }
                 None => {
                     return Err(match object_type {
-                        _ if schema.as_deref().is_some_and(|s| self.ctx.db.schema_by_name(s).is_none()) => {
+                        _ if schema
+                            .as_deref()
+                            .is_some_and(|s| self.ctx.db.schema_by_name(s).is_none()) =>
+                        {
                             PgError::new(
                                 code::INVALID_SCHEMA_NAME,
-                                format!("schema \"{}\" does not exist", schema.as_deref().unwrap_or("")),
+                                format!(
+                                    "schema \"{}\" does not exist",
+                                    schema.as_deref().unwrap_or("")
+                                ),
                             )
                         }
                         a::ObjectType::Schema => PgError::new(
@@ -1187,10 +1193,9 @@ impl Ddl<'_, '_> {
             Ok(o) => o,
             Err(e) => {
                 if if_exists {
-                    self.ctx
-                        .rt
-                        .notices
-                        .push(PgError::notice(format!("relation \"{tname}\" does not exist, skipping")));
+                    self.ctx.rt.notices.push(PgError::notice(format!(
+                        "relation \"{tname}\" does not exist, skipping"
+                    )));
                     return Ok("ALTER TABLE".into());
                 }
                 return Err(e);

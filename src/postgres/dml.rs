@@ -712,7 +712,12 @@ fn index_key(
 
 /// A key that unique index `idx` can't hold twice (nulls are distinct
 /// unless NULLS NOT DISTINCT).
-fn unique_key(ctx: &mut Ctx, b: &BoundIndex, idx: &super::catalog::Index, row: &Row) -> PgResult<Option<Vec<Value>>> {
+fn unique_key(
+    ctx: &mut Ctx,
+    b: &BoundIndex,
+    idx: &super::catalog::Index,
+    row: &Row,
+) -> PgResult<Option<Vec<Value>>> {
     Ok(index_key(ctx, b, idx, row)?
         .filter(|k| idx.nulls_not_distinct || !k.iter().any(|v| v.is_null())))
 }
@@ -743,7 +748,11 @@ pub fn unique_index_conflict(
 
 /// Whether two of `t`'s rows already collide in unique index `idx` (each
 /// row's key computed once).
-pub fn unique_index_has_duplicate(ctx: &mut Ctx, t: &Table, idx: &super::catalog::Index) -> PgResult<bool> {
+pub fn unique_index_has_duplicate(
+    ctx: &mut Ctx,
+    t: &Table,
+    idx: &super::catalog::Index,
+) -> PgResult<bool> {
     let b = bind_index(ctx, t, idx)?;
     let mut keys: Vec<Vec<Value>> = vec![];
     for r in &t.rows {

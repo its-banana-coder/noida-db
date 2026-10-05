@@ -304,7 +304,12 @@ pub fn format_date_styled(d: i32, style: DateStyle, dmy: bool) -> String {
 
 /// A timestamp (`zone` given: timestamptz, shown in that zone with its
 /// abbreviation) in the given DateStyle.
-pub fn format_timestamp_styled(ts: i64, zone: Option<&Zone>, style: DateStyle, dmy: bool) -> String {
+pub fn format_timestamp_styled(
+    ts: i64,
+    zone: Option<&Zone>,
+    style: DateStyle,
+    dmy: bool,
+) -> String {
     if style == DateStyle::Iso || ts == TS_INF || ts == TS_NEG_INF {
         return match zone {
             Some(z) => format_timestamptz(ts, z),
@@ -1555,12 +1560,54 @@ mod tests {
         let tz = parse_timestamptz("2001-07-04 23:00:00+00", &ctx).unwrap();
         use DateStyle::*;
         let cases = [
-            (Sql, false, "12/27/2001", "03/15/0044 BC", "12/27/2001 04:05:06.789", "07/04/2001 16:00:00 PDT"),
-            (Sql, true, "27/12/2001", "15/03/0044 BC", "27/12/2001 04:05:06.789", "04/07/2001 16:00:00 PDT"),
-            (Postgres, false, "12-27-2001", "03-15-0044 BC", "Thu Dec 27 04:05:06.789 2001", "Wed Jul 04 16:00:00 2001 PDT"),
-            (Postgres, true, "27-12-2001", "15-03-0044 BC", "Thu 27 Dec 04:05:06.789 2001", "Wed 04 Jul 16:00:00 2001 PDT"),
-            (German, true, "27.12.2001", "15.03.0044 BC", "27.12.2001 04:05:06.789", "04.07.2001 16:00:00 PDT"),
-            (Iso, true, "2001-12-27", "0044-03-15 BC", "2001-12-27 04:05:06.789", "2001-07-04 16:00:00-07"),
+            (
+                Sql,
+                false,
+                "12/27/2001",
+                "03/15/0044 BC",
+                "12/27/2001 04:05:06.789",
+                "07/04/2001 16:00:00 PDT",
+            ),
+            (
+                Sql,
+                true,
+                "27/12/2001",
+                "15/03/0044 BC",
+                "27/12/2001 04:05:06.789",
+                "04/07/2001 16:00:00 PDT",
+            ),
+            (
+                Postgres,
+                false,
+                "12-27-2001",
+                "03-15-0044 BC",
+                "Thu Dec 27 04:05:06.789 2001",
+                "Wed Jul 04 16:00:00 2001 PDT",
+            ),
+            (
+                Postgres,
+                true,
+                "27-12-2001",
+                "15-03-0044 BC",
+                "Thu 27 Dec 04:05:06.789 2001",
+                "Wed 04 Jul 16:00:00 2001 PDT",
+            ),
+            (
+                German,
+                true,
+                "27.12.2001",
+                "15.03.0044 BC",
+                "27.12.2001 04:05:06.789",
+                "04.07.2001 16:00:00 PDT",
+            ),
+            (
+                Iso,
+                true,
+                "2001-12-27",
+                "0044-03-15 BC",
+                "2001-12-27 04:05:06.789",
+                "2001-07-04 16:00:00-07",
+            ),
         ];
         for (st, dmy, ed, ebc, ets, etz) in cases {
             assert_eq!(format_date_styled(d, st, dmy), ed);
@@ -1575,7 +1622,11 @@ mod tests {
     fn interval_styles() {
         // Expected values from Postgres 14.
         let cases = [
-            ("1 year 2 mons 3 days 04:05:06.5", "@ 1 year 2 mons 3 days 4 hours 5 mins 6.5 secs", "+1-2 +3 +4:05:06.5"),
+            (
+                "1 year 2 mons 3 days 04:05:06.5",
+                "@ 1 year 2 mons 3 days 4 hours 5 mins 6.5 secs",
+                "+1-2 +3 +4:05:06.5",
+            ),
             ("-1 day", "@ 1 day ago", "-1 0:00:00"),
             ("1 day -00:00:01", "@ 1 day -1 sec", "+0-0 +1 -0:00:01"),
             ("-1 year -2 mons", "@ 1 year 2 mons ago", "-1-2"),

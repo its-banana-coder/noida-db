@@ -1285,7 +1285,11 @@ mod tests {
         let kv = |a: &str, b: &str| (a.to_string(), b.to_string());
         assert_eq!(
             startup_options("-c intervalstyle=postgres_verbose --search-path=a\\ b -cwork_mem=8MB"),
-            vec![kv("intervalstyle", "postgres_verbose"), kv("search_path", "a b"), kv("work_mem", "8MB")]
+            vec![
+                kv("intervalstyle", "postgres_verbose"),
+                kv("search_path", "a b"),
+                kv("work_mem", "8MB")
+            ]
         );
         assert_eq!(startup_options("  "), vec![]);
     }

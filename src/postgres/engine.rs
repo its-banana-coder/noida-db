@@ -459,7 +459,9 @@ impl Engine {
                                 format!("database \"{n}\" does not exist"),
                             ));
                         }
-                        r.notices.push(PgError::notice(format!("database \"{n}\" does not exist, skipping")));
+                        r.notices.push(PgError::notice(format!(
+                            "database \"{n}\" does not exist, skipping"
+                        )));
                     }
                 }
                 Ok(r)

@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use super::error::{PgError, PgResult, code};
 use super::types::FmtCtx;
-use crate::sql::datetime::{DateStyle, IntervalStyle};
 use super::tz::{self, Zone};
+use crate::sql::datetime::{DateStyle, IntervalStyle};
 
 /// The Postgres version noida-db reports.
 pub const SERVER_VERSION: &str = "16.4";
@@ -281,8 +281,10 @@ impl Settings {
             "DateStyle" => {
                 // As check_datestyle: start from the current value; a style
                 // or an order given replaces just that half.
-                let cur = self.values.get("DateStyle").cloned().unwrap_or_else(|| "ISO, MDY".into());
-                let (mut style, mut order) = cur.split_once(", ").map_or(("ISO", "MDY"), |(a, b)| (a, b));
+                let cur =
+                    self.values.get("DateStyle").cloned().unwrap_or_else(|| "ISO, MDY".into());
+                let (mut style, mut order) =
+                    cur.split_once(", ").map_or(("ISO", "MDY"), |(a, b)| (a, b));
                 let (mut have_style, mut have_order) = (false, false);
                 for p in value.split(',').map(|p| p.trim().to_ascii_lowercase()) {
                     let (st, ord) = match p.as_str() {
@@ -385,7 +387,11 @@ impl Settings {
     pub fn fmt(&self) -> FmtCtx {
         FmtCtx {
             zone: self.zone.clone(),
-            date_style: match self.values.get("DateStyle").map(|v| v.split(',').next().unwrap_or("")) {
+            date_style: match self
+                .values
+                .get("DateStyle")
+                .map(|v| v.split(',').next().unwrap_or(""))
+            {
                 Some("SQL") => DateStyle::Sql,
                 Some("Postgres") => DateStyle::Postgres,
                 Some("German") => DateStyle::German,
