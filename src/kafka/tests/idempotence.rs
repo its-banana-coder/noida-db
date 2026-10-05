@@ -13,53 +13,43 @@ fn make_v2_batch(
     base_sequence: i32,
     records_count: i32,
 ) -> Vec<u8> {
-    let mut buf = vec![0u8; 61];
-    // base_offset = 0
-    buf[0..8].copy_from_slice(&0i64.to_be_bytes());
-    // batch_length = 50
-    buf[8..12].copy_from_slice(&50i32.to_be_bytes());
-    // partition_leader_epoch = 0
-    buf[12..16].copy_from_slice(&0i32.to_be_bytes());
-    // magic = 2
-    buf[16] = 2;
-    // crc = 0
-    buf[17..21].copy_from_slice(&0u32.to_be_bytes());
-    // attributes = 0
-    buf[21..23].copy_from_slice(&0i16.to_be_bytes());
-    // last_offset_delta = records_count - 1
-    let delta = (records_count - 1).max(0);
-    buf[23..27].copy_from_slice(&delta.to_be_bytes());
-    // first_timestamp = 0
-    buf[27..35].copy_from_slice(&0i64.to_be_bytes());
-    // max_timestamp = 0
-    buf[35..43].copy_from_slice(&0i64.to_be_bytes());
-    // producer_id
-    buf[43..51].copy_from_slice(&producer_id.to_be_bytes());
-    // producer_epoch
-    buf[51..53].copy_from_slice(&producer_epoch.to_be_bytes());
-    // base_sequence
-    buf[53..57].copy_from_slice(&base_sequence.to_be_bytes());
-    // records_count
-    buf[57..61].copy_from_slice(&records_count.to_be_bytes());
-    // append arbitrary payload
-    buf.extend_from_slice(b"sample-record-payload");
-    buf
+    let values: Vec<&[u8]> =
+        (0..records_count).map(|_| b"sample-record-payload".as_ref()).collect();
+    super::record_batch(&values, producer_id, producer_epoch, base_sequence)
 }
 
 #[test]
 fn test_init_producer_id() {
     let t = T::new();
 
-    let req1 = InitProducerIdRequest::default();
+    // kafka-protocol's default transactional_id is Some(""), which a broker
+    // rejects; a non-transactional producer sends null.
+    let mut req1 = InitProducerIdRequest::default();
+    req1.transactional_id = None;
     let resp1 = t.engine.handle_init_producer_id(&req1, 4);
     assert_eq!(resp1.error_code, 0);
     assert!(resp1.producer_id.0 >= 1000);
     assert_eq!(resp1.producer_epoch, 0);
 
-    let req2 = InitProducerIdRequest::default();
+    let req2 = req1.clone();
     let resp2 = t.engine.handle_init_producer_id(&req2, 4);
     assert_eq!(resp2.error_code, 0);
     assert_eq!(resp2.producer_id.0, resp1.producer_id.0 + 1);
+
+    // An empty transactional id, a producer id without an epoch, and a
+    // transactional timeout out of range are all refused.
+    let empty = InitProducerIdRequest::default();
+    assert_eq!(t.engine.handle_init_producer_id(&empty, 4).error_code, 42);
+    let mut half = req1.clone();
+    half.producer_id = kafka_protocol::messages::ProducerId(5);
+    assert_eq!(t.engine.handle_init_producer_id(&half, 4).error_code, 42);
+    for timeout in [0, -5, 900_001] {
+        let mut tx = InitProducerIdRequest::default();
+        tx.transactional_id =
+            Some(kafka_protocol::messages::TransactionalId(StrBytes::from_static_str("tx")));
+        tx.transaction_timeout_ms = timeout;
+        assert_eq!(t.engine.handle_init_producer_id(&tx, 4).error_code, 50, "{timeout}");
+    }
 }
 
 #[test]

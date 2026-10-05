@@ -85,7 +85,10 @@ fn test_kafka_diff() {
 
     // 1. ApiVersions at v0, v1, v2, v3
     for v in 0..=3 {
-        let req = ApiVersionsRequest::default();
+        // v3 names the client; both brokers reject an empty name (42).
+        let mut req = ApiVersionsRequest::default();
+        req.client_software_name = StrBytes::from_static_str("noida-diff");
+        req.client_software_version = StrBytes::from_static_str("1.0");
         let ref_resp: ApiVersionsResponse =
             send_request(&mut ref_stream, ApiKey::ApiVersions, v, cid, None, &req);
         let noida_resp: ApiVersionsResponse =
@@ -97,7 +100,11 @@ fn test_kafka_diff() {
     }
 
     // 2. CreateTopics happy path & error cases
-    let diff_topic = TopicName::from(StrBytes::from_static_str("diff-topic-1"));
+    // Unique per run: the reference broker keeps state between runs.
+    let run_id =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let grp = format!("diff-grp-{run_id}");
+    let diff_topic = TopicName::from(StrBytes::from_string(format!("diff-topic-{run_id}")));
     let mut create_req = CreateTopicsRequest::default();
     let mut ct = CreatableTopic::default();
     ct.name = diff_topic.clone();
@@ -158,10 +165,26 @@ fn test_kafka_diff() {
         ref_p.responses[0].partition_responses[0].error_code,
         noida_p.responses[0].partition_responses[0].error_code
     );
-    assert_eq!(
-        ref_p.responses[0].partition_responses[0].base_offset,
-        noida_p.responses[0].partition_responses[0].base_offset
-    );
+    // Bytes that aren't a record batch: CORRUPT_MESSAGE on both.
+    assert_eq!(ref_p.responses[0].partition_responses[0].error_code, 2);
+    compared_count += 1;
+
+    // A real batch.
+    prod_req.topic_data[0].partition_data[0].records =
+        Some(bytes::Bytes::from(record_batch(b"diff test record content")));
+    let ref_p: ProduceResponse =
+        send_request(&mut ref_stream, ApiKey::Produce, 8, cid, Some("diff"), &prod_req);
+    let noida_p: ProduceResponse =
+        send_request(&mut noida_stream, ApiKey::Produce, 8, cid, Some("diff"), &prod_req);
+    cid += 1;
+    for field in [
+        |p: &ProduceResponse| p.responses[0].partition_responses[0].error_code as i64,
+        |p: &ProduceResponse| p.responses[0].partition_responses[0].base_offset,
+        |p: &ProduceResponse| p.responses[0].partition_responses[0].log_append_time_ms,
+        |p: &ProduceResponse| p.responses[0].partition_responses[0].log_start_offset,
+    ] {
+        assert_eq!(field(&ref_p), field(&noida_p));
+    }
     compared_count += 1;
 
     // Fetch offset 0
@@ -234,7 +257,30 @@ fn test_kafka_diff() {
     compared_count += 1;
 
     // 6. InitProducerId
-    let init_pid_req = InitProducerIdRequest::default();
+    // The crate's default (an empty transactional id) is INVALID_REQUEST;
+    // then a plain idempotent producer (null id).
+    let mut init_pid_req = InitProducerIdRequest::default();
+    for tx_id in [Some(Default::default()), None] {
+        init_pid_req.transactional_id = tx_id;
+        let ref_pid: InitProducerIdResponse = send_request(
+            &mut ref_stream,
+            ApiKey::InitProducerId,
+            4,
+            cid,
+            Some("diff"),
+            &init_pid_req,
+        );
+        let noida_pid: InitProducerIdResponse = send_request(
+            &mut noida_stream,
+            ApiKey::InitProducerId,
+            4,
+            cid,
+            Some("diff"),
+            &init_pid_req,
+        );
+        cid += 1;
+        assert_eq!(ref_pid.error_code, noida_pid.error_code);
+    }
     let ref_pid: InitProducerIdResponse =
         send_request(&mut ref_stream, ApiKey::InitProducerId, 4, cid, Some("diff"), &init_pid_req);
     let noida_pid: InitProducerIdResponse = send_request(
@@ -251,7 +297,7 @@ fn test_kafka_diff() {
 
     // 7. FindCoordinator
     let mut fc_req = FindCoordinatorRequest::default();
-    fc_req.key = StrBytes::from_static_str("diff-grp");
+    fc_req.key = StrBytes::from_string(grp.clone());
     let ref_fc: FindCoordinatorResponse =
         send_request(&mut ref_stream, ApiKey::FindCoordinator, 3, cid, Some("diff"), &fc_req);
     let noida_fc: FindCoordinatorResponse =
@@ -262,12 +308,38 @@ fn test_kafka_diff() {
 
     // 8. JoinGroup round trip (MEMBER_ID_REQUIRED 79)
     let mut j_req = JoinGroupRequest::default();
-    j_req.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    j_req.group_id = GroupId(StrBytes::from_string(grp.clone()));
     j_req.protocol_type = StrBytes::from_static_str("consumer");
     let mut j_proto = JoinGroupRequestProtocol::default();
     j_proto.name = StrBytes::from_static_str("range");
-    j_proto.metadata = bytes::Bytes::from("metadata");
+    // A real ConsumerProtocolSubscription v0 (no topics, null user data).
+    j_proto.metadata = bytes::Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]);
     j_req.protocols.push(j_proto);
+
+    // Request checks: session timeout (the crate's default 0 is out of
+    // range), empty group id, no protocols.
+    let mut bad_cases = Vec::new();
+    bad_cases.push(j_req.clone());
+    j_req.session_timeout_ms = 10_000;
+    j_req.rebalance_timeout_ms = 10_000;
+    let mut no_group = j_req.clone();
+    no_group.group_id = GroupId(StrBytes::from_static_str(""));
+    bad_cases.push(no_group);
+    let mut no_protocols = j_req.clone();
+    no_protocols.protocols.clear();
+    bad_cases.push(no_protocols);
+    let mut too_long = j_req.clone();
+    too_long.session_timeout_ms = 1_800_001;
+    bad_cases.push(too_long);
+    for bad in &bad_cases {
+        let r: JoinGroupResponse =
+            send_request(&mut ref_stream, ApiKey::JoinGroup, 5, cid, Some("diff"), bad);
+        let n: JoinGroupResponse =
+            send_request(&mut noida_stream, ApiKey::JoinGroup, 5, cid, Some("diff"), bad);
+        cid += 1;
+        assert_eq!(r.error_code, n.error_code, "JoinGroup {bad:?}");
+        compared_count += 1;
+    }
 
     let ref_j1: JoinGroupResponse =
         send_request(&mut ref_stream, ApiKey::JoinGroup, 5, cid, Some("diff"), &j_req);
@@ -295,7 +367,7 @@ fn test_kafka_diff() {
 
     // 9. SyncGroup
     let mut ref_sync = SyncGroupRequest::default();
-    ref_sync.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    ref_sync.group_id = GroupId(StrBytes::from_string(grp.clone()));
     ref_sync.member_id = ref_j2.member_id.clone();
     ref_sync.generation_id = ref_j2.generation_id;
     let mut ref_assign = SyncGroupRequestAssignment::default();
@@ -304,7 +376,7 @@ fn test_kafka_diff() {
     ref_sync.assignments.push(ref_assign);
 
     let mut noida_sync = SyncGroupRequest::default();
-    noida_sync.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    noida_sync.group_id = GroupId(StrBytes::from_string(grp.clone()));
     noida_sync.member_id = noida_j2.member_id.clone();
     noida_sync.generation_id = noida_j2.generation_id;
     let mut noida_assign = SyncGroupRequestAssignment::default();
@@ -322,12 +394,12 @@ fn test_kafka_diff() {
 
     // 10. Heartbeat
     let mut ref_hb = HeartbeatRequest::default();
-    ref_hb.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    ref_hb.group_id = GroupId(StrBytes::from_string(grp.clone()));
     ref_hb.member_id = ref_j2.member_id.clone();
     ref_hb.generation_id = ref_j2.generation_id;
 
     let mut noida_hb = HeartbeatRequest::default();
-    noida_hb.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    noida_hb.group_id = GroupId(StrBytes::from_string(grp.clone()));
     noida_hb.member_id = noida_j2.member_id.clone();
     noida_hb.generation_id = noida_j2.generation_id;
 
@@ -353,7 +425,7 @@ fn test_kafka_diff() {
 
     // 11. OffsetCommit and OffsetFetch
     let mut oc_req = OffsetCommitRequest::default();
-    oc_req.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    oc_req.group_id = GroupId(StrBytes::from_string(grp.clone()));
     let mut oc_t = OffsetCommitRequestTopic::default();
     oc_t.name = diff_topic.clone();
     let mut oc_p = OffsetCommitRequestPartition::default();
@@ -375,7 +447,7 @@ fn test_kafka_diff() {
 
     // OffsetFetch
     let mut of_req = OffsetFetchRequest::default();
-    of_req.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    of_req.group_id = GroupId(StrBytes::from_string(grp.clone()));
     let mut of_t = OffsetFetchRequestTopic::default();
     of_t.name = diff_topic.clone();
     of_t.partition_indexes.push(0);
@@ -394,11 +466,11 @@ fn test_kafka_diff() {
 
     // 12. LeaveGroup
     let mut leave_ref = LeaveGroupRequest::default();
-    leave_ref.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    leave_ref.group_id = GroupId(StrBytes::from_string(grp.clone()));
     leave_ref.member_id = ref_j2.member_id;
 
     let mut leave_noida = LeaveGroupRequest::default();
-    leave_noida.group_id = GroupId(StrBytes::from_static_str("diff-grp"));
+    leave_noida.group_id = GroupId(StrBytes::from_string(grp.clone()));
     leave_noida.member_id = noida_j2.member_id;
 
     let ref_l: LeaveGroupResponse =
@@ -411,6 +483,9 @@ fn test_kafka_diff() {
 
     // 13. DeleteTopics
     let mut del_req = DeleteTopicsRequest::default();
+    // The crate's default timeout (0) gets REQUEST_TIMED_OUT from a real
+    // broker, whose controller can't finish the delete within it.
+    del_req.timeout_ms = 30_000;
     del_req.topic_names.push(diff_topic);
     let ref_del: DeleteTopicsResponse =
         send_request(&mut ref_stream, ApiKey::DeleteTopics, 4, cid, Some("diff"), &del_req);
@@ -423,4 +498,33 @@ fn test_kafka_diff() {
         "Successfully compared {} response pairs against reference Kafka broker",
         compared_count
     );
+}
+
+/// A one-record v2 batch, encoded by kafka-protocol (valid CRC and lengths).
+fn record_batch(value: &[u8]) -> Vec<u8> {
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    };
+    let record = Record {
+        transactional: false,
+        control: false,
+        delete_horizon: false,
+        partition_leader_epoch: 0,
+        producer_id: -1,
+        producer_epoch: -1,
+        timestamp_type: TimestampType::Creation,
+        offset: 0,
+        sequence: -1,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64,
+        key: None,
+        value: Some(bytes::Bytes::copy_from_slice(value)),
+        headers: Default::default(),
+    };
+    let mut buf = bytes::BytesMut::new();
+    let options = RecordEncodeOptions { version: 2, compression: Compression::None };
+    RecordBatchEncoder::encode(&mut buf, std::iter::once(&record), &options).unwrap();
+    buf.to_vec()
 }

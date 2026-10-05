@@ -59,6 +59,11 @@ fn test_offset_commit_generation_check() {
 
     // Join and sync group
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id = GroupId(StrBytes::from_static_str("gen-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
     let step1 = t.engine.handle_join_group(&join_req, 5);
@@ -128,6 +133,11 @@ fn test_offset_delete() {
 
     // Create group record by joining so group exists
     let mut join_req = JoinGroupRequest::default();
+    join_req.protocols.push(
+        kafka_protocol::messages::join_group_request::JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range")),
+    );
+    join_req.session_timeout_ms = 10_000; // within group.min/max.session.timeout.ms
     join_req.group_id = GroupId(StrBytes::from_static_str("del-grp"));
     join_req.protocol_type = StrBytes::from_static_str("consumer");
     let step1 = t.engine.handle_join_group(&join_req, 5);
