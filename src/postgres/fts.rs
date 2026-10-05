@@ -645,7 +645,9 @@ impl QueryParser<'_> {
         if self.i < self.s.len() {
             return Err(syntax_error());
         }
-        Ok(Some(q))
+        // Stopwords leave empty operands; Postgres drops them and the
+        // operators that no longer have two sides.
+        Ok(drop_empty(q))
     }
 
     fn skip_ws(&mut self) {
@@ -875,6 +877,278 @@ fn positions_matching(v: &Vector, q: &Query) -> Option<Vec<u16>> {
 /// document length in ways nothing here tracks; it orders matches
 /// sensibly (more distinct matched terms, closer together, ranks higher)
 /// but does not reproduce Postgres's exact numbers.
+/// A query without its empty (stopword) operands, or `None` if nothing
+/// is left.
+fn drop_empty(q: Query) -> Option<Query> {
+    match q {
+        Query::Lexeme(l, _) if l.is_empty() => None,
+        Query::Lexeme(..) => Some(q),
+        Query::Not(a) => drop_empty(*a).map(|a| Query::Not(Box::new(a))),
+        Query::And(a, b) => match (drop_empty(*a), drop_empty(*b)) {
+            (Some(a), Some(b)) => Some(Query::And(Box::new(a), Box::new(b))),
+            (x, y) => x.or(y),
+        },
+        Query::Or(a, b) => match (drop_empty(*a), drop_empty(*b)) {
+            (Some(a), Some(b)) => Some(Query::Or(Box::new(a), Box::new(b))),
+            (x, y) => x.or(y),
+        },
+        Query::Phrase(a, b, d) => match (drop_empty(*a), drop_empty(*b)) {
+            (Some(a), Some(b)) => Some(Query::Phrase(Box::new(a), Box::new(b), d)),
+            (x, y) => x.or(y),
+        },
+    }
+}
+
+/// `ts_rank`'s default weights for D, C, B, A.
+pub const DEFAULT_WEIGHTS: [f32; 4] = [0.1, 0.2, 0.4, 1.0];
+
+fn query_lexemes(q: &Query, out: &mut Vec<(String, bool)>) {
+    match q {
+        Query::Lexeme(l, p) => {
+            if !out.iter().any(|(x, _)| x == l) {
+                out.push((l.clone(), *p));
+            }
+        }
+        Query::Not(a) => query_lexemes(a, out),
+        Query::And(a, b) | Query::Or(a, b) | Query::Phrase(a, b, _) => {
+            query_lexemes(a, out);
+            query_lexemes(b, out);
+        }
+    }
+}
+
+/// Operand and operator nodes in a tsquery.
+pub fn numnode(q: &Query) -> usize {
+    match q {
+        Query::Lexeme(..) => 1,
+        Query::Not(a) => 1 + numnode(a),
+        Query::And(a, b) | Query::Or(a, b) | Query::Phrase(a, b, _) => 1 + numnode(a) + numnode(b),
+    }
+}
+
+/// Postgres's `ts_rank` (tsrank.c): `calc_rank_and` for AND/phrase
+/// queries (pairwise proximity of the terms), `calc_rank_or` otherwise
+/// (each term's weighted occurrences, diminishing), then normalization.
+pub fn ts_rank(vector: &str, q: &Query, w: [f32; 4], norm: i32) -> PgResult<f32> {
+    let v = parse_weighted(vector)?;
+    let wpos = |c: char| match c {
+        'A' => w[3],
+        'B' => w[2],
+        'C' => w[1],
+        _ => w[0],
+    };
+    let mut items = vec![];
+    query_lexemes(q, &mut items);
+    // Postgres sorts the operands (SortAndUniqItems); float sums follow
+    // that order.
+    items.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    // Each operand's (position, weight) list; an entry without positions
+    // counts as one occurrence at position 0 with weight D.
+    let find = |l: &str, prefix: bool| -> Option<Vec<(u16, char)>> {
+        let mut ps: Vec<(u16, char)> = vec![];
+        let mut found = false;
+        for (x, p) in &v {
+            if x == l || (prefix && x.starts_with(l)) {
+                found = true;
+                if p.is_empty() {
+                    ps.push((0, 'D'));
+                } else {
+                    ps.extend(p.iter().map(|&(pos, c)| (pos, if c == '\0' { 'D' } else { c })));
+                }
+            }
+        }
+        found.then_some(ps)
+    };
+    let is_and = matches!(q, Query::And(..) | Query::Phrase(..));
+    let calc_or = || -> f32 {
+        let mut res = 0.0f32;
+        for (l, p) in &items {
+            let Some(post) = find(l, *p) else { continue };
+            let (mut resj, mut wjm, mut jm) = (0.0f32, -1.0f32, 0usize);
+            for (j, &(_, c)) in post.iter().enumerate() {
+                let wv = wpos(c);
+                resj += wv / ((j + 1) * (j + 1)) as f32;
+                if wv > wjm {
+                    wjm = wv;
+                    jm = j;
+                }
+            }
+            res = (res as f64
+                + ((wjm + resj - wjm / ((jm + 1) * (jm + 1)) as f32) as f64) / 1.644_934_066_85)
+                as f32;
+        }
+        if !items.is_empty() {
+            res /= items.len() as f32;
+        }
+        res
+    };
+    let mut res = if is_and && items.len() >= 2 {
+        let pos: Vec<Option<Vec<(u16, char)>>> = items.iter().map(|(l, p)| find(l, *p)).collect();
+        // As in tsrank.c: word_distance is float4 computed in double;
+        // curw and the running result are float4 with double arithmetic.
+        let word_distance = |d: i32| -> f32 {
+            if d > 100 {
+                1e-30
+            } else {
+                (1.0 / (1.005 + 0.05 * (d as f64 / 1.5 - 2.0).exp())) as f32
+            }
+        };
+        let mut res = -1.0f32;
+        for i in 0..pos.len() {
+            let Some(pi) = &pos[i] else { continue };
+            for pk in pos.iter().take(i).flatten() {
+                for &(a, ca) in pi {
+                    for &(b, cb) in pk {
+                        let mut dist = (a as i32 - b as i32).abs();
+                        if dist == 0 && a != 0 && b != 0 {
+                            continue;
+                        }
+                        if dist == 0 {
+                            dist = 16383;
+                        }
+                        let curw =
+                            ((wpos(ca) as f64) * (wpos(cb) as f64) * (word_distance(dist) as f64))
+                                .sqrt() as f32;
+                        res = if res < 0.0 {
+                            curw
+                        } else {
+                            (1.0 - (1.0 - res as f64) * (1.0 - curw as f64)) as f32
+                        };
+                    }
+                }
+            }
+        }
+        res
+    } else {
+        calc_or()
+    };
+    if res < 0.0 {
+        res = 1e-20;
+    }
+    let len: usize = v.iter().map(|(_, p)| p.len().max(1)).sum();
+    if norm & 1 != 0 && !v.is_empty() {
+        res = (res as f64 / ((len + 1) as f64).ln() * 2f64.ln()) as f32;
+    }
+    if norm & 2 != 0 && len > 0 {
+        res /= len as f32;
+    }
+    if norm & 8 != 0 && !v.is_empty() {
+        res /= v.len() as f32;
+    }
+    if norm & 16 != 0 && !v.is_empty() {
+        res = (res as f64 / ((v.len() + 1) as f64).ln() * 2f64.ln()) as f32;
+    }
+    if norm & 32 != 0 {
+        res /= res + 1.0;
+    }
+    Ok(res)
+}
+
+/// `ts_headline`: the document with the query's (non-negated) terms
+/// wrapped in StartSel/StopSel; a document longer than MaxWords is cut to
+/// MaxWords words around the first match (Postgres's default parser
+/// options: StartSel=<b>, StopSel=</b>, MaxWords=35, MinWords=15,
+/// ShortWord=3, HighlightAll=false).
+pub fn headline(doc: &str, q: Option<&Query>, config: &str, opts: &str) -> PgResult<String> {
+    let mut start_sel = "<b>".to_string();
+    let mut stop_sel = "</b>".to_string();
+    let mut max_words = 35usize;
+    let mut min_words = 15usize;
+    let mut highlight_all = false;
+    for opt in opts.split(',') {
+        let Some((k, v)) = opt.split_once('=') else { continue };
+        let v = v.trim().trim_matches('"').to_string();
+        match k.trim().to_ascii_lowercase().as_str() {
+            "startsel" => start_sel = v,
+            "stopsel" => stop_sel = v,
+            "maxwords" => max_words = v.parse().unwrap_or(max_words),
+            "minwords" => min_words = v.parse().unwrap_or(min_words),
+            "highlightall" => {
+                highlight_all = matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "1" | "t" | "true" | "on" | "yes" | "y"
+                )
+            }
+            "shortword" | "maxfragments" | "fragmentdelimiter" => {}
+            other => {
+                return Err(PgError::new(
+                    code::INVALID_PARAMETER_VALUE,
+                    format!("unrecognized headline parameter: \"{other}\""),
+                ));
+            }
+        }
+    }
+    if min_words >= max_words {
+        return Err(PgError::new(
+            code::INVALID_PARAMETER_VALUE,
+            "MinWords should be less than MaxWords",
+        ));
+    }
+    let mut terms = vec![];
+    if let Some(q) = q {
+        fn positive(q: &Query, out: &mut Vec<(String, bool)>) {
+            match q {
+                Query::Lexeme(l, p) => out.push((l.clone(), *p)),
+                Query::Not(_) => {}
+                Query::And(a, b) | Query::Or(a, b) | Query::Phrase(a, b, _) => {
+                    positive(a, out);
+                    positive(b, out);
+                }
+            }
+        }
+        positive(q, &mut terms);
+    }
+    // Words with byte offsets, and whether each matches a term.
+    let mut spans: Vec<(usize, usize, bool)> = vec![];
+    let mut start = None;
+    let bytes: Vec<(usize, char)> = doc.char_indices().collect();
+    for (k, &(i, c)) in bytes.iter().enumerate() {
+        let word_char = c.is_alphanumeric()
+            || (c == '\''
+                && start.is_some()
+                && bytes.get(k + 1).is_some_and(|n| n.1.is_alphanumeric()));
+        match (word_char, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                spans.push((s, i, false));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, doc.len(), false));
+    }
+    for sp in spans.iter_mut() {
+        let w = doc[sp.0..sp.1].to_lowercase();
+        if let Some(lx) = lexeme(&w, config) {
+            sp.2 = terms.iter().any(|(t, p)| *t == lx || (*p && lx.starts_with(t.as_str())));
+        }
+    }
+    let (from, to) = if highlight_all || spans.len() <= max_words {
+        (0, doc.len())
+    } else {
+        let first = spans.iter().position(|s| s.2).unwrap_or(0);
+        let end = (first + max_words).min(spans.len());
+        let begin = end.saturating_sub(max_words);
+        (spans[begin].0, spans[end - 1].1)
+    };
+    let mut out = String::new();
+    let mut pos = from;
+    for &(s, e, hit) in &spans {
+        if !hit || s < from || e > to {
+            continue;
+        }
+        out.push_str(&doc[pos..s]);
+        out.push_str(&start_sel);
+        out.push_str(&doc[s..e]);
+        out.push_str(&stop_sel);
+        pos = e;
+    }
+    out.push_str(&doc[pos..to]);
+    Ok(out)
+}
+
 pub fn rank(v: &Vector, q: &Query) -> f32 {
     fn score(v: &Vector, q: &Query) -> f32 {
         match q {

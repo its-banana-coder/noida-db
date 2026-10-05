@@ -773,6 +773,56 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             ctx.rt.lastval = Some(oid);
             Value::Int(v)
         }
+        "__enum_sortorder" => {
+            let oid = a[0].as_int().unwrap_or(0) as u32;
+            match (&a[1], ctx.db.enums.get(&oid)) {
+                (Value::Text(label), Some(e)) => e
+                    .labels
+                    .iter()
+                    .find(|(_, l, _)| l == label)
+                    .map_or(Value::Null, |(o, _, _)| Value::Float(*o as f64)),
+                _ => Value::Null,
+            }
+        }
+        "__enum_key" => {
+            let rank = system_call("__enum_sortorder", a, tys, Type::FLOAT8, ctx)?;
+            Value::Record(vec![rank, a[1].clone()])
+        }
+        "enum_range" | "enum_first" | "enum_last" => {
+            let Some(Base::Enum(oid)) = tys.first().map(|t| t.base) else {
+                return Err(PgError::new(
+                    code::INVALID_PARAMETER_VALUE,
+                    "could not determine actual enum type",
+                ));
+            };
+            let Some(e) = ctx.db.enums.get(&oid) else { return Ok(Value::Null) };
+            let mut labels = e.labels.clone();
+            labels.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(Ordering::Equal));
+            let names: Vec<String> = labels.into_iter().map(|(_, l, _)| l).collect();
+            match name {
+                "enum_first" => names.first().cloned().map_or(Value::Null, Value::Text),
+                "enum_last" => names.last().cloned().map_or(Value::Null, Value::Text),
+                _ => {
+                    // enum_range(lo, hi): the labels between them (NULL = open end).
+                    let pos = |v: Option<&Value>| match v {
+                        Some(Value::Text(l)) => names.iter().position(|n| n == l),
+                        _ => None,
+                    };
+                    let lo = if a.len() > 1 { pos(a.first()).unwrap_or(0) } else { 0 };
+                    let hi = if a.len() > 1 {
+                        pos(a.get(1)).unwrap_or(names.len().saturating_sub(1))
+                    } else {
+                        names.len().saturating_sub(1)
+                    };
+                    let items: Vec<Value> = if names.is_empty() || lo > hi {
+                        vec![]
+                    } else {
+                        names[lo..=hi].iter().cloned().map(Value::Text).collect()
+                    };
+                    Value::Array(Box::new(types::Array::new(items)))
+                }
+            }
+        }
         "record_field" => {
             let idx = a[1].as_int().unwrap_or(0) as usize;
             match &a[0] {
@@ -1268,7 +1318,27 @@ fn run_select(s: &Select, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         }
     }
     sort_rows(&mut out, &s.order);
-    apply_limit(&mut out, &s.limit, &s.offset, ctx)?;
+    if s.with_ties {
+        // FETCH FIRST n ROWS WITH TIES: also every following row that ties
+        // the last one on the ORDER BY keys.
+        let full = out.clone();
+        let before = out.len();
+        apply_limit(&mut out, &None, &s.offset, ctx)?;
+        let skipped = before - out.len();
+        apply_limit(&mut out, &s.limit, &None, ctx)?;
+        if let Some(last) = out.last().cloned() {
+            let key = |r: &Row| s.order.iter().map(|k| r[k.col].clone()).collect::<Vec<_>>();
+            let last_key = key(&last);
+            for r in full.iter().skip(skipped + out.len()) {
+                if !rows_equal(&key(r), &last_key) {
+                    break;
+                }
+                out.push(r.clone());
+            }
+        }
+    } else {
+        apply_limit(&mut out, &s.limit, &s.offset, ctx)?;
+    }
     if s.visible < s.proj.len() {
         for r in out.iter_mut() {
             r.truncate(s.visible);
@@ -1282,16 +1352,21 @@ fn expand_srfs(proj: &[Expr], rows: &[Row], ctx: &mut Ctx) -> PgResult<Vec<Row>>
     let mut out = vec![];
     for r in rows {
         // Each projection item may produce several values.
-        let mut columns: Vec<Vec<Value>> = vec![];
+        let mut columns: Vec<(Vec<Value>, bool)> = vec![];
         for e in proj {
-            columns.push(eval_multi(e, r, ctx)?);
+            let is_srf = e.contains(&|x| {
+                matches!(x, Expr::Call { name, .. } if super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf))
+            });
+            columns.push((eval_multi(e, r, ctx)?, is_srf));
         }
-        let n = columns.iter().map(|c| c.len()).max().unwrap_or(1);
+        // Set-returning columns run in lockstep, the shorter ones padded
+        // with NULLs; plain columns repeat.
+        let n = columns.iter().filter(|c| c.1).map(|c| c.0.len()).max().unwrap_or(1);
         for i in 0..n {
             let mut row = vec![];
-            for c in &columns {
-                row.push(if c.len() == 1 {
-                    c[0].clone()
+            for (c, srf) in &columns {
+                row.push(if !srf {
+                    c.first().cloned().unwrap_or(Value::Null)
                 } else {
                     c.get(i).cloned().unwrap_or(Value::Null)
                 });
@@ -1319,8 +1394,9 @@ fn eval_multi(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Value>> {
             })
             .collect());
     }
+    let is_srf = |x: &Expr| matches!(x, Expr::Call { name, .. } if super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf));
     if let Expr::Call { name, args, arg_tys, ty } = e
-        && super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf)
+        && is_srf(e)
     {
         let mut vals = vec![];
         for a in args {
@@ -1332,7 +1408,46 @@ fn eval_multi(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Value>> {
             .map(|mut r| if r.len() == 1 { r.remove(0) } else { Value::Record(r) })
             .collect());
     }
+    // A set-returning call inside an expression (`unnest(a) * 10`,
+    // `generate_series(...)::date`): expand it, then evaluate the rest of
+    // the expression once per value.
+    if e.contains(&is_srf) {
+        let mut template = e.clone();
+        let mut srf = None;
+        take_first_srf(&mut template, &mut srf, &is_srf);
+        if let Some(srf) = srf {
+            let mut out = vec![];
+            for v in eval_multi(&srf, row, ctx)? {
+                let mut t = template.clone();
+                fill_srf_slot(&mut t, &v);
+                out.extend(eval_multi(&t, row, ctx)?);
+            }
+            return Ok(out);
+        }
+    }
     Ok(vec![eval(e, row, ctx)?])
+}
+
+/// The marker left where `take_first_srf` cut a set-returning call out.
+const SRF_SLOT: &str = "\u{0}srf-slot";
+
+fn take_first_srf(e: &mut Expr, found: &mut Option<Expr>, is_srf: &dyn Fn(&Expr) -> bool) {
+    if found.is_some() {
+        return;
+    }
+    if is_srf(e) {
+        *found = Some(std::mem::replace(e, Expr::Const(Value::Text(SRF_SLOT.into()))));
+        return;
+    }
+    e.children_mut(&mut |c| take_first_srf(c, found, is_srf));
+}
+
+fn fill_srf_slot(e: &mut Expr, v: &Value) {
+    if matches!(e, Expr::Const(Value::Text(t)) if t == SRF_SLOT) {
+        *e = Expr::Const(v.clone());
+        return;
+    }
+    e.children_mut(&mut |c| fill_srf_slot(c, v));
 }
 
 fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
@@ -1747,7 +1862,23 @@ fn srf_rows(
             })
             .collect(),
         "jsonb_path_query" => {
-            return Err(PgError::new(code::FEATURE_NOT_SUPPORTED, "jsonpath is not supported"));
+            let path = super::jsonpath::parse(match &a[1] {
+                Value::Text(s) => s,
+                _ => "",
+            })?;
+            let doc = match &a[0] {
+                Value::Jsonb(j) => (**j).clone(),
+                _ => crate::sql::json::Json::Null,
+            };
+            let vars = match a.get(2) {
+                Some(Value::Jsonb(j)) => (**j).clone(),
+                _ => crate::sql::json::Json::Object(vec![]),
+            };
+            let silent = a.get(3).and_then(Value::as_bool).unwrap_or(false);
+            path.query(&doc, &vars, silent)?
+                .into_iter()
+                .map(|j| vec![Value::Jsonb(Box::new(j))])
+                .collect()
         }
         _ => {
             let _ = &env;
@@ -2155,10 +2286,15 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
                 }
                 groups[idx].seen[i].push(first);
             }
-            if !agg.order.is_empty() {
+            // DISTINCT without ORDER BY: Postgres sorts the input to drop
+            // duplicates, so the aggregate sees it in ascending order.
+            if !agg.order.is_empty() || agg.distinct {
                 let mut keys = Vec::with_capacity(agg.order.len());
                 for (e, _, _) in &agg.order {
                     keys.push(eval(e, r, ctx)?);
+                }
+                if agg.order.is_empty() {
+                    keys = vals.iter().take(1).cloned().collect();
                 }
                 groups[idx].ordered[i].push((keys, vals));
                 continue;
@@ -2170,10 +2306,13 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
     // Aggregates with ORDER BY see their inputs in that order.
     for g in &mut groups {
         for (i, agg) in aggs.iter().enumerate() {
-            if agg.order.is_empty() {
+            if agg.order.is_empty() && !agg.distinct {
                 continue;
             }
             let mut inputs = std::mem::take(&mut g.ordered[i]);
+            if agg.order.is_empty() {
+                inputs.sort_by(|a, b| types::cmp_values(&a.0[0], &b.0[0]));
+            }
             inputs.sort_by(|a, b| {
                 for (k, (_, desc, nulls_first)) in agg.order.iter().enumerate() {
                     let o = match (a.0[k].is_null(), b.0[k].is_null()) {
@@ -2373,7 +2512,7 @@ fn compute_window(
         }
         "first_value" | "last_value" | "nth_value" => {
             for p in 0..n {
-                let (start, end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]])?;
+                let (start, end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]], &order_keys)?;
                 let pick = match w.name {
                     "first_value" => start,
                     "last_value" => end.saturating_sub(1),
@@ -2398,14 +2537,7 @@ fn compute_window(
                 ));
             };
             for p in 0..n {
-                let (start, mut end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]])?;
-                if w.frame.is_none() && !w.order.is_empty() {
-                    // Default frame: RANGE UNBOUNDED PRECEDING TO CURRENT ROW (peers included).
-                    end = p + 1;
-                    while end < n && same_peer(p, end) {
-                        end += 1;
-                    }
-                }
+                let (start, end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]], &order_keys)?;
                 let mut st = new_state(agg);
                 let mut count = 0;
                 let mut seen: Vec<Value> = vec![];
@@ -2442,31 +2574,200 @@ fn frame_bounds(
     n: usize,
     ctx: &mut Ctx,
     row: &Row,
+    keys: &[Vec<Value>],
 ) -> PgResult<(usize, usize)> {
-    let Some(f) = &w.frame else {
-        return Ok(if w.order.is_empty() { (0, n) } else { (0, p + 1) });
+    let peer = |a: usize, b: usize| !w.order.is_empty() && rows_equal(&keys[a], &keys[b]);
+    let peer_start = |p: usize| {
+        let mut s = p;
+        while s > 0 && peer(s - 1, p) {
+            s -= 1;
+        }
+        s
     };
-    let val = |b: &FrameBound, ctx: &mut Ctx| -> PgResult<i64> {
-        Ok(match b {
-            FrameBound::Preceding(e) | FrameBound::Following(e) => {
-                eval(e, row, ctx)?.as_int().unwrap_or(0)
+    let peer_end = |p: usize| {
+        let mut e = p + 1;
+        while e < n && peer(p, e) {
+            e += 1;
+        }
+        e
+    };
+    // No frame clause: RANGE UNBOUNDED PRECEDING .. CURRENT ROW, peers
+    // included (the whole partition without ORDER BY).
+    let Some(f) = &w.frame else {
+        return Ok(if w.order.is_empty() { (0, n) } else { (0, peer_end(p)) });
+    };
+    let count = |e: &Expr, ctx: &mut Ctx| -> PgResult<i64> {
+        let v = eval(e, row, ctx)?;
+        match v.as_int() {
+            Some(k) if k >= 0 => Ok(k),
+            Some(_) => Err(PgError::new(
+                code::INVALID_PRECEDING_OR_FOLLOWING_SIZE,
+                "frame starting offset must not be negative",
+            )),
+            None if v.is_null() => Err(PgError::new(
+                code::NULL_VALUE_NOT_ALLOWED,
+                "frame starting offset must not be null",
+            )),
+            None => Ok(0),
+        }
+    };
+    if f.rows {
+        let start = match &f.start {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::CurrentRow => p,
+            FrameBound::Preceding(e) => p.saturating_sub(count(e, ctx)? as usize),
+            FrameBound::Following(e) => p + count(e, ctx)? as usize,
+            FrameBound::UnboundedFollowing => n,
+        };
+        let end = match &f.end {
+            FrameBound::UnboundedFollowing => n,
+            FrameBound::CurrentRow => p + 1,
+            FrameBound::Following(e) => (p + count(e, ctx)? as usize + 1).min(n),
+            FrameBound::Preceding(e) => (p + 1).saturating_sub(count(e, ctx)? as usize),
+            FrameBound::UnboundedPreceding => 0,
+        };
+        return Ok((start.min(n), end.min(n)));
+    }
+    if f.groups {
+        // Peer-group numbers and their [start, end) ranges.
+        let mut group_of = vec![0usize; n];
+        let mut bounds: Vec<(usize, usize)> = vec![];
+        let mut i = 0;
+        while i < n {
+            let e = peer_end(i);
+            for g in group_of.iter_mut().take(e).skip(i) {
+                *g = bounds.len();
             }
-            _ => 0,
-        })
+            bounds.push((i, e));
+            i = e;
+        }
+        let g = group_of[p] as i64;
+        let last = bounds.len() as i64 - 1;
+        let at = |k: i64| bounds[k.clamp(0, last) as usize];
+        let start = match &f.start {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::CurrentRow => at(g).0,
+            FrameBound::Preceding(e) => at((g - count(e, ctx)?).max(0)).0,
+            FrameBound::Following(e) => {
+                let k = g + count(e, ctx)?;
+                if k > last { n } else { at(k).0 }
+            }
+            FrameBound::UnboundedFollowing => n,
+        };
+        let end = match &f.end {
+            FrameBound::UnboundedFollowing => n,
+            FrameBound::CurrentRow => at(g).1,
+            FrameBound::Following(e) => at((g + count(e, ctx)?).min(last)).1,
+            FrameBound::Preceding(e) => {
+                let k = g - count(e, ctx)?;
+                if k < 0 { 0 } else { at(k).1 }
+            }
+            FrameBound::UnboundedPreceding => 0,
+        };
+        return Ok((start, end));
+    }
+    // RANGE: offsets are distances in the (single) ORDER BY key's values.
+    let desc = w.order.first().is_some_and(|o| o.1);
+    let key = |q: usize| keys[q].first().cloned().unwrap_or(Value::Null);
+    let cur = key(p);
+    let (fmt, now, stmt_now) = env!(ctx);
+    let env = Env { fmt: &fmt, now, stmt_now };
+    // `key - off` / `key + off`, comparable with the other keys.
+    let shift = |off: &Value, plus: bool| -> PgResult<Value> {
+        let k = match &cur {
+            Value::Date(d) => Value::Ts(super::casts::date_to_ts(*d)),
+            other => other.clone(),
+        };
+        match (&k, off) {
+            (Value::Ts(_), Value::Interval(_)) => funcs::binop(
+                if plus { "+" } else { "-" },
+                &k,
+                off,
+                Type::TIMESTAMP,
+                &[Type::TIMESTAMP, Type::INTERVAL],
+                &env,
+            ),
+            _ => {
+                let (Some(x), Some(y)) = (num_f64(&k), num_f64(off)) else {
+                    return Err(PgError::new(
+                        code::FEATURE_NOT_SUPPORTED,
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for this column type",
+                    ));
+                };
+                if y < 0.0 {
+                    return Err(PgError::new(
+                        code::INVALID_PRECEDING_OR_FOLLOWING_SIZE,
+                        "invalid preceding or following size in window function",
+                    ));
+                }
+                Ok(Value::Float(if plus { x + y } else { x - y }))
+            }
+        }
+    };
+    let cmp = |q: usize, b: &Value| -> Ordering {
+        let k = match key(q) {
+            Value::Date(d) => Value::Ts(super::casts::date_to_ts(d)),
+            other => other,
+        };
+        match (num_f64(&k), num_f64(b)) {
+            (Some(x), Some(y)) if !matches!(k, Value::Ts(_)) => {
+                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            }
+            _ => types::cmp_values(&k, b),
+        }
+    };
+    // "Before the bound" in sort order: smaller for ASC, larger for DESC.
+    let before = |q: usize, b: &Value| {
+        let c = cmp(q, b);
+        if desc { c == Ordering::Greater } else { c == Ordering::Less }
+    };
+    let after = |q: usize, b: &Value| {
+        let c = cmp(q, b);
+        if desc { c == Ordering::Less } else { c == Ordering::Greater }
+    };
+    let offset_bound = |e: &Expr, toward_start: bool, ctx: &mut Ctx| -> PgResult<Option<Value>> {
+        if cur.is_null() {
+            return Ok(None);
+        }
+        let off = eval(e, row, ctx)?;
+        // PRECEDING moves toward the start of the sort order.
+        let plus = toward_start == desc;
+        Ok(Some(shift(&off, plus)?))
     };
     let start = match &f.start {
         FrameBound::UnboundedPreceding => 0,
-        FrameBound::CurrentRow => p,
-        FrameBound::Preceding(_) => p.saturating_sub(val(&f.start, ctx)? as usize),
-        FrameBound::Following(_) => p + val(&f.start, ctx)? as usize,
+        FrameBound::CurrentRow => peer_start(p),
         FrameBound::UnboundedFollowing => n,
+        FrameBound::Preceding(e) | FrameBound::Following(e) => {
+            let toward_start = matches!(f.start, FrameBound::Preceding(_));
+            match offset_bound(e, toward_start, ctx)? {
+                None => peer_start(p),
+                Some(b) => (0..n).find(|&q| !key(q).is_null() && !before(q, &b)).unwrap_or(n),
+            }
+        }
     };
     let end = match &f.end {
         FrameBound::UnboundedFollowing => n,
-        FrameBound::CurrentRow => p + 1,
-        FrameBound::Following(_) => (p + val(&f.end, ctx)? as usize + 1).min(n),
-        FrameBound::Preceding(_) => (p + 1).saturating_sub(val(&f.end, ctx)? as usize),
+        FrameBound::CurrentRow => peer_end(p),
         FrameBound::UnboundedPreceding => 0,
+        FrameBound::Preceding(e) | FrameBound::Following(e) => {
+            let toward_start = matches!(f.end, FrameBound::Preceding(_));
+            match offset_bound(e, toward_start, ctx)? {
+                None => peer_end(p),
+                Some(b) => {
+                    (0..n).rev().find(|&q| !key(q).is_null() && !after(q, &b)).map_or(0, |q| q + 1)
+                }
+            }
+        }
     };
-    Ok((start.min(n), end.min(n)))
+    Ok((start, end.max(start)))
+}
+
+fn num_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Num(n) => Some(n.to_f64()),
+        _ => None,
+    }
 }

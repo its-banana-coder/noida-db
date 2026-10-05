@@ -54,7 +54,7 @@ impl Dec {
     fn with_scale(&self, scale: u32) -> Vec<u8> {
         let mut d = self.digits.clone();
         if !d.is_empty() {
-            d.extend(std::iter::repeat_n(0, (scale - self.scale) as usize));
+            d.extend(std::iter::repeat_n(0, scale.saturating_sub(self.scale) as usize));
         }
         d
     }
@@ -64,7 +64,10 @@ impl Dec {
     pub fn round_to(&self, scale: i64, truncate: bool) -> Dec {
         let cur = self.scale as i64;
         if scale >= cur {
-            let s = scale.min(MAX_DISPLAY_SCALE) as u32;
+            // Never below the value's own scale: `round(5e-16383, 1000000)`
+            // is the value itself (the cap used to undercut its scale and
+            // underflow into a 4 GB allocation, killing the server).
+            let s = (scale.min(MAX_DISPLAY_SCALE) as u32).max(self.scale);
             return Dec { neg: self.neg, digits: self.with_scale(s), scale: s, hidden: 0 };
         }
         let drop = (cur - scale) as usize;

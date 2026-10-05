@@ -66,7 +66,9 @@ to_tsquery(text)tsquery to_tsquery(text,text)tsquery
 plainto_tsquery(text)tsquery plainto_tsquery(text,text)tsquery
 phraseto_tsquery(text)tsquery phraseto_tsquery(text,text)tsquery
 websearch_to_tsquery(text)tsquery websearch_to_tsquery(text,text)tsquery
-ts_rank(tsvector,tsquery)float4 setweight(tsvector,char)tsvector
+ts_rank(tsvector,tsquery)float4 ts_rank(tsvector,tsquery,int4)float4 ts_rank(_float4,tsvector,tsquery)float4 ts_rank(_float4,tsvector,tsquery,int4)float4
+ts_headline(text,tsquery)text ts_headline(text,text,tsquery)text ts_headline(text,tsquery,text)text ts_headline(text,text,tsquery,text)text numnode(tsquery)int4
+setweight(tsvector,char)tsvector
 int4range(int4,int4)int4range int4range(int4,int4,text)int4range
 int8range(int8,int8)int8range int8range(int8,int8,text)int8range
 numrange(numeric,numeric)numrange numrange(numeric,numeric,text)numrange
@@ -117,14 +119,20 @@ s:jsonb_array_elements_text(jsonb)text s:json_array_elements_text(json)text
 s:jsonb_each(jsonb)(key text,value jsonb) s:json_each(json)(key text,value json)
 s:jsonb_each_text(jsonb)(key text,value text) s:json_each_text(json)(key text,value text)
 s:jsonb_object_keys(jsonb)text s:json_object_keys(json)text
-s:jsonb_path_query(jsonb,text)jsonb
+s:jsonb_path_query(jsonb,text)jsonb s:jsonb_path_query(jsonb,text,jsonb)jsonb s:jsonb_path_query(jsonb,text,jsonb,bool)jsonb
+jsonb_path_exists(jsonb,text)bool jsonb_path_exists(jsonb,text,jsonb)bool jsonb_path_exists(jsonb,text,jsonb,bool)bool
+jsonb_path_match(jsonb,text)bool jsonb_path_match(jsonb,text,jsonb)bool jsonb_path_match(jsonb,text,jsonb,bool)bool
+jsonb_path_query_array(jsonb,text)jsonb jsonb_path_query_array(jsonb,text,jsonb)jsonb jsonb_path_query_array(jsonb,text,jsonb,bool)jsonb
+jsonb_path_query_first(jsonb,text)jsonb jsonb_path_query_first(jsonb,text,jsonb)jsonb jsonb_path_query_first(jsonb,text,jsonb,bool)jsonb
 s:_pg_expandarray(anyarray)(x anyelement,n int4)
 _pg_char_max_length(oid,int4)int4 _pg_numeric_precision(oid,int4)int4 _pg_numeric_scale(oid,int4)int4
 _pg_datetime_precision(oid,int4)int4 _pg_truetypid(pg_node_tree,oid)oid _pg_truetypmod(pg_node_tree,oid)int4
 record_field(record,int4)anyelement
+!enum_range(anyelement)anyarray !enum_range(anyelement,anyelement)anyarray !enum_first(anyelement)anyelement !enum_last(anyelement)anyelement
+__enum_sortorder(int4,text)float8 __enum_key(int4,text)record
 array_length(anyarray,int4)int4 array_upper(anyarray,int4)int4 array_lower(anyarray,int4)int4 cardinality(anyarray)int4
 array_ndims(anyarray)int4 array_dims(anyarray)text
-!array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
+!array_set_element(anyarray,int4,anyelement)anyarray !array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
 !array_remove(anyarray,anyelement)anyarray !array_replace(anyarray,anyelement,anyelement)anyarray
 !array_position(anyarray,anyelement)int4 !array_positions(anyarray,anyelement)_int4
 array_fill(anyelement,_int4)anyarray trim_array(anyarray,int4)anyarray

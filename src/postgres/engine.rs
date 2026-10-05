@@ -1034,6 +1034,15 @@ impl Engine {
     }
 
     fn commit(&self, s: &mut Session) -> PgResult<()> {
+        // Deferred constraints are checked now; a violation rolls back.
+        if let Some(tx) = s.txn.as_ref()
+            && tx.wrote
+            && let Err(e) = super::dml::check_deferred(&tx.state)
+        {
+            self.rollback(s);
+            s.status = TxStatus::Idle;
+            return Err(e);
+        }
         let Some(tx) = s.txn.take() else { return Ok(()) };
         let mut g = self.global.lock().unwrap();
         if tx.wrote
@@ -1296,6 +1305,11 @@ pub(crate) fn run_one(
             };
             let mut d = ddl(ctx, info);
             let tag = d.create_enum(name, labels)?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::AlterType(at) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.alter_type(&at.name, &at.operation)?;
             Ok(StmtResult::tag(tag))
         }
         S::AlterTable(at) => {

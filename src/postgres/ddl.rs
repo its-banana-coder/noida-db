@@ -141,6 +141,7 @@ impl Ddl<'_, '_> {
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
+                                deferral: deferral(&fk.characteristics),
                             },
                         ));
                     }
@@ -279,6 +280,7 @@ impl Ddl<'_, '_> {
                     cols: fk.referred_columns.iter().map(ident).collect(),
                     on_delete: fk_action(&fk.on_delete),
                     on_update: fk_action(&fk.on_update),
+                    deferral: deferral(&fk.characteristics),
                 },
             ),
             a::TableConstraint::Check(chk) => (
@@ -309,12 +311,20 @@ impl Ddl<'_, '_> {
                 )
             })?);
         }
+        let mut fk_deferral = (false, false);
         let (kind, label, nulls_distinct) = match kind {
             PendingConstraint::PrimaryKey => (ConstraintKind::PrimaryKey, "pkey", true),
             PendingConstraint::Unique => (ConstraintKind::Unique, "key", true),
             PendingConstraint::UniqueNulls(nd) => (ConstraintKind::Unique, "key", nd),
             PendingConstraint::Check(sql) => (ConstraintKind::Check(sql), "check", true),
-            PendingConstraint::ForeignKey { table: parts, cols: refcols, on_delete, on_update } => {
+            PendingConstraint::ForeignKey {
+                table: parts,
+                cols: refcols,
+                on_delete,
+                on_update,
+                deferral,
+            } => {
+                fk_deferral = deferral;
                 let rname = parts.last().cloned().unwrap_or_default();
                 let rschema =
                     if parts.len() > 1 { Some(parts[parts.len() - 2].clone()) } else { None };
@@ -449,7 +459,8 @@ impl Ddl<'_, '_> {
             kind,
             cols: idxs,
             index_oid,
-            deferrable: false,
+            deferrable: fk_deferral.0,
+            initially_deferred: fk_deferral.1,
             comment: None,
         });
         // Existing rows must satisfy the new constraint.
@@ -854,6 +865,94 @@ impl Ddl<'_, '_> {
         Ok("CREATE TYPE".into())
     }
 
+    /// `ALTER TYPE <enum> ADD VALUE [IF NOT EXISTS] 'v' [BEFORE|AFTER 'x']`
+    /// and `RENAME VALUE 'a' TO 'b'`.
+    pub fn alter_type(
+        &mut self,
+        name: &a::ObjectName,
+        op: &a::AlterTypeOperation,
+    ) -> PgResult<String> {
+        let parts = name_parts(name);
+        let (schema, n) = self.target(&parts)?;
+        let oid = self
+            .ctx
+            .db
+            .find_enum(schema, &n)
+            .or_else(|| {
+                (parts.len() == 1)
+                    .then(|| self.ctx.db.enums.values().find(|e| e.name == n))
+                    .flatten()
+            })
+            .map(|e| e.oid)
+            .ok_or_else(|| {
+                PgError::new(code::UNDEFINED_OBJECT, format!("type \"{n}\" does not exist"))
+            })?;
+        match op {
+            a::AlterTypeOperation::AddValue(add) => {
+                let label = add.value.value.clone();
+                let e = &self.ctx.db.enums[&oid];
+                if e.labels.iter().any(|(_, l, _)| *l == label) {
+                    if add.if_not_exists {
+                        return Ok("ALTER TYPE".into());
+                    }
+                    return Err(PgError::new(
+                        code::DUPLICATE_OBJECT,
+                        format!("enum label \"{label}\" already exists"),
+                    ));
+                }
+                let mut sorted = e.labels.clone();
+                sorted.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+                let order = match &add.position {
+                    None => sorted.last().map_or(1.0, |l| l.0 + 1.0),
+                    Some(pos) => {
+                        let (nb, before) = match pos {
+                            a::AlterTypeAddValuePosition::Before(x) => (&x.value, true),
+                            a::AlterTypeAddValuePosition::After(x) => (&x.value, false),
+                        };
+                        let Some(i) = sorted.iter().position(|(_, l, _)| l == nb) else {
+                            return Err(PgError::new(
+                                code::INVALID_PARAMETER_VALUE,
+                                format!("\"{nb}\" is not an existing enum label"),
+                            ));
+                        };
+                        let here = sorted[i].0;
+                        if before {
+                            let prev = if i == 0 { here - 1.0 } else { sorted[i - 1].0 };
+                            (prev + here) / 2.0
+                        } else {
+                            let next = sorted.get(i + 1).map_or(here + 1.0, |l| l.0);
+                            (here + next) / 2.0
+                        }
+                    }
+                };
+                let loid = self.ctx.db.alloc_oid();
+                self.ctx.db.enums.get_mut(&oid).unwrap().labels.push((order, label, loid));
+                Ok("ALTER TYPE".into())
+            }
+            a::AlterTypeOperation::RenameValue(r) => {
+                let e = self.ctx.db.enums.get_mut(&oid).unwrap();
+                if e.labels.iter().any(|(_, l, _)| *l == r.to.value) {
+                    return Err(PgError::new(
+                        code::DUPLICATE_OBJECT,
+                        format!("enum label \"{}\" already exists", r.to.value),
+                    ));
+                }
+                let Some(slot) = e.labels.iter_mut().find(|(_, l, _)| *l == r.from.value) else {
+                    return Err(PgError::new(
+                        code::INVALID_PARAMETER_VALUE,
+                        format!("\"{}\" is not an existing enum label", r.from.value),
+                    ));
+                };
+                slot.1 = r.to.value.clone();
+                Ok("ALTER TYPE".into())
+            }
+            a::AlterTypeOperation::Rename(r) => {
+                self.ctx.db.enums.get_mut(&oid).unwrap().name = r.new_name.value.clone();
+                Ok("ALTER TYPE".into())
+            }
+        }
+    }
+
     pub fn drop(&mut self, d: &a::Statement) -> PgResult<String> {
         let a::Statement::Drop { object_type, if_exists, names, cascade, .. } = d else {
             return Err(unsupported("DROP"));
@@ -1106,6 +1205,7 @@ impl Ddl<'_, '_> {
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
+                                deferral: deferral(&fk.characteristics),
                             });
                         }
                         a::ColumnOption::Generated { generation_expr, .. } => {
@@ -1164,23 +1264,46 @@ impl Ddl<'_, '_> {
                     _ => None,
                 };
                 let nrows = self.ctx.db.table(oid).unwrap().rows.len();
-                for i in 0..nrows {
+                let not_null = self.ctx.db.table(oid).unwrap().columns[idx].not_null;
+                let mut values = Vec::with_capacity(nrows);
+                for _ in 0..nrows {
                     let v = match &value {
                         Some(e) => super::exec::eval(e, &[], self.ctx)?,
                         None => Value::Null,
                     };
-                    let v = super::casts::cast(
-                        v,
-                        Type::INT8,
-                        ty,
-                        typmod,
-                        false,
-                        &self.info.fmt,
-                        self.info.now,
-                    )
-                    .unwrap_or(Value::Null);
+                    // nextval() is int8; a default was already coerced.
+                    let v = if default_sql.is_none() && has_identity {
+                        super::casts::cast(
+                            v,
+                            Type::INT8,
+                            ty,
+                            typmod,
+                            false,
+                            &self.info.fmt,
+                            self.info.now,
+                        )
+                        .unwrap_or(Value::Null)
+                    } else {
+                        v
+                    };
+                    values.push(v);
+                }
+                // NOT NULL without a default on a table with rows fails, and
+                // the column isn't added.
+                if not_null && values.iter().any(Value::is_null) {
                     let t = self.ctx.db.table_mut(oid).unwrap();
-                    t.rows[i].push(v);
+                    t.columns.pop();
+                    let tname = t.name.clone();
+                    return Err(PgError::new(
+                        code::NOT_NULL_VIOLATION,
+                        format!("column \"{cname}\" of relation \"{tname}\" contains null values"),
+                    )
+                    .table("public", &tname)
+                    .column(&cname));
+                }
+                let t = self.ctx.db.table_mut(oid).unwrap();
+                for (r, v) in t.rows.iter_mut().zip(values) {
+                    r.push(v);
                 }
                 if nrows == 0 {
                     let t = self.ctx.db.table_mut(oid).unwrap();
@@ -1658,7 +1781,21 @@ enum PendingConstraint {
     Unique,
     UniqueNulls(bool),
     Check(String),
-    ForeignKey { table: Vec<String>, cols: Vec<String>, on_delete: FkAction, on_update: FkAction },
+    ForeignKey {
+        table: Vec<String>,
+        cols: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
+        /// (DEFERRABLE, INITIALLY DEFERRED)
+        deferral: (bool, bool),
+    },
+}
+
+/// A constraint's `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`.
+fn deferral(c: &Option<a::ConstraintCharacteristics>) -> (bool, bool) {
+    let Some(c) = c else { return (false, false) };
+    let deferred = matches!(c.initially, Some(a::DeferrableInitial::Deferred));
+    (c.deferrable.unwrap_or(false) || deferred, deferred)
 }
 
 fn fk_action(a: &Option<a::ReferentialAction>) -> FkAction {

@@ -52,8 +52,22 @@ fn after_rows(
 
 pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     match d {
-        Dml::Insert { table, cols, source, defaults, on_conflict, returning, .. } => {
+        Dml::Insert {
+            table,
+            cols,
+            source,
+            defaults,
+            on_conflict,
+            returning,
+            overriding_system,
+        } => {
+            // Subqueries in RETURNING see the table as it was when the
+            // statement started (its snapshot), not the rows it wrote.
+            let mut snap = returning_snapshot(returning, ctx);
             let rows = exec::run_query(source, ctx)?;
+            // Rows this statement inserted or updated: an ON CONFLICT DO
+            // UPDATE may not touch one twice.
+            let mut touched: std::collections::HashSet<usize> = Default::default();
             plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Insert, &[])?;
             let mut out = vec![];
             let mut count = 0;
@@ -68,6 +82,20 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     // DEFAULT in a VALUES list.
                     if matches!(source_default(source, i), Some(col) if col == c) && v.is_null() {
                         continue;
+                    }
+                    if !*overriding_system {
+                        let t = table_of(ctx, *table)?;
+                        if let Some((true, _)) = t.columns[c].identity {
+                            let name = t.columns[c].name.clone();
+                            return Err(PgError::new(
+                                code::GENERATED_ALWAYS,
+                                format!("cannot insert a non-DEFAULT value into column \"{name}\""),
+                            )
+                            .detail(format!(
+                                "Column \"{name}\" is an identity column defined as GENERATED ALWAYS."
+                            ))
+                            .hint("Use OVERRIDING SYSTEM VALUE to override."));
+                        }
                     }
                     row[c] = v;
                     given[c] = true;
@@ -98,6 +126,13 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         match &oc.action {
                             ConflictAction::Nothing => continue,
                             ConflictAction::Update { sets, filter } => {
+                                if touched.contains(&idx) {
+                                    return Err(PgError::new(
+                                        code::CARDINALITY_VIOLATION,
+                                        "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                                    )
+                                    .hint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values."));
+                                }
                                 let existing = t.rows[idx].clone();
                                 let mut combined = existing.clone();
                                 combined.extend(row.clone());
@@ -118,9 +153,14 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                                 check_row(ctx, *table, &updated, Some(idx))?;
                                 let t = ctx.db.table_mut(*table).unwrap();
                                 t.rows[idx] = updated.clone();
+                                touched.insert(idx);
                                 count += 1;
                                 if !returning.is_empty() {
-                                    out.push(project(returning, &updated, ctx)?);
+                                    let mut r = with_system(ctx, *table, &updated, idx);
+                                    // An updated row's xmax is the updating
+                                    // transaction (non-zero).
+                                    set_xmax(ctx, *table, &mut r, 1);
+                                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                                 }
                                 continue;
                             }
@@ -130,9 +170,12 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 check_row(ctx, *table, &row, None)?;
                 let t = ctx.db.table_mut(*table).unwrap();
                 t.rows.push(row.clone());
+                let pos = t.rows.len() - 1;
+                touched.insert(pos);
                 count += 1;
                 if !returning.is_empty() {
-                    out.push(project(returning, &row, ctx)?);
+                    let r = with_system(ctx, *table, &row, pos);
+                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                 }
                 written.push((None, Some(row)));
             }
@@ -141,6 +184,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             Ok(out)
         }
         Dml::Update { table, from, filter, sets, defaults, returning } => {
+            // Subqueries in RETURNING see the table as it was when the
+            // statement started (its snapshot), not the rows it wrote.
+            let mut snap = returning_snapshot(returning, ctx);
             let set_cols: Vec<usize> = sets.iter().map(|(c, _)| *c).collect();
             plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Update, &set_cols)?;
             let t = table_of(ctx, *table)?;
@@ -209,7 +255,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 let t = ctx.db.table_mut(*table).unwrap();
                 t.rows[*i] = new.clone();
                 if !returning.is_empty() {
-                    out.push(project(returning, new, ctx)?);
+                    let mut r = with_system(ctx, *table, new, *i);
+                    set_xmax(ctx, *table, &mut r, 1);
+                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                 }
             }
             let written: Vec<(Option<Row>, Option<Row>)> = updates
@@ -221,6 +269,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             Ok(out)
         }
         Dml::Delete { table, using, filter, returning } => {
+            // Subqueries in RETURNING see the table as it was when the
+            // statement started (its snapshot), not the rows it wrote.
+            let mut snap = returning_snapshot(returning, ctx);
             plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Delete, &[])?;
             let t = table_of(ctx, *table)?;
             let base = t.rows.clone();
@@ -259,7 +310,8 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
             if !returning.is_empty() {
                 for &i in &doomed {
-                    out.push(project(returning, &base[i], ctx)?);
+                    let r = with_system(ctx, *table, &base[i], i);
+                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                 }
             }
             for &i in &doomed {
@@ -377,6 +429,46 @@ fn table_of<'a>(ctx: &'a Ctx, oid: u32) -> PgResult<&'a Table> {
     ctx.db.table(oid).ok_or_else(|| {
         PgError::new(code::UNDEFINED_TABLE, format!("relation with OID {oid} does not exist"))
     })
+}
+
+/// A stored row followed by its system column values (as RETURNING sees
+/// them).
+fn with_system(ctx: &Ctx, table: u32, row: &Row, pos: usize) -> Row {
+    let mut r = row.clone();
+    if let Ok(t) = table_of(ctx, table) {
+        r.extend(t.system_col_values(pos));
+    }
+    r
+}
+
+/// Sets `xmax` in a row built by `with_system`.
+fn set_xmax(ctx: &Ctx, table: u32, row: &mut Row, v: i64) {
+    if let Ok(t) = table_of(ctx, table) {
+        let i = t.columns.len() + 3;
+        if i < row.len() {
+            row[i] = Value::Int(v);
+        }
+    }
+}
+
+fn returning_snapshot(returning: &[Expr], ctx: &Ctx) -> Option<super::catalog::DbState> {
+    let has_sub = returning
+        .iter()
+        .any(|e| e.contains(&|x| matches!(x, Expr::Sub { .. } | Expr::InSub { .. })));
+    has_sub.then(|| ctx.db.clone())
+}
+
+fn project_snap(
+    exprs: &[Expr],
+    row: &Row,
+    ctx: &mut Ctx,
+    snap: &mut Option<super::catalog::DbState>,
+) -> PgResult<Row> {
+    let Some(db) = snap.as_mut() else { return project(exprs, row, ctx) };
+    std::mem::swap(ctx.db, db);
+    let r = project(exprs, row, ctx);
+    std::mem::swap(ctx.db, db);
+    r
 }
 
 fn project(exprs: &[Expr], row: &Row, ctx: &mut Ctx) -> PgResult<Row> {
@@ -536,7 +628,8 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
                 }
             }
             ConstraintKind::ForeignKey { ref_table, ref_cols, .. } => {
-                if cons.cols.iter().any(|&c| row[c].is_null()) {
+                // INITIALLY DEFERRED: checked at COMMIT (`check_deferred`).
+                if cons.cols.iter().any(|&c| row[c].is_null()) || cons.initially_deferred {
                     continue;
                 }
                 let parent = table_of(ctx, *ref_table)?;
@@ -672,6 +765,9 @@ fn cascade_delete(ctx: &mut Ctx, table: u32, row: &Row) -> PgResult<()> {
             .map(|(i, _)| i)
             .collect();
         if matching.is_empty() {
+            continue;
+        }
+        if cons.initially_deferred && matches!(on_delete, FkAction::NoAction) {
             continue;
         }
         match on_delete {
@@ -812,4 +908,56 @@ fn referencing(ctx: &Ctx, table: u32) -> Vec<(u32, Constraint)> {
         }
     }
     out
+}
+
+/// At COMMIT: every `INITIALLY DEFERRED` foreign key must hold for every
+/// row (Postgres checks the rows it queued; checking them all gives the
+/// same answer).
+pub fn check_deferred(db: &super::catalog::DbState) -> PgResult<()> {
+    for t in db.tables.values() {
+        for cons in &t.constraints {
+            let ConstraintKind::ForeignKey { ref_table, ref_cols, .. } = &cons.kind else {
+                continue;
+            };
+            if !cons.initially_deferred {
+                continue;
+            }
+            let Some(parent) = db.tables.get(ref_table) else { continue };
+            for row in &t.rows {
+                if cons.cols.iter().any(|&c| row[c].is_null()) {
+                    continue;
+                }
+                let found = parent.rows.iter().any(|pr| {
+                    cons.cols
+                        .iter()
+                        .zip(ref_cols)
+                        .all(|(&c, &p)| types::cmp_values(&row[c], &pr[p]) == Ordering::Equal)
+                });
+                if !found {
+                    let keys: Vec<String> =
+                        cons.cols.iter().map(|&c| t.columns[c].name.clone()).collect();
+                    let vals: Vec<String> = cons
+                        .cols
+                        .iter()
+                        .map(|&c| types::to_text(&row[c], t.columns[c].ty, &Default::default()))
+                        .collect();
+                    return Err(PgError::new(
+                        code::FOREIGN_KEY_VIOLATION,
+                        format!(
+                            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                            t.name, cons.name
+                        ),
+                    )
+                    .detail(format!(
+                        "Key ({})=({}) is not present in table \"{}\".",
+                        keys.join(", "),
+                        vals.join(", "),
+                        parent.name
+                    ))
+                    .constraint(&cons.name));
+                }
+            }
+        }
+    }
+    Ok(())
 }

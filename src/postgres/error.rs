@@ -111,6 +111,7 @@ pub mod code {
     pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
     pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const INVALID_PRECEDING_OR_FOLLOWING_SIZE: &str = "22013";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
     pub const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
@@ -131,6 +132,7 @@ pub mod code {
     pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
     pub const INVALID_JSON_TEXT: &str = "22P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
+    pub const GENERATED_ALWAYS: &str = "428C9";
     pub const DATA_EXCEPTION: &str = "22000";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";

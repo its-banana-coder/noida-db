@@ -107,6 +107,9 @@ pub struct Constraint {
     /// Backing index for PK/UNIQUE.
     pub index_oid: Option<u32>,
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: a foreign key checked at COMMIT.
+    #[serde(default)]
+    pub initially_deferred: bool,
     pub comment: Option<String>,
 }
 
