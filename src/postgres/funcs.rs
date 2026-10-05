@@ -1656,6 +1656,19 @@ pub fn call(
             Text(trim_chars(&s, chars, name != "rtrim", name != "ltrim"))
         }
         "lpad" | "rpad" => {
+            // Postgres sizes the result for 4-byte characters (UTF-8), in
+            // an int32.
+            let len = int(&a[1]).max(0);
+            if len * 4 > i32::MAX as i64 {
+                return Err(err(code::PROGRAM_LIMIT_EXCEEDED, "requested length too large"));
+            }
+            let want = len * 4 + 4;
+            if want > 0x3FFF_FFFF {
+                return Err(err(
+                    code::INTERNAL_ERROR,
+                    format!("invalid memory alloc request size {want}"),
+                ));
+            }
             Text(pad(text(&a[0]), int(&a[1]), a.get(2).map_or(" ", text), name == "lpad"))
         }
         "left" | "right" => {
@@ -1802,6 +1815,9 @@ pub fn call(
             }
             let (len, lo) = arr.dims[0];
             let (lo, hi) = (lo as i64, lo as i64 + len as i64 - 1);
+            if hi.max(i) - lo.min(i) + 1 > types::MAX_ARRAY_SIZE {
+                return Err(array_too_big());
+            }
             if i < lo {
                 let pad = (lo - i) as usize;
                 let mut items = vec![Null; pad];
@@ -2512,11 +2528,45 @@ pub fn call(
             ))),
         },
         "array_fill" => {
-            let dims: Vec<i64> = arr_items(&a[1]).iter().map(int).collect();
-            let total: i64 = dims.iter().product();
+            // array_fill(value, dims [, lower bounds])
+            let ints = |v: &Value| -> PgResult<Vec<i64>> {
+                arr_items(v)
+                    .iter()
+                    .map(|x| {
+                        x.as_int().ok_or_else(|| {
+                            err(code::NULL_VALUE_NOT_ALLOWED, "dimension values cannot be null")
+                        })
+                    })
+                    .collect()
+            };
+            let dims = ints(&a[1])?;
+            let lbs = match a.get(2) {
+                Some(l) => ints(l)?,
+                None => vec![1; dims.len()],
+            };
+            if lbs.len() != dims.len() {
+                return Err(err(code::ARRAY_SUBSCRIPT_ERROR, "wrong number of array subscripts")
+                    .detail("Low bound array has different size than dimensions array."));
+            }
+            let mut total: i64 = 1;
+            for (&d, &lb) in dims.iter().zip(&lbs) {
+                total = total.saturating_mul(d);
+                if d < 0 || total > types::MAX_ARRAY_SIZE {
+                    return Err(array_too_big());
+                }
+                if lb + d - 1 > i32::MAX as i64 {
+                    return Err(err(
+                        code::PROGRAM_LIMIT_EXCEEDED,
+                        format!("array lower bound is too large: {lb}"),
+                    ));
+                }
+            }
+            if dims.is_empty() || total == 0 {
+                return Ok(Some(Array(Box::new(types::Array::empty()))));
+            }
             Array(Box::new(types::Array {
-                dims: dims.iter().map(|&d| (d as i32, 1)).collect(),
-                items: vec![a[0].clone(); total.max(0) as usize],
+                dims: dims.iter().zip(&lbs).map(|(&d, &lb)| (d as i32, lb as i32)).collect(),
+                items: vec![a[0].clone(); total as usize],
             }))
         }
         "trim_array" => match arr(&a[0]) {
@@ -3329,4 +3379,12 @@ mod tests {
         let s = to_char(&Value::Ts(t), Type::TIMESTAMP, "FMMonth FMDD, HH12 AM", &env).unwrap();
         assert_eq!(s.as_str(), Some("March 5, 02 PM"));
     }
+}
+
+/// Postgres's MaxArraySize error.
+fn array_too_big() -> PgError {
+    PgError::new(
+        code::PROGRAM_LIMIT_EXCEEDED,
+        format!("array size exceeds the maximum allowed ({})", types::MAX_ARRAY_SIZE),
+    )
 }

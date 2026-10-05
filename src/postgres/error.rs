@@ -200,6 +200,7 @@ pub mod code {
     pub const RAISE_EXCEPTION: &str = "P0001";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+    pub const OUT_OF_MEMORY: &str = "53200";
     pub const TOO_MANY_COLUMNS: &str = "54011";
     pub const STATEMENT_TOO_COMPLEX: &str = "54001";
     pub const CONFIGURATION_LIMIT_EXCEEDED: &str = "53400";

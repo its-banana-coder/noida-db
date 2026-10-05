@@ -591,6 +591,9 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
 // ---------------------------------------------------------------------------
 // Text output
 
+/// Postgres's MaxArraySize: the most elements an array may have.
+pub const MAX_ARRAY_SIZE: i64 = 134_217_727;
+
 /// Session settings that affect text output.
 #[derive(Clone)]
 pub struct FmtCtx {

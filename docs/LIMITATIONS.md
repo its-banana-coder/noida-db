@@ -221,6 +221,9 @@ constraints.
   `'english'`/`'simple'`; `ts_rank_cd`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
+- Results are built in memory, not streamed: `generate_series` past
+  10,000,000 rows fails with `53200 out of memory` (Postgres would stream
+  it).
 
 - A set-returning user function in a select list (it works in `FROM`).
 - `BETWEEN SYMMETRIC` (the SQL parser rejects it) and the `GROUPING()`
