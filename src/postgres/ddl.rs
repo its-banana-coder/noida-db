@@ -141,6 +141,7 @@ impl Ddl<'_, '_> {
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
+                                deferral: deferral(&fk.characteristics),
                             },
                         ));
                     }
@@ -279,6 +280,7 @@ impl Ddl<'_, '_> {
                     cols: fk.referred_columns.iter().map(ident).collect(),
                     on_delete: fk_action(&fk.on_delete),
                     on_update: fk_action(&fk.on_update),
+                    deferral: deferral(&fk.characteristics),
                 },
             ),
             a::TableConstraint::Check(chk) => (
@@ -309,12 +311,20 @@ impl Ddl<'_, '_> {
                 )
             })?);
         }
+        let mut fk_deferral = (false, false);
         let (kind, label, nulls_distinct) = match kind {
             PendingConstraint::PrimaryKey => (ConstraintKind::PrimaryKey, "pkey", true),
             PendingConstraint::Unique => (ConstraintKind::Unique, "key", true),
             PendingConstraint::UniqueNulls(nd) => (ConstraintKind::Unique, "key", nd),
             PendingConstraint::Check(sql) => (ConstraintKind::Check(sql), "check", true),
-            PendingConstraint::ForeignKey { table: parts, cols: refcols, on_delete, on_update } => {
+            PendingConstraint::ForeignKey {
+                table: parts,
+                cols: refcols,
+                on_delete,
+                on_update,
+                deferral,
+            } => {
+                fk_deferral = deferral;
                 let rname = parts.last().cloned().unwrap_or_default();
                 let rschema =
                     if parts.len() > 1 { Some(parts[parts.len() - 2].clone()) } else { None };
@@ -449,7 +459,8 @@ impl Ddl<'_, '_> {
             kind,
             cols: idxs,
             index_oid,
-            deferrable: false,
+            deferrable: fk_deferral.0,
+            initially_deferred: fk_deferral.1,
             comment: None,
         });
         // Existing rows must satisfy the new constraint.
@@ -1194,6 +1205,7 @@ impl Ddl<'_, '_> {
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
+                                deferral: deferral(&fk.characteristics),
                             });
                         }
                         a::ColumnOption::Generated { generation_expr, .. } => {
@@ -1252,23 +1264,46 @@ impl Ddl<'_, '_> {
                     _ => None,
                 };
                 let nrows = self.ctx.db.table(oid).unwrap().rows.len();
-                for i in 0..nrows {
+                let not_null = self.ctx.db.table(oid).unwrap().columns[idx].not_null;
+                let mut values = Vec::with_capacity(nrows);
+                for _ in 0..nrows {
                     let v = match &value {
                         Some(e) => super::exec::eval(e, &[], self.ctx)?,
                         None => Value::Null,
                     };
-                    let v = super::casts::cast(
-                        v,
-                        Type::INT8,
-                        ty,
-                        typmod,
-                        false,
-                        &self.info.fmt,
-                        self.info.now,
-                    )
-                    .unwrap_or(Value::Null);
+                    // nextval() is int8; a default was already coerced.
+                    let v = if default_sql.is_none() && has_identity {
+                        super::casts::cast(
+                            v,
+                            Type::INT8,
+                            ty,
+                            typmod,
+                            false,
+                            &self.info.fmt,
+                            self.info.now,
+                        )
+                        .unwrap_or(Value::Null)
+                    } else {
+                        v
+                    };
+                    values.push(v);
+                }
+                // NOT NULL without a default on a table with rows fails, and
+                // the column isn't added.
+                if not_null && values.iter().any(Value::is_null) {
                     let t = self.ctx.db.table_mut(oid).unwrap();
-                    t.rows[i].push(v);
+                    t.columns.pop();
+                    let tname = t.name.clone();
+                    return Err(PgError::new(
+                        code::NOT_NULL_VIOLATION,
+                        format!("column \"{cname}\" of relation \"{tname}\" contains null values"),
+                    )
+                    .table("public", &tname)
+                    .column(&cname));
+                }
+                let t = self.ctx.db.table_mut(oid).unwrap();
+                for (r, v) in t.rows.iter_mut().zip(values) {
+                    r.push(v);
                 }
                 if nrows == 0 {
                     let t = self.ctx.db.table_mut(oid).unwrap();
@@ -1746,7 +1781,21 @@ enum PendingConstraint {
     Unique,
     UniqueNulls(bool),
     Check(String),
-    ForeignKey { table: Vec<String>, cols: Vec<String>, on_delete: FkAction, on_update: FkAction },
+    ForeignKey {
+        table: Vec<String>,
+        cols: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
+        /// (DEFERRABLE, INITIALLY DEFERRED)
+        deferral: (bool, bool),
+    },
+}
+
+/// A constraint's `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`.
+fn deferral(c: &Option<a::ConstraintCharacteristics>) -> (bool, bool) {
+    let Some(c) = c else { return (false, false) };
+    let deferred = matches!(c.initially, Some(a::DeferrableInitial::Deferred));
+    (c.deferrable.unwrap_or(false) || deferred, deferred)
 }
 
 fn fk_action(a: &Option<a::ReferentialAction>) -> FkAction {

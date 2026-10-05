@@ -1318,7 +1318,27 @@ fn run_select(s: &Select, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         }
     }
     sort_rows(&mut out, &s.order);
-    apply_limit(&mut out, &s.limit, &s.offset, ctx)?;
+    if s.with_ties {
+        // FETCH FIRST n ROWS WITH TIES: also every following row that ties
+        // the last one on the ORDER BY keys.
+        let full = out.clone();
+        let before = out.len();
+        apply_limit(&mut out, &None, &s.offset, ctx)?;
+        let skipped = before - out.len();
+        apply_limit(&mut out, &s.limit, &None, ctx)?;
+        if let Some(last) = out.last().cloned() {
+            let key = |r: &Row| s.order.iter().map(|k| r[k.col].clone()).collect::<Vec<_>>();
+            let last_key = key(&last);
+            for r in full.iter().skip(skipped + out.len()) {
+                if !rows_equal(&key(r), &last_key) {
+                    break;
+                }
+                out.push(r.clone());
+            }
+        }
+    } else {
+        apply_limit(&mut out, &s.limit, &s.offset, ctx)?;
+    }
     if s.visible < s.proj.len() {
         for r in out.iter_mut() {
             r.truncate(s.visible);

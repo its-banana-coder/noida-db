@@ -519,6 +519,15 @@ impl<'a> Binder<'a> {
                 }
             }
             if let Some(f) = &q.fetch
+                && f.with_ties
+                && q.order_by.is_none()
+            {
+                return Err(PgError::new(
+                    code::SYNTAX_ERROR,
+                    "WITH TIES cannot be specified without ORDER BY clause",
+                ));
+            }
+            if let Some(f) = &q.fetch
                 && let Some(qty) = &f.quantity
             {
                 let te = self.bind_expr(qty)?;
@@ -2533,6 +2542,18 @@ impl<'a> Binder<'a> {
             }
             return Ok(and_all(conds));
         }
+        // `xid = int4` (Postgres's xideqint4): `RETURNING xmax = 0`.
+        let int_like = |t: Type| matches!(t.base, Base::Int2 | Base::Int4 | Base::Int8) && !t.array;
+        let as_int8 = |te: TE| TE::new(te.e, Type::INT8);
+        let (l, r) = match (l.ty.base, r.ty.base) {
+            (Base::Xid, _) if int_like(r.ty) && matches!(op, CmpOp::Eq | CmpOp::Ne) => {
+                (as_int8(l), r)
+            }
+            (_, Base::Xid) if int_like(l.ty) && matches!(op, CmpOp::Eq | CmpOp::Ne) => {
+                (l, as_int8(r))
+            }
+            _ => (l, r),
+        };
         let ty = self
             .common_type(&[l.ty, r.ty], "comparison", 0)
             .map_err(|_| no_operator(op.symbol(), l.ty, r.ty))?;
@@ -4135,7 +4156,7 @@ impl<'a> Binder<'a> {
                 defaults,
                 on_conflict,
                 returning,
-                overriding_system: false,
+                overriding_system: ins.overwrite,
             })),
             cols: rcols,
             tag: "INSERT",
@@ -4355,6 +4376,37 @@ impl<'a> Binder<'a> {
                         )
                     })?);
                 }
+                // The columns must be exactly some unique index's.
+                let mut want = idx.clone();
+                want.sort_unstable();
+                let matches = table
+                    .constraints
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c.kind,
+                            super::catalog::ConstraintKind::PrimaryKey
+                                | super::catalog::ConstraintKind::Unique
+                        )
+                    })
+                    .map(|c| c.cols.clone())
+                    .chain(
+                        table
+                            .indexes
+                            .iter()
+                            .filter(|i| i.unique && i.cols.iter().all(Option::is_some))
+                            .map(|i| i.cols.iter().flatten().copied().collect()),
+                    )
+                    .any(|mut c: Vec<usize>| {
+                        c.sort_unstable();
+                        c == want
+                    });
+                if !matches {
+                    return Err(PgError::new(
+                        code::INVALID_COLUMN_REFERENCE,
+                        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                    ));
+                }
                 Some(idx)
             }
             Some(a::ConflictTarget::OnConstraint(name)) => {
@@ -4445,6 +4497,15 @@ impl<'a> Binder<'a> {
         if matches!(&asg.value, a::Expr::Identifier(id) if ident(id) == "default") {
             return Ok((idx, Expr::Default(idx)));
         }
+        if let Some((true, _)) = table.columns[idx].identity {
+            return Err(PgError::new(
+                code::GENERATED_ALWAYS,
+                format!("column \"{col}\" can only be updated to DEFAULT"),
+            )
+            .detail(format!(
+                "Column \"{col}\" is an identity column defined as GENERATED ALWAYS."
+            )));
+        }
         let te = self.bind_expr(&asg.value)?;
         let c = &table.columns[idx];
         let e = self.coerce_assign(te, c.ty, c.typmod, &c.name, &table.name)?;
@@ -4473,6 +4534,9 @@ impl<'a> Binder<'a> {
                 rec: None,
             });
         }
+        // System columns follow the table's (the DML appends their values:
+        // `RETURNING xmax = 0` tells an upsert's insert from its update).
+        push_system_cols(&mut scope, &table.name, oid, table.columns.len());
         scope.rels.push(table.name.clone());
         self.scopes.push(scope);
         self.frames.push(AggFrame { forbid: Some("RETURNING"), ..Default::default() });
