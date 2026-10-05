@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::analysis;
 use super::dates;
+use super::query_string;
 use super::scoring;
 use super::sorting;
 
@@ -272,21 +273,145 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
     out
 }
 
+/// A query string analyzed the way `field` is: `keyword` (and numeric,
+/// boolean, date) fields take it whole, text fields through `standard`.
+fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
+    match resolve_field(mappings, field).1.as_deref() {
+        None | Some("text") | Some("match_only_text") => analysis::standard(text),
+        Some(_) => vec![text.to_string()],
+    }
+}
+
+/// A query value as text: `"quick"`, `10`, `true`.
+fn query_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
 fn eval_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let (text, op) = if let Some(o) = spec.as_object() {
+    let (text, op, boost) = if let Some(o) = spec.as_object() {
         (
-            o.get("query").and_then(Value::as_str).unwrap_or("").to_string(),
+            query_text(o.get("query")),
             o.get("operator").and_then(Value::as_str).unwrap_or("or").to_string(),
+            o.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32,
         )
     } else {
-        (spec.as_str().unwrap_or("").to_string(), "or".to_string())
+        (query_text(Some(spec)), "or".to_string(), 1.0)
     };
-    let query_terms = analysis::standard(&text);
+    let query_terms = analyze_for(mappings, field, &text);
     if query_terms.is_empty() {
         return HashMap::new();
     }
-    bm25_scores(mappings, docs, field, &query_terms, op.eq_ignore_ascii_case("and"))
+    let mut scores =
+        bm25_scores(mappings, docs, field, &query_terms, op.eq_ignore_ascii_case("and"));
+    if boost != 1.0 {
+        scores.values_mut().for_each(|s| *s *= boost);
+    }
+    scores
+}
+
+/// Damerau-Levenshtein (optimal string alignment) distance.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
+            }
+        }
+    }
+    d[a.len()][b.len()]
+}
+
+/// `fuzziness` as a maximum edit count for a term (`AUTO` = 0 below 3
+/// characters, 1 below 6, else 2).
+fn max_edits(fuzziness: Option<&Value>, term: &str) -> usize {
+    let len = term.chars().count();
+    match fuzziness {
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0).min(2) as usize,
+        Some(Value::String(s)) if s.parse::<usize>().is_ok() => s.parse::<usize>().unwrap().min(2),
+        _ => {
+            if len < 3 {
+                0
+            } else if len < 6 {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// `fuzzy`: terms within the edit distance, scored like the terms they
+/// matched.
+fn eval_fuzzy(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
+    let (value, fuzziness, prefix_len, boost) = match spec {
+        Value::Object(o) => (
+            query_text(o.get("value")),
+            o.get("fuzziness").cloned(),
+            o.get("prefix_length").and_then(Value::as_u64).unwrap_or(0) as usize,
+            o.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32,
+        ),
+        other => (query_text(Some(other)), None, 0, 1.0),
+    };
+    let edits = max_edits(fuzziness.as_ref(), &value);
+    let prefix: String = value.chars().take(prefix_len).collect();
+    let mut candidates: HashSet<String> = HashSet::new();
+    for d in docs {
+        for t in tokens_for(mappings, &d.source, field) {
+            if t.starts_with(&prefix) && edit_distance(&t, &value) <= edits {
+                candidates.insert(t);
+            }
+        }
+    }
+    let mut out: HashMap<usize, f32> = HashMap::new();
+    for term in candidates {
+        for (i, s) in bm25_scores(mappings, docs, field, std::slice::from_ref(&term), false) {
+            let e = out.entry(i).or_insert(0.0);
+            *e = e.max(s * boost);
+        }
+    }
+    out
+}
+
+/// `dis_max`: a document's best sub-query score, plus `tie_breaker` times
+/// the others.
+fn eval_dis_max(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<HashMap<usize, f32>, EsError> {
+    let tie = v.get("tie_breaker").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+    let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    let mut per: HashMap<usize, Vec<f32>> = HashMap::new();
+    for q in v.get("queries").and_then(Value::as_array).cloned().unwrap_or_default() {
+        for (i, s) in eval(&q, mappings, docs)? {
+            per.entry(i).or_default().push(s);
+        }
+    }
+    Ok(per
+        .into_iter()
+        .map(|(i, ss)| {
+            let max = ss.iter().copied().fold(f32::MIN, f32::max);
+            let sum: f32 = ss.iter().sum();
+            (i, (max + tie * (sum - max)) * boost)
+        })
+        .collect())
 }
 
 /// Whether `query_terms` occurs in `doc_tokens` as a contiguous run at
@@ -302,18 +427,54 @@ fn phrase_matches(doc_tokens: &[String], query_terms: &[String]) -> bool {
     (0..=doc_tokens.len() - n).any(|start| doc_tokens[start..start + n] == query_terms[..])
 }
 
+/// A sloppy phrase match: some choice of positions for the query terms
+/// whose total displacement from consecutive order is at most `slop`
+/// (Lucene's edit-distance notion of phrase slop, reordering included).
+fn sloppy_phrase_matches(doc_tokens: &[String], query_terms: &[String], slop: usize) -> bool {
+    if slop == 0 {
+        return phrase_matches(doc_tokens, query_terms);
+    }
+    let positions: Vec<Vec<usize>> = query_terms
+        .iter()
+        .map(|t| doc_tokens.iter().enumerate().filter(|(_, d)| *d == t).map(|(i, _)| i).collect())
+        .collect();
+    if positions.iter().any(Vec::is_empty) {
+        return false;
+    }
+    fn search(positions: &[Vec<usize>], k: usize, chosen: &mut Vec<usize>, slop: usize) -> bool {
+        if k == positions.len() {
+            let offsets: Vec<i64> =
+                chosen.iter().enumerate().map(|(i, &p)| p as i64 - i as i64).collect();
+            let (lo, hi) = (offsets.iter().min().unwrap(), offsets.iter().max().unwrap());
+            return (hi - lo) as usize <= slop;
+        }
+        for &p in &positions[k] {
+            if chosen.contains(&p) {
+                continue;
+            }
+            chosen.push(p);
+            if search(positions, k + 1, chosen, slop) {
+                return true;
+            }
+            chosen.pop();
+        }
+        false
+    }
+    search(&positions, 0, &mut Vec::new(), slop)
+}
+
 /// `match_phrase`: like `match`, but the query's analyzed terms must appear
 /// in the document at consecutive positions, in order (slop 0 — the only
 /// slop value implemented; a non-zero `slop` option is accepted but
 /// currently treated as 0).
 fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let text = if let Some(o) = spec.as_object() {
-        o.get("query").and_then(Value::as_str).unwrap_or("").to_string()
+    let (text, slop) = if let Some(o) = spec.as_object() {
+        (query_text(o.get("query")), o.get("slop").and_then(Value::as_u64).unwrap_or(0) as usize)
     } else {
-        spec.as_str().unwrap_or("").to_string()
+        (query_text(Some(spec)), 0)
     };
-    let query_terms = analysis::standard(&text);
+    let query_terms = analyze_for(mappings, field, &text);
     if query_terms.is_empty() {
         return HashMap::new();
     }
@@ -321,7 +482,7 @@ fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Hash
     let matched: HashSet<usize> = per_doc
         .iter()
         .enumerate()
-        .filter(|(_, toks)| phrase_matches(toks, &query_terms))
+        .filter(|(_, toks)| sloppy_phrase_matches(toks, &query_terms, slop))
         .map(|(idx, _)| idx)
         .collect();
     // Score the same as an AND `match` (every term must be present, which a
@@ -679,6 +840,9 @@ fn eval_bool(
     for i in &candidates {
         scores.entry(*i).or_insert(0.0);
     }
+    if let Some(b) = v.get("boost").and_then(Value::as_f64) {
+        scores.values_mut().for_each(|s| *s *= b as f32);
+    }
     Ok(scores)
 }
 
@@ -744,6 +908,20 @@ pub fn eval(
     }
     if let Some(v) = obj.get("bool") {
         return eval_bool(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("dis_max") {
+        return eval_dis_max(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("fuzzy") {
+        return Ok(eval_fuzzy(v, mappings, docs));
+    }
+    if let Some(v) = obj.get("query_string") {
+        let q = query_string::query_string(v, mappings)?;
+        return eval(&q, mappings, docs);
+    }
+    if let Some(v) = obj.get("simple_query_string") {
+        let q = query_string::simple_query_string(v, mappings)?;
+        return eval(&q, mappings, docs);
     }
     if let Some(v) = obj.get("constant_score") {
         let inner = v.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));

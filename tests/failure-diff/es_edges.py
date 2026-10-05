@@ -54,7 +54,7 @@ def norm(v):
         return float(f"{v:.5g}")
     if isinstance(v, dict):
         return {k: norm(x) for k, x in v.items() if k not in VOLATILE}
-    if isinstance(v, list):
+    if isinstance(v, (list, tuple)):
         return [norm(x) for x in v]
     return v
 

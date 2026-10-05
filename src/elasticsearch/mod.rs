@@ -3,6 +3,7 @@
 mod analysis;
 mod dates;
 mod engine;
+mod query_string;
 mod scoring;
 mod search;
 mod server;
