@@ -443,6 +443,7 @@ impl Engine {
                     ));
                 }
                 let mut g = self.global.lock().unwrap();
+                let mut r = StmtResult::tag("DROP DATABASE");
                 for name in names {
                     let n = super::binder::name_parts(name).pop().unwrap_or_default();
                     if g.sessions.values().any(|h| h.database == n) {
@@ -451,14 +452,17 @@ impl Engine {
                             "cannot drop the currently open database".to_string(),
                         ));
                     }
-                    if g.databases.remove(&n).is_none() && !if_exists {
-                        return Err(PgError::new(
-                            code::INVALID_CATALOG_NAME,
-                            format!("database \"{n}\" does not exist"),
-                        ));
+                    if g.databases.remove(&n).is_none() {
+                        if !if_exists {
+                            return Err(PgError::new(
+                                code::INVALID_CATALOG_NAME,
+                                format!("database \"{n}\" does not exist"),
+                            ));
+                        }
+                        r.notices.push(PgError::notice(format!("database \"{n}\" does not exist, skipping")));
                     }
                 }
-                Ok(StmtResult::tag("DROP DATABASE"))
+                Ok(r)
             }
             S::StartTransaction { .. } => {
                 if s.txn.is_some() && s.status != TxStatus::Idle {

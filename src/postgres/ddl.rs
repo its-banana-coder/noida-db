@@ -751,6 +751,7 @@ impl Ddl<'_, '_> {
         let t = db.table(oid).unwrap();
         let mut cols = vec![];
         let mut exprs = vec![];
+        let mut expr_names = vec![];
         let mut desc = vec![];
         for c in &ci.columns {
             desc.push(c.column.options.sort == Some(a::OrderBySort::Desc));
@@ -770,17 +771,19 @@ impl Ddl<'_, '_> {
                     b2.bind_table_expr(t, &other.to_string())?;
                     cols.push(None);
                     exprs.push(other.to_string());
+                    expr_names.push(b2.index_column_name(other));
                 }
             }
         }
         let name = match &ci.name {
             Some(n) => name_parts(n).pop().unwrap_or_default(),
             None => {
+                let mut names = expr_names.into_iter();
                 let base: Vec<String> = cols
                     .iter()
                     .map(|c| match c {
                         Some(i) => t.columns[*i].name.clone(),
-                        None => "expr".into(),
+                        None => names.next().unwrap_or_else(|| "expr".into()),
                     })
                     .collect();
                 self.ctx.db.unique_rel_name(t.schema, &format!("{}_{}_idx", t.name, base.join("_")))
@@ -963,9 +966,27 @@ impl Ddl<'_, '_> {
             let schema = (parts.len() > 1).then(|| parts[parts.len() - 2].clone());
             let found = self.find_object(*object_type, schema.as_deref(), &n)?;
             match found {
-                None if *if_exists => continue,
+                None if *if_exists => {
+                    let msg = match schema.as_deref() {
+                        Some(s) if self.ctx.db.schema_by_name(s).is_none() => {
+                            format!("schema \"{s}\" does not exist, skipping")
+                        }
+                        _ => format!(
+                            "{} \"{n}\" does not exist, skipping",
+                            object_kind_name(*object_type).to_ascii_lowercase()
+                        ),
+                    };
+                    self.ctx.rt.notices.push(PgError::notice(msg));
+                    continue;
+                }
                 None => {
                     return Err(match object_type {
+                        _ if schema.as_deref().is_some_and(|s| self.ctx.db.schema_by_name(s).is_none()) => {
+                            PgError::new(
+                                code::INVALID_SCHEMA_NAME,
+                                format!("schema \"{}\" does not exist", schema.as_deref().unwrap_or("")),
+                            )
+                        }
                         a::ObjectType::Schema => PgError::new(
                             code::INVALID_SCHEMA_NAME,
                             format!("schema \"{n}\" does not exist"),
@@ -977,6 +998,16 @@ impl Ddl<'_, '_> {
                         a::ObjectType::Index => PgError::new(
                             code::UNDEFINED_OBJECT,
                             format!("index \"{n}\" does not exist"),
+                        ),
+                        a::ObjectType::Table
+                        | a::ObjectType::View
+                        | a::ObjectType::MaterializedView
+                        | a::ObjectType::Sequence => PgError::new(
+                            code::UNDEFINED_TABLE,
+                            format!(
+                                "{} \"{n}\" does not exist",
+                                object_kind_name(*object_type).to_ascii_lowercase()
+                            ),
                         ),
                         _ => undefined_table(&n),
                     });
@@ -1156,6 +1187,10 @@ impl Ddl<'_, '_> {
             Ok(o) => o,
             Err(e) => {
                 if if_exists {
+                    self.ctx
+                        .rt
+                        .notices
+                        .push(PgError::notice(format!("relation \"{tname}\" does not exist, skipping")));
                     return Ok("ALTER TABLE".into());
                 }
                 return Err(e);
@@ -1322,6 +1357,11 @@ impl Ddl<'_, '_> {
                     let t = self.ctx.db.table(oid).unwrap();
                     let Some(idx) = t.col_index(&cname) else {
                         if *if_exists {
+                            let msg = format!(
+                                "column \"{cname}\" of relation \"{}\" does not exist, skipping",
+                                t.name
+                            );
+                            self.ctx.rt.notices.push(PgError::notice(msg));
                             continue;
                         }
                         return Err(PgError::new(
@@ -1502,6 +1542,11 @@ impl Ddl<'_, '_> {
                 let t = self.ctx.db.table(oid).unwrap();
                 if !t.constraints.iter().any(|c| c.name == n) {
                     if *if_exists {
+                        let msg = format!(
+                            "constraint \"{n}\" of relation \"{}\" does not exist, skipping",
+                            t.name
+                        );
+                        self.ctx.rt.notices.push(PgError::notice(msg));
                         return Ok(());
                     }
                     return Err(PgError::new(
