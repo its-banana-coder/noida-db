@@ -1,10 +1,12 @@
 //! Minimal Elasticsearch 8.15 compatible HTTP service for local development.
 
 mod analysis;
+mod dates;
 mod engine;
 mod scoring;
 mod search;
 mod server;
+mod sorting;
 
 #[cfg(test)]
 mod tests;

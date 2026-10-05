@@ -15,6 +15,45 @@ use serde::{Deserialize, Serialize};
 struct State {
     indices: HashMap<String, Index>,
     templates: HashMap<String, Value>,
+    /// Open scrolls and points in time (in memory only, like a node's).
+    #[serde(skip)]
+    contexts: HashMap<String, SearchContext>,
+}
+
+/// A frozen view of the searched indices: a scroll pages through hits
+/// computed when it opened; a point in time is searched again and again.
+struct SearchContext {
+    expires: std::time::Instant,
+    kind: ContextKind,
+}
+
+enum ContextKind {
+    Scroll { hits: Vec<Value>, total: Value, max_score: Value, pos: usize, size: usize },
+    Pit { mappings: Value, docs: Vec<CommittedDoc> },
+}
+
+/// A `keep_alive`/`scroll` duration (`1m`, `30s`, `500ms`, `2h`, `1d`).
+fn parse_keep_alive(s: &str) -> Option<std::time::Duration> {
+    let split = s.find(|c: char| !c.is_ascii_digit())?;
+    let n: u64 = s[..split].parse().ok()?;
+    let ms = match &s[split..] {
+        "ms" => n,
+        "s" => n * 1000,
+        "m" => n * 60_000,
+        "h" => n * 3_600_000,
+        "d" => n * 86_400_000,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_millis(ms))
+}
+
+fn context_missing(id: &str) -> (u16, Value) {
+    let mut e = search::EsError::shard_failure(
+        "search_context_missing_exception",
+        &format!("No search context found for id [{id}]"),
+    );
+    e.status = 404;
+    (404, e.to_json())
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -105,6 +144,12 @@ impl Engine {
         if segments.first() == Some(&"_alias") {
             return self.get_alias(&segments);
         }
+        if segments.first() == Some(&"_search") && segments.get(1) == Some(&"scroll") {
+            return self.scroll_api(method, segments.get(2).copied(), &q, body);
+        }
+        if segments.first() == Some(&"_pit") {
+            return self.close_pit(method, body);
+        }
         if segments.first() == Some(&"_search") || segments.first() == Some(&"_count") {
             return self.search_or_count(method, segments[0], "*", &q, body);
         }
@@ -164,21 +209,22 @@ impl Engine {
                 self.index_action(method, index_name, segments[1])
             }
             "_search" | "_count" => self.search_or_count(method, segments[1], index_name, &q, body),
+            "_pit" if method == "POST" => self.open_pit(index_name, &q),
             "_delete_by_query" | "_update_by_query" => {
                 self.by_query(method, segments[1], index_name, &q, body)
             }
             "_alias" | "_aliases" => self.index_alias(method, index_name, segments.get(2).copied()),
             "_analyze" => self.analyze(body),
-            "_doc" | "_create" | "_source" if segments.len() >= 3 => {
+            "_doc" | "_create" | "_source" if segments.len() == 3 => {
                 self.document_api(method, index_name, segments[2], segments[1], &q, body)
             }
-            "_doc" if method == "POST" => {
+            "_doc" if method == "POST" && segments.len() == 2 => {
                 self.document_api(method, index_name, "", "_doc", &q, body)
             }
             "_bulk" => self.bulk(method, index_name, &q, body),
-            "_update" if segments.len() >= 3 => self.update(method, index_name, segments[2], body),
+            "_update" if segments.len() == 3 => self.update(method, index_name, segments[2], body),
             "_mget" => self.mget(method, index_name, &q, body),
-            _ => (404, error("not_found", "no handler found for uri", 404)),
+            _ => no_handler(method, path),
         }
     }
 
@@ -235,7 +281,9 @@ impl Engine {
         if method != "GET" && method != "POST" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
-        let mut req = parse_json(body).unwrap_or_else(|| json!({}));
+        let Some(mut req) = parse_json(body) else {
+            return (400, malformed_body());
+        };
         // URL parameters the clients send instead of body fields. Found via
         // testing before a public release: `_source_includes` etc. were
         // ignored, returning whole documents.
@@ -243,25 +291,77 @@ impl Engine {
             req["_source"] = f;
         }
         for (param, key) in [("size", "size"), ("from", "from")] {
-            if let Some(n) = q.get(param).and_then(|v| v.parse::<u64>().ok()) {
+            if let Some(n) = q.get(param).and_then(|v| v.parse::<i64>().ok()) {
                 req[key] = json!(n);
             }
         }
-        let s = self.0.lock().unwrap();
+        if let Some(sort) = q.get("sort") {
+            // `?sort=price:desc,name`
+            req["sort"] = Value::Array(
+                sort.split(',')
+                    .map(|s| match s.split_once(':') {
+                        Some((f, o)) => json!({f: o}),
+                        None => json!(s),
+                    })
+                    .collect(),
+            );
+        }
+        let mut s = self.0.lock().unwrap();
+        let now = std::time::Instant::now();
+        s.contexts.retain(|_, c| c.expires > now);
+        if let Some(pit) = req.get("pit") {
+            if index_pattern != "*" {
+                return (
+                    400,
+                    error(
+                        "action_request_validation_exception",
+                        "Validation Failed: 1: [indices] cannot be used with point in time. Do \
+                         not specify any index with point in time.;",
+                        400,
+                    ),
+                );
+            }
+            let id = pit.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let keep = pit.get("keep_alive").and_then(Value::as_str).and_then(parse_keep_alive);
+            let Some(ctx) = s.contexts.get_mut(&id) else { return context_missing(&id) };
+            if let Some(k) = keep {
+                ctx.expires = now + k;
+            }
+            let ContextKind::Pit { mappings, docs } = &ctx.kind else {
+                return context_missing(&id);
+            };
+            let opts = search::SearchOptions { typed: true, pit: true, ..Default::default() };
+            return match search::search_with(mappings, docs, &req, &opts) {
+                Ok(mut resp) => {
+                    resp["pit_id"] = json!(id);
+                    (200, resp)
+                }
+                Err(e) => (e.status, e.to_json()),
+            };
+        }
         let is_wildcard = index_pattern == "_all" || index_pattern == "*";
         let names = Self::resolve_indices(&s, index_pattern);
+        let ignore_unavailable = q.get("ignore_unavailable").is_some_and(|v| v == "true");
         if names.is_empty() && !is_wildcard {
+            if ignore_unavailable && action == "_search" {
+                return (
+                    200,
+                    json!({"took": 0, "timed_out": false,
+                           "_shards": {"total": 0, "successful": 0, "skipped": 0, "failed": 0},
+                           "hits": {"total": {"value": 0, "relation": "eq"}, "max_score": 0.0, "hits": []}}),
+                );
+            }
             return missing_index(index_pattern);
         }
         if action == "_count" {
-            let counts: Result<Vec<u64>, String> = names
+            let counts: Result<Vec<u64>, search::EsError> = names
                 .iter()
                 .filter_map(|n| s.indices.get(n))
                 .map(|i| search::count(&i.mappings, &i.committed, &req))
                 .collect();
             let total: u64 = match counts {
                 Ok(cs) => cs.into_iter().sum(),
-                Err(reason) => return (400, error("parsing_exception", &reason, 400)),
+                Err(e) => return (e.status, e.to_json()),
             };
             let shards = names.len().max(1);
             return (
@@ -272,20 +372,181 @@ impl Engine {
         // A query spanning more than one index may mix mappings, so fields
         // fall back to runtime type inference rather than any one index's
         // explicit mapping (see `search::tokens_for`).
-        let (mappings, docs): (Value, Vec<CommittedDoc>) = if names.len() == 1 {
+        let (mappings, docs, typed): (Value, Vec<CommittedDoc>, bool) = if names.len() == 1 {
             let i = &s.indices[&names[0]];
-            (i.mappings.clone(), i.committed.clone())
+            (i.mappings.clone(), i.committed.clone(), true)
         } else {
+            // Several indices: their mappings merged (the first index to
+            // map a field wins), so typed fields still sort and range as
+            // their type.
             let mut docs = Vec::new();
+            let mut props = Map::new();
             for n in &names {
                 docs.extend(s.indices[n].committed.iter().cloned());
+                if let Some(p) = s.indices[n].mappings.get("properties").and_then(Value::as_object)
+                {
+                    for (k, v) in p {
+                        props.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
             }
-            (json!({"properties": {}}), docs)
+            (json!({"properties": props}), docs, !names.is_empty())
         };
-        match search::search(&mappings, &docs, &req) {
-            Ok(resp) => (200, resp),
-            Err(reason) => (400, error("parsing_exception", &reason, 400)),
+        let scroll = q
+            .get("scroll")
+            .cloned()
+            .or_else(|| req.get("scroll").and_then(Value::as_str).map(str::to_string));
+        if let Some(scroll) = scroll {
+            let keep = parse_keep_alive(&scroll).unwrap_or(std::time::Duration::from_secs(60));
+            let size = req.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
+            let opts = search::SearchOptions { typed, all_hits: true, ..Default::default() };
+            let mut resp = match search::search_with(&mappings, &docs, &req, &opts) {
+                Ok(r) => r,
+                Err(e) => return (e.status, e.to_json()),
+            };
+            let hits = resp["hits"]["hits"].as_array().cloned().unwrap_or_default();
+            resp["hits"]["hits"] = Value::Array(hits.iter().take(size).cloned().collect());
+            let id = scroll_id();
+            resp["_scroll_id"] = json!(id);
+            s.contexts.insert(
+                id,
+                SearchContext {
+                    expires: now + keep,
+                    kind: ContextKind::Scroll {
+                        total: resp["hits"]["total"].clone(),
+                        max_score: resp["hits"]["max_score"].clone(),
+                        hits,
+                        pos: size,
+                        size,
+                    },
+                },
+            );
+            return (200, resp);
         }
+        match search::search_typed(&mappings, &docs, &req, typed) {
+            Ok(resp) => (200, resp),
+            Err(e) => (e.status, e.to_json()),
+        }
+    }
+
+    /// `POST/GET /_search/scroll` (next page) and `DELETE /_search/scroll`
+    /// (clear one, several, or `_all`).
+    fn scroll_api(
+        &self,
+        method: &str,
+        path_id: Option<&str>,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
+        let Some(req) = parse_json(body) else { return (400, malformed_body()) };
+        let mut s = self.0.lock().unwrap();
+        let now = std::time::Instant::now();
+        s.contexts.retain(|_, c| c.expires > now);
+        let ids: Vec<String> = match (path_id, req.get("scroll_id"), q.get("scroll_id")) {
+            (Some(p), _, _) => p.split(',').map(str::to_string).collect(),
+            (_, Some(Value::String(i)), _) => vec![i.clone()],
+            (_, Some(Value::Array(a)), _) => {
+                a.iter().filter_map(Value::as_str).map(str::to_string).collect()
+            }
+            (_, _, Some(i)) => vec![i.clone()],
+            _ => Vec::new(),
+        };
+        if method == "DELETE" {
+            let freed = if ids.iter().any(|i| i == "_all") {
+                let before = s.contexts.len();
+                s.contexts.retain(|_, c| !matches!(c.kind, ContextKind::Scroll { .. }));
+                before - s.contexts.len()
+            } else {
+                ids.iter().filter(|i| s.contexts.remove(i.as_str()).is_some()).count()
+            };
+            let all = ids.iter().any(|i| i == "_all");
+            let status = if freed == 0 && !all { 404 } else { 200 };
+            return (status, json!({"succeeded": true, "num_freed": freed}));
+        }
+        let Some(id) = ids.first().cloned() else {
+            return (
+                400,
+                error(
+                    "action_request_validation_exception",
+                    "Validation Failed: 1: scrollId is missing;",
+                    400,
+                ),
+            );
+        };
+        let keep = req
+            .get("scroll")
+            .and_then(Value::as_str)
+            .or(q.get("scroll").map(String::as_str))
+            .and_then(parse_keep_alive);
+        let Some(ctx) = s.contexts.get_mut(&id) else { return context_missing(&id) };
+        if let Some(k) = keep {
+            ctx.expires = now + k;
+        }
+        let ContextKind::Scroll { hits, total, max_score, pos, size } = &mut ctx.kind else {
+            return context_missing(&id);
+        };
+        let page: Vec<Value> = hits.iter().skip(*pos).take(*size).cloned().collect();
+        *pos += *size;
+        (
+            200,
+            json!({
+                "_scroll_id": id,
+                "took": 0,
+                "timed_out": false,
+                "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
+                "hits": {"total": total, "max_score": max_score, "hits": page},
+            }),
+        )
+    }
+
+    /// `POST /<index>/_pit?keep_alive=1m`: freezes the index's searchable
+    /// documents for later `pit` searches.
+    fn open_pit(&self, index_pattern: &str, q: &HashMap<String, String>) -> (u16, Value) {
+        let Some(keep) = q.get("keep_alive").and_then(|k| parse_keep_alive(k)) else {
+            return (
+                400,
+                error(
+                    "action_request_validation_exception",
+                    "Validation Failed: 1: [keep_alive] is not specified;",
+                    400,
+                ),
+            );
+        };
+        let mut s = self.0.lock().unwrap();
+        let names = Self::resolve_indices(&s, index_pattern);
+        if names.is_empty() {
+            return missing_index(index_pattern);
+        }
+        let mut docs = Vec::new();
+        let mut props = Map::new();
+        for n in &names {
+            docs.extend(s.indices[n].committed.iter().cloned());
+            if let Some(p) = s.indices[n].mappings.get("properties").and_then(Value::as_object) {
+                for (k, v) in p {
+                    props.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        let id = scroll_id();
+        s.contexts.insert(
+            id.clone(),
+            SearchContext {
+                expires: std::time::Instant::now() + keep,
+                kind: ContextKind::Pit { mappings: json!({"properties": props}), docs },
+            },
+        );
+        (200, json!({"id": id}))
+    }
+
+    /// `DELETE /_pit` with `{"id": ...}`.
+    fn close_pit(&self, method: &str, body: &[u8]) -> (u16, Value) {
+        if method != "DELETE" {
+            return no_handler(method, "/_pit");
+        }
+        let Some(req) = parse_json(body) else { return (400, malformed_body()) };
+        let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+        let freed = usize::from(self.0.lock().unwrap().contexts.remove(id).is_some());
+        (if freed == 0 { 404 } else { 200 }, json!({"succeeded": true, "num_freed": freed}))
     }
 
     fn analyze(&self, body: &[u8]) -> (u16, Value) {
@@ -527,22 +788,24 @@ impl Engine {
                 d.source = src;
                 d.version += 1;
                 d.seq = seq;
-                let result = (
+                let mut result = (
                     if exists { 200 } else { 201 },
                     doc_response(index, &id, d, if exists { "updated" } else { "created" }),
                 );
                 maybe_refresh(i, index, q);
+                mark_forced_refresh(&mut result.1, q);
                 result
             }
             "DELETE" => {
                 if let Some(d) = i.docs.remove(&id) {
                     i.order.retain(|x| x != &id);
                     i.seq += 1;
-                    let result = (
+                    let mut result = (
                         200,
                         json!({"_index":index,"_id":id,"_version":d.version+1,"result":"deleted","_shards":{"total":2,"successful":1,"failed":0},"_seq_no":i.seq,"_primary_term":1}),
                     );
                     maybe_refresh(i, index, q);
+                    mark_forced_refresh(&mut result.1, q);
                     result
                 } else {
                     missing_doc(index, &id)
@@ -677,7 +940,7 @@ impl Engine {
             docs.extend(ids.iter().map(|id| json!({"_id": id})));
         }
         let filter = source_filter_from_params(q);
-        let items=docs.iter().map(|d|{let ix=d.get("_index").and_then(Value::as_str).unwrap_or(index); let id=d.get("_id").and_then(Value::as_str).unwrap_or("");let s=self.0.lock().unwrap(); let doc=s.indices.get(ix).and_then(|i|i.docs.get(id)); match doc {Some(doc)=>json!({"_index":ix,"_id":id,"_version":doc.version,"_seq_no":doc.seq,"_primary_term":1,"found":true,"_source":search::filter_source(&doc.source, filter.as_ref())}),None=>json!({"_index":ix,"_id":id,"found":false,"_source":null})}}).collect::<Vec<_>>();
+        let items=docs.iter().map(|d|{let ix=d.get("_index").and_then(Value::as_str).unwrap_or(index); let id=d.get("_id").and_then(Value::as_str).unwrap_or("");let s=self.0.lock().unwrap(); let doc=s.indices.get(ix).and_then(|i|i.docs.get(id)); match doc {Some(doc)=>json!({"_index":ix,"_id":id,"_version":doc.version,"_seq_no":doc.seq,"_primary_term":1,"found":true,"_source":search::filter_source(&doc.source, filter.as_ref())}),None=>json!({"_index":ix,"_id":id,"found":false})}}).collect::<Vec<_>>();
         (200, json!({"docs":items}))
     }
 
@@ -713,7 +976,7 @@ impl Engine {
             let i = s.indices.get_mut(name).unwrap();
             let matched = match search::eval(&query, &i.mappings, &i.committed) {
                 Ok(m) => m,
-                Err(reason) => return (400, error("parsing_exception", &reason, 400)),
+                Err(e) => return (e.status, e.to_json()),
             };
             let ids: Vec<String> = matched.keys().map(|&k| i.committed[k].id.clone()).collect();
             for id in ids {
@@ -859,8 +1122,28 @@ fn missing_index(name: &str) -> (u16, Value) {
         json!({"error":{"root_cause":[{"type":"index_not_found_exception","reason":format!("no such index [{name}]"),"index_uuid":"_na_","resource.type":"index_or_alias","resource.id":name,"index":name}],"type":"index_not_found_exception","reason":format!("no such index [{name}]"),"index_uuid":"_na_","resource.type":"index_or_alias","resource.id":name,"index":name},"status":404}),
     )
 }
+/// An opaque id for a scroll or point in time.
+fn scroll_id() -> String {
+    use std::sync::atomic::AtomicU64;
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("FGx1ZXJ5QW5kRmV0Y2gB{nanos:x}{n:x}")
+}
+
 fn missing_doc(index: &str, id: &str) -> (u16, Value) {
-    (404, json!({"_index":index,"_id":id,"found":false,"_source":null}))
+    (404, json!({"_index":index,"_id":id,"found":false}))
+}
+/// A request body that isn't JSON.
+pub fn malformed_body() -> Value {
+    error("x_content_parse_exception", "Failed to parse request body: not valid JSON", 400)
+}
+/// Elasticsearch's answer for a path/method no REST handler takes.
+pub fn no_handler(method: &str, path: &str) -> (u16, Value) {
+    (400, json!({"error": format!("no handler found for uri [{path}] and method [{method}]")}))
 }
 fn version_conflict(_index: &str, id: &str) -> Value {
     error(
@@ -914,6 +1197,14 @@ fn wants_refresh(q: &HashMap<String, String>) -> bool {
 fn maybe_refresh(i: &mut Index, name: &str, q: &HashMap<String, String>) {
     if wants_refresh(q) {
         i.refresh(name);
+    }
+}
+
+/// `refresh=true` (not `wait_for`) adds `"forced_refresh": true` to a
+/// write's response.
+fn mark_forced_refresh(resp: &mut Value, q: &HashMap<String, String>) {
+    if q.get("refresh").is_some_and(|v| v.is_empty() || v == "true") {
+        resp["forced_refresh"] = json!(true);
     }
 }
 
@@ -992,6 +1283,8 @@ fn new_index_from_templates(templates: &HashMap<String, Value>, name: &str) -> I
         mappings: json!({"properties": {}}),
         settings: json!({"index": {"number_of_shards": "1", "number_of_replicas": "1"}}),
         opened: true,
+        // Writes bump this before using it: the first gets seq_no 0.
+        seq: -1,
         ..Index::default()
     };
     let mut matching: Vec<&Value> = templates

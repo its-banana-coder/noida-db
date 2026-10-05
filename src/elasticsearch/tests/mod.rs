@@ -51,7 +51,8 @@ fn index_and_document_crud_preserve_elasticsearch_response_fields() {
     assert_eq!(deleted["result"], "deleted");
     assert_eq!(
         call(&engine, "GET", "/books/_doc/1", "").1,
-        json!({"_index":"books","_id":"1","found":false,"_source":null})
+        // As a real node answers: no `_source` key at all.
+        json!({"_index":"books","_id":"1","found":false})
     );
 }
 
