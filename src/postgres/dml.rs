@@ -495,7 +495,7 @@ pub fn session_info(ctx: &Ctx) -> SessionInfo {
     SessionInfo {
         user: ctx.rt.user.clone(),
         database: ctx.rt.database.clone(),
-        search_path: ctx.rt.settings.search_path(&ctx.rt.user),
+        search_path: ctx.rt.settings.lookup_path(&ctx.rt.user),
         fmt: ctx.rt.settings.fmt(),
         now: ctx.rt.now,
     }
@@ -675,31 +675,51 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
 }
 
 /// The key `idx` stores for `row`: `None` when a partial index excludes it.
+/// An index's predicate and key expressions, bound once.
+struct BoundIndex {
+    pred: Option<Expr>,
+    exprs: Vec<Expr>,
+}
+
+fn bind_index(ctx: &mut Ctx, t: &Table, idx: &super::catalog::Index) -> PgResult<BoundIndex> {
+    let pred = idx.predicate.as_ref().map(|p| bind_check(ctx, t, p)).transpose()?;
+    let exprs = idx.exprs.iter().map(|e| bind_check(ctx, t, e)).collect::<PgResult<_>>()?;
+    Ok(BoundIndex { pred, exprs })
+}
+
+/// `row`'s key in the index (`None`: outside a partial index's predicate).
 fn index_key(
     ctx: &mut Ctx,
-    t: &Table,
+    b: &BoundIndex,
     idx: &super::catalog::Index,
     row: &Row,
 ) -> PgResult<Option<Vec<Value>>> {
-    if let Some(pred) = &idx.predicate {
-        let e = bind_check(ctx, t, pred)?;
-        if !matches!(exec::eval(&e, row, ctx)?, Value::Bool(true)) {
-            return Ok(None);
-        }
+    if let Some(e) = &b.pred
+        && !matches!(exec::eval(e, row, ctx)?, Value::Bool(true))
+    {
+        return Ok(None);
     }
-    let mut exprs = idx.exprs.iter();
+    let mut exprs = b.exprs.iter();
     let mut key = vec![];
     for c in &idx.cols {
         match c {
             Some(i) => key.push(row[*i].clone()),
-            None => {
-                let sql = exprs.next().expect("expression index key");
-                let e = bind_check(ctx, t, sql)?;
-                key.push(exec::eval(&e, row, ctx)?);
-            }
+            None => key.push(exec::eval(exprs.next().expect("expression index key"), row, ctx)?),
         }
     }
     Ok(Some(key))
+}
+
+/// A key that unique index `idx` can't hold twice (nulls are distinct
+/// unless NULLS NOT DISTINCT).
+fn unique_key(
+    ctx: &mut Ctx,
+    b: &BoundIndex,
+    idx: &super::catalog::Index,
+    row: &Row,
+) -> PgResult<Option<Vec<Value>>> {
+    Ok(index_key(ctx, b, idx, row)?
+        .filter(|k| idx.nulls_not_distinct || !k.iter().any(|v| v.is_null())))
 }
 
 /// The row of `t` (other than `skip`) that `row` collides with in the unique
@@ -711,21 +731,39 @@ pub fn unique_index_conflict(
     row: &Row,
     skip: Option<usize>,
 ) -> PgResult<Option<Vec<Value>>> {
-    let Some(key) = index_key(ctx, t, idx, row)? else { return Ok(None) };
-    if !idx.nulls_not_distinct && key.iter().any(|v| v.is_null()) {
-        return Ok(None);
-    }
+    let b = bind_index(ctx, t, idx)?;
+    let Some(key) = unique_key(ctx, &b, idx, row)? else { return Ok(None) };
     for (i, other) in t.rows.iter().enumerate() {
         if Some(i) == skip {
             continue;
         }
-        if let Some(k) = index_key(ctx, t, idx, other)?
+        if let Some(k) = index_key(ctx, &b, idx, other)?
             && k.iter().zip(&key).all(|(a, b)| types::values_equal(a, b))
         {
             return Ok(Some(key));
         }
     }
     Ok(None)
+}
+
+/// Whether two of `t`'s rows already collide in unique index `idx` (each
+/// row's key computed once).
+pub fn unique_index_has_duplicate(
+    ctx: &mut Ctx,
+    t: &Table,
+    idx: &super::catalog::Index,
+) -> PgResult<bool> {
+    let b = bind_index(ctx, t, idx)?;
+    let mut keys: Vec<Vec<Value>> = vec![];
+    for r in &t.rows {
+        if let Some(k) = unique_key(ctx, &b, idx, r)? {
+            if keys.iter().any(|o| o.iter().zip(&k).all(|(a, b)| types::values_equal(a, b))) {
+                return Ok(true);
+            }
+            keys.push(k);
+        }
+    }
+    Ok(false)
 }
 
 fn bind_check(ctx: &mut Ctx, t: &Table, sql: &str) -> PgResult<Expr> {

@@ -281,7 +281,7 @@ fn convert(v: Value, from: Type, to: Type, fmt: &FmtCtx, now: i64) -> PgResult<V
         (Value::Ts(t), Base::Timestamptz) if tb == Base::Timetz => {
             let off = fmt
                 .zone
-                .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+                .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
             Value::TimeTz(datetime::utc_to_local(t, &fmt.zone).rem_euclid(USECS_PER_DAY), off)
         }
         (Value::Time(t), _) if tb == Base::Interval => {

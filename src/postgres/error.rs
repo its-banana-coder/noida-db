@@ -36,6 +36,10 @@ impl PgError {
         }
     }
 
+    pub fn notice(message: impl Into<String>) -> PgError {
+        PgError { severity: "NOTICE", ..PgError::new("00000", message) }
+    }
+
     pub fn fatal(code: &'static str, message: impl Into<String>) -> PgError {
         PgError { severity: "FATAL", ..PgError::new(code, message) }
     }

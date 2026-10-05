@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use super::error::{PgError, PgResult, code};
 use super::types::FmtCtx;
 use super::tz::{self, Zone};
+use crate::sql::datetime::{DateStyle, IntervalStyle};
 
 /// The Postgres version noida-db reports.
 pub const SERVER_VERSION: &str = "16.4";
@@ -124,6 +125,8 @@ pub struct Settings {
     /// Values at session start (RESET goes back here).
     session_defaults: BTreeMap<String, String>,
     pub zone: Zone,
+    /// This session's temporary schema (`pg_temp_N`).
+    pub temp_schema: String,
 }
 
 fn canonical(name: &str) -> Option<&'static str> {
@@ -135,7 +138,12 @@ impl Default for Settings {
     fn default() -> Self {
         let values: BTreeMap<String, String> =
             DEFAULTS.iter().map(|(n, v, _)| (n.to_string(), v.to_string())).collect();
-        let mut s = Settings { session_defaults: values.clone(), values, zone: Zone::utc() };
+        let mut s = Settings {
+            session_defaults: values.clone(),
+            values,
+            zone: Zone::utc(),
+            temp_schema: String::new(),
+        };
         s.values.insert(
             "server_version_full".into(),
             format!("PostgreSQL {SERVER_VERSION} (noida-db)"),
@@ -278,50 +286,58 @@ impl Settings {
                 }
             }
             "DateStyle" => {
-                let v = value.to_ascii_lowercase();
-                let parts: Vec<&str> = v.split(',').map(str::trim).collect();
-                for p in &parts {
-                    if !matches!(
-                        *p,
-                        "iso"
-                            | "mdy"
-                            | "dmy"
-                            | "ymd"
-                            | "us"
-                            | "euro"
-                            | "european"
-                            | "noneuropean"
-                            | "sql"
-                            | "postgres"
-                            | "german"
-                    ) {
-                        return Err(bad(value));
+                // As check_datestyle: start from the current value; a style
+                // or an order given replaces just that half.
+                let cur =
+                    self.values.get("DateStyle").cloned().unwrap_or_else(|| "ISO, MDY".into());
+                let (mut style, mut order) =
+                    cur.split_once(", ").map_or(("ISO", "MDY"), |(a, b)| (a, b));
+                let (mut have_style, mut have_order) = (false, false);
+                for p in value.split(',').map(|p| p.trim().to_ascii_lowercase()) {
+                    let (st, ord) = match p.as_str() {
+                        "iso" => (Some("ISO"), None),
+                        "sql" => (Some("SQL"), None),
+                        "postgres" => (Some("Postgres"), None),
+                        "german" => (Some("German"), None),
+                        "ymd" => (None, Some("YMD")),
+                        "dmy" | "euro" | "european" => (None, Some("DMY")),
+                        "mdy" | "us" | "noneuro" | "noneuropean" => (None, Some("MDY")),
+                        "default" => (Some("ISO"), Some("MDY")),
+                        _ => return Err(bad(value)),
+                    };
+                    if let Some(st) = st {
+                        if have_style && st != style {
+                            return Err(PgError::new(
+                                code::INVALID_PARAMETER_VALUE,
+                                format!("invalid value for parameter \"DateStyle\": \"{value}\""),
+                            )
+                            .detail("Conflicting \"datestyle\" specifications."));
+                        }
+                        style = st;
+                        have_style = true;
+                        if st == "German" && !have_order && ord.is_none() {
+                            order = "DMY";
+                        }
+                    }
+                    if let Some(o) = ord {
+                        if have_order && o != order {
+                            return Err(PgError::new(
+                                code::INVALID_PARAMETER_VALUE,
+                                format!("invalid value for parameter \"DateStyle\": \"{value}\""),
+                            )
+                            .detail("Conflicting \"datestyle\" specifications."));
+                        }
+                        order = o;
+                        have_order = true;
                     }
                 }
-                if parts.iter().any(|p| matches!(*p, "sql" | "postgres" | "german")) {
-                    return Err(PgError::new(
-                        code::FEATURE_NOT_SUPPORTED,
-                        "noida-db only supports DateStyle ISO output",
-                    ));
-                }
-                let order = if parts.iter().any(|p| matches!(*p, "dmy" | "euro" | "european")) {
-                    "DMY"
-                } else if parts.contains(&"ymd") {
-                    "YMD"
-                } else {
-                    "MDY"
-                };
-                format!("ISO, {order}")
+                format!("{style}, {order}")
             }
             "IntervalStyle" => match value.to_ascii_lowercase().as_str() {
                 "postgres" => "postgres".into(),
                 "iso_8601" => "iso_8601".into(),
-                "sql_standard" | "postgres_verbose" => {
-                    return Err(PgError::new(
-                        code::FEATURE_NOT_SUPPORTED,
-                        format!("IntervalStyle {value} is not supported"),
-                    ));
-                }
+                "sql_standard" => "sql_standard".into(),
+                "postgres_verbose" => "postgres_verbose".into(),
                 _ => return Err(bad(value)),
             },
             "extra_float_digits" => {
@@ -378,7 +394,23 @@ impl Settings {
     pub fn fmt(&self) -> FmtCtx {
         FmtCtx {
             zone: self.zone.clone(),
-            interval_iso: self.values.get("IntervalStyle").is_some_and(|v| v == "iso_8601"),
+            date_style: match self
+                .values
+                .get("DateStyle")
+                .map(|v| v.split(',').next().unwrap_or(""))
+            {
+                Some("SQL") => DateStyle::Sql,
+                Some("Postgres") => DateStyle::Postgres,
+                Some("German") => DateStyle::German,
+                _ => DateStyle::Iso,
+            },
+            dmy: self.values.get("DateStyle").is_some_and(|v| v.ends_with("DMY")),
+            interval_style: match self.values.get("IntervalStyle").map(String::as_str) {
+                Some("iso_8601") => IntervalStyle::Iso8601,
+                Some("postgres_verbose") => IntervalStyle::PostgresVerbose,
+                Some("sql_standard") => IntervalStyle::SqlStandard,
+                _ => IntervalStyle::Postgres,
+            },
             bytea_escape: self.values.get("bytea_output").is_some_and(|v| v == "escape"),
             reg_names: None,
             extra_float_digits: self
@@ -389,13 +421,28 @@ impl Settings {
         }
     }
 
-    /// Schemas named by search_path (with `$user` expanded, missing ones kept).
+    /// Schemas named by search_path (with `$user` and `pg_temp` expanded,
+    /// missing ones kept): where new objects go, and current_schema().
     pub fn search_path(&self, user: &str) -> Vec<String> {
         let sp = self.values.get("search_path").cloned().unwrap_or_default();
         split_path(&sp)
             .into_iter()
-            .map(|s| if s == "$user" { user.to_string() } else { s })
+            .map(|s| match s.as_str() {
+                "$user" => user.to_string(),
+                "pg_temp" if !self.temp_schema.is_empty() => self.temp_schema.clone(),
+                _ => s,
+            })
             .collect()
+    }
+
+    /// The schemas a relation name is looked up in: search_path, with the
+    /// session's temporary schema first unless search_path places it.
+    pub fn lookup_path(&self, user: &str) -> Vec<String> {
+        let mut path = self.search_path(user);
+        if !self.temp_schema.is_empty() && !path.contains(&self.temp_schema) {
+            path.insert(0, self.temp_schema.clone());
+        }
+        path
     }
 }
 
@@ -479,6 +526,20 @@ mod tests {
         assert_eq!(s.get("extra_float_digits").unwrap(), "1");
         assert_eq!(s.set("DateStyle", "iso, dmy").unwrap(), Some("DateStyle"));
         assert_eq!(s.get("datestyle").unwrap(), "ISO, DMY");
+        // Expected values from Postgres 14, each starting from ISO, MDY.
+        for (v, want) in [
+            ("postgres", "Postgres, MDY"),
+            ("german", "German, DMY"),
+            ("dmy", "ISO, DMY"),
+            ("ymd, german", "German, YMD"),
+            ("German, MDY", "German, MDY"),
+        ] {
+            s.set("DateStyle", "ISO, MDY").unwrap();
+            s.set("DateStyle", v).unwrap();
+            assert_eq!(s.get("DateStyle").unwrap(), want, "{v}");
+        }
+        assert!(s.set("DateStyle", "sql, german").is_err());
+        s.set("DateStyle", "ISO, MDY").unwrap();
     }
 
     #[test]

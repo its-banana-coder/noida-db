@@ -66,6 +66,13 @@ def run(port, scenario):
     for step in scenario:
         who, action = step[0], step[1]
         c = conn(who)
+        if isinstance(action, tuple) and action[0] == "reconnect":
+            # Ends the session (what lives only for it goes) and opens a new one.
+            c.close()
+            del conns[who]
+            time.sleep(0.2)
+            trace.append((who, "reconnect", "ok"))
+            continue
         if isinstance(action, tuple) and action[0] == "sleep":
             time.sleep(action[1])
             continue

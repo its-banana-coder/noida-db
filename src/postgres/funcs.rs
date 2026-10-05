@@ -1005,7 +1005,7 @@ pub fn json_timestamp(t: i64, tz: bool, env: &Env) -> String {
         let off = env
             .fmt
             .zone
-            .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+            .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
         let local =
             datetime::format_timestamp(t + off as i64 * USECS_PER_SEC).replacen(' ', "T", 1);
         let sign = if off < 0 { '-' } else { '+' };
@@ -2766,7 +2766,7 @@ pub fn extract_value(field: &str, v: &Value, ty: Type, env: &Env) -> PgResult<Nu
                 let off = env
                     .fmt
                     .zone
-                    .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+                    .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
                 (t + off as i64 * USECS_PER_SEC, Some(*t), Some(off))
             } else {
                 (*t, None, None)
@@ -2813,7 +2813,7 @@ fn to_char(v: &Value, ty: Type, fmt: &str, env: &Env) -> PgResult<Value> {
             let off = env
                 .fmt
                 .zone
-                .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+                .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
             (t + off as i64 * USECS_PER_SEC, Some(off), None)
         }
         (Value::Ts(t), _) => (*t, None, None),
@@ -2977,7 +2977,7 @@ fn to_char(v: &Value, ty: Type, fmt: &str, env: &Env) -> PgResult<Value> {
             } else {
                 let (_, _, ab) = env.fmt.zone.info_at_utc(
                     (local - o as i64 * USECS_PER_SEC).div_euclid(USECS_PER_SEC)
-                        - datetime::PG_EPOCH_DAYS * 86400,
+                        + datetime::PG_EPOCH_DAYS * 86400,
                 );
                 if off.is_some() { ab } else { String::new() }
             };
