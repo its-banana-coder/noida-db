@@ -820,8 +820,8 @@ impl Ddl<'_, '_> {
         if ci.unique {
             let t = self.ctx.db.table(oid).unwrap().clone();
             let idx = t.indexes.last().unwrap().clone();
-            for (i, r) in t.rows.iter().enumerate() {
-                if super::dml::unique_index_conflict(self.ctx, &t, &idx, r, Some(i))?.is_some() {
+            {
+                if super::dml::unique_index_has_duplicate(self.ctx, &t, &idx)? {
                     let names: Vec<String> = idx
                         .cols
                         .iter()

@@ -300,7 +300,13 @@ fn serve(stream: TcpStream, engine: Engine, cfg: Arc<Config>) -> io::Result<()> 
             return Ok(());
         }
     };
-    // Startup parameters the client asked for.
+    // Startup parameters the client asked for; `options` carries more as
+    // `-c name=value` / `--name=value` (PGOPTIONS).
+    if let Some(opts) = startup.parameters.get("options") {
+        for (k, v) in startup_options(opts) {
+            let _ = session.rt.settings.set(&k, &v);
+        }
+    }
     for (k, v) in &startup.parameters {
         if matches!(k.as_str(), "user" | "database" | "client_encoding" | "options" | "replication")
         {
@@ -329,6 +335,43 @@ fn serve(stream: TcpStream, engine: Engine, cfg: Arc<Config>) -> io::Result<()> 
     let result = main_loop(&mut conn, &engine, &mut session);
     engine.disconnect(&session);
     result
+}
+
+/// Splits libpq's `options` (words separated by spaces, `\` escaping
+/// the next character) into the settings it sets.
+fn startup_options(opts: &str) -> Vec<(String, String)> {
+    let mut words = vec![];
+    let mut cur = String::new();
+    let mut chars = opts.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => cur.extend(chars.next()),
+            c if c.is_ascii_whitespace() => {
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let mut out = vec![];
+    let mut it = words.into_iter();
+    while let Some(w) = it.next() {
+        let kv = if w == "-c" {
+            it.next()
+        } else if let Some(r) = w.strip_prefix("--").or_else(|| w.strip_prefix("-c")) {
+            Some(r.to_string())
+        } else {
+            None
+        };
+        if let Some((k, v)) = kv.as_deref().and_then(|kv| kv.split_once('=')) {
+            out.push((k.replace('-', "_"), v.to_string()));
+        }
+    }
+    out
 }
 
 fn authenticate(conn: &mut Conn, cfg: &Config, user: &str) -> PgResult<()> {
@@ -1231,4 +1274,19 @@ fn data_row(row: &[Value], cols: &[OutCol], formats: &[i16], fmt: &types::FmtCtx
     data.extend_from_slice(&buf);
     let _ = buf.remaining();
     DataRow::new(data, field_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_options;
+
+    #[test]
+    fn startup_options_parse() {
+        let kv = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            startup_options("-c intervalstyle=postgres_verbose --search-path=a\\ b -cwork_mem=8MB"),
+            vec![kv("intervalstyle", "postgres_verbose"), kv("search_path", "a b"), kv("work_mem", "8MB")]
+        );
+        assert_eq!(startup_options("  "), vec![]);
+    }
 }
