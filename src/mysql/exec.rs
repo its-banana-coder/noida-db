@@ -115,7 +115,7 @@ impl Executor {
     fn resolve_table_context(&self, plan: &Plan) -> Result<Option<Table>, MySqlError> {
         match plan {
             Plan::Scan { db, table, alias } => {
-                let mut t = self.load_table(db, table)?;
+                let mut t = self.load_table_shape(db, table)?;
                 if self.rowid_scans {
                     t.columns.push(rowid_column());
                 }
@@ -1940,6 +1940,21 @@ impl Executor {
             Plan::Filter { source, predicate } => {
                 let table_context = self.resolve_table_context(&source)?;
 
+                // WHERE over a plain table: test the stored rows, copy
+                // only the matches (not the whole table first).
+                if let Plan::Scan { db, table, .. } = source.as_ref()
+                    && let Some(t) = self.shared_table(db, table)
+                    && !t.rows.is_empty()
+                {
+                    let mut out_rows = Vec::new();
+                    for row in &t.rows {
+                        let val = self.eval_expr(&predicate, row, table_context.as_ref())?;
+                        if !val.is_null() && val != Value::Int(0) {
+                            out_rows.push(row.clone());
+                        }
+                    }
+                    return Ok(out_rows);
+                }
                 let rows = self.execute_plan(*source)?;
                 if rows.is_empty() {
                     check_columns(
@@ -2212,6 +2227,32 @@ impl Executor {
             return Err(MySqlError::new(1049, "42000", format!("Unknown database '{}'", db)));
         }
         Err(MySqlError::unknown_table(table))
+    }
+
+    /// A table's columns and keys, without copying its rows.
+    fn load_table_shape(&self, db: &str, table: &str) -> Result<Table, MySqlError> {
+        let state = self.db.lock().unwrap();
+        if let Some(t) = crate::mysql::infoschema::lookup_table(&state, db, table) {
+            return Ok(t.shape());
+        }
+        if !state.schemas.contains_key(db) {
+            return Err(MySqlError::new(1049, "42000", format!("Unknown database '{}'", db)));
+        }
+        Err(MySqlError::unknown_table(table))
+    }
+
+    /// The shared table for a plain read of `db.table`, when this
+    /// connection sees it as stored (no other transaction's uncommitted
+    /// rows to leave out, no skipped or rowid scan).
+    fn shared_table(&self, db: &str, table: &str) -> Option<Arc<Table>> {
+        if self.rowid_scans || self.skip_rows.is_some() {
+            return None;
+        }
+        let state = self.db.lock().unwrap();
+        if state.committed_view(self.conn_id, db, table).is_some() {
+            return None;
+        }
+        crate::mysql::infoschema::lookup_table(&state, db, table)
     }
 
     /// A table as this connection reads it: other connections'
