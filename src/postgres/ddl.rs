@@ -33,7 +33,10 @@ impl Ddl<'_, '_> {
                 self.temp_schema()
             } else {
                 self.ctx.db.schema_by_name(s).ok_or_else(|| {
-                    PgError::new(code::INVALID_SCHEMA_NAME, format!("schema \"{s}\" does not exist"))
+                    PgError::new(
+                        code::INVALID_SCHEMA_NAME,
+                        format!("schema \"{s}\" does not exist"),
+                    )
                 })?
             }
         } else {
@@ -64,7 +67,10 @@ impl Ddl<'_, '_> {
             return oid;
         }
         let oid = self.ctx.db.alloc_oid();
-        self.ctx.db.schemas.insert(oid, Schema { oid, name, owner: BOOTSTRAP_SUPERUSER, comment: None });
+        self.ctx
+            .db
+            .schemas
+            .insert(oid, Schema { oid, name, owner: BOOTSTRAP_SUPERUSER, comment: None });
         oid
     }
 

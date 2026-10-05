@@ -454,7 +454,8 @@ impl DbState {
         let Some(oid) = self.schemas.values().find(|s| s.name == name).map(|s| s.oid) else {
             return;
         };
-        let tables: Vec<u32> = self.tables.values().filter(|t| t.schema == oid).map(|t| t.oid).collect();
+        let tables: Vec<u32> =
+            self.tables.values().filter(|t| t.schema == oid).map(|t| t.oid).collect();
         self.tables.retain(|_, t| t.schema != oid);
         self.triggers.retain(|_, tr| !tables.contains(&tr.table));
         self.sequences.retain(|_, s| s.schema != oid);
@@ -466,8 +467,12 @@ impl DbState {
 
     /// Drops every session's temporary schema (they don't outlive a restart).
     pub fn drop_temp_schemas(&mut self) {
-        let names: Vec<String> =
-            self.schemas.values().filter(|s| is_temp_schema(&s.name)).map(|s| s.name.clone()).collect();
+        let names: Vec<String> = self
+            .schemas
+            .values()
+            .filter(|s| is_temp_schema(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
         for n in names {
             self.drop_schema_objects(&n);
         }

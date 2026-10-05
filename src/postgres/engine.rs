@@ -1142,7 +1142,9 @@ impl Engine {
 /// Temporary tables' `ON COMMIT DELETE ROWS` / `ON COMMIT DROP`.
 fn on_commit_actions(db: &mut DbState, temp_schema: &str) {
     use super::catalog::OnCommit;
-    let Some(ns) = db.schemas.values().find(|s| s.name == temp_schema).map(|s| s.oid) else { return };
+    let Some(ns) = db.schemas.values().find(|s| s.name == temp_schema).map(|s| s.oid) else {
+        return;
+    };
     let mut dropped = vec![];
     for t in db.tables.values_mut() {
         if t.schema != ns {
@@ -1317,8 +1319,7 @@ pub(crate) fn run_one(
         }
         S::CreateView(cv) => {
             let mut d = ddl(ctx, info);
-            let tag =
-                d.create_view(
+            let tag = d.create_view(
                 &cv.name,
                 &cv.query,
                 &cv.columns,
