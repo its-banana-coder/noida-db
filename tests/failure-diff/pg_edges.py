@@ -496,3 +496,19 @@ PG_EDGES.update({
         "SELECT v, avg(v) OVER (ORDER BY v RANGE BETWEEN 1.5 PRECEDING AND 0.5 FOLLOWING) FROM w ORDER BY v",
     ),
 })
+
+PG_EDGES.update({
+    "pg edge: overlaps and srf expressions": steps(
+        "SELECT ('2024-01-01'::date, '2024-02-01'::date) OVERLAPS ('2024-02-01'::date, '2024-03-01'::date)",
+        "SELECT ('2024-01-01'::date, interval '10 days') OVERLAPS ('2024-01-05'::date, interval '1 day')",
+        "SELECT ('2024-03-01'::date, '2024-01-01'::date) OVERLAPS ('2024-02-01'::date, '2024-02-02'::date)",
+        "SELECT ('2024-01-01'::timestamp, '2024-01-01'::timestamp) OVERLAPS ('2024-01-01'::timestamp, '2024-01-02'::timestamp)",
+        "SELECT (TIME '10:00', TIME '11:00') OVERLAPS (TIME '10:30', TIME '12:00')",
+        "SELECT ('2024-01-01'::date, NULL::date) OVERLAPS ('2023-01-01'::date, '2023-02-01'::date)",
+        "SELECT upper(unnest(ARRAY['a','b'])) || '!'",
+        "SELECT coalesce(unnest(ARRAY[NULL, 2]), 0)",
+        "SELECT x, generate_series(1, 2) + x FROM (VALUES (10), (20)) v(x) ORDER BY 1, 2",
+        "SELECT (generate_series(1, 3) * 2)::text",
+        "SELECT generate_series('2024-01-01'::timestamp, '2024-01-01 02:00'::timestamp, '1 hour')",
+    ),
+})

@@ -2338,7 +2338,14 @@ impl<'a> Binder<'a> {
             Some(te) => Some(Box::new(self.coerce(te, ty, -1, CastCtx::Implicit, "CASE")?)),
             None => None,
         };
-        Ok(TE::new(Expr::Case { operand: None, whens: out_whens, else_: else_e }, ty))
+        let case = Expr::Case { operand: None, whens: out_whens, else_: else_e };
+        if expr_has_srf(&case) {
+            return Err(PgError::new(
+                code::FEATURE_NOT_SUPPORTED,
+                "set-returning functions are not allowed in CASE",
+            ));
+        }
+        Ok(TE::new(case, ty))
     }
 
     fn bind_access(&mut self, root: &a::Expr, chain: &[a::AccessExpr]) -> PgResult<TE> {
@@ -2569,6 +2576,80 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// `(s1, e1) OVERLAPS (s2, e2)`: each end may be an interval (a
+    /// length from the start); periods are normalized so start <= end and
+    /// overlap when they share an instant (Postgres's definition, with an
+    /// equal start always overlapping).
+    fn bind_overlaps(&mut self, left: &a::Expr, right: &a::Expr) -> PgResult<TE> {
+        let pair = |e: &a::Expr| -> PgResult<(a::Expr, a::Expr)> {
+            match e {
+                a::Expr::Tuple(items) if items.len() == 2 => {
+                    Ok((items[0].clone(), items[1].clone()))
+                }
+                a::Expr::Nested(inner) => match inner.as_ref() {
+                    a::Expr::Tuple(items) if items.len() == 2 => {
+                        Ok((items[0].clone(), items[1].clone()))
+                    }
+                    _ => Err(PgError::new(
+                        code::SYNTAX_ERROR,
+                        "wrong number of parameters on left side of OVERLAPS expression",
+                    )),
+                },
+                _ => Err(PgError::new(
+                    code::SYNTAX_ERROR,
+                    "wrong number of parameters on left side of OVERLAPS expression",
+                )),
+            }
+        };
+        let ((s1, e1), (s2, e2)) = (pair(left)?, pair(right)?);
+        let mut ends = vec![];
+        for (s, e) in [(s1, e1), (s2, e2)] {
+            let st = self.bind_expr(&s)?;
+            let en = self.bind_expr(&e)?;
+            // An interval end is start + interval.
+            let en = if en.ty.base == Base::Interval && !en.ty.array {
+                self.bind_binary(&s, &a::BinaryOperator::Plus, &e)?
+            } else {
+                en
+            };
+            ends.push((st, en));
+        }
+        let tys: Vec<Type> = ends.iter().flat_map(|(a, b)| [a.ty, b.ty]).collect();
+        let ty = self.common_type(&tys, "OVERLAPS", 0)?;
+        let mut ex = vec![];
+        for (st, en) in ends {
+            let st = self.coerce(st, ty, -1, CastCtx::Implicit, "OVERLAPS")?;
+            let en = self.coerce(en, ty, -1, CastCtx::Implicit, "OVERLAPS")?;
+            // NULL in, NULL out (least/greatest would skip it).
+            let any_null = Expr::Or(vec![
+                Expr::IsNull(Box::new(st.clone()), false),
+                Expr::IsNull(Box::new(en.clone()), false),
+            ]);
+            let guard = |e: Expr| Expr::Case {
+                operand: None,
+                whens: vec![(any_null.clone(), Expr::Const(Value::Null))],
+                else_: Some(Box::new(e)),
+            };
+            ex.push((
+                guard(Expr::Greatest(vec![st.clone(), en.clone()], true)),
+                guard(Expr::Greatest(vec![st, en], false)),
+            ));
+        }
+        let ((a1, b1), (a2, b2)) = (ex[0].clone(), ex[1].clone());
+        let cmp = |op: CmpOp, l: &Expr, r: &Expr| Expr::Compare {
+            op,
+            left: Box::new(l.clone()),
+            right: Box::new(r.clone()),
+            bpchar: false,
+        };
+        let e = Expr::Or(vec![
+            Expr::And(vec![cmp(CmpOp::Gt, &a1, &a2), cmp(CmpOp::Lt, &a1, &b2)]),
+            Expr::And(vec![cmp(CmpOp::Gt, &a2, &a1), cmp(CmpOp::Lt, &a2, &b1)]),
+            cmp(CmpOp::Eq, &a1, &a2),
+        ]);
+        Ok(TE::new(e, Type::BOOL))
+    }
+
     fn bind_binary(
         &mut self,
         left: &a::Expr,
@@ -2576,6 +2657,9 @@ impl<'a> Binder<'a> {
         right: &a::Expr,
     ) -> PgResult<TE> {
         use a::BinaryOperator as B;
+        if matches!(op, B::Overlaps) {
+            return self.bind_overlaps(left, right);
+        }
         if matches!(op, B::And | B::Or) {
             let l = self.bind_expr(left)?;
             let r = self.bind_expr(right)?;
@@ -3026,6 +3110,15 @@ impl<'a> Binder<'a> {
                 let mut out = vec![];
                 for te in tes {
                     out.push(self.coerce(te, ty, -1, CastCtx::Implicit, &name)?);
+                }
+                if out.iter().any(expr_has_srf) {
+                    return Err(PgError::new(
+                        code::FEATURE_NOT_SUPPORTED,
+                        format!(
+                            "set-returning functions are not allowed in {}",
+                            name.to_uppercase()
+                        ),
+                    ));
                 }
                 let e = match name.as_str() {
                     "coalesce" => Expr::Coalesce(out),

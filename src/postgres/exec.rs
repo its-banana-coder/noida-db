@@ -1389,8 +1389,9 @@ fn eval_multi(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Value>> {
             })
             .collect());
     }
+    let is_srf = |x: &Expr| matches!(x, Expr::Call { name, .. } if super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf));
     if let Expr::Call { name, args, arg_tys, ty } = e
-        && super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf)
+        && is_srf(e)
     {
         let mut vals = vec![];
         for a in args {
@@ -1402,7 +1403,46 @@ fn eval_multi(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Value>> {
             .map(|mut r| if r.len() == 1 { r.remove(0) } else { Value::Record(r) })
             .collect());
     }
+    // A set-returning call inside an expression (`unnest(a) * 10`,
+    // `generate_series(...)::date`): expand it, then evaluate the rest of
+    // the expression once per value.
+    if e.contains(&is_srf) {
+        let mut template = e.clone();
+        let mut srf = None;
+        take_first_srf(&mut template, &mut srf, &is_srf);
+        if let Some(srf) = srf {
+            let mut out = vec![];
+            for v in eval_multi(&srf, row, ctx)? {
+                let mut t = template.clone();
+                fill_srf_slot(&mut t, &v);
+                out.extend(eval_multi(&t, row, ctx)?);
+            }
+            return Ok(out);
+        }
+    }
     Ok(vec![eval(e, row, ctx)?])
+}
+
+/// The marker left where `take_first_srf` cut a set-returning call out.
+const SRF_SLOT: &str = "\u{0}srf-slot";
+
+fn take_first_srf(e: &mut Expr, found: &mut Option<Expr>, is_srf: &dyn Fn(&Expr) -> bool) {
+    if found.is_some() {
+        return;
+    }
+    if is_srf(e) {
+        *found = Some(std::mem::replace(e, Expr::Const(Value::Text(SRF_SLOT.into()))));
+        return;
+    }
+    e.children_mut(&mut |c| take_first_srf(c, found, is_srf));
+}
+
+fn fill_srf_slot(e: &mut Expr, v: &Value) {
+    if matches!(e, Expr::Const(Value::Text(t)) if t == SRF_SLOT) {
+        *e = Expr::Const(v.clone());
+        return;
+    }
+    e.children_mut(&mut |c| fill_srf_slot(c, v));
 }
 
 fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
