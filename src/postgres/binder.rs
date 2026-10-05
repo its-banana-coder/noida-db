@@ -1791,6 +1791,20 @@ impl<'a> Binder<'a> {
         if let Some((_, te)) = self.lookup_column(name, rel) {
             return Ok(te);
         }
+        // SQL keywords that are functions without parentheses.
+        if rel.is_none()
+            && matches!(
+                name,
+                "current_schema"
+                    | "current_catalog"
+                    | "current_role"
+                    | "current_user"
+                    | "session_user"
+                    | "user"
+            )
+        {
+            return self.bind_keyword_function(name);
+        }
         match rel {
             Some(r) if !self.rel_in_scope(r) => Err(missing_from(r)),
             Some(r) => Err(PgError::new(

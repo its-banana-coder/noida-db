@@ -334,7 +334,19 @@ pub struct DbState {
     /// Triggers, by OID.
     #[serde(default)]
     pub triggers: BTreeMap<u32, Trigger>,
+    /// Extensions created (beyond the built-in plpgsql): name -> (OID, schema).
+    #[serde(default)]
+    pub extensions: BTreeMap<String, (u32, u32)>,
 }
+
+/// Extensions whose functions and types noida-db provides: (name, version,
+/// description). plpgsql is always installed.
+pub const EXTENSIONS: &[(&str, &str, &str)] = &[
+    ("plpgsql", "1.0", "PL/pgSQL procedural language"),
+    ("pgcrypto", "1.3", "cryptographic functions"),
+    ("uuid-ossp", "1.1", "generate universally unique identifiers (UUIDs)"),
+    ("citext", "1.6", "data type for case-insensitive character strings"),
+];
 
 /// A `CREATE FUNCTION` / `CREATE PROCEDURE`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -429,6 +441,7 @@ impl Default for DbState {
             db_comment: None,
             functions: BTreeMap::new(),
             triggers: BTreeMap::new(),
+            extensions: BTreeMap::new(),
         }
     }
 }
