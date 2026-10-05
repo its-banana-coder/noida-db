@@ -371,6 +371,7 @@ pub enum Plan {
         table: String,
         columns: Vec<Column>,
         unique_keys: Vec<UniqueKey>,
+        indexes: Vec<UniqueKey>,
         foreign_keys: Vec<crate::mysql::catalog::ForeignKey>,
         if_not_exists: bool,
     },
@@ -413,7 +414,11 @@ pub enum Plan {
         if_not_exists: bool,
         /// `CREATE UNIQUE INDEX name ...` (enforced, like a UNIQUE key).
         unique: Option<String>,
+        /// The index's name (a plain index's too).
+        name: String,
     },
+    /// `RENAME TABLE a TO b, c TO d`: (db, table, new name) each.
+    RenameTables(Vec<(String, String, String)>),
     Insert {
         db: String,
         table: String,
@@ -883,6 +888,13 @@ pub enum AlterOp {
         new: String,
     },
     RenameTable(String),
+    /// `ADD INDEX`/`ADD KEY` (plain).
+    AddIndex(UniqueKey),
+    /// `RENAME INDEX|KEY old TO new`.
+    RenameKey {
+        old: String,
+        new: String,
+    },
     AddUnique(UniqueKey),
     /// A foreign key; an empty name gets MySQL's `<table>_ibfk_<n>`.
     AddForeignKey(crate::mysql::catalog::ForeignKey),

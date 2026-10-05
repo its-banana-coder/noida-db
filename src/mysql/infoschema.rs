@@ -251,19 +251,18 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 rows,
             )
         }
-        // One row per (key, column) of each PRIMARY/UNIQUE key; plain
-        // `KEY`/`INDEX` declarations aren't tracked.
+        // One row per (index, column).
         "STATISTICS" => {
             let mut rows = Vec::new();
             for (db, t) in user_tables(state) {
-                for (key, cols) in t.keys() {
+                for (key, cols, unique) in t.all_indexes() {
                     for (seq, &c) in cols.iter().enumerate() {
                         let col = &t.columns[c];
                         rows.push(vec![
                             text("def"),
                             text(db),
                             text(&t.name),
-                            Value::Int(0),
+                            Value::Int(i64::from(!unique)),
                             text(db),
                             text(&key),
                             Value::Int(seq as i64 + 1),
@@ -502,12 +501,12 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
 /// `SHOW INDEX FROM t`'s rows, in MySQL's 15-column shape.
 pub fn show_index(t: &Table) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
-    for (key, cols) in t.keys() {
+    for (key, cols, unique) in t.all_indexes() {
         for (seq, &c) in cols.iter().enumerate() {
             let col = &t.columns[c];
             rows.push(vec![
                 text(&t.name),
-                Value::Int(0),
+                Value::Int(i64::from(!unique)),
                 text(&key),
                 Value::Int(seq as i64 + 1),
                 text(&col.name),

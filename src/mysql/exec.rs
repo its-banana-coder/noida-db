@@ -1099,19 +1099,21 @@ impl Executor {
                         .collect::<Vec<_>>()
                         .join(",")
                 };
-                let keys = t.keys();
-                for (name, cols) in &keys {
+                let keys = t.all_indexes();
+                for (name, cols, unique) in &keys {
                     if name == "PRIMARY" {
                         lines.push(format!("  PRIMARY KEY ({})", quote(cols)));
-                    } else {
+                    } else if *unique {
                         lines.push(format!("  UNIQUE KEY `{name}` ({})", quote(cols)));
+                    } else {
+                        lines.push(format!("  KEY `{name}` ({})", quote(cols)));
                     }
                 }
                 // InnoDB gives a foreign key an index of its own unless an
                 // existing key already starts with its columns.
                 let names = |cs: &[String]| cs.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>();
                 for fk in &t.foreign_keys {
-                    let covered = keys.iter().any(|(_, cols)| {
+                    let covered = keys.iter().any(|(_, cols, _)| {
                         cols.len() >= fk.columns.len()
                             && cols
                                 .iter()
@@ -1142,16 +1144,32 @@ impl Executor {
                     }
                     lines.push(l);
                 }
+                // The next AUTO_INCREMENT value shows once it has moved.
+                let auto =
+                    if t.columns.iter().any(|c| c.auto_increment) && t.next_auto_increment > 1 {
+                        format!(" AUTO_INCREMENT={}", t.next_auto_increment)
+                    } else {
+                        String::new()
+                    };
                 let sql = format!(
-                    "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+                    "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{auto} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
                     t.name,
                     lines.join(",\n")
                 );
                 Ok(vec![vec![Value::Text(t.name.clone()), Value::Text(sql)]])
             }
-            Plan::CreateTable { db, table, columns, unique_keys, foreign_keys, if_not_exists } => {
+            Plan::CreateTable {
+                db,
+                table,
+                columns,
+                unique_keys,
+                indexes,
+                foreign_keys,
+                if_not_exists,
+            } => {
                 let mut t = Table::new(table.clone(), columns);
                 t.unique_keys = unique_keys;
+                t.indexes = indexes;
                 for fk in foreign_keys {
                     self.add_foreign_key(&db, &mut t, fk, false)?;
                 }
@@ -1282,7 +1300,7 @@ impl Executor {
                 state.schemas.insert(name, crate::mysql::catalog::Schema::default());
                 Ok(vec![])
             }
-            Plan::CreateIndex { db, table, columns, if_not_exists, unique } => {
+            Plan::CreateIndex { db, table, columns, if_not_exists, unique, name } => {
                 let mut t = match self.load_table(&db, &table) {
                     Ok(t) => t,
                     Err(_) if if_not_exists => return Ok(vec![]),
@@ -1299,7 +1317,19 @@ impl Executor {
                 }
                 if let Some(name) = unique {
                     add_unique_key(&mut t, UniqueKey { name, columns })?;
-                    self.store_table(&db, t)?;
+                } else {
+                    add_index(&mut t, UniqueKey { name, columns })?;
+                }
+                self.store_table(&db, t)?;
+                Ok(vec![])
+            }
+            Plan::RenameTables(pairs) => {
+                for (db, table, new) in pairs {
+                    self.execute_plan(Plan::AlterTable {
+                        db,
+                        table,
+                        ops: vec![AlterOp::RenameTable(new)],
+                    })?;
                 }
                 Ok(vec![])
             }
@@ -2394,7 +2424,13 @@ impl Executor {
                         )),
                     },
                 },
-                None => Ok(self.outer_column(name)?.unwrap_or(Value::Null)),
+                None => self.outer_column(name)?.ok_or_else(|| {
+                    MySqlError::new(
+                        1054,
+                        "42S22",
+                        format!("Unknown column '{name}' in 'field list'"),
+                    )
+                }),
             },
             Expr::Subquery(plan) => {
                 let rows = self.run_subquery(plan, row, table)?;
@@ -3285,6 +3321,12 @@ pub(crate) fn eval_call(name: &str, args: &[Value]) -> Result<Value, MySqlError>
         "NOW" | "CURRENT_TIMESTAMP" | "LOCALTIMESTAMP" | "LOCALTIME" | "SYSDATE" => {
             Ok(Value::Ts(now_ts()))
         }
+        "CURTIME" | "CURRENT_TIME" | "UTC_TIME" => {
+            // Whole seconds, as MySQL's default precision.
+            let day = crate::sql::datetime::USECS_PER_DAY;
+            let us = now_ts().rem_euclid(day);
+            Ok(Value::Time(us - us % 1_000_000))
+        }
         "CURDATE" | "CURRENT_DATE" => {
             Ok(Value::Date(now_ts().div_euclid(crate::sql::datetime::USECS_PER_DAY) as i32))
         }
@@ -4126,6 +4168,14 @@ fn resolve_column(t: &Table, sought: &str) -> Result<Option<usize>, MySqlError> 
 /// A UNIQUE (or PRIMARY) key over existing rows: error 1062 if they
 /// already collide, else added.
 fn add_unique_key(t: &mut Table, key: UniqueKey) -> Result<(), MySqlError> {
+    check_unique(t, &key)?;
+    t.unique_keys.retain(|k| !k.name.eq_ignore_ascii_case(&key.name));
+    t.unique_keys.push(key);
+    Ok(())
+}
+
+/// Fails if `t`'s rows already hold a duplicate for `key`.
+fn check_unique(t: &Table, key: &UniqueKey) -> Result<(), MySqlError> {
     let mut probe = t.clone();
     probe.unique_keys = vec![key.clone()];
     for c in probe.columns.iter_mut() {
@@ -4139,8 +4189,6 @@ fn add_unique_key(t: &mut Table, key: UniqueKey) -> Result<(), MySqlError> {
         }
         probe.rows.push(row);
     }
-    t.unique_keys.retain(|k| !k.name.eq_ignore_ascii_case(&key.name));
-    t.unique_keys.push(key);
     Ok(())
 }
 
@@ -4201,6 +4249,17 @@ fn place_column(
     Ok(())
 }
 
+/// Adds a plain index, named after its first column when unnamed.
+fn add_index(t: &mut Table, mut key: UniqueKey) -> Result<(), MySqlError> {
+    if key.name.is_empty() {
+        key.name = t.index_name_for(key.columns.first().map_or("", String::as_str));
+    } else if t.has_index(&key.name) {
+        return Err(MySqlError::new(1061, "42000", format!("Duplicate key name '{}'", key.name)));
+    }
+    t.indexes.push(key);
+    Ok(())
+}
+
 /// Applies one `ALTER TABLE` operation to `t` (a copy: a failing operation
 /// leaves the real table untouched).
 fn alter_table(
@@ -4257,7 +4316,16 @@ fn alter_table(
             for row in t.rows.iter_mut() {
                 row.remove(i);
             }
-            t.unique_keys.retain(|k| !k.columns.iter().any(|c| c.eq_ignore_ascii_case(&name)));
+            // Each index loses the column (and goes once it has none); a
+            // narrower UNIQUE key must still hold.
+            for k in t.unique_keys.iter_mut().chain(t.indexes.iter_mut()) {
+                k.columns.retain(|c| !c.eq_ignore_ascii_case(&name));
+            }
+            t.unique_keys.retain(|k| !k.columns.is_empty());
+            t.indexes.retain(|k| !k.columns.is_empty());
+            for k in &t.unique_keys {
+                check_unique(t, k)?;
+            }
         }
         AlterOp::ReplaceColumn { old, mut col, unique, pos } => {
             let i = column_index_or_err(t, &old, "field list")?;
@@ -4270,7 +4338,7 @@ fn alter_table(
                 row[i] = coerce_to_column(v, &col, mode)?;
             }
             if !old.eq_ignore_ascii_case(&col.name) {
-                for k in t.unique_keys.iter_mut() {
+                for k in t.unique_keys.iter_mut().chain(t.indexes.iter_mut()) {
                     for c in k.columns.iter_mut() {
                         if c.eq_ignore_ascii_case(&old) {
                             *c = col.name.clone();
@@ -4286,7 +4354,7 @@ fn alter_table(
         }
         AlterOp::RenameColumn { old, new } => {
             let i = column_index_or_err(t, &old, "field list")?;
-            for k in t.unique_keys.iter_mut() {
+            for k in t.unique_keys.iter_mut().chain(t.indexes.iter_mut()) {
                 for c in k.columns.iter_mut() {
                     if c.eq_ignore_ascii_case(&old) {
                         *c = new.clone();
@@ -4320,9 +4388,40 @@ fn alter_table(
         AlterOp::DropKey(name) if name.eq_ignore_ascii_case("PRIMARY") => {
             t.columns.iter_mut().for_each(|c| c.primary_key = false);
         }
-        // A plain (non-unique) index isn't tracked, so dropping one that
-        // isn't a UNIQUE key is a no-op rather than an error.
-        AlterOp::DropKey(name) => t.unique_keys.retain(|k| !k.name.eq_ignore_ascii_case(&name)),
+        AlterOp::DropKey(name) => {
+            if !t.has_index(&name) {
+                return Err(MySqlError::new(
+                    1091,
+                    "42000",
+                    format!("Can't DROP '{name}'; check that column/key exists"),
+                ));
+            }
+            t.unique_keys.retain(|k| !k.name.eq_ignore_ascii_case(&name));
+            t.indexes.retain(|k| !k.name.eq_ignore_ascii_case(&name));
+        }
+        AlterOp::AddIndex(key) => {
+            for c in &key.columns {
+                column_index_or_err(t, c, "key")?;
+            }
+            add_index(t, key)?;
+        }
+        AlterOp::RenameKey { old, new } => {
+            if old.eq_ignore_ascii_case("PRIMARY") || !t.has_index(&old) {
+                return Err(MySqlError::new(
+                    1176,
+                    "42000",
+                    format!("Key '{old}' doesn't exist in table '{}'", t.name),
+                ));
+            }
+            if !old.eq_ignore_ascii_case(&new) && t.has_index(&new) {
+                return Err(MySqlError::new(1061, "42000", format!("Duplicate key name '{new}'")));
+            }
+            for k in t.unique_keys.iter_mut().chain(t.indexes.iter_mut()) {
+                if k.name.eq_ignore_ascii_case(&old) {
+                    k.name = new.clone();
+                }
+            }
+        }
         AlterOp::DropPrimaryKey => t.columns.iter_mut().for_each(|c| c.primary_key = false),
         AlterOp::SetDefault { col, default, now } => {
             let i = column_index_or_err(t, &col, "field list")?;

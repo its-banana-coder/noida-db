@@ -273,6 +273,7 @@ impl Engine {
             | Plan::Truncate { .. }
             | Plan::CreateDatabase { .. }
             | Plan::AlterTable { .. }
+            | Plan::RenameTables(_)
             | Plan::DropDatabase { .. }
             | Plan::CreateIndex { .. } => {
                 self.commit();
@@ -343,7 +344,7 @@ impl Engine {
     /// error (CLIENT_MULTI_STATEMENTS).
     pub fn execute_multi(&mut self, sql: &str) -> Vec<StatementResult> {
         let dialect = MySqlDialect {};
-        let rewritten = rewrite_comma_update(sql);
+        let rewritten = rewrite_rename_key(sql).or_else(|| rewrite_comma_update(sql));
         let text = rewritten.as_deref().unwrap_or(sql);
         let asts = match Parser::parse_sql(&dialect, text) {
             Ok(a) => a,
@@ -371,7 +372,7 @@ impl Engine {
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
-        let rewritten = rewrite_comma_update(sql);
+        let rewritten = rewrite_rename_key(sql).or_else(|| rewrite_comma_update(sql));
         let sql = rewritten.as_deref().unwrap_or(sql);
         let mut asts = Parser::parse_sql(&dialect, sql)
             .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
@@ -899,6 +900,32 @@ fn sql_mode_assignment(set: &sqlparser::ast::Set) -> Option<crate::mysql::sqlmod
         .or(out);
     }
     out
+}
+
+/// `ALTER TABLE t ... RENAME {INDEX|KEY} a TO b ...`, which the SQL parser
+/// doesn't know, as a column rename of a marked name that the binder turns
+/// back into an index rename.
+pub fn rewrite_rename_key(sql: &str) -> Option<String> {
+    let trimmed = sql.trim_start();
+    if trimmed.len() < 11 || !trimmed[..11].eq_ignore_ascii_case("ALTER TABLE") {
+        return None;
+    }
+    let re = regex_lite::Regex::new(
+        r"(?i)\brename\s+(?:index|key)\s+(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)\s+to\b",
+    )
+    .expect("regex");
+    if !re.is_match(sql) {
+        return None;
+    }
+    let out = re.replace_all(sql, |c: &regex_lite::Captures| {
+        let name = c[1].trim_matches('`').replace("``", "`");
+        format!(
+            "RENAME COLUMN `{}{}` TO",
+            crate::mysql::binder::RENAME_KEY_MARKER,
+            name.replace('`', "``")
+        )
+    });
+    Some(out.into_owned())
 }
 
 /// `Some(on)` if `set` assigns `autocommit` (`SET autocommit = 0`,
