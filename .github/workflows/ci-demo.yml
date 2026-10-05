@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./  # this repo's action.yml; elsewhere: its-banana-coder/noida-db@main
-        with: { version: "0.1.3" }
+        with: { version: "0.2.0" }
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -r examples/ci-demo/requirements.txt

@@ -646,4 +646,22 @@ PG_EDGES.update({
         "DROP TABLE ds_idx",
         "DROP VIEW no_such_view",
     ),
+    "pg edge: statement_timeout": steps(
+        "SET statement_timeout = 200",
+        "SHOW statement_timeout",
+        "SELECT pg_sleep(2)",
+        # Slow on any server: a sleep per row, interrupted mid-scan.
+        "SELECT count(*) FROM generate_series(1, 10) g WHERE pg_sleep(0.1) IS NOT NULL",
+        "SET statement_timeout = '1.5s'",
+        "SHOW statement_timeout",
+        "SET statement_timeout = '10 x'",
+        "SET statement_timeout = -1",
+        "BEGIN",
+        "SET LOCAL statement_timeout = 100",
+        "SELECT pg_sleep(1)",
+        "SELECT 1",
+        "ROLLBACK",
+        "SET statement_timeout = 0",
+        "SELECT pg_sleep(0.3)",
+    ),
 })

@@ -149,18 +149,21 @@ struct Global {
 
 #[derive(Clone)]
 struct SessionHandle {
-    pid: i32,
-    secret: i32,
-    cancel: Arc<AtomicBool>,
     channels: Vec<String>,
     notifications: Arc<Mutex<Vec<(i32, String, String)>>>,
     database: String,
 }
 
+/// Each session's cancel flag, by (pid, secret key).
+type CancelFlags = BTreeMap<(i32, i32), Arc<AtomicBool>>;
+
 #[derive(Clone)]
 pub struct Engine {
     global: Arc<Mutex<Global>>,
     next_pid: Arc<AtomicI32>,
+    /// Cancel flags by (pid, secret), apart from `global`, which a running
+    /// statement holds: a CancelRequest must get through meanwhile.
+    cancels: Arc<Mutex<CancelFlags>>,
 }
 
 impl Default for Engine {
@@ -210,6 +213,7 @@ impl Engine {
                 next_db_oid: snapshot.next_db_oid,
             })),
             next_pid: Arc::new(AtomicI32::new(10_000)),
+            cancels: Default::default(),
         }
     }
 
@@ -233,6 +237,7 @@ impl Engine {
                 next_db_oid: super::catalog::DATABASE_OID + 1,
             })),
             next_pid: Arc::new(AtomicI32::new(10_000)),
+            cancels: Default::default(),
         }
     }
 
@@ -249,13 +254,11 @@ impl Engine {
         let pid = self.next_pid.fetch_add(1, AtomicOrdering::SeqCst);
         let secret = (super::funcs::random_u64() as i32) | 1;
         let cancel = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().unwrap().insert((pid, secret), cancel.clone());
         let notifications = Arc::new(Mutex::new(vec![]));
         g.sessions.insert(
             id,
             SessionHandle {
-                pid,
-                secret,
-                cancel: cancel.clone(),
                 channels: vec![],
                 notifications: notifications.clone(),
                 database: database.to_string(),
@@ -279,6 +282,9 @@ impl Engine {
                 stmt_now: now,
                 listening: vec![],
                 notices: vec![],
+                cancel: cancel.clone(),
+                deadline: None,
+                ticks: 0,
             },
             status: TxStatus::Idle,
             txn: None,
@@ -294,6 +300,7 @@ impl Engine {
     /// Ends a session: its temporary schema is dropped (once no other
     /// transaction is writing, since a commit replaces the whole state).
     pub fn disconnect(&self, s: &Session) {
+        self.cancels.lock().unwrap().remove(&(s.pid, s.secret));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             let mut g = self.global.lock().unwrap();
@@ -315,9 +322,8 @@ impl Engine {
 
     /// Handles a CancelRequest: flags the matching session.
     pub fn cancel(&self, pid: i32, secret: i32) {
-        let g = self.global.lock().unwrap();
-        if let Some(h) = g.sessions.values().find(|h| h.pid == pid && h.secret == secret) {
-            h.cancel.store(true, AtomicOrdering::SeqCst);
+        if let Some(c) = self.cancels.lock().unwrap().get(&(pid, secret)) {
+            c.store(true, AtomicOrdering::SeqCst);
         }
     }
 
@@ -406,6 +412,7 @@ impl Engine {
             ));
         }
         s.rt.stmt_now = super::datetime::now_micros();
+        s.rt.start_statement();
         if s.txn.is_none() {
             s.rt.now = s.rt.stmt_now;
         }
@@ -1055,6 +1062,7 @@ impl Engine {
                     }
                 }
             }
+            s.rt.check_interrupt()?;
             if std::time::Instant::now() > deadline {
                 return Err(PgError::new(
                     code::LOCK_NOT_AVAILABLE,

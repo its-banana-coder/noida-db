@@ -357,6 +357,27 @@ impl Settings {
                 }
                 n.to_string()
             }
+            "statement_timeout" | "lock_timeout" | "idle_in_transaction_session_timeout" => {
+                let ms = parse_ms(value).ok_or_else(|| {
+                    // A number with an unknown unit gets the list of units.
+                    if value.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+                        bad(value).hint(
+                            "Valid units for this parameter are \"us\", \"ms\", \"s\", \"min\", \"h\", and \"d\".",
+                        )
+                    } else {
+                        bad(value)
+                    }
+                })?;
+                if !(0..=i32::MAX as i64).contains(&ms) {
+                    return Err(PgError::new(
+                        code::INVALID_PARAMETER_VALUE,
+                        format!(
+                            "{ms} ms is outside the valid range for parameter \"{name}\" (0 .. 2147483647)"
+                        ),
+                    ));
+                }
+                format_ms(ms)
+            }
             "bytea_output" => match value.to_ascii_lowercase().as_str() {
                 v @ ("hex" | "escape") => v.to_string(),
                 _ => return Err(bad(value)),
@@ -446,6 +467,40 @@ impl Settings {
     }
 }
 
+/// A milliseconds setting (statement_timeout): a number, optionally with
+/// a unit (us, ms, s, min, h, d), rounded to whole milliseconds.
+pub fn parse_ms(v: &str) -> Option<i64> {
+    let v = v.trim();
+    let split = v
+        .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'))
+        .unwrap_or(v.len());
+    let n: f64 = v[..split].parse().ok()?;
+    let mult = match v[split..].trim() {
+        "" | "ms" => 1.0,
+        "us" => 0.001,
+        "s" => 1000.0,
+        "min" => 60_000.0,
+        "h" => 3_600_000.0,
+        "d" => 86_400_000.0,
+        _ => return None,
+    };
+    let ms = (n * mult).round();
+    ms.is_finite().then_some(ms as i64)
+}
+
+/// How SHOW prints milliseconds: in the largest unit that divides them.
+fn format_ms(ms: i64) -> String {
+    if ms == 0 {
+        return "0".into();
+    }
+    for (unit, size) in [("d", 86_400_000), ("h", 3_600_000), ("min", 60_000), ("s", 1000)] {
+        if ms % size == 0 {
+            return format!("{}{unit}", ms / size);
+        }
+    }
+    format!("{ms}ms")
+}
+
 fn bool_setting(n: &str) -> bool {
     matches!(
         n,
@@ -510,6 +565,28 @@ pub fn split_path(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeouts() {
+        // Expected values from Postgres 14.
+        let mut s = Settings::default();
+        for (v, want) in [
+            ("0", "0"),
+            ("1000", "1s"),
+            ("60000", "1min"),
+            ("1.5s", "1500ms"),
+            ("90s", "90s"),
+            ("3600000", "1h"),
+            ("10 s", "10s"),
+            ("1000us", "1ms"),
+        ] {
+            s.set("statement_timeout", v).unwrap();
+            assert_eq!(s.get("statement_timeout").unwrap(), want, "{v}");
+        }
+        assert!(s.set("statement_timeout", "abc").unwrap_err().hint.is_none());
+        assert!(s.set("statement_timeout", "10 x").unwrap_err().hint.is_some());
+        assert!(s.set("statement_timeout", "-1").is_err());
+    }
 
     #[test]
     fn set_show_reset() {

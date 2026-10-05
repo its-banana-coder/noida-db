@@ -30,6 +30,52 @@ pub struct Runtime {
     pub listening: Vec<String>,
     /// Notifications to deliver to this session.
     pub notices: Vec<PgError>,
+    /// Set by a CancelRequest for this session.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// When the running statement exceeds statement_timeout.
+    pub deadline: Option<std::time::Instant>,
+    /// Work done since the last interrupt check.
+    pub ticks: u32,
+}
+
+impl Runtime {
+    /// Starts a statement: an earlier cancel no longer applies, and
+    /// statement_timeout starts counting.
+    pub fn start_statement(&mut self) {
+        self.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        let ms = self
+            .settings
+            .get("statement_timeout")
+            .ok()
+            .and_then(|v| super::session::parse_ms(&v))
+            .unwrap_or(0);
+        self.deadline = (ms > 0)
+            .then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    }
+
+    /// Fails the statement if it was canceled or ran out of time.
+    pub fn check_interrupt(&self) -> PgResult<()> {
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(PgError::new(
+                code::QUERY_CANCELED,
+                "canceling statement due to user request",
+            ));
+        }
+        if self.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Err(PgError::new(
+                code::QUERY_CANCELED,
+                "canceling statement due to statement timeout",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `check_interrupt`, every so many calls (cheap enough for hot loops).
+    #[inline]
+    pub fn tick(&mut self) -> PgResult<()> {
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks & 4095 == 0 { self.check_interrupt() } else { Ok(()) }
+    }
 }
 
 pub struct Ctx<'a> {
@@ -70,6 +116,7 @@ macro_rules! env {
 
 /// Evaluates an expression against `row`.
 pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
+    ctx.rt.tick()?;
     Ok(match e {
         Expr::Const(v) => v.clone(),
         Expr::UserFunc { oid, args } => {
@@ -634,8 +681,22 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
         "pg_relation_filenode" => a[0].clone(),
         "pg_relation_is_publishable" => Value::Bool(true),
         "pg_sleep" => {
-            let secs = funcs::as_f64(&a[0]).clamp(0.0, 10.0);
-            std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+            // Sleeps in slices so a cancel or statement_timeout ends it.
+            let secs = funcs::as_f64(&a[0]);
+            let end = std::time::Instant::now()
+                + std::time::Duration::from_secs_f64(if secs.is_finite() {
+                    secs.clamp(0.0, 1e9)
+                } else {
+                    0.0
+                });
+            loop {
+                ctx.rt.check_interrupt()?;
+                let now = std::time::Instant::now();
+                if now >= end {
+                    break;
+                }
+                std::thread::sleep((end - now).min(std::time::Duration::from_millis(10)));
+            }
             void()
         }
         "pg_advisory_lock"
@@ -1789,6 +1850,7 @@ fn srf_rows(
                     let mut out = vec![];
                     let mut v = *from;
                     while (step > 0 && v <= *to) || (step < 0 && v >= *to) {
+                        ctx.rt.tick()?;
                         out.push(vec![Value::Int(v)]);
                         match v.checked_add(step) {
                             Some(n) => v = n,
