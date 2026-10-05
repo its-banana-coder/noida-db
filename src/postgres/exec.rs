@@ -45,6 +45,13 @@ pub struct Ctx<'a> {
     /// Rows affected by the last DML node.
     pub affected: usize,
     pub databases: Vec<(u32, String)>,
+    /// Results of subqueries that read no outer row, one map per running
+    /// query (by the subquery plan's address): like Postgres's InitPlans,
+    /// they run once per execution of the query containing them.
+    pub subq_cache: Vec<std::collections::HashMap<usize, std::sync::Arc<Vec<Row>>>>,
+    /// The outermost `outer` level read since the innermost running
+    /// subquery started (how it tells whether it is correlated).
+    pub min_outer: usize,
 }
 
 impl Ctx<'_> {
@@ -83,6 +90,7 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
         Expr::Col(i) => row.get(*i).cloned().unwrap_or(Value::Null),
         Expr::Outer(depth, i) => {
             let n = ctx.outer.len();
+            ctx.min_outer = ctx.min_outer.min(n.wrapping_sub(*depth));
             ctx.outer
                 .get(n.wrapping_sub(*depth))
                 .and_then(|r| r.get(*i))
@@ -288,7 +296,7 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
             let rows = run_subquery(query, row, ctx)?;
             let mut saw_null = false;
             let mut found = false;
-            for r in &rows {
+            for r in rows.iter() {
                 let mut all_eq = true;
                 let mut null_here = false;
                 for (i, lv) in lvals.iter().enumerate() {
@@ -334,9 +342,7 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
             match kind {
                 SubKind::Exists => Value::Bool(!rows.is_empty()),
                 SubKind::Array => Value::Array(Box::new(Array::new(
-                    rows.into_iter()
-                        .map(|mut r| if r.is_empty() { Value::Null } else { r.remove(0) })
-                        .collect(),
+                    rows.iter().map(|r| r.first().cloned().unwrap_or(Value::Null)).collect(),
                 ))),
                 SubKind::Scalar => {
                     if rows.len() > 1 {
@@ -345,10 +351,7 @@ pub fn eval(e: &Expr, row: &[Value], ctx: &mut Ctx) -> PgResult<Value> {
                             "more than one row returned by a subquery used as an expression",
                         ));
                     }
-                    rows.into_iter()
-                        .next()
-                        .map(|mut r| if r.is_empty() { Value::Null } else { r.remove(0) })
-                        .unwrap_or(Value::Null)
+                    rows.first().and_then(|r| r.first()).cloned().unwrap_or(Value::Null)
                 }
             }
         }
@@ -412,11 +415,28 @@ fn compare_values(a: &Value, b: &Value, bpchar: bool) -> Ordering {
     types::cmp_values(a, b)
 }
 
-fn run_subquery(q: &Query, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
+/// Runs a subquery for `row` of the query containing it. A run that read
+/// nothing from `row` (or further out) would give the same rows for any
+/// other row, so they're kept for the rest of the containing query.
+fn run_subquery(q: &Query, row: &[Value], ctx: &mut Ctx) -> PgResult<std::sync::Arc<Vec<Row>>> {
+    let key = q as *const Query as usize;
+    if let Some(rows) = ctx.subq_cache.last().and_then(|m| m.get(&key)) {
+        return Ok(rows.clone());
+    }
+    let base = ctx.outer.len();
+    let saved = std::mem::replace(&mut ctx.min_outer, usize::MAX);
     ctx.outer.push(row.to_vec());
     let r = run_query(q, ctx);
     ctx.outer.pop();
-    r
+    let reached = ctx.min_outer;
+    ctx.min_outer = saved.min(reached);
+    let rows = std::sync::Arc::new(r?);
+    if reached > base
+        && let Some(m) = ctx.subq_cache.last_mut()
+    {
+        m.insert(key, rows.clone());
+    }
+    Ok(rows)
 }
 
 /// Names for reg* values, built from the live catalog.
@@ -1033,6 +1053,13 @@ pub fn nextval(ctx: &mut Ctx, oid: u32) -> PgResult<i64> {
 // Query execution
 
 pub fn run_query(q: &Query, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
+    ctx.subq_cache.push(Default::default());
+    let r = run_query_inner(q, ctx);
+    ctx.subq_cache.pop();
+    r
+}
+
+fn run_query_inner(q: &Query, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     match q {
         Query::Select(s) => run_select(s, ctx),
         Query::Values { rows, order, limit, offset } => {
@@ -1530,11 +1557,22 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
             let rrows = exec_from(right, ctx)?;
             let mut right_matched = vec![false; rrows.len()];
+            // With `l.a = r.b [AND ...]` in ON, only right rows whose keys
+            // hash alike can match; ON still decides every candidate.
+            let index = equi_join_index(on.as_ref(), *left_cols, &lrows, &rrows);
+            let all: Vec<usize> = if index.is_none() { (0..rrows.len()).collect() } else { vec![] };
             for l in &lrows {
                 let mut matched = false;
-                for (j, r) in rrows.iter().enumerate() {
+                let candidates = match &index {
+                    Some((lkeys, map)) => match join_key(l, lkeys) {
+                        Some(k) => map.get(&k).map(Vec::as_slice).unwrap_or(&[]),
+                        None => &[],
+                    },
+                    None => &all[..],
+                };
+                for &j in candidates {
                     let mut row = l.clone();
-                    row.extend(r.clone());
+                    row.extend(rrows[j].iter().cloned());
                     if join_ok(on, &row, ctx)? {
                         matched = true;
                         right_matched[j] = true;
@@ -1603,6 +1641,115 @@ fn exec_func(f: &From, row: &[Value], ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         }
     }
     Ok(rows)
+}
+
+/// A join key column's value, such that values Postgres calls equal get
+/// the same key (unequal ones may share one: ON still checks each pair).
+#[derive(PartialEq, Eq, Hash)]
+enum JoinKey {
+    Bool(bool),
+    /// Integers and numerics, as normalized decimal text.
+    Exact(String),
+    Text(String),
+    Bytes(Vec<u8>),
+    Int(i64),
+    Uuid([u8; 16]),
+}
+
+fn join_key_value(v: &Value) -> Option<JoinKey> {
+    Some(match v {
+        Value::Bool(b) => JoinKey::Bool(*b),
+        Value::Int(i) => JoinKey::Exact(i.to_string()),
+        Value::Num(n) => {
+            let s = n.to_string();
+            let s =
+                if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { &s };
+            JoinKey::Exact(if s == "-0" { "0".into() } else { s.to_string() })
+        }
+        // bpchar comparison ignores trailing spaces.
+        Value::Text(t) => JoinKey::Text(t.trim_end_matches(' ').to_string()),
+        Value::Bytes(b) => JoinKey::Bytes(b.clone()),
+        Value::Date(d) => JoinKey::Int(*d as i64),
+        Value::Time(t) | Value::Ts(t) => JoinKey::Int(*t),
+        Value::Uuid(u) => JoinKey::Uuid(*u),
+        _ => return None,
+    })
+}
+
+/// A row's key; `None` when a key column is NULL (no `=` can hold).
+fn join_key(row: &[Value], cols: &[usize]) -> Option<Vec<JoinKey>> {
+    let mut k = Vec::with_capacity(cols.len());
+    for &c in cols {
+        let v = row.get(c)?;
+        if v.is_null() {
+            return None;
+        }
+        k.push(join_key_value(v)?);
+    }
+    Some(k)
+}
+
+type JoinIndex = (Vec<usize>, std::collections::HashMap<Vec<JoinKey>, Vec<usize>>);
+
+/// For an ON condition with `left.col = right.col` conjuncts: the left key
+/// columns and the right rows by key. `None` (try every pair) when there
+/// are no such conjuncts or a key value isn't hashable this way.
+fn equi_join_index(
+    on: Option<&Expr>,
+    left_cols: usize,
+    lrows: &[Row],
+    rrows: &[Row],
+) -> Option<JoinIndex> {
+    fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+        match e {
+            Expr::And(xs) => xs.iter().for_each(|x| conjuncts(x, out)),
+            other => out.push(other),
+        }
+    }
+    let mut cs = vec![];
+    conjuncts(on?, &mut cs);
+    let (mut lk, mut rk) = (vec![], vec![]);
+    for c in cs {
+        if let Expr::Compare { op: CmpOp::Eq, left, right, .. } = c
+            && let (Expr::Col(a), Expr::Col(b)) = (&**left, &**right)
+        {
+            match (*a < left_cols, *b < left_cols) {
+                (true, false) => {
+                    lk.push(*a);
+                    rk.push(*b - left_cols);
+                }
+                (false, true) => {
+                    lk.push(*b);
+                    rk.push(*a - left_cols);
+                }
+                _ => {}
+            }
+        }
+    }
+    if lk.is_empty() || lrows.len() * rrows.len() < 64 {
+        return None;
+    }
+    // Floats compare equal to integers and numerics (via float8), which
+    // these keys don't model: such joins try every pair.
+    let unhashable = |rows: &[Row], cols: &[usize]| {
+        rows.iter().any(|r| {
+            cols.iter().any(|&c| {
+                r.get(c).is_some_and(|v| {
+                    !v.is_null() && (matches!(v, Value::Float(_)) || join_key_value(v).is_none())
+                })
+            })
+        })
+    };
+    if unhashable(lrows, &lk) || unhashable(rrows, &rk) {
+        return None;
+    }
+    let mut map: std::collections::HashMap<Vec<JoinKey>, Vec<usize>> = Default::default();
+    for (j, r) in rrows.iter().enumerate() {
+        if let Some(k) = join_key(r, &rk) {
+            map.entry(k).or_default().push(j);
+        }
+    }
+    Some((lk, map))
 }
 
 fn join_ok(on: &Option<Expr>, row: &[Value], ctx: &mut Ctx) -> PgResult<bool> {
