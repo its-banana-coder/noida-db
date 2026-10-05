@@ -477,3 +477,22 @@ PG_EDGES.update({
         "SELECT setweight(to_tsvector('english', 'title words'), 'A') || to_tsvector('english', 'body words')",
     ),
 })
+
+PG_EDGES.update({
+    "pg edge: window frames": steps(
+        "CREATE TABLE w (g text, x int, d date, v numeric)",
+        "INSERT INTO w VALUES ('a', 1, '2024-01-01', 1.5), ('a', 2, '2024-01-02', 2), ('a', 2, '2024-01-05', 3), ('a', 5, '2024-01-10', 4), ('a', NULL, NULL, 5), ('b', 10, '2024-02-01', 6), ('b', 20, '2024-03-01', 7)",
+        "SELECT x, sum(v) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM w ORDER BY x, v",
+        "SELECT x, sum(v) OVER (ORDER BY x DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w ORDER BY x DESC NULLS LAST, v",
+        "SELECT d, count(*) OVER (ORDER BY d RANGE BETWEEN INTERVAL '3 days' PRECEDING AND CURRENT ROW) FROM w ORDER BY d, v",
+        "SELECT x, sum(v) OVER (ORDER BY x GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w ORDER BY x, v",
+        "SELECT x, sum(v) OVER (ORDER BY x GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM w ORDER BY x, v",
+        "SELECT x, last_value(v) OVER (ORDER BY x), first_value(v) OVER (ORDER BY x ROWS BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM w ORDER BY x, v",
+        "SELECT x, sum(v) OVER (ORDER BY x RANGE CURRENT ROW) FROM w ORDER BY x, v",
+        "SELECT g, x, sum(x) OVER (PARTITION BY g ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w ORDER BY g, x",
+        "SELECT x, sum(v) OVER (ORDER BY x RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM w",
+        "SELECT x, sum(v) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM w",
+        "SELECT x, nth_value(v, 2) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w ORDER BY x, v",
+        "SELECT v, avg(v) OVER (ORDER BY v RANGE BETWEEN 1.5 PRECEDING AND 0.5 FOLLOWING) FROM w ORDER BY v",
+    ),
+})

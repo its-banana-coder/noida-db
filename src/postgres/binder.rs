@@ -3540,11 +3540,20 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_frame(&mut self, f: &a::WindowFrame) -> PgResult<Frame> {
+        // RANGE offsets are values of the ORDER BY key's type (a number, or
+        // an interval for a date/timestamp key); ROWS/GROUPS offsets count.
+        let range = matches!(f.units, a::WindowFrameUnits::Range);
         let bound = |b: &a::WindowFrameBound, me: &mut Self| -> PgResult<FrameBound> {
             Ok(match b {
                 a::WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
                 a::WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
                 a::WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+                a::WindowFrameBound::Preceding(Some(e)) if range => {
+                    FrameBound::Preceding(me.bind_expr(e)?.e)
+                }
+                a::WindowFrameBound::Following(Some(e)) if range => {
+                    FrameBound::Following(me.bind_expr(e)?.e)
+                }
                 a::WindowFrameBound::Preceding(Some(e)) => {
                     let te = me.bind_expr(e)?;
                     FrameBound::Preceding(me.coerce(
@@ -3568,15 +3577,25 @@ impl<'a> Binder<'a> {
             })
         };
         let rows = matches!(f.units, a::WindowFrameUnits::Rows);
-        if !rows && !matches!(f.units, a::WindowFrameUnits::Range) {
-            return Err(unsupported("GROUPS window frames"));
-        }
+        let groups = matches!(f.units, a::WindowFrameUnits::Groups);
         let start = bound(&f.start_bound, self)?;
         let end = match &f.end_bound {
             Some(b) => bound(b, self)?,
             None => FrameBound::CurrentRow,
         };
-        Ok(Frame { rows, start, end })
+        if matches!(start, FrameBound::UnboundedFollowing) {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                "frame start cannot be UNBOUNDED FOLLOWING",
+            ));
+        }
+        if matches!(end, FrameBound::UnboundedPreceding) {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                "frame end cannot be UNBOUNDED PRECEDING",
+            ));
+        }
+        Ok(Frame { rows, groups, start, end })
     }
 
     // -----------------------------------------------------------------

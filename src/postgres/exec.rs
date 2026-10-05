@@ -2423,7 +2423,7 @@ fn compute_window(
         }
         "first_value" | "last_value" | "nth_value" => {
             for p in 0..n {
-                let (start, end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]])?;
+                let (start, end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]], &order_keys)?;
                 let pick = match w.name {
                     "first_value" => start,
                     "last_value" => end.saturating_sub(1),
@@ -2448,14 +2448,7 @@ fn compute_window(
                 ));
             };
             for p in 0..n {
-                let (start, mut end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]])?;
-                if w.frame.is_none() && !w.order.is_empty() {
-                    // Default frame: RANGE UNBOUNDED PRECEDING TO CURRENT ROW (peers included).
-                    end = p + 1;
-                    while end < n && same_peer(p, end) {
-                        end += 1;
-                    }
-                }
+                let (start, end) = frame_bounds(w, p, n, ctx, &rows[idxs[p]], &order_keys)?;
                 let mut st = new_state(agg);
                 let mut count = 0;
                 let mut seen: Vec<Value> = vec![];
@@ -2492,31 +2485,200 @@ fn frame_bounds(
     n: usize,
     ctx: &mut Ctx,
     row: &Row,
+    keys: &[Vec<Value>],
 ) -> PgResult<(usize, usize)> {
-    let Some(f) = &w.frame else {
-        return Ok(if w.order.is_empty() { (0, n) } else { (0, p + 1) });
+    let peer = |a: usize, b: usize| !w.order.is_empty() && rows_equal(&keys[a], &keys[b]);
+    let peer_start = |p: usize| {
+        let mut s = p;
+        while s > 0 && peer(s - 1, p) {
+            s -= 1;
+        }
+        s
     };
-    let val = |b: &FrameBound, ctx: &mut Ctx| -> PgResult<i64> {
-        Ok(match b {
-            FrameBound::Preceding(e) | FrameBound::Following(e) => {
-                eval(e, row, ctx)?.as_int().unwrap_or(0)
+    let peer_end = |p: usize| {
+        let mut e = p + 1;
+        while e < n && peer(p, e) {
+            e += 1;
+        }
+        e
+    };
+    // No frame clause: RANGE UNBOUNDED PRECEDING .. CURRENT ROW, peers
+    // included (the whole partition without ORDER BY).
+    let Some(f) = &w.frame else {
+        return Ok(if w.order.is_empty() { (0, n) } else { (0, peer_end(p)) });
+    };
+    let count = |e: &Expr, ctx: &mut Ctx| -> PgResult<i64> {
+        let v = eval(e, row, ctx)?;
+        match v.as_int() {
+            Some(k) if k >= 0 => Ok(k),
+            Some(_) => Err(PgError::new(
+                code::INVALID_PRECEDING_OR_FOLLOWING_SIZE,
+                "frame starting offset must not be negative",
+            )),
+            None if v.is_null() => Err(PgError::new(
+                code::NULL_VALUE_NOT_ALLOWED,
+                "frame starting offset must not be null",
+            )),
+            None => Ok(0),
+        }
+    };
+    if f.rows {
+        let start = match &f.start {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::CurrentRow => p,
+            FrameBound::Preceding(e) => p.saturating_sub(count(e, ctx)? as usize),
+            FrameBound::Following(e) => p + count(e, ctx)? as usize,
+            FrameBound::UnboundedFollowing => n,
+        };
+        let end = match &f.end {
+            FrameBound::UnboundedFollowing => n,
+            FrameBound::CurrentRow => p + 1,
+            FrameBound::Following(e) => (p + count(e, ctx)? as usize + 1).min(n),
+            FrameBound::Preceding(e) => (p + 1).saturating_sub(count(e, ctx)? as usize),
+            FrameBound::UnboundedPreceding => 0,
+        };
+        return Ok((start.min(n), end.min(n)));
+    }
+    if f.groups {
+        // Peer-group numbers and their [start, end) ranges.
+        let mut group_of = vec![0usize; n];
+        let mut bounds: Vec<(usize, usize)> = vec![];
+        let mut i = 0;
+        while i < n {
+            let e = peer_end(i);
+            for g in group_of.iter_mut().take(e).skip(i) {
+                *g = bounds.len();
             }
-            _ => 0,
-        })
+            bounds.push((i, e));
+            i = e;
+        }
+        let g = group_of[p] as i64;
+        let last = bounds.len() as i64 - 1;
+        let at = |k: i64| bounds[k.clamp(0, last) as usize];
+        let start = match &f.start {
+            FrameBound::UnboundedPreceding => 0,
+            FrameBound::CurrentRow => at(g).0,
+            FrameBound::Preceding(e) => at((g - count(e, ctx)?).max(0)).0,
+            FrameBound::Following(e) => {
+                let k = g + count(e, ctx)?;
+                if k > last { n } else { at(k).0 }
+            }
+            FrameBound::UnboundedFollowing => n,
+        };
+        let end = match &f.end {
+            FrameBound::UnboundedFollowing => n,
+            FrameBound::CurrentRow => at(g).1,
+            FrameBound::Following(e) => at((g + count(e, ctx)?).min(last)).1,
+            FrameBound::Preceding(e) => {
+                let k = g - count(e, ctx)?;
+                if k < 0 { 0 } else { at(k).1 }
+            }
+            FrameBound::UnboundedPreceding => 0,
+        };
+        return Ok((start, end));
+    }
+    // RANGE: offsets are distances in the (single) ORDER BY key's values.
+    let desc = w.order.first().is_some_and(|o| o.1);
+    let key = |q: usize| keys[q].first().cloned().unwrap_or(Value::Null);
+    let cur = key(p);
+    let (fmt, now, stmt_now) = env!(ctx);
+    let env = Env { fmt: &fmt, now, stmt_now };
+    // `key - off` / `key + off`, comparable with the other keys.
+    let shift = |off: &Value, plus: bool| -> PgResult<Value> {
+        let k = match &cur {
+            Value::Date(d) => Value::Ts(super::casts::date_to_ts(*d)),
+            other => other.clone(),
+        };
+        match (&k, off) {
+            (Value::Ts(_), Value::Interval(_)) => funcs::binop(
+                if plus { "+" } else { "-" },
+                &k,
+                off,
+                Type::TIMESTAMP,
+                &[Type::TIMESTAMP, Type::INTERVAL],
+                &env,
+            ),
+            _ => {
+                let (Some(x), Some(y)) = (num_f64(&k), num_f64(off)) else {
+                    return Err(PgError::new(
+                        code::FEATURE_NOT_SUPPORTED,
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for this column type",
+                    ));
+                };
+                if y < 0.0 {
+                    return Err(PgError::new(
+                        code::INVALID_PRECEDING_OR_FOLLOWING_SIZE,
+                        "invalid preceding or following size in window function",
+                    ));
+                }
+                Ok(Value::Float(if plus { x + y } else { x - y }))
+            }
+        }
+    };
+    let cmp = |q: usize, b: &Value| -> Ordering {
+        let k = match key(q) {
+            Value::Date(d) => Value::Ts(super::casts::date_to_ts(d)),
+            other => other,
+        };
+        match (num_f64(&k), num_f64(b)) {
+            (Some(x), Some(y)) if !matches!(k, Value::Ts(_)) => {
+                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            }
+            _ => types::cmp_values(&k, b),
+        }
+    };
+    // "Before the bound" in sort order: smaller for ASC, larger for DESC.
+    let before = |q: usize, b: &Value| {
+        let c = cmp(q, b);
+        if desc { c == Ordering::Greater } else { c == Ordering::Less }
+    };
+    let after = |q: usize, b: &Value| {
+        let c = cmp(q, b);
+        if desc { c == Ordering::Less } else { c == Ordering::Greater }
+    };
+    let offset_bound = |e: &Expr, toward_start: bool, ctx: &mut Ctx| -> PgResult<Option<Value>> {
+        if cur.is_null() {
+            return Ok(None);
+        }
+        let off = eval(e, row, ctx)?;
+        // PRECEDING moves toward the start of the sort order.
+        let plus = toward_start == desc;
+        Ok(Some(shift(&off, plus)?))
     };
     let start = match &f.start {
         FrameBound::UnboundedPreceding => 0,
-        FrameBound::CurrentRow => p,
-        FrameBound::Preceding(_) => p.saturating_sub(val(&f.start, ctx)? as usize),
-        FrameBound::Following(_) => p + val(&f.start, ctx)? as usize,
+        FrameBound::CurrentRow => peer_start(p),
         FrameBound::UnboundedFollowing => n,
+        FrameBound::Preceding(e) | FrameBound::Following(e) => {
+            let toward_start = matches!(f.start, FrameBound::Preceding(_));
+            match offset_bound(e, toward_start, ctx)? {
+                None => peer_start(p),
+                Some(b) => (0..n).find(|&q| !key(q).is_null() && !before(q, &b)).unwrap_or(n),
+            }
+        }
     };
     let end = match &f.end {
         FrameBound::UnboundedFollowing => n,
-        FrameBound::CurrentRow => p + 1,
-        FrameBound::Following(_) => (p + val(&f.end, ctx)? as usize + 1).min(n),
-        FrameBound::Preceding(_) => (p + 1).saturating_sub(val(&f.end, ctx)? as usize),
+        FrameBound::CurrentRow => peer_end(p),
         FrameBound::UnboundedPreceding => 0,
+        FrameBound::Preceding(e) | FrameBound::Following(e) => {
+            let toward_start = matches!(f.end, FrameBound::Preceding(_));
+            match offset_bound(e, toward_start, ctx)? {
+                None => peer_end(p),
+                Some(b) => {
+                    (0..n).rev().find(|&q| !key(q).is_null() && !after(q, &b)).map_or(0, |q| q + 1)
+                }
+            }
+        }
     };
-    Ok((start.min(n), end.min(n)))
+    Ok((start, end.max(start)))
+}
+
+fn num_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) => Some(*f),
+        Value::Num(n) => Some(n.to_f64()),
+        _ => None,
+    }
 }
