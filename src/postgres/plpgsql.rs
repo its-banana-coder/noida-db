@@ -1629,6 +1629,8 @@ fn run_sql(
         notifies: vec![],
         affected: 0,
         databases,
+        subq_cache: vec![],
+        min_outer: usize::MAX,
     };
     let r = super::engine::run_one(&mut nested, &stmt, info, types);
     let notifies = std::mem::take(&mut nested.notifies);

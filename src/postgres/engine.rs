@@ -849,6 +849,8 @@ impl Engine {
             notifies: vec![],
             affected: 0,
             databases: databases_info,
+            subq_cache: vec![],
+            min_outer: usize::MAX,
         };
         let info = SessionInfo {
             user: ctx.rt.user.clone(),
