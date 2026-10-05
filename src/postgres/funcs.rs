@@ -329,6 +329,17 @@ pub fn binop(
         // Full-text search: whichever operand resolved to tsquery names
         // the query side, the other is the tsvector side (Postgres allows
         // either order, `tsvector @@ tsquery` and `tsquery @@ tsvector`).
+        ("@?", Jsonb(j), Text(p)) => {
+            let path = super::jsonpath::parse(p)?;
+            Bool(!path.query(j, &Json::Object(vec![]), true)?.is_empty())
+        }
+        ("@@", Jsonb(j), Text(p)) => {
+            let path = super::jsonpath::parse(p)?;
+            match path.matches(j, &Json::Object(vec![]), true)? {
+                Some(b) => Bool(b),
+                None => Null,
+            }
+        }
         ("@@", Text(x), Text(y)) => {
             let (vec_text, q_text) = if tys[0].base == Base::Tsquery { (y, x) } else { (x, y) };
             let vec = fts::parse_vector(vec_text)?;
@@ -1810,6 +1821,35 @@ pub fn call(
             let q = fts::parse_query_text(text(&rest[1]))?
                 .unwrap_or(fts::Query::Lexeme(String::new(), false));
             return Ok(Some(Float(fts::ts_rank(text(&rest[0]), &q, weights, norm)? as f64)));
+        }
+        "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first" => {
+            let path = super::jsonpath::parse(text(&a[1]))?;
+            let vars = a.get(2).map_or(Json::Object(vec![]), |v| jv(v).clone());
+            if !matches!(vars, Json::Object(_)) {
+                return Err(err(
+                    code::INVALID_PARAMETER_VALUE,
+                    "\"vars\" argument is not an object",
+                ));
+            }
+            let silent = a.get(3).and_then(Value::as_bool).unwrap_or(false);
+            let doc = jv(&a[0]);
+            return Ok(Some(match name {
+                "jsonb_path_exists" => Bool(!path.query(doc, &vars, silent)?.is_empty()),
+                "jsonb_path_match" => match path.matches(doc, &vars, silent)? {
+                    Some(b) => Bool(b),
+                    None => Null,
+                },
+                "jsonb_path_query_array" => {
+                    Jsonb(Box::new(Json::Array(path.query(doc, &vars, silent)?)))
+                }
+                _ => match path.query(doc, &vars, silent)?.into_iter().next() {
+                    Some(j) => Jsonb(Box::new(j)),
+                    None => Null,
+                },
+            }));
         }
         "numnode" => {
             let q = fts::parse_query_text(text(&a[0]))?;

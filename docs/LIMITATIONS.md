@@ -165,11 +165,18 @@ shifted), and `websearch_to_tsquery`'s web-search syntax (`"phrases"`,
 `word1 OR word2`, `-excluded`); verified against Django's
 `django.contrib.postgres.search` (`SearchVector`/`SearchQuery`/
 `SearchRank`) and Miniflux's own full-text index (title/content combined
-via `setweight`+`||`) end to end. `ts_rank`'s exact number is a documented
-approximation (it orders matches sensibly but doesn't reproduce Postgres's
-own formula, which weights lexeme importance labels and document length
-nothing here tracks); GIN/GiST indexes and `ts_headline` are not
-implemented.
+via `setweight`+`||`) end to end. `ts_rank` follows Postgres's own
+formula (label weights, proximity for AND/phrase queries, normalization
+flags) and matches it to the last digit; `ts_headline` highlights with the
+usual options (StartSel/StopSel/MaxWords/MinWords/HighlightAll) but picks
+the excerpt of a long document more simply than Postgres's cover search.
+GIN/GiST indexes are accepted as plain indexes.
+
+SQL/JSON path (`jsonb_path_query`/`_array`/`_first`/`_exists`/`_match`,
+`@?`, `@@`) supports lax and strict modes, accessors, filters,
+`like_regex`, `starts with`, arithmetic, variables and the item methods
+`type`, `size`, `double`, `ceiling`, `floor`, `abs`, `keyvalue`; not
+`.datetime()` or `.**{n to m}` level ranges.
 
 `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` works: a
 materialized view keeps its rows from `CREATE`/the last `REFRESH` until
@@ -210,8 +217,8 @@ constraints.
   before assignment, transition tables (`REFERENCING NEW TABLE`), triggers
   on views (`INSTEAD OF`) and `TRUNCATE` triggers, and event triggers.
   Extensions (`CREATE EXTENSION` is accepted and does nothing).
-- Full-text search: GIN/GiST indexes, `ts_headline`, any text search
-  config other than `'english'`/`'simple'`.
+- Full-text search: any text search config other than
+  `'english'`/`'simple'`; `ts_rank_cd`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
 

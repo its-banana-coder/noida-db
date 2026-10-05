@@ -18,6 +18,7 @@ pub mod error;
 pub mod exec;
 pub mod fts;
 pub mod funcs;
+pub mod jsonpath;
 pub mod keywords;
 pub mod pgcatalog;
 pub mod plan;

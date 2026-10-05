@@ -119,7 +119,11 @@ s:jsonb_array_elements_text(jsonb)text s:json_array_elements_text(json)text
 s:jsonb_each(jsonb)(key text,value jsonb) s:json_each(json)(key text,value json)
 s:jsonb_each_text(jsonb)(key text,value text) s:json_each_text(json)(key text,value text)
 s:jsonb_object_keys(jsonb)text s:json_object_keys(json)text
-s:jsonb_path_query(jsonb,text)jsonb
+s:jsonb_path_query(jsonb,text)jsonb s:jsonb_path_query(jsonb,text,jsonb)jsonb s:jsonb_path_query(jsonb,text,jsonb,bool)jsonb
+jsonb_path_exists(jsonb,text)bool jsonb_path_exists(jsonb,text,jsonb)bool jsonb_path_exists(jsonb,text,jsonb,bool)bool
+jsonb_path_match(jsonb,text)bool jsonb_path_match(jsonb,text,jsonb)bool jsonb_path_match(jsonb,text,jsonb,bool)bool
+jsonb_path_query_array(jsonb,text)jsonb jsonb_path_query_array(jsonb,text,jsonb)jsonb jsonb_path_query_array(jsonb,text,jsonb,bool)jsonb
+jsonb_path_query_first(jsonb,text)jsonb jsonb_path_query_first(jsonb,text,jsonb)jsonb jsonb_path_query_first(jsonb,text,jsonb,bool)jsonb
 s:_pg_expandarray(anyarray)(x anyelement,n int4)
 _pg_char_max_length(oid,int4)int4 _pg_numeric_precision(oid,int4)int4 _pg_numeric_scale(oid,int4)int4
 _pg_datetime_precision(oid,int4)int4 _pg_truetypid(pg_node_tree,oid)oid _pg_truetypmod(pg_node_tree,oid)int4

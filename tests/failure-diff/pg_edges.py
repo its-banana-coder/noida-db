@@ -545,3 +545,37 @@ PG_EDGES.update({
         "UPDATE arr SET a[1] = 'x' WHERE id = 1",
     ),
 })
+
+J = """'{"a":[1,2,3,4],"b":{"c":"x","d":[{"e":1},{"e":5}]},"s":"Hello","n":null,"f":1.5}'"""
+PG_EDGES.update({
+    "pg edge: jsonpath": steps(
+        f"SELECT jsonb_path_query({J}, '$.a[*] ? (@ > 2)')",
+        f"SELECT jsonb_path_query_array({J}, '$.a[1 to 2]'), jsonb_path_query_array({J}, '$.a[last]'), jsonb_path_query_array({J}, '$.a[last - 1, 0]')",
+        f"SELECT jsonb_path_query_array({J}, '$.b.d[*].e'), jsonb_path_query_array({J}, '$.b.d.e'), jsonb_path_query_array({J}, 'strict $.b.d[*].e')",
+        f"SELECT jsonb_path_query({J}, 'strict $.b.d.e')",
+        f"SELECT jsonb_path_query({J}, 'strict $.missing')",
+        f"SELECT jsonb_path_query_array({J}, 'lax $.missing'), jsonb_path_exists({J}, '$.missing'), jsonb_path_exists({J}, '$.b.c')",
+        f"SELECT jsonb_path_query_array({J}, '$.*'), jsonb_path_query_array({J}, '$.b.*')",
+        f"SELECT jsonb_path_query_array({J}, '$.**.e'), jsonb_path_query_first({J}, '$.a[*]')",
+        f"SELECT jsonb_path_query_array({J}, '$.a[*] ? (@ > 1 && @ < 4)'), jsonb_path_query_array({J}, '$.a[*] ? (@ == 1 || @ == 4)'), jsonb_path_query_array({J}, '$.a[*] ? (!(@ > 2))')",
+        f"SELECT jsonb_path_query_array({J}, '$.b.d[*] ? (@.e > 2)'), jsonb_path_query_array({J}, '$.b.d ? (exists (@.e))')",
+        f"SELECT jsonb_path_query_array({J}, '$.s ? (@ like_regex \"^he\" flag \"i\")'), jsonb_path_query_array({J}, '$.s ? (@ starts with \"He\")')",
+        f"SELECT jsonb_path_query({J}, '$.a[0] + $.f'), jsonb_path_query({J}, '$.a.size()'), jsonb_path_query({J}, '-$.f')",
+        f"SELECT jsonb_path_query_array({J}, '$.a.type()'), jsonb_path_query({J}, '$.b.type()'), jsonb_path_query({J}, '$.n.type()')",
+        f"SELECT jsonb_path_query({J}, '$.f.ceiling()'), jsonb_path_query({J}, '$.f.floor()'), jsonb_path_query({J}, '(-$.f).abs()')",
+        """SELECT jsonb_path_query('"1.25"', '$.double()'), jsonb_path_query('[1, "2"]', '$[*].double()')""",
+        f"SELECT jsonb_path_query({J}, '$.a[*] ? (@ > $min)', '{{\"min\": 2}}')",
+        f"SELECT jsonb_path_query({J}, '$.a ? (@ > $nope)')",
+        f"SELECT jsonb_path_query({J}, '$.a +')",
+        f"SELECT jsonb_path_match({J}, '$.a[0] == 1'), jsonb_path_match({J}, 'exists($.b.c)'), {J}::jsonb @@ '$.f > 1', {J}::jsonb @? '$.a[*] ? (@ > 3)', {J}::jsonb @? '$.zzz'",
+        f"SELECT jsonb_path_match({J}, '$.a')",
+        f"SELECT jsonb_path_query({J}, 'strict $.a[10]')",
+        f"SELECT jsonb_path_query({J}, 'strict $.a[10]', '{{}}', true)",
+        f"SELECT jsonb_path_query({J}, '$.a[*] ? (@ == \"1\")'), jsonb_path_query({J}, '$.n ? (@ == null)'), jsonb_path_query_array({J}, '$.a[*] ? (@ != null)')",
+        "CREATE TABLE jp (id int, d jsonb)",
+        """INSERT INTO jp VALUES (1, '{"tags":["a","b"],"price":10}'), (2, '{"tags":["c"],"price":30}'), (3, '{"price":"n/a"}')""",
+        "SELECT id FROM jp WHERE d @? '$.tags[*] ? (@ == \"c\")' ORDER BY id",
+        "SELECT id FROM jp WHERE d @@ '$.price > 15' ORDER BY id",
+        "SELECT id, jsonb_path_query_first(d, '$.price') FROM jp ORDER BY id",
+    ),
+})

@@ -2695,6 +2695,7 @@ impl<'a> Binder<'a> {
             B::AtArrow => "@>",
             B::ArrowAt => "<@",
             B::AtAt => "@@",
+            B::AtQuestion => "@?",
             B::Question => "?",
             B::QuestionPipe => "?|",
             B::QuestionAnd => "?&",
@@ -2845,6 +2846,10 @@ impl<'a> Binder<'a> {
             // Either order (`tsvector @@ tsquery` or `tsquery @@ tsvector`);
             // whichever side already resolved to tsquery decides which is
             // which, defaulting to (tsvector, tsquery) when neither has.
+            // jsonb @? jsonpath (does it yield anything) / jsonb @@ jsonpath
+            // (its single boolean).
+            "@?" => (Type::JSONB, Type::TEXT, Type::BOOL),
+            "@@" if lt.base == Base::Jsonb => (Type::JSONB, Type::TEXT, Type::BOOL),
             "@@" => {
                 if lt.base == Base::Tsquery || rt.base == Base::Tsvector {
                     (Type::TSQUERY, Type::TSVECTOR, Type::BOOL)

@@ -1352,16 +1352,21 @@ fn expand_srfs(proj: &[Expr], rows: &[Row], ctx: &mut Ctx) -> PgResult<Vec<Row>>
     let mut out = vec![];
     for r in rows {
         // Each projection item may produce several values.
-        let mut columns: Vec<Vec<Value>> = vec![];
+        let mut columns: Vec<(Vec<Value>, bool)> = vec![];
         for e in proj {
-            columns.push(eval_multi(e, r, ctx)?);
+            let is_srf = e.contains(&|x| {
+                matches!(x, Expr::Call { name, .. } if super::sigs::kind_of(name) == Some(super::sigs::Kind::Srf))
+            });
+            columns.push((eval_multi(e, r, ctx)?, is_srf));
         }
-        let n = columns.iter().map(|c| c.len()).max().unwrap_or(1);
+        // Set-returning columns run in lockstep, the shorter ones padded
+        // with NULLs; plain columns repeat.
+        let n = columns.iter().filter(|c| c.1).map(|c| c.0.len()).max().unwrap_or(1);
         for i in 0..n {
             let mut row = vec![];
-            for c in &columns {
-                row.push(if c.len() == 1 {
-                    c[0].clone()
+            for (c, srf) in &columns {
+                row.push(if !srf {
+                    c.first().cloned().unwrap_or(Value::Null)
                 } else {
                     c.get(i).cloned().unwrap_or(Value::Null)
                 });
@@ -1857,7 +1862,23 @@ fn srf_rows(
             })
             .collect(),
         "jsonb_path_query" => {
-            return Err(PgError::new(code::FEATURE_NOT_SUPPORTED, "jsonpath is not supported"));
+            let path = super::jsonpath::parse(match &a[1] {
+                Value::Text(s) => s,
+                _ => "",
+            })?;
+            let doc = match &a[0] {
+                Value::Jsonb(j) => (**j).clone(),
+                _ => crate::sql::json::Json::Null,
+            };
+            let vars = match a.get(2) {
+                Some(Value::Jsonb(j)) => (**j).clone(),
+                _ => crate::sql::json::Json::Object(vec![]),
+            };
+            let silent = a.get(3).and_then(Value::as_bool).unwrap_or(false);
+            path.query(&doc, &vars, silent)?
+                .into_iter()
+                .map(|j| vec![Value::Jsonb(Box::new(j))])
+                .collect()
         }
         _ => {
             let _ = &env;
