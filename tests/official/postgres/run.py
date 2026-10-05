@@ -6,8 +6,8 @@ output against the suite's expected files.
     python3 tests/official/postgres/run.py PORT [test ...] [--json PATH]
 
 As pg_regress: tests run in schedule order (sequentially) in a fresh
-`regression` database, with `psql -X -a -q`, PGTZ=PST8PDT and
-PGDATESTYLE='Postgres, MDY', output compared with expected/<test>.out (or
+`regression` database, with `psql -X -a -q`, PGTZ=PST8PDT,
+PGDATESTYLE='Postgres, MDY' and intervalstyle=postgres_verbose, output compared with expected/<test>.out (or
 its alternatives, best match). Server-side `COPY ... FROM/TO 'file'`
 becomes psql's client-side `\\copy` (applied to every server alike), since
 the server may not share a filesystem with the suite.
@@ -86,7 +86,7 @@ def psql(port, db, sql, transform=True):
     if transform:
         sql = to_client_copy(sql)
     env = dict(os.environ, PGTZ="PST8PDT", PGDATESTYLE="Postgres, MDY", PGPASSWORD="postgres",
-               PGAPPNAME="pg_regress", LC_MESSAGES="C", LANG="C", LC_ALL="C")
+               PGAPPNAME="pg_regress", PGOPTIONS="-c intervalstyle=postgres_verbose", LC_MESSAGES="C", LANG="C", LC_ALL="C")
     try:
         p = subprocess.run(
             ["psql", "-X", "-a", "-q", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", db,
