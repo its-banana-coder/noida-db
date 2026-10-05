@@ -1960,6 +1960,13 @@ impl Binder {
                 if idents.is_empty() {
                     return Err(MySqlError::unsupported("empty compound identifier"));
                 }
+                // `@@session.x` / `@@global.x` are system variables.
+                if let [scope, var] = &idents[..]
+                    && let Some(scope) = scope.value.strip_prefix("@@")
+                    && matches!(scope.to_ascii_lowercase().as_str(), "session" | "global" | "local")
+                {
+                    return Ok(Expr::SysVar(var.value.clone()));
+                }
                 let dotted = idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
                 Ok(Expr::ColName(dotted))
             }
