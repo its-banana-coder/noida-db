@@ -20,6 +20,7 @@ import difflib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 
@@ -87,18 +88,26 @@ def psql(port, db, sql, transform=True):
         sql = to_client_copy(sql)
     env = dict(os.environ, PGTZ="PST8PDT", PGDATESTYLE="Postgres, MDY", PGPASSWORD="postgres",
                PGAPPNAME="pg_regress", PGOPTIONS="-c intervalstyle=postgres_verbose", LC_MESSAGES="C", LANG="C", LC_ALL="C")
+    p = subprocess.Popen(
+        ["psql", "-X", "-a", "-q", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", db,
+         "-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, cwd=WORK,
+    )
     try:
-        p = subprocess.run(
-            ["psql", "-X", "-a", "-q", "-h", "127.0.0.1", "-p", str(port), "-U", "postgres", "-d", db,
-             "-v", "HIDE_TABLEAM=on", "-v", "HIDE_TOAST_COMPRESSION=on"],
-            input=sql.encode(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
-            timeout=TIMEOUT, cwd=WORK,
-        )
-        return p.stdout.decode("utf-8", "replace")
-    except subprocess.TimeoutExpired as e:
+        out, _ = p.communicate(sql.encode(), timeout=TIMEOUT)
+        return out.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        # Cancel the running statement (psql sends a CancelRequest on
+        # SIGINT) so the server is free for the next test, then stop.
+        p.send_signal(signal.SIGINT)
+        try:
+            p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        p.kill()
+        out, _ = p.communicate()
         # What ran before the stuck statement still counts.
-        out = (e.stdout or b"").decode("utf-8", "replace")
-        return out + f"\n<<noida-runner: timed out after {TIMEOUT}s>>\n"
+        return out.decode("utf-8", "replace") + f"\n<<noida-runner: timed out after {TIMEOUT}s>>\n"
 
 
 def untransform(out):
