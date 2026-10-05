@@ -4077,6 +4077,16 @@ impl<'a> Binder<'a> {
         name
     }
 
+    /// Postgres's FigureIndexColname: the name an index expression gives a
+    /// generated index name (`expr` when it has none).
+    pub fn index_column_name(&self, e: &a::Expr) -> String {
+        let te = TE::new(Expr::Const(Value::Null), Type::TEXT);
+        match self.colname_strength(e, &te) {
+            (_, 0) => "expr".into(),
+            (n, _) => n,
+        }
+    }
+
     /// (name, strength): 2 is a name of its own, 1 a fallback from a cast or
     /// CASE, 0 none at all.
     fn colname_strength(&self, e: &a::Expr, te: &TE) -> (String, u8) {
