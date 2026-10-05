@@ -35,7 +35,7 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
 /// production entry point used by `services::start_persistent`.
 pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
     let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
-    crate::persistence::on_shutdown(save);
+    crate::persistence::on_save("redis", save);
     Ok(addr)
 }
 

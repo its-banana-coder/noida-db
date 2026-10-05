@@ -464,6 +464,7 @@ impl Engine {
                         GlobalDb { oid, name, db: DbState::default(), seqs: BTreeMap::new() },
                     );
                 }
+                crate::persistence::mark("postgres");
                 Ok(StmtResult::tag("CREATE DATABASE"))
             }
             S::Drop { object_type: a::ObjectType::Database, if_exists, names, .. } => {
@@ -495,6 +496,7 @@ impl Engine {
                         )));
                     }
                 }
+                crate::persistence::mark("postgres");
                 Ok(r)
             }
             S::StartTransaction { .. } => {
@@ -1090,6 +1092,7 @@ impl Engine {
             && let Some(global_db) = g.databases.get_mut(&s.rt.database)
         {
             global_db.db = tx.state;
+            crate::persistence::mark("postgres");
         }
         if g.writer == Some(s.id) {
             g.writer = None;

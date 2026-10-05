@@ -162,6 +162,7 @@ impl Engine {
     /// Rolls back this connection's open transaction, if any (on
     /// disconnect, as MySQL does).
     pub fn rollback(&mut self) {
+        crate::persistence::mark("mysql");
         let mut state = self.db.lock().unwrap();
         if let Some(undo) = state.open_txns.remove(&self.conn_id) {
             state.undo(&undo);
@@ -175,6 +176,7 @@ impl Engine {
 
     /// Ends this connection's transaction, keeping its writes.
     pub fn commit(&mut self) {
+        crate::persistence::mark("mysql");
         if self.in_tx {
             self.db.lock().unwrap().open_txns.remove(&self.conn_id);
         }
@@ -391,6 +393,19 @@ impl Engine {
     }
 
     fn execute_statement(
+        &mut self,
+        stmt: Statement,
+        sql: &str,
+    ) -> Result<Vec<Vec<Value>>, MySqlError> {
+        let reads = matches!(stmt, Statement::Query(_));
+        let r = self.execute_statement_inner(stmt, sql);
+        if !reads && r.is_ok() {
+            crate::persistence::mark("mysql");
+        }
+        r
+    }
+
+    fn execute_statement_inner(
         &mut self,
         stmt: Statement,
         sql: &str,

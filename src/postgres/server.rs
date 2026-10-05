@@ -70,7 +70,7 @@ pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
 
 pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Result<SocketAddr> {
     let (addr, save) = spawn_persistent_with_for_test(addr, data_dir, cfg)?;
-    crate::persistence::on_shutdown(save);
+    crate::persistence::on_save("postgres", save);
     Ok(addr)
 }
 
