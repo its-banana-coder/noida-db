@@ -530,3 +530,18 @@ PG_EDGES.update({
         "SELECT numnode(to_tsquery('english', 'a & b | !c')), numnode(plainto_tsquery('english', 'the'))",
     ),
 })
+
+PG_EDGES.update({
+    "pg edge: array element assignment": steps(
+        "CREATE TABLE arr (id int, a int[], s text)",
+        "INSERT INTO arr VALUES (1, '{1,2,3}', 'x[1]'), (2, NULL, 'y'), (3, '{}', 'z')",
+        "UPDATE arr SET a[2] = 20 WHERE id = 1",
+        "UPDATE arr SET a[5] = 50, s = 'a[2] = b' WHERE id = 1",
+        "UPDATE arr SET a[3] = 7 WHERE id = 2",
+        "UPDATE arr SET a[1] = id * 10 WHERE id = 3",
+        "SELECT id, a, s, array_lower(a, 1), array_upper(a, 1) FROM arr ORDER BY id",
+        "UPDATE arr SET a[0] = -1 WHERE id = 1 RETURNING a",
+        "UPDATE arr SET a[NULL] = 1 WHERE id = 1",
+        "UPDATE arr SET a[1] = 'x' WHERE id = 1",
+    ),
+})

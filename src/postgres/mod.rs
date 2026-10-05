@@ -5,6 +5,7 @@
 // rare error path, where its size costs nothing worth the indirection.
 #![allow(clippy::result_large_err)]
 
+pub mod arrayset;
 pub mod auth;
 pub mod binder;
 pub mod casts;
@@ -48,7 +49,9 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let after_routines = plpgsql::rewrite(sql2)?;
     let sql3 = after_routines.as_deref().unwrap_or(sql2);
     let after_overriding = rewrite_overriding(sql3);
-    let sql = after_overriding.as_deref().unwrap_or(sql3);
+    let sql4 = after_overriding.as_deref().unwrap_or(sql3);
+    let after_subscripts = arrayset::rewrite(sql4);
+    let sql = after_subscripts.as_deref().unwrap_or(sql4);
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(syntax_error)
 }
 

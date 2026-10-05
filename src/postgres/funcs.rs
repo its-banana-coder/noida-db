@@ -1742,6 +1742,46 @@ pub fn call(
                     .map_or_else(String::new, |q| fts::format_query(&q)),
             )));
         }
+        "array_set_element" => {
+            // `arr[i] = v`: a NULL array becomes a one-element array at
+            // index i; an index past either end pads with NULLs.
+            let Some(i) = a[1].as_int() else {
+                return Err(err(
+                    code::NULL_VALUE_NOT_ALLOWED,
+                    "array subscript in assignment must not be null",
+                ));
+            };
+            let v = a[2].clone();
+            let mut arr = match &a[0] {
+                Array(x) => (**x).clone(),
+                _ => types::Array::empty(),
+            };
+            if arr.dims.len() > 1 {
+                return Err(err(code::ARRAY_SUBSCRIPT_ERROR, "wrong number of array subscripts"));
+            }
+            if arr.dims.is_empty() {
+                arr.dims = vec![(1, i as i32)];
+                arr.items = vec![v];
+                return Ok(Some(Array(Box::new(arr))));
+            }
+            let (len, lo) = arr.dims[0];
+            let (lo, hi) = (lo as i64, lo as i64 + len as i64 - 1);
+            if i < lo {
+                let pad = (lo - i) as usize;
+                let mut items = vec![Null; pad];
+                items.append(&mut arr.items);
+                items[0] = v;
+                arr.items = items;
+                arr.dims = vec![(len + pad as i32, i as i32)];
+            } else if i > hi {
+                arr.items.resize((i - lo) as usize, Null);
+                arr.items.push(v);
+                arr.dims = vec![(arr.items.len() as i32, lo as i32)];
+            } else {
+                arr.items[(i - lo) as usize] = v;
+            }
+            return Ok(Some(Array(Box::new(arr))));
+        }
         "ts_rank" => {
             // ([weights,] vector, query [, normalization])
             let (weights, rest) = match &a[0] {

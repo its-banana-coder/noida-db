@@ -2265,10 +2265,15 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
                 }
                 groups[idx].seen[i].push(first);
             }
-            if !agg.order.is_empty() {
+            // DISTINCT without ORDER BY: Postgres sorts the input to drop
+            // duplicates, so the aggregate sees it in ascending order.
+            if !agg.order.is_empty() || agg.distinct {
                 let mut keys = Vec::with_capacity(agg.order.len());
                 for (e, _, _) in &agg.order {
                     keys.push(eval(e, r, ctx)?);
+                }
+                if agg.order.is_empty() {
+                    keys = vals.iter().take(1).cloned().collect();
                 }
                 groups[idx].ordered[i].push((keys, vals));
                 continue;
@@ -2280,10 +2285,13 @@ fn aggregate(rows: &[Row], keys: &[Expr], aggs: &[AggCall], ctx: &mut Ctx) -> Pg
     // Aggregates with ORDER BY see their inputs in that order.
     for g in &mut groups {
         for (i, agg) in aggs.iter().enumerate() {
-            if agg.order.is_empty() {
+            if agg.order.is_empty() && !agg.distinct {
                 continue;
             }
             let mut inputs = std::mem::take(&mut g.ordered[i]);
+            if agg.order.is_empty() {
+                inputs.sort_by(|a, b| types::cmp_values(&a.0[0], &b.0[0]));
+            }
             inputs.sort_by(|a, b| {
                 for (k, (_, desc, nulls_first)) in agg.order.iter().enumerate() {
                     let o = match (a.0[k].is_null(), b.0[k].is_null()) {
