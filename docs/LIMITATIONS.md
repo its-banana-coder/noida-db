@@ -838,13 +838,33 @@ auto-created on first write. `_delete_by_query` and `_update_by_query`
 `_source_includes` and `_source_excludes` are honored as URL parameters
 on `_search`, GET and `_mget`, and `_mget` takes the `ids` shorthand.
 
-Not yet built: `query_string`, `simple_query_string`, `search_after`,
-scroll/PIT, nested field mappings and nested queries, highlighting,
-date-math ranges (`now-1d/d`), `date_histogram`, painless scripts
-(`_update` / `_update_by_query` with a `script`), gzip, `_cat`/`_cluster` endpoints, and exact
-Elasticsearch error/response parity for every path. This is not ready to
-replace Elasticsearch for application workflows that search with more
-than the query types above (aggregating is well covered).
+Also built and compared step by step against Elasticsearch 8.15.3 by
+`tests/failure-diff/es_edges.py` (every scenario identical):
+`query_string` and `simple_query_string` (Lucene syntax, multi-field
+best/most-fields scoring, URI search `?q=`), `dis_max`, `fuzzy`, sloppy
+`match_phrase`; `sort` values on hits, `search_after`, scroll and point in
+time (with the implicit `_shard_doc` tiebreaker); `nested` mappings,
+queries, `inner_hits` and aggregations; highlighting (the unified
+highlighter's tags, phrase spans, sentence fragments bounded by
+`fragment_size`, passage scoring); date math in `range` (`now-1d/d`,
+`date||+1M/M`, `format`, `time_zone`), `date_histogram` and `date_range`;
+Painless update scripts (`_update`, `_update_by_query`, upserts,
+`ctx.op`); the 1s `refresh_interval` and search-idle refresh;
+`_cluster/health|settings|state|stats`, `_nodes`, `_stats`, `_cat/*`;
+gzip request and response bodies; request validation (result window,
+negative sizes, malformed JSON, unknown aggregations).
+
+**Differs**
+- Painless is an interpreter for the subset update scripts use (no
+  `script_fields`, script sorting or `script` queries, no regexes, no
+  stored scripts).
+- `_cluster/health` answers a `wait_for_status` it can't meet at once
+  with a timed-out 408 instead of waiting.
+- Store sizes in `_cat`/`_stats` are estimates.
+
+**Not yet**: `function_score`, `percolate`, `more_like_this`,
+`geo_*`, `significant_terms`, `percentiles`, pipeline aggregations,
+ingest pipelines, `_reindex`, analyzers beyond the built-in five.
 
 ## Numbers we do not claim yet
 

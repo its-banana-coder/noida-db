@@ -39,7 +39,7 @@ sql = []
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
 mysql = ["sql", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = ["dep:kafka-protocol", "dep:bytes", "dep:crc32c"]
-elasticsearch = ["dep:regex-lite"]
+elasticsearch = ["dep:regex-lite", "dep:flate2"]
 mongodb = []
 # HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
 # same as the other services' wire protocols.
@@ -69,6 +69,8 @@ serde_json = "1"
 kafka-protocol = { version = "0.18.0", optional = true }
 # Kafka: re-sealing a record batch after the broker edits its header.
 crc32c = { version = "0.6", optional = true }
+# Elasticsearch: gzip request/response bodies (clients' http_compress).
+flate2 = { version = "1", optional = true }
 bson = { version = "3.1.0", features = ["chrono-0_4", "uuid-1"] }
 # Persistence: catching SIGINT/SIGTERM to save a snapshot before exit.
 signal-hook = "0.3"
