@@ -1662,7 +1662,8 @@ fn join_key_value(v: &Value) -> Option<JoinKey> {
         Value::Int(i) => JoinKey::Exact(i.to_string()),
         Value::Num(n) => {
             let s = n.to_string();
-            let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { &s };
+            let s =
+                if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.') } else { &s };
             JoinKey::Exact(if s == "-0" { "0".into() } else { s.to_string() })
         }
         // bpchar comparison ignores trailing spaces.
@@ -1693,7 +1694,12 @@ type JoinIndex = (Vec<usize>, std::collections::HashMap<Vec<JoinKey>, Vec<usize>
 /// For an ON condition with `left.col = right.col` conjuncts: the left key
 /// columns and the right rows by key. `None` (try every pair) when there
 /// are no such conjuncts or a key value isn't hashable this way.
-fn equi_join_index(on: Option<&Expr>, left_cols: usize, lrows: &[Row], rrows: &[Row]) -> Option<JoinIndex> {
+fn equi_join_index(
+    on: Option<&Expr>,
+    left_cols: usize,
+    lrows: &[Row],
+    rrows: &[Row],
+) -> Option<JoinIndex> {
     fn conjuncts<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
         match e {
             Expr::And(xs) => xs.iter().for_each(|x| conjuncts(x, out)),
@@ -1728,7 +1734,9 @@ fn equi_join_index(on: Option<&Expr>, left_cols: usize, lrows: &[Row], rrows: &[
     let unhashable = |rows: &[Row], cols: &[usize]| {
         rows.iter().any(|r| {
             cols.iter().any(|&c| {
-                r.get(c).is_some_and(|v| !v.is_null() && (matches!(v, Value::Float(_)) || join_key_value(v).is_none()))
+                r.get(c).is_some_and(|v| {
+                    !v.is_null() && (matches!(v, Value::Float(_)) || join_key_value(v).is_none())
+                })
             })
         })
     };
