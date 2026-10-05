@@ -47,6 +47,31 @@ fn user_tables(state: &DbState) -> impl Iterator<Item = (&String, &Arc<Table>)> 
     state.schemas.iter().flat_map(|(db, s)| s.tables.values().map(move |t| (db, t)))
 }
 
+/// Every view, as (schema, view).
+fn user_views(state: &DbState) -> impl Iterator<Item = (&String, &crate::mysql::catalog::View)> {
+    state.schemas.iter().flat_map(|(db, s)| s.views.values().map(move |v| (db, v)))
+}
+
+/// MySQL's rule of thumb for an updatable view: one table, no
+/// aggregation, DISTINCT, GROUP BY or set operation.
+fn view_updatable(sql: &str) -> bool {
+    let l = format!(" {} ", sql.to_ascii_lowercase());
+    ![
+        " group by ",
+        " distinct ",
+        " union ",
+        " join ",
+        "sum(",
+        "count(",
+        "avg(",
+        "min(",
+        "max(",
+        " having ",
+    ]
+    .iter()
+    .any(|p| l.contains(p))
+}
+
 fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
     // Column lists are MySQL 8's own, in its order: introspection code
     // (JDBC's DatabaseMetaData, Hibernate, Prisma) selects columns by name.
@@ -128,6 +153,12 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         text(""),
                     ]
                 })
+                .chain(user_views(state).map(|(db, v)| {
+                    let mut row = vec![text("def"), text(db), text(&v.name), text("VIEW")];
+                    row.extend(std::iter::repeat_n(Value::Null, 16));
+                    row.push(text("VIEW"));
+                    row
+                }))
                 .collect(),
         ),
         "COLUMNS" => {
@@ -464,7 +495,22 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                 "CHARACTER_SET_CLIENT",
                 "COLLATION_CONNECTION",
             ],
-            vec![],
+            user_views(state)
+                .map(|(db, v)| {
+                    vec![
+                        text("def"),
+                        text(db),
+                        text(&v.name),
+                        text(&v.sql),
+                        text("NONE"),
+                        text(if view_updatable(&v.sql) { "YES" } else { "NO" }),
+                        text("root@localhost"),
+                        text("DEFINER"),
+                        text("utf8mb4"),
+                        text("utf8mb4_0900_ai_ci"),
+                    ]
+                })
+                .collect(),
         ),
         "ROUTINES" => table_of(
             name,

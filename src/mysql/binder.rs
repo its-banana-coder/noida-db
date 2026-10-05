@@ -1223,13 +1223,17 @@ impl Binder {
                     right: Box::new(step),
                 }
             };
-            self.ctes
-                .push((name.clone(), Plan::Derived { plan: Box::new(plan), alias: name, columns }));
+            self.ctes.push((
+                name.clone(),
+                Plan::Derived { plan: Box::new(plan), alias: name, columns, view: None },
+            ));
             return Ok(());
         }
         let plan = self.bind_query(query)?;
-        self.ctes
-            .push((name.clone(), Plan::Derived { plan: Box::new(plan), alias: name, columns }));
+        self.ctes.push((
+            name.clone(),
+            Plan::Derived { plan: Box::new(plan), alias: name, columns, view: None },
+        ));
         Ok(())
     }
 
@@ -1681,6 +1685,7 @@ impl Binder {
                     plan: Box::new(plan),
                     alias: alias.name.value.clone(),
                     columns: alias.columns.iter().map(|c| c.name.value.clone()).collect(),
+                    view: None,
                 })
             }
             TableFactor::Table { name, alias, .. } => {
@@ -1693,6 +1698,11 @@ impl Binder {
             }
             _ => Err(MySqlError::unsupported("table factor")),
         }
+    }
+
+    /// Binds as if inside view `db.name` (so naming it is recursion).
+    pub fn enter_view(&mut self, db: &str, name: &str) {
+        self.view_stack.push((db.to_string(), name.to_string()));
     }
 
     /// A view used in FROM: its SELECT, as a derived table named after it.
@@ -1721,7 +1731,7 @@ impl Binder {
         };
         // The view's query sees its own database and none of the
         // enclosing query's CTEs.
-        let saved_db = std::mem::replace(&mut self.current_db, Some(db.to_string()));
+        let saved_db = self.current_db.replace(db.to_string());
         let saved_ctes = std::mem::take(&mut self.ctes);
         self.view_stack.push(key);
         let plan = self.bind_query(*q);
@@ -1732,6 +1742,7 @@ impl Binder {
             plan: Box::new(plan?),
             alias: alias.unwrap_or_else(|| view.name.clone()),
             columns: view.columns.clone(),
+            view: Some(format!("{db}.{}", view.name)),
         })
     }
 

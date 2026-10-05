@@ -498,6 +498,8 @@ pub enum Plan {
         plan: Box<Plan>,
         alias: String,
         columns: Vec<String>,
+        /// `db.name` when this is a view's SELECT.
+        view: Option<String>,
     },
     /// `UNION [ALL]`, `INTERSECT` and `EXCEPT`. Column names come from the
     /// left side.
