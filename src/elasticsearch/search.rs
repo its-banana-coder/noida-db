@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::analysis;
 use super::dates;
+use super::highlight;
 use super::query_string;
 use super::scoring;
 use super::sorting;
@@ -1932,6 +1933,11 @@ pub fn search_with(
             // `"_source": false` omits the key, as Elasticsearch does.
             if !matches!(source_filter, Some(Value::Bool(false))) {
                 hit["_source"] = apply_source_filter(&d.source, source_filter);
+            }
+            if let Some(hl) = body.get("highlight")
+                && let Some(h) = highlight::highlight(hl, &query, mappings, &d.source)
+            {
+                hit["highlight"] = h;
             }
             if !specs.is_empty() {
                 hit["sort"] = Value::Array(keys.clone());

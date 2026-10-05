@@ -247,6 +247,36 @@ scenario("highlight", setup() + [
      {"pick": lambda r: [(h["_id"], h.get("highlight")) for h in r["hits"]["hits"]]}),
 ])
 
+LONG_DOCS = [
+    {"text": "Elasticsearch is a distributed search engine. It stores documents as JSON. "
+             "Search is fast because of the inverted index! Do you like search? "
+             "The quick brown fox jumps over the lazy dog while the search engine indexes everything "
+             "in near real time, which makes search results visible about one second after indexing.",
+     "tags": ["search", "engine", "json"], "title": "Search engines"},
+    {"text": "Nothing to see here", "tags": ["misc"], "title": "Other"},
+]
+LONG_MAPPING = {"mappings": {"properties": {"text": {"type": "text"}, "tags": {"type": "keyword"},
+                                            "title": {"type": "text"}}}}
+HL = lambda r: [(h["_id"], h.get("highlight")) for h in r["hits"]["hits"]]
+L = "/long/_search"
+scenario("highlight_long", setup("long", LONG_MAPPING, LONG_DOCS) + [
+    ("POST", L, {"query": {"match": {"text": "search"}}, "highlight": {"fields": {"text": {}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "search"}}, "highlight": {"fields": {"text": {"number_of_fragments": 2}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "search"}}, "highlight": {"fields": {"text": {"fragment_size": 30}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "index"}}, "highlight": {"fields": {"text": {"fragment_size": 20, "number_of_fragments": 3}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "index"}}, "highlight": {"fields": {"title": {"no_match_size": 10}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "index"}},
+                 "highlight": {"require_field_match": False, "fields": {"title": {"no_match_size": 10}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"terms": {"tags": ["search", "json"]}}, "highlight": {"fields": {"tags": {}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"query_string": {"query": "text:(fox OR dog) AND title:search*"}},
+                 "highlight": {"fields": {"*": {}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match_phrase": {"text": "search engine"}}, "highlight": {"fields": {"text": {"number_of_fragments": 0}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"prefix": {"text": "ind"}}, "highlight": {"fields": {"text": {"pre_tags": ["["], "post_tags": ["]"]}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"fuzzy": {"text": "serch"}}, "highlight": {"fields": {"text": {"number_of_fragments": 1}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "search"}}, "highlight": {"order": "score", "fields": {"text": {"number_of_fragments": 2}}}}, {"pick": HL}),
+    ("POST", L, {"query": {"match": {"text": "nothing"}}, "highlight": {"fields": {"text": {}}}, "_source": False}, {"pick": HL}),
+])
+
 scenario("date_math_range", setup() + [
     ("POST", S, {"query": {"range": {"date": {"gte": "2024-01-15", "lt": "2024-02-01"}}}}, {"pick": ids}),
     ("POST", S, {"query": {"range": {"date": {"gte": "2024-01-15||+1M/M"}}}}, {"pick": ids}),
