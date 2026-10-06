@@ -750,8 +750,8 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   backreferences in the pattern.
 - Views are read-only (INSERT/UPDATE/DELETE through a view aren't
   supported), and `SHOW CREATE VIEW` shows the SELECT as written where
-  MySQL prints its canonical form. `JOIN ... USING` and `NATURAL JOIN`
-  aren't supported yet (`JOIN ... ON` and a bare `JOIN` are).
+  MySQL prints its canonical form. `JOIN ... USING` / `NATURAL JOIN` over
+  a derived table or a view without a column list aren't supported.
 - A recursive CTE is held in memory: past 1,000,000 rows it fails with
   1114 "The table ... is full" (MySQL would spill to disk).
 - Plain `KEY`/`INDEX` declarations are recorded (SHOW INDEX, SHOW CREATE

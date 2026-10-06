@@ -1071,8 +1071,10 @@ impl Executor {
                 )
                 .map_err(|e| MySqlError::syntax_error(&e.to_string()))?
                 .remove(0);
+                let tables = std::sync::Arc::new(self.db.lock().unwrap().table_columns());
                 let mut binder = crate::mysql::binder::Binder::new(Some(db.clone()))
-                    .with_views(std::sync::Arc::new(defs));
+                    .with_views(std::sync::Arc::new(defs))
+                    .with_tables(tables);
                 binder.enter_view(&db, &name);
                 let plan = binder.bind_statement(stmt)?;
                 let names = {
@@ -4543,8 +4545,10 @@ impl Executor {
                 }));
             }
         }
+        let tables = std::sync::Arc::new(self.db.lock().unwrap().table_columns());
         let inner_plan = crate::mysql::binder::Binder::new(Some(db.to_string()))
             .with_views(defs.clone())
+            .with_tables(tables)
             .bind_statement(inner)?;
         let inner_names = {
             let state = self.db.lock().unwrap();

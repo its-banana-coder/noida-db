@@ -757,6 +757,27 @@ MYSQL_QUERIES = {
         (A, "SELECT a, b FROM si WHERE a = 2 INTO @ta, @tb"),
         (A, "SELECT @ta, @tb"),
     ],
+    "join using and natural join": [
+        (A, "CREATE TABLE ja (id int, x int, n varchar(5))"),
+        (A, "CREATE TABLE jb (id int, y int, n varchar(5))"),
+        (A, "CREATE TABLE jc (id int, z int)"),
+        (A, "INSERT INTO ja VALUES (1, 10, 'p'), (2, 20, 'q'), (3, 30, 'r')"),
+        (A, "INSERT INTO jb VALUES (1, 100, 'p'), (2, 200, 'z'), (4, 400, 'r')"),
+        (A, "INSERT INTO jc VALUES (1, 7), (4, 9)"),
+        (A, "SELECT * FROM ja JOIN jb USING (id) ORDER BY id"),
+        (A, "SELECT * FROM ja LEFT JOIN jb USING (id) ORDER BY id"),
+        (A, "SELECT * FROM ja RIGHT JOIN jb USING (id) ORDER BY id"),
+        (A, "SELECT * FROM ja JOIN jb USING (id, n)"),
+        (A, "SELECT * FROM ja NATURAL JOIN jb"),
+        (A, "SELECT * FROM ja NATURAL LEFT JOIN jb ORDER BY id"),
+        (A, "SELECT id, ja.id, jb.id, x, y FROM ja JOIN jb USING (id) ORDER BY ja.id"),
+        (A, "SELECT id, jb.id FROM ja LEFT JOIN jb USING (id) ORDER BY id"),
+        (A, "SELECT * FROM ja JOIN jb USING (id) JOIN jc USING (id)"),
+        (A, "SELECT count(*) FROM ja JOIN jb USING (nope)"),
+        (A, "SELECT id FROM ja JOIN jb USING (id) WHERE id IN (SELECT id FROM jc)"),
+        (A, "SELECT ja.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
+        (A, "SELECT ja.id, jb.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

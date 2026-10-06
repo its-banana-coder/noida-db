@@ -687,8 +687,14 @@ impl Engine {
             _ => {}
         }
 
-        let views = std::sync::Arc::new(self.db.lock().unwrap().view_defs());
-        let mut binder = Binder::new(self.current_db.clone()).with_sql(sql).with_views(views);
+        let (views, tables) = {
+            let st = self.db.lock().unwrap();
+            (std::sync::Arc::new(st.view_defs()), std::sync::Arc::new(st.table_columns()))
+        };
+        let mut binder = Binder::new(self.current_db.clone())
+            .with_sql(sql)
+            .with_views(views)
+            .with_tables(tables);
         let plan = binder.bind_statement(stmt)?;
         self.last_column_names = {
             let state = self.db.lock().unwrap();
