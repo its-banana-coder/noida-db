@@ -126,6 +126,19 @@ impl Table {
         }
     }
 
+    /// A copy of everything but the rows (what resolving column names needs).
+    pub fn shape(&self) -> Table {
+        Table {
+            name: self.name.clone(),
+            columns: self.columns.clone(),
+            rows: Vec::new(),
+            next_auto_increment: self.next_auto_increment,
+            unique_keys: self.unique_keys.clone(),
+            foreign_keys: self.foreign_keys.clone(),
+            indexes: self.indexes.clone(),
+        }
+    }
+
     /// Every index as `(name, column indices, unique)`: PRIMARY, the UNIQUE
     /// keys, then the plain ones, as MySQL lists them.
     pub fn all_indexes(&self) -> Vec<(String, Vec<usize>, bool)> {

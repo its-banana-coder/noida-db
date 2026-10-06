@@ -1329,7 +1329,10 @@ fn sort_rows(rows: &mut [Row], keys: &[SortKey]) {
 }
 
 fn run_select(s: &Select, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
-    let mut rows = exec_from(&s.from, ctx)?;
+    let mut rows = match filtered_scan(s, ctx)? {
+        Some(rows) => return run_select_rest(s, rows, ctx),
+        None => exec_from(&s.from, ctx)?,
+    };
     if let Some(f) = &s.filter {
         let mut kept = Vec::with_capacity(rows.len());
         for r in rows {
@@ -1339,6 +1342,35 @@ fn run_select(s: &Select, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         }
         rows = kept;
     }
+    run_select_rest(s, rows, ctx)
+}
+
+/// One table with a WHERE that reads only its stored columns: the filter
+/// runs on the stored rows and only the rows it keeps are copied (rather
+/// than copying the whole table first).
+fn filtered_scan(s: &Select, ctx: &mut Ctx) -> PgResult<Option<Vec<Row>>> {
+    let (From::Table { oid, .. }, Some(f)) = (&s.from, &s.filter) else { return Ok(None) };
+    let Some(t) = ctx.db.tables.get(oid).cloned() else { return Ok(None) };
+    if !t.matview_populated || t.columns.iter().any(|c| c.dropped) {
+        return Ok(None);
+    }
+    let width = t.columns.len();
+    if f.contains(&|x| matches!(x, Expr::Col(i) if *i >= width)) {
+        return Ok(None);
+    }
+    let mut kept = vec![];
+    for (pos, r) in t.rows.iter().enumerate() {
+        if truthy(&eval(f, r, ctx)?) {
+            let mut row = r.clone();
+            row.extend(t.system_col_values(pos));
+            kept.push(row);
+        }
+    }
+    Ok(Some(kept))
+}
+
+/// Everything in a SELECT after FROM and WHERE.
+fn run_select_rest(s: &Select, mut rows: Vec<Row>, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     // Grouping and aggregation.
     if let (Some(keys), Some(sets)) = (&s.group, &s.grouping_sets) {
         // One aggregation per grouping set; keys outside the set are NULL.
