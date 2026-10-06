@@ -1,7 +1,7 @@
 //! `UPDATE t SET arr[i] = v`: sqlparser doesn't parse a subscripted
 //! assignment target, so before parsing it becomes
-//! `arr = array_set_element(arr, (i), (v))`, which does what Postgres's
-//! array element assignment does.
+//! `arr = subscript_set(arr, (v), (i), ...)`, which does what Postgres's
+//! array element or jsonb subscript assignment does.
 
 /// Rewrites every `col[idx] = value` in an UPDATE's (or ON CONFLICT DO
 /// UPDATE's) SET list; `None` when there's nothing to rewrite.
@@ -152,22 +152,35 @@ fn rewrite_set_list(c: &[char], mut i: usize) -> (String, usize, bool) {
             j += 1;
         }
         if !target.is_empty() && c.get(j) == Some(&'[') {
-            let idx_end = scan_expr(c, j + 1, false);
-            let mut k = idx_end + 1;
-            while k < c.len() && c[k].is_whitespace() {
-                k += 1;
+            // One or more subscripts: `col[a][b]... = value`.
+            let mut subs = vec![];
+            let mut idx_end = j;
+            let mut k = j;
+            while c.get(k) == Some(&'[') {
+                idx_end = scan_expr(c, k + 1, false);
+                if c.get(idx_end) != Some(&']') {
+                    break;
+                }
+                subs.push(c[k + 1..idx_end].iter().collect::<String>());
+                k = idx_end + 1;
+                while k < c.len() && c[k].is_whitespace() {
+                    k += 1;
+                }
             }
-            if c.get(idx_end) == Some(&']') && c.get(k) == Some(&'=') && c.get(k + 1) != Some(&'>')
+            if !subs.is_empty()
+                && c.get(idx_end) == Some(&']')
+                && c.get(k) == Some(&'=')
+                && c.get(k + 1) != Some(&'>')
             {
-                let idx: String = c[j + 1..idx_end].iter().collect();
                 let vend = scan_expr(c, k + 1, true);
                 let val: String = c[k + 1..vend].iter().collect();
                 // The column name alone (a dotted target keeps its last part).
                 let col = target.rsplit('.').next().unwrap_or(&target);
+                let subs: Vec<String> = subs.iter().map(|s| format!("({})", s.trim())).collect();
                 out.push_str(&format!(
-                    "{col} = array_set_element({col}, ({}), ({}))",
-                    idx.trim(),
-                    val.trim()
+                    "{col} = subscript_set({col}, ({}), {})",
+                    val.trim(),
+                    subs.join(", ")
                 ));
                 if val.ends_with(char::is_whitespace) {
                     out.push(' ');
@@ -203,11 +216,15 @@ mod tests {
     fn rewrites_subscripted_targets_only() {
         assert_eq!(
             rewrite("UPDATE t SET a[2] = 'z', b = 1 WHERE id = 2").unwrap(),
-            "UPDATE t SET a = array_set_element(a, (2), ('z')), b = 1 WHERE id = 2"
+            "UPDATE t SET a = subscript_set(a, ('z'), (2)), b = 1 WHERE id = 2"
         );
         assert_eq!(
             rewrite("UPDATE t SET a[i + 1] = f(x, y) RETURNING a").unwrap(),
-            "UPDATE t SET a = array_set_element(a, (i + 1), (f(x, y))) RETURNING a"
+            "UPDATE t SET a = subscript_set(a, (f(x, y)), (i + 1)) RETURNING a"
+        );
+        assert_eq!(
+            rewrite("UPDATE t SET j['a'][0] = '1' WHERE id = 1").unwrap(),
+            "UPDATE t SET j = subscript_set(j, ('1'), ('a'), (0)) WHERE id = 1"
         );
         assert!(rewrite("UPDATE t SET a = '[x]'").is_none());
         assert!(rewrite("SELECT a[1] FROM t").is_none());

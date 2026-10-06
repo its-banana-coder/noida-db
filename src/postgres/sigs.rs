@@ -132,7 +132,7 @@ record_field(record,int4)anyelement
 __enum_sortorder(int4,text)float8 __enum_key(int4,text)record
 array_length(anyarray,int4)int4 array_upper(anyarray,int4)int4 array_lower(anyarray,int4)int4 cardinality(anyarray)int4
 array_ndims(anyarray)int4 array_dims(anyarray)text
-!array_set_element(anyarray,int4,anyelement)anyarray !array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
+!array_set_element(anyarray,int4,anyelement)anyarray !subscript_set(anyarray,anyelement,...any)anyarray !subscript_set(jsonb,jsonb,...any)jsonb !array_append(anyarray,anyelement)anyarray !array_prepend(anyelement,anyarray)anyarray !array_cat(anyarray,anyarray)anyarray
 !array_remove(anyarray,anyelement)anyarray !array_replace(anyarray,anyelement,anyelement)anyarray
 !array_position(anyarray,anyelement)int4 !array_positions(anyarray,anyelement)_int4
 array_fill(anyelement,_int4)anyarray array_fill(anyelement,_int4,_int4)anyarray trim_array(anyarray,int4)anyarray

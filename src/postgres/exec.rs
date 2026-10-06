@@ -971,8 +971,21 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
                         arr.items.get(pos as usize).cloned().unwrap_or(Value::Null)
                     }
                 }
-                (Value::Jsonb(j), Some(i)) => {
-                    j.index(i).cloned().map(|x| Value::Jsonb(Box::new(x))).unwrap_or(Value::Null)
+                // A key on an object, an index on an array (a numeric
+                // text key counts as one; an integer on an object is
+                // that key), NULL otherwise.
+                (Value::Jsonb(j), _) => {
+                    use crate::sql::json::Json;
+                    let found = match (j.as_ref(), &a[1]) {
+                        (Json::Object(_), Value::Text(k)) => j.get(k),
+                        (Json::Object(_), Value::Int(i)) => j.get(&i.to_string()),
+                        (Json::Array(_), Value::Int(i)) => j.index(*i),
+                        (Json::Array(_), Value::Text(k)) => {
+                            k.trim().parse::<i64>().ok().and_then(|i| j.index(i))
+                        }
+                        _ => None,
+                    };
+                    found.cloned().map(|x| Value::Jsonb(Box::new(x))).unwrap_or(Value::Null)
                 }
                 _ => Value::Null,
             }
