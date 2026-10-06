@@ -287,6 +287,21 @@ pub fn row_diff(before: &[Row], after: &[Row]) -> (Vec<Row>, Vec<Row>) {
 }
 
 impl DbState {
+    /// Every table's column names, by (database, name), for the binder.
+    pub fn table_columns(&self) -> std::collections::HashMap<(String, String), Vec<String>> {
+        self.schemas
+            .iter()
+            .flat_map(|(db, s)| {
+                s.tables.values().map(move |t| {
+                    (
+                        (db.clone(), t.name.clone()),
+                        t.columns.iter().map(|c| c.name.clone()).collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Every view, by (database, name), for the binder.
     pub fn view_defs(&self) -> std::collections::HashMap<(String, String), View> {
         self.schemas

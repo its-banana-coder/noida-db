@@ -7,9 +7,10 @@ use crate::mysql::plan::{
 use crate::mysql::types::Value;
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, DataType, Expr as AstExpr, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, LimitClause,
-    ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    LimitClause, ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator,
+    Value as AstValue,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -22,6 +23,11 @@ pub struct Binder {
     views: Arc<HashMap<(String, String), View>>,
     /// Views being expanded, innermost last.
     view_stack: Vec<(String, String)>,
+    /// Column names of every table, by (database, name), for `USING`.
+    table_cols: Arc<HashMap<(String, String), Vec<String>>>,
+    /// The current SELECT's `USING`/`NATURAL` columns: an unqualified name
+    /// binds to the shared column.
+    using_cols: HashMap<String, AstExpr>,
     pub current_db: Option<String>,
     pub prepared_types: HashMap<String, Vec<Value>>,
     /// Assigns each `?` placeholder encountered while binding an
@@ -62,10 +68,18 @@ impl Binder {
         self
     }
 
+    /// Lets the binder see tables' column names (for `USING`/`NATURAL`).
+    pub fn with_tables(mut self, tables: Arc<HashMap<(String, String), Vec<String>>>) -> Self {
+        self.table_cols = tables;
+        self
+    }
+
     pub fn new(current_db: Option<String>) -> Self {
         Self {
             views: Default::default(),
             view_stack: Vec::new(),
+            table_cols: Default::default(),
+            using_cols: HashMap::new(),
             current_db,
             prepared_types: HashMap::new(),
             param_counter: 0,
@@ -1343,247 +1357,431 @@ impl Binder {
                 self.finish_set(plan, order_by, limit_clause)
             }
             SetExpr::Select(select) => {
-                let mut source =
-                    if select.from.is_empty() { Plan::Dummy } else { self.bind_from(select.from)? };
-
-                if let Some(selection) = select.selection {
-                    let pred = self.bind_expr(selection)?;
-                    source = Plan::Filter { source: Box::new(source), predicate: pred };
-                }
-
-                let distinct = match &select.distinct {
-                    None => false,
-                    Some(sqlparser::ast::Distinct::Distinct) => true,
-                    Some(_) => return Err(MySqlError::unsupported("DISTINCT ON")),
-                };
-
-                // The projection is bound first: GROUP BY, HAVING and ORDER
-                // BY may all refer to its aliases (`... AS total ORDER BY
-                // total`) and positions (`ORDER BY 2`).
-                let mut exprs = Vec::new();
-                let mut names = Vec::new();
-                // (alias, expr) for every `expr AS alias` item -- only real
-                // aliases, not plain column names.
-                let mut aliases: Vec<(String, Expr)> = Vec::new();
-                let mut has_wildcard = false;
-                self.named_windows = select.named_window.clone();
-                self.window_ok = true;
-                for item in select.projection {
-                    match item {
-                        SelectItem::UnnamedExpr(expr) => {
-                            // Real MySQL labels an unaliased plain column
-                            // reference with the column's own name, and
-                            // anything else with the expression's source
-                            // text exactly as written (`count(*)`, `1`,
-                            // `price * 2`) -- what `row['COUNT(*)']`-style
-                            // code reads. Found via testing before a public
-                            // release: those used to be labeled `col0`.
-                            let name = match &expr {
-                                AstExpr::Identifier(ident) => ident.value.clone(),
-                                AstExpr::CompoundIdentifier(idents) => idents
-                                    .last()
-                                    .map(|i| i.value.clone())
-                                    .unwrap_or_else(|| "?".to_string()),
-                                other => self.source_text(other).unwrap_or_else(|| "?".to_string()),
-                            };
-                            exprs.push(self.bind_expr(expr)?);
-                            names.push(name);
-                        }
-                        SelectItem::ExprWithAlias { expr, alias } => {
-                            let bound = self.bind_expr(expr)?;
-                            aliases.push((alias.value.clone(), bound.clone()));
-                            exprs.push(bound);
-                            names.push(alias.value);
-                        }
-                        // `SELECT *` and `SELECT table.*` -- expanded to the
-                        // real per-column values (and, in
-                        // `plan::column_names`, the real per-column names)
-                        // at execution time, not here -- the binder has no
-                        // catalog access to look the table's columns up.
-                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                            exprs.push(Expr::Wildcard);
-                            names.push("*".to_string());
-                            has_wildcard = true;
-                        }
-                        _ => return Err(MySqlError::unsupported("select item")),
-                    }
-                }
-                self.window_ok = false;
-                let alias_of = |e: &AstExpr| -> Option<Expr> {
-                    match e {
-                        AstExpr::Identifier(i) => aliases
-                            .iter()
-                            .find(|(a, _)| a.eq_ignore_ascii_case(&i.value))
-                            .map(|(_, x)| x.clone()),
-                        _ => None,
-                    }
-                };
-                let position_of = |e: &AstExpr| -> Option<usize> {
-                    match e {
-                        AstExpr::Value(sqlparser::ast::ValueWithSpan {
-                            value: AstValue::Number(n, _),
-                            ..
-                        }) => n.parse::<usize>().ok(),
-                        _ => None,
-                    }
-                };
-
-                // GROUP BY accepts a column, an alias, or a position.
-                let mut group_exprs: Vec<Expr> = Vec::new();
-                match select.group_by {
-                    GroupByExpr::Expressions(gexprs, _) => {
-                        for g in gexprs {
-                            if let Some(n) = position_of(&g) {
-                                if n == 0 || n > exprs.len() || has_wildcard {
-                                    return Err(MySqlError::new(
-                                        1054,
-                                        "42S22",
-                                        format!("Unknown column '{n}' in 'group statement'"),
-                                    ));
-                                }
-                                group_exprs.push(exprs[n - 1].clone());
-                            } else if let Some(x) = alias_of(&g) {
-                                group_exprs.push(x);
-                            } else {
-                                group_exprs.push(self.bind_expr(g)?);
-                            }
-                        }
-                    }
-                    GroupByExpr::All(_) => {
-                        return Err(MySqlError::unsupported("GROUP BY ALL"));
-                    }
-                }
-
-                // HAVING may name a SELECT-list alias (`HAVING cnt > 2`).
-                let having = match select.having {
-                    Some(h) => Some(substitute_aliases(self.bind_expr(h)?, &aliases)),
-                    None => None,
-                };
-
-                // ORDER BY: a position addresses an output column directly;
-                // an alias or any other expression is evaluated as a hidden
-                // trailing column (see `Plan::Finish`).
-                let mut order: Vec<(SortKey, bool)> = Vec::new();
-                let mut hidden_exprs: Vec<Expr> = Vec::new();
-                if let Some(ob) = order_by {
-                    let items = match ob.kind {
-                        OrderByKind::Expressions(items) => items,
-                        OrderByKind::All(_) => return Err(MySqlError::unsupported("ORDER BY ALL")),
-                    };
-                    for item in items {
-                        let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
-                        if let Some(n) = position_of(&item.expr) {
-                            if n == 0 || (!has_wildcard && n > exprs.len()) {
-                                return Err(MySqlError::new(
-                                    1054,
-                                    "42S22",
-                                    format!("Unknown column '{n}' in 'order clause'"),
-                                ));
-                            }
-                            order.push((SortKey::Output(n - 1), asc));
-                            continue;
-                        }
-                        let bound = match alias_of(&item.expr) {
-                            Some(x) => x,
-                            None => {
-                                self.window_ok = true;
-                                let b = self.bind_expr(item.expr);
-                                self.window_ok = false;
-                                b?
-                            }
-                        };
-                        hidden_exprs.push(bound);
-                        order.push((SortKey::Hidden(hidden_exprs.len() - 1), asc));
-                    }
-                }
-                let (limit, offset) = match limit_clause {
-                    Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
-                        if !limit_by.is_empty() {
-                            return Err(MySqlError::unsupported("LIMIT BY"));
-                        }
-                        let limit = limit.map(|e| self.bind_count(e)).transpose()?;
-                        let offset = offset.map(|o| self.bind_count(o.value)).transpose()?;
-                        (limit, offset)
-                    }
-                    Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
-                        // `LIMIT offset, count`: bind in textual order.
-                        let offset = self.bind_count(offset)?;
-                        (Some(self.bind_count(limit)?), Some(offset))
-                    }
-                    None => (None, None),
-                };
-                let calc_found_rows =
-                    select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
-
-                // SELECT DISTINCT can only sort by what it selects (3065).
-                if distinct && !has_wildcard {
-                    for (k, h) in hidden_exprs.iter().enumerate() {
-                        if exprs.contains(h) || contains_agg(h) {
-                            continue;
-                        }
-                        let mut missing = None;
-                        crate::mysql::plan::for_each_colname(h, &mut |n| {
-                            let bare = n.rsplit('.').next().unwrap_or(n);
-                            let selected = exprs.iter().any(|e| {
-                                matches!(e, Expr::ColName(x)
-                                    if x.rsplit('.').next().unwrap_or(x).eq_ignore_ascii_case(bare))
-                            });
-                            if !selected && missing.is_none() {
-                                missing = Some(n.to_string());
-                            }
-                        });
-                        if let Some(col) = missing {
-                            return Err(MySqlError::new(
-                                3065,
-                                "HY000",
-                                format!(
-                                    "Expression #{} of ORDER BY clause is not in SELECT list, references column '{col}' which is not in SELECT list; this is incompatible with DISTINCT",
-                                    k + 1
-                                ),
-                            ));
-                        }
-                    }
-                }
-                let mut having = having;
-                let has_agg = !group_exprs.is_empty()
-                    || exprs.iter().any(contains_agg)
-                    || hidden_exprs.iter().any(contains_agg)
-                    || having.as_ref().is_some_and(contains_agg);
-                // HAVING in a query with no GROUP BY or aggregate filters its
-                // rows like WHERE (over the select list's aliases), as in
-                // MySQL; JDBC's metadata queries rely on it.
-                if !has_agg && let Some(h) = having.take() {
-                    source = Plan::Filter { source: Box::new(source), predicate: h };
-                }
-                let is_aggregate = has_agg || having.is_some();
-                let hidden = hidden_exprs.len();
-                exprs.extend(hidden_exprs);
-                let plan = if is_aggregate {
-                    Plan::Aggregate { source: Box::new(source), group_exprs, exprs, names, having }
-                } else {
-                    Plan::Project { source: Box::new(source), exprs, names }
-                };
-                if !order.is_empty()
-                    || limit.is_some()
-                    || offset.is_some()
-                    || distinct
-                    || calc_found_rows
-                {
-                    Ok(Plan::Finish {
-                        source: Box::new(plan),
-                        order,
-                        hidden,
-                        distinct,
-                        limit,
-                        offset,
-                        calc_found_rows,
-                    })
-                } else {
-                    Ok(plan)
-                }
+                // `USING`/`NATURAL` columns are named once (see `rewrite_using`),
+                // for this SELECT only.
+                let saved = std::mem::take(&mut self.using_cols);
+                let r = self
+                    .rewrite_using(select)
+                    .and_then(|select| self.bind_select(select, order_by, limit_clause));
+                self.using_cols = saved;
+                r
             }
             _ => Err(MySqlError::unsupported("query body")),
         }
+    }
+
+    fn bind_select(
+        &mut self,
+        select: Box<sqlparser::ast::Select>,
+        order_by: Option<sqlparser::ast::OrderBy>,
+        limit_clause: Option<LimitClause>,
+    ) -> Result<Plan, MySqlError> {
+        let mut source =
+            if select.from.is_empty() { Plan::Dummy } else { self.bind_from(select.from)? };
+
+        if let Some(selection) = select.selection {
+            let pred = self.bind_expr(selection)?;
+            source = Plan::Filter { source: Box::new(source), predicate: pred };
+        }
+
+        let distinct = match &select.distinct {
+            None => false,
+            Some(sqlparser::ast::Distinct::Distinct) => true,
+            Some(_) => return Err(MySqlError::unsupported("DISTINCT ON")),
+        };
+
+        // The projection is bound first: GROUP BY, HAVING and ORDER
+        // BY may all refer to its aliases (`... AS total ORDER BY
+        // total`) and positions (`ORDER BY 2`).
+        let mut exprs = Vec::new();
+        let mut names = Vec::new();
+        // (alias, expr) for every `expr AS alias` item -- only real
+        // aliases, not plain column names.
+        let mut aliases: Vec<(String, Expr)> = Vec::new();
+        let mut has_wildcard = false;
+        self.named_windows = select.named_window.clone();
+        self.window_ok = true;
+        for item in select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) => {
+                    // Real MySQL labels an unaliased plain column
+                    // reference with the column's own name, and
+                    // anything else with the expression's source
+                    // text exactly as written (`count(*)`, `1`,
+                    // `price * 2`) -- what `row['COUNT(*)']`-style
+                    // code reads. Found via testing before a public
+                    // release: those used to be labeled `col0`.
+                    let name = match &expr {
+                        AstExpr::Identifier(ident) => ident.value.clone(),
+                        AstExpr::CompoundIdentifier(idents) => idents
+                            .last()
+                            .map(|i| i.value.clone())
+                            .unwrap_or_else(|| "?".to_string()),
+                        other => self.source_text(other).unwrap_or_else(|| "?".to_string()),
+                    };
+                    exprs.push(self.bind_expr(expr)?);
+                    names.push(name);
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let bound = self.bind_expr(expr)?;
+                    aliases.push((alias.value.clone(), bound.clone()));
+                    exprs.push(bound);
+                    names.push(alias.value);
+                }
+                // `SELECT *` and `SELECT table.*` -- expanded to the
+                // real per-column values (and, in
+                // `plan::column_names`, the real per-column names)
+                // at execution time, not here -- the binder has no
+                // catalog access to look the table's columns up.
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                    exprs.push(Expr::Wildcard);
+                    names.push("*".to_string());
+                    has_wildcard = true;
+                }
+                _ => return Err(MySqlError::unsupported("select item")),
+            }
+        }
+        self.window_ok = false;
+        let alias_of = |e: &AstExpr| -> Option<Expr> {
+            match e {
+                AstExpr::Identifier(i) => aliases
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(&i.value))
+                    .map(|(_, x)| x.clone()),
+                _ => None,
+            }
+        };
+        let position_of = |e: &AstExpr| -> Option<usize> {
+            match e {
+                AstExpr::Value(sqlparser::ast::ValueWithSpan {
+                    value: AstValue::Number(n, _),
+                    ..
+                }) => n.parse::<usize>().ok(),
+                _ => None,
+            }
+        };
+
+        // GROUP BY accepts a column, an alias, or a position.
+        let mut group_exprs: Vec<Expr> = Vec::new();
+        match select.group_by {
+            GroupByExpr::Expressions(gexprs, _) => {
+                for g in gexprs {
+                    if let Some(n) = position_of(&g) {
+                        if n == 0 || n > exprs.len() || has_wildcard {
+                            return Err(MySqlError::new(
+                                1054,
+                                "42S22",
+                                format!("Unknown column '{n}' in 'group statement'"),
+                            ));
+                        }
+                        group_exprs.push(exprs[n - 1].clone());
+                    } else if let Some(x) = alias_of(&g) {
+                        group_exprs.push(x);
+                    } else {
+                        group_exprs.push(self.bind_expr(g)?);
+                    }
+                }
+            }
+            GroupByExpr::All(_) => {
+                return Err(MySqlError::unsupported("GROUP BY ALL"));
+            }
+        }
+
+        // HAVING may name a SELECT-list alias (`HAVING cnt > 2`).
+        let having = match select.having {
+            Some(h) => Some(substitute_aliases(self.bind_expr(h)?, &aliases)),
+            None => None,
+        };
+
+        // ORDER BY: a position addresses an output column directly;
+        // an alias or any other expression is evaluated as a hidden
+        // trailing column (see `Plan::Finish`).
+        let mut order: Vec<(SortKey, bool)> = Vec::new();
+        let mut hidden_exprs: Vec<Expr> = Vec::new();
+        if let Some(ob) = order_by {
+            let items = match ob.kind {
+                OrderByKind::Expressions(items) => items,
+                OrderByKind::All(_) => return Err(MySqlError::unsupported("ORDER BY ALL")),
+            };
+            for item in items {
+                let asc = !matches!(item.options.sort, Some(OrderBySort::Desc));
+                if let Some(n) = position_of(&item.expr) {
+                    if n == 0 || (!has_wildcard && n > exprs.len()) {
+                        return Err(MySqlError::new(
+                            1054,
+                            "42S22",
+                            format!("Unknown column '{n}' in 'order clause'"),
+                        ));
+                    }
+                    order.push((SortKey::Output(n - 1), asc));
+                    continue;
+                }
+                // A bare name matching output columns' names (not explicit
+                // aliases, handled below): one is that column; two different
+                // ones are ambiguous, as in MySQL.
+                if let AstExpr::Identifier(i) = &item.expr
+                    && !has_wildcard
+                    && alias_of(&item.expr).is_none()
+                {
+                    let hits: Vec<usize> = (0..names.len())
+                        .filter(|&k| names[k].eq_ignore_ascii_case(&i.value))
+                        .collect();
+                    let mut distinct: Vec<String> =
+                        hits.iter().map(|&k| format!("{:?}", exprs[k])).collect();
+                    distinct.sort();
+                    distinct.dedup();
+                    if distinct.len() > 1 {
+                        return Err(MySqlError::new(
+                            1052,
+                            "23000",
+                            format!("Column '{}' in order clause is ambiguous", i.value),
+                        ));
+                    }
+                    if let Some(&k) = hits.first() {
+                        order.push((SortKey::Output(k), asc));
+                        continue;
+                    }
+                }
+                let bound = match alias_of(&item.expr) {
+                    Some(x) => x,
+                    None => {
+                        self.window_ok = true;
+                        let b = self.bind_expr(item.expr);
+                        self.window_ok = false;
+                        b?
+                    }
+                };
+                hidden_exprs.push(bound);
+                order.push((SortKey::Hidden(hidden_exprs.len() - 1), asc));
+            }
+        }
+        let (limit, offset) = match limit_clause {
+            Some(LimitClause::LimitOffset { limit, offset, limit_by }) => {
+                if !limit_by.is_empty() {
+                    return Err(MySqlError::unsupported("LIMIT BY"));
+                }
+                let limit = limit.map(|e| self.bind_count(e)).transpose()?;
+                let offset = offset.map(|o| self.bind_count(o.value)).transpose()?;
+                (limit, offset)
+            }
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                // `LIMIT offset, count`: bind in textual order.
+                let offset = self.bind_count(offset)?;
+                (Some(self.bind_count(limit)?), Some(offset))
+            }
+            None => (None, None),
+        };
+        let calc_found_rows =
+            select.select_modifiers.as_ref().is_some_and(|m| m.sql_calc_found_rows);
+
+        // SELECT DISTINCT can only sort by what it selects (3065).
+        if distinct && !has_wildcard {
+            for (k, h) in hidden_exprs.iter().enumerate() {
+                if exprs.contains(h) || contains_agg(h) {
+                    continue;
+                }
+                let mut missing = None;
+                crate::mysql::plan::for_each_colname(h, &mut |n| {
+                    let bare = n.rsplit('.').next().unwrap_or(n);
+                    let selected = exprs.iter().any(|e| {
+                        matches!(e, Expr::ColName(x)
+                            if x.rsplit('.').next().unwrap_or(x).eq_ignore_ascii_case(bare))
+                    });
+                    if !selected && missing.is_none() {
+                        missing = Some(n.to_string());
+                    }
+                });
+                if let Some(col) = missing {
+                    return Err(MySqlError::new(
+                        3065,
+                        "HY000",
+                        format!(
+                            "Expression #{} of ORDER BY clause is not in SELECT list, references column '{col}' which is not in SELECT list; this is incompatible with DISTINCT",
+                            k + 1
+                        ),
+                    ));
+                }
+            }
+        }
+        let mut having = having;
+        let has_agg = !group_exprs.is_empty()
+            || exprs.iter().any(contains_agg)
+            || hidden_exprs.iter().any(contains_agg)
+            || having.as_ref().is_some_and(contains_agg);
+        // HAVING in a query with no GROUP BY or aggregate filters its
+        // rows like WHERE (over the select list's aliases), as in
+        // MySQL; JDBC's metadata queries rely on it.
+        if !has_agg && let Some(h) = having.take() {
+            source = Plan::Filter { source: Box::new(source), predicate: h };
+        }
+        let is_aggregate = has_agg || having.is_some();
+        let hidden = hidden_exprs.len();
+        exprs.extend(hidden_exprs);
+        let plan = if is_aggregate {
+            Plan::Aggregate { source: Box::new(source), group_exprs, exprs, names, having }
+        } else {
+            Plan::Project { source: Box::new(source), exprs, names }
+        };
+        if !order.is_empty() || limit.is_some() || offset.is_some() || distinct || calc_found_rows {
+            Ok(Plan::Finish {
+                source: Box::new(plan),
+                order,
+                hidden,
+                distinct,
+                limit,
+                offset,
+                calc_found_rows,
+            })
+        } else {
+            Ok(plan)
+        }
+    }
+
+    /// `a JOIN b USING (c)` / `a NATURAL JOIN b`, which the planner doesn't
+    /// take: rewritten as `ON a.c = b.c`. As in MySQL, `SELECT *` lists each
+    /// shared column once, first (the right table's for a RIGHT JOIN), then
+    /// the rest of each side's columns; an unqualified `c` means the shared
+    /// column, while `a.c` and `b.c` still name each side's own.
+    fn rewrite_using(
+        &mut self,
+        mut sel: Box<sqlparser::ast::Select>,
+    ) -> Result<Box<sqlparser::ast::Select>, MySqlError> {
+        use sqlparser::ast::{JoinOperator as J, SelectItem};
+        if sel.from.len() != 1 {
+            return Ok(sel);
+        }
+        let constraint = |op: &J| match op {
+            J::Join(c)
+            | J::Inner(c)
+            | J::Left(c)
+            | J::LeftOuter(c)
+            | J::Right(c)
+            | J::RightOuter(c) => Some(c.clone()),
+            _ => None,
+        };
+        if !sel.from[0].joins.iter().any(|j| {
+            matches!(
+                constraint(&j.join_operator),
+                Some(JoinConstraint::Using(_) | JoinConstraint::Natural)
+            )
+        }) {
+            return Ok(sel);
+        }
+        let mut visible = self.factor_columns(&sel.from[0].relation)?;
+        let mut shared: Vec<(String, AstExpr)> = Vec::new();
+        for j in sel.from[0].joins.iter_mut() {
+            let right_cols = self.factor_columns(&j.relation)?;
+            let names: Vec<String> = match constraint(&j.join_operator) {
+                Some(JoinConstraint::Using(cols)) => {
+                    cols.iter().map(|c| c.to_string().trim_matches('`').to_string()).collect()
+                }
+                Some(JoinConstraint::Natural) => visible
+                    .iter()
+                    .filter(|(n, _)| right_cols.iter().any(|(r, _)| r.eq_ignore_ascii_case(n)))
+                    .map(|(n, _)| n.clone())
+                    .collect(),
+                _ => {
+                    visible.extend(right_cols);
+                    continue;
+                }
+            };
+            let right_join = matches!(j.join_operator, J::Right(_) | J::RightOuter(_));
+            let find = |cols: &[(String, AstExpr)], n: &str| {
+                cols.iter()
+                    .find(|(c, _)| c.eq_ignore_ascii_case(n))
+                    .map(|(_, e)| e.clone())
+                    .ok_or_else(|| {
+                        MySqlError::new(
+                            1054,
+                            "42S22",
+                            format!("Unknown column '{n}' in 'from clause'"),
+                        )
+                    })
+            };
+            let mut on: Option<AstExpr> = None;
+            let mut merged = Vec::new();
+            for n in &names {
+                let (l, r) = (find(&visible, n)?, find(&right_cols, n)?);
+                let eq = AstExpr::BinaryOp {
+                    left: Box::new(l.clone()),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(r.clone()),
+                };
+                on = Some(match on {
+                    None => eq,
+                    Some(prev) => AstExpr::BinaryOp {
+                        left: Box::new(prev),
+                        op: BinaryOperator::And,
+                        right: Box::new(eq),
+                    },
+                });
+                merged.push((n.clone(), if right_join { r } else { l }));
+            }
+            let c = on.map_or(JoinConstraint::None, JoinConstraint::On);
+            j.join_operator = match &j.join_operator {
+                J::Left(_) => J::Left(c),
+                J::LeftOuter(_) => J::LeftOuter(c),
+                J::Right(_) => J::Right(c),
+                J::RightOuter(_) => J::RightOuter(c),
+                J::Inner(_) => J::Inner(c),
+                _ => J::Join(c),
+            };
+            let is_shared = |n: &str| names.iter().any(|x| x.eq_ignore_ascii_case(n));
+            // RIGHT JOIN lists the right side's columns first.
+            let (first, second) =
+                if right_join { (right_cols, visible) } else { (visible, right_cols) };
+            let mut next: Vec<(String, AstExpr)> = merged.clone();
+            next.extend(first.into_iter().filter(|(n, _)| !is_shared(n)));
+            next.extend(second.into_iter().filter(|(n, _)| !is_shared(n)));
+            visible = next;
+            shared.retain(|(n, _)| !is_shared(n));
+            shared.extend(merged);
+        }
+        self.using_cols = shared.into_iter().map(|(n, e)| (n.to_ascii_lowercase(), e)).collect();
+        let mut projection = Vec::new();
+        for item in std::mem::take(&mut sel.projection) {
+            if let SelectItem::Wildcard(_) = item {
+                for (n, e) in &visible {
+                    projection.push(SelectItem::ExprWithAlias {
+                        expr: e.clone(),
+                        alias: Ident::new(n.clone()),
+                    });
+                }
+            } else {
+                projection.push(item);
+            }
+        }
+        sel.projection = projection;
+        Ok(sel)
+    }
+
+    /// A FROM item's columns, each as a reference qualified by its name or
+    /// alias (for `USING`/`NATURAL`).
+    fn factor_columns(&self, tf: &TableFactor) -> Result<Vec<(String, AstExpr)>, MySqlError> {
+        let TableFactor::Table { name, alias, .. } = tf else {
+            return Err(MySqlError::unsupported("JOIN ... USING with a derived table"));
+        };
+        let (db, table) = self.resolve_table_name(name)?;
+        let qual = alias.as_ref().map_or_else(|| table.clone(), |a| a.name.value.clone());
+        let cols = match self.views.get(&(db.clone(), table.clone())) {
+            Some(v) if !v.columns.is_empty() => v.columns.clone(),
+            Some(_) => return Err(MySqlError::unsupported("JOIN ... USING with a view")),
+            None => self
+                .table_cols
+                .get(&(db.clone(), table.clone()))
+                .cloned()
+                .ok_or_else(|| MySqlError::unknown_table(&table))?,
+        };
+        Ok(cols
+            .into_iter()
+            .map(|c| {
+                let e = AstExpr::CompoundIdentifier(vec![
+                    Ident::new(qual.clone()),
+                    Ident::new(c.clone()),
+                ]);
+                (c, e)
+            })
+            .collect())
     }
 
     fn bind_from(&mut self, from: Vec<TableWithJoins>) -> Result<Plan, MySqlError> {
@@ -1955,7 +2153,8 @@ impl Binder {
             JoinConstraint::On(expr) => self.bind_expr(expr.clone()),
             // `a JOIN b` with no ON: every pair, as CROSS JOIN.
             JoinConstraint::None => Ok(Expr::Const(Value::Int(1))),
-            _ => Err(MySqlError::unsupported("JOIN ... USING / NATURAL JOIN")),
+            // Rewritten to ON by `rewrite_using` before binding.
+            _ => Err(MySqlError::unsupported("JOIN ... USING / NATURAL JOIN here")),
         }
     }
 
@@ -2033,6 +2232,13 @@ impl Binder {
                     ) =>
             {
                 Ok(Expr::Call { name: ident.value.to_ascii_uppercase(), args: vec![] })
+            }
+            AstExpr::Identifier(ident)
+                if !ident.value.starts_with('@')
+                    && self.using_cols.contains_key(&ident.value.to_ascii_lowercase()) =>
+            {
+                let e = self.using_cols[&ident.value.to_ascii_lowercase()].clone();
+                self.bind_expr(e)
             }
             AstExpr::Identifier(ident) => {
                 if ident.value.starts_with("@@") {
