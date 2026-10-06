@@ -2816,10 +2816,30 @@ impl Engine {
     /// Clones out the shared state (resolving any in-flight transactions as
     /// aborted, per spec §5) and serializes it into a `Snapshot` DTO for
     /// on-disk persistence.
+    /// The state to save. Open transactions are saved as aborted (they
+    /// can't survive a restart), but the running broker keeps them open:
+    /// the autosave runs while producers are mid-transaction, and resolving
+    /// them in place made their commits fail with INVALID_TXN_STATE.
     pub fn snapshot(&self) -> Snapshot {
         let mut state = self.state.lock().unwrap();
+        let open: Vec<(String, i32, PartitionState)> = state
+            .topics
+            .iter()
+            .flat_map(|(topic, ts)| {
+                ts.partitions
+                    .iter()
+                    .filter(|(_, p)| !p.active_txns.is_empty())
+                    .map(move |(&id, p)| (topic.clone(), id, p.clone()))
+            })
+            .collect();
         state.resolve_open_transactions_for_shutdown();
-        state.to_snapshot()
+        let snapshot = state.to_snapshot();
+        for (topic, id, part) in open {
+            if let Some(ts) = state.topics.get_mut(&topic) {
+                ts.partitions.insert(id, part);
+            }
+        }
+        snapshot
     }
 
     /// Builds an `Engine` from a previously saved `Snapshot`, updating `host`
@@ -3119,4 +3139,38 @@ fn offset_for_timestamp(part: &PartitionState, target: i64, end: i64) -> (i64, i
         }
     }
     best.unwrap_or((-1, -1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_leaves_live_transactions_open() {
+        // The autosave snapshots while producers are mid-transaction: the
+        // saved copy has them aborted, the running broker still has them open.
+        let engine = Engine::new("127.0.0.1".into(), 9092);
+        {
+            let mut st = engine.state.lock().unwrap();
+            let mut part = PartitionState::new(0, 1);
+            part.active_txns.insert(7, 0);
+            let mut topic = TopicState {
+                name: "t".into(),
+                is_internal: false,
+                partitions: HashMap::new(),
+                configs: HashMap::new(),
+            };
+            topic.partitions.insert(0, part);
+            st.topics.insert("t".into(), topic);
+        }
+        let snap = engine.snapshot();
+        let (_, saved_topic) = snap.topics.iter().find(|(n, _)| n == "t").unwrap();
+        let (_, saved) = &saved_topic.partitions[0];
+        assert!(saved.aborted_txns.iter().any(|&(pid, _)| pid == 7), "saved copy aborts it");
+        let st = engine.state.lock().unwrap();
+        let live = &st.topics["t"].partitions[&0];
+        assert_eq!(live.active_txns.get(&7), Some(&0), "live transaction still open");
+        assert!(live.aborted_txns.is_empty(), "live state not aborted");
+        assert_eq!(live.high_watermark, 0, "no control batch appended to the live log");
+    }
 }
