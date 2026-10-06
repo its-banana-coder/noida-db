@@ -748,8 +748,10 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   `regex` syntax, which covers ICU's common subset (classes, POSIX
   `[[:alpha:]]`, anchors, groups, repetition) but not look-around or
   backreferences in the pattern.
-- Views (`CREATE VIEW`) aren't supported yet; nor are `JOIN ... USING`
-  and `NATURAL JOIN` (`JOIN ... ON` and a bare `JOIN` are).
+- Views are read-only (INSERT/UPDATE/DELETE through a view aren't
+  supported), and `SHOW CREATE VIEW` shows the SELECT as written where
+  MySQL prints its canonical form. `JOIN ... USING` and `NATURAL JOIN`
+  aren't supported yet (`JOIN ... ON` and a bare `JOIN` are).
 - A recursive CTE is held in memory: past 1,000,000 rows it fails with
   1114 "The table ... is full" (MySQL would spill to disk).
 - Plain `KEY`/`INDEX` declarations are recorded (SHOW INDEX, SHOW CREATE

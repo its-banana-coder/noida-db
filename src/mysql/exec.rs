@@ -1017,8 +1017,15 @@ impl Executor {
                 let schema = state.schemas.get(&db).ok_or_else(|| {
                     MySqlError::new(1049, "42000", format!("Unknown database '{}'", db))
                 })?;
+                let mut names: Vec<(&String, &str)> = schema
+                    .tables
+                    .keys()
+                    .map(|n| (n, "BASE TABLE"))
+                    .chain(schema.views.keys().map(|n| (n, "VIEW")))
+                    .collect();
+                names.sort();
                 let mut rows = Vec::new();
-                for table_name in schema.tables.keys() {
+                for (table_name, kind) in names {
                     if let Some(p) = &like
                         && !mysql_like(table_name, p, Some('\\'))
                     {
@@ -1026,13 +1033,152 @@ impl Executor {
                     }
                     let mut row = vec![Value::Text(table_name.clone())];
                     if full {
-                        row.push(Value::Text("BASE TABLE".into()));
+                        row.push(Value::Text(kind.into()));
                     }
                     rows.push(row);
                 }
                 Ok(rows)
             }
+            Plan::CreateView { db, name, columns, sql, or_replace } => {
+                {
+                    let state = self.db.lock().unwrap();
+                    let schema = state.schemas.get(&db).ok_or_else(|| {
+                        MySqlError::new(1049, "42000", format!("Unknown database '{db}'"))
+                    })?;
+                    if schema.tables.contains_key(&name) {
+                        return Err(if or_replace {
+                            MySqlError::new(1347, "HY000", format!("'{db}.{name}' is not VIEW"))
+                        } else {
+                            MySqlError::new(1050, "42S01", format!("Table '{name}' already exists"))
+                        });
+                    }
+                    if schema.views.contains_key(&name) && !or_replace {
+                        return Err(MySqlError::new(
+                            1050,
+                            "42S01",
+                            format!("Table '{name}' already exists"),
+                        ));
+                    }
+                }
+                // MySQL checks the definition when the view is created: its
+                // tables and columns must exist, it can't name itself, and a
+                // column list must match the SELECT.
+                let view = crate::mysql::catalog::View { name: name.clone(), sql, columns };
+                let defs = self.db.lock().unwrap().view_defs();
+                let stmt = sqlparser::parser::Parser::parse_sql(
+                    &sqlparser::dialect::MySqlDialect {},
+                    &view.sql,
+                )
+                .map_err(|e| MySqlError::syntax_error(&e.to_string()))?
+                .remove(0);
+                let mut binder = crate::mysql::binder::Binder::new(Some(db.clone()))
+                    .with_views(std::sync::Arc::new(defs));
+                binder.enter_view(&db, &name);
+                let plan = binder.bind_statement(stmt)?;
+                let names = {
+                    let state = self.db.lock().unwrap();
+                    crate::mysql::plan::column_names(&plan, &state)
+                };
+                if !view.columns.is_empty() && view.columns.len() != names.len() {
+                    return Err(MySqlError::new(
+                        1353,
+                        "HY000",
+                        "In definition of view, derived table or common table expression, SELECT list and column names list have different column counts",
+                    ));
+                }
+                let mut seen = std::collections::HashSet::new();
+                for n in if view.columns.is_empty() { &names } else { &view.columns } {
+                    if !seen.insert(n.to_ascii_lowercase()) {
+                        return Err(MySqlError::new(
+                            1060,
+                            "42S21",
+                            format!("Duplicate column name '{n}'"),
+                        ));
+                    }
+                }
+                self.execute_plan(plan)?;
+                let mut state = self.db.lock().unwrap();
+                if let Some(schema) = state.schemas.get_mut(&db) {
+                    schema.views.insert(name, view);
+                }
+                Ok(vec![])
+            }
+            Plan::DropView { db, names, if_exists } => {
+                let mut state = self.db.lock().unwrap();
+                let schema = state.schemas.get_mut(&db).ok_or_else(|| {
+                    MySqlError::new(1049, "42000", format!("Unknown database '{db}'"))
+                })?;
+                let mut missing = Vec::new();
+                for n in &names {
+                    if schema.tables.contains_key(n) {
+                        return Err(MySqlError::new(
+                            1347,
+                            "HY000",
+                            format!("'{db}.{n}' is not VIEW"),
+                        ));
+                    }
+                    if !schema.views.contains_key(n) {
+                        missing.push(format!("{db}.{n}"));
+                    }
+                }
+                if !missing.is_empty() && !if_exists {
+                    return Err(MySqlError::new(
+                        1051,
+                        "42S02",
+                        format!("Unknown table '{}'", missing.join(",")),
+                    ));
+                }
+                for n in &names {
+                    schema.views.remove(n);
+                }
+                Ok(vec![])
+            }
+            Plan::ShowCreateView { db, name } => {
+                let view = {
+                    let state = self.db.lock().unwrap();
+                    let schema = state.schemas.get(&db).ok_or_else(|| {
+                        MySqlError::new(1049, "42000", format!("Unknown database '{db}'"))
+                    })?;
+                    if schema.tables.contains_key(&name) {
+                        return Err(MySqlError::new(
+                            1347,
+                            "HY000",
+                            format!("'{db}.{name}' is not VIEW"),
+                        ));
+                    }
+                    schema.views.get(&name).cloned().ok_or_else(|| {
+                        MySqlError::new(1146, "42S02", format!("Table '{db}.{name}' doesn't exist"))
+                    })?
+                };
+                let cols = if view.columns.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " ({})",
+                        view.columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(",")
+                    )
+                };
+                Ok(vec![vec![
+                    Value::Text(name.clone()),
+                    Value::Text(format!(
+                        "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `{name}`{cols} AS {}",
+                        view.sql
+                    )),
+                    Value::Text("utf8mb4".into()),
+                    Value::Text("utf8mb4_0900_ai_ci".into()),
+                ]])
+            }
             Plan::ShowColumns { db, table } => {
+                let view = self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .schemas
+                    .get(&db)
+                    .and_then(|s| s.views.get(&table).cloned());
+                if let Some(view) = view {
+                    return self.view_columns(&db, &view);
+                }
                 let t = self.load_table(&db, &table)?;
                 let keys = t.keys();
                 let mut rows = Vec::new();
@@ -1167,6 +1313,23 @@ impl Executor {
                 foreign_keys,
                 if_not_exists,
             } => {
+                if self
+                    .db
+                    .lock()
+                    .unwrap()
+                    .schemas
+                    .get(&db)
+                    .is_some_and(|s| s.views.contains_key(&table))
+                {
+                    if if_not_exists {
+                        return Ok(vec![]);
+                    }
+                    return Err(MySqlError::new(
+                        1050,
+                        "42S01",
+                        format!("Table '{table}' already exists"),
+                    ));
+                }
                 let mut t = Table::new(table.clone(), columns);
                 t.unique_keys = unique_keys;
                 t.indexes = indexes;
@@ -1862,6 +2025,20 @@ impl Executor {
                 self.skip_rows = None;
                 res
             }
+            Plan::Derived { plan, view: Some(view), .. } => self.execute_plan(*plan).map_err(|e| {
+                // A view whose definition no longer resolves.
+                if matches!(e.code, 1054 | 1146) {
+                    MySqlError::new(
+                        1356,
+                        "HY000",
+                        format!(
+                            "View '{view}' references invalid table(s) or column(s) or function(s) or definer/invoker of view lack rights to use them"
+                        ),
+                    )
+                } else {
+                    e
+                }
+            }),
             Plan::Derived { plan, .. } => self.execute_plan(*plan),
             Plan::InsertSelect { insert, query } => {
                 // The SELECT runs first, over the table as it was (so
@@ -4297,6 +4474,170 @@ fn place_column(
         row.insert(to, v);
     }
     Ok(())
+}
+
+impl Executor {
+    /// `SHOW COLUMNS`/`DESCRIBE` of a view: a column read straight from a
+    /// table keeps that column's type and nullability (as MySQL reports);
+    /// a computed one gets a type from its values.
+    fn view_columns(
+        &mut self,
+        db: &str,
+        view: &crate::mysql::catalog::View,
+    ) -> Result<Vec<Vec<Value>>, MySqlError> {
+        use sqlparser::ast::{SetExpr, Statement, TableFactor};
+        let parse = |sql: &str| {
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::MySqlDialect {}, sql)
+                .map_err(|e| MySqlError::syntax_error(&e.to_string()))
+        };
+        let defs = std::sync::Arc::new(self.db.lock().unwrap().view_defs());
+        let inner = parse(&view.sql)?.remove(0);
+        // Columns of the tables and views named in the view's FROM (not in
+        // nested subqueries), as (name, type, nullable).
+        let mut sources: Vec<(String, String, bool)> = Vec::new();
+        // Each SELECT-list item's aggregate, if it is one: (function, argument column).
+        let mut aggs: Vec<Option<(String, String)>> = Vec::new();
+        if let Statement::Query(q) = &inner
+            && let SetExpr::Select(sel) = q.body.as_ref()
+        {
+            for twj in &sel.from {
+                for tf in
+                    std::iter::once(&twj.relation).chain(twj.joins.iter().map(|j| &j.relation))
+                {
+                    if let TableFactor::Table { name, .. } = tf
+                        && let Some(last) = name.0.last()
+                    {
+                        let n = last.to_string().trim_matches('`').to_string();
+                        let nested = defs.get(&(db.to_string(), n.clone())).cloned();
+                        if let Some(v) = nested {
+                            for r in self.view_columns(db, &v)? {
+                                if let (Value::Text(c), Value::Text(t), Value::Text(nl)) =
+                                    (&r[0], &r[1], &r[2])
+                                {
+                                    sources.push((c.clone(), t.clone(), nl == "YES"));
+                                }
+                            }
+                        } else if let Ok(t) = self.load_table(db, &n) {
+                            for c in &t.columns {
+                                sources.push((c.name.clone(), mysql_type_name(&c.ty), !c.not_null));
+                            }
+                        }
+                    }
+                }
+            }
+            for item in &sel.projection {
+                let e = match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+                    _ => None,
+                };
+                aggs.push(e.and_then(|e| match e {
+                    sqlparser::ast::Expr::Function(f) => {
+                        let arg = f.args.to_string();
+                        Some((
+                            f.name.to_string().to_ascii_lowercase(),
+                            arg.trim_matches(|c| c == '(' || c == ')').to_string(),
+                        ))
+                    }
+                    _ => None,
+                }));
+            }
+        }
+        let inner_plan = crate::mysql::binder::Binder::new(Some(db.to_string()))
+            .with_views(defs.clone())
+            .bind_statement(inner)?;
+        let inner_names = {
+            let state = self.db.lock().unwrap();
+            crate::mysql::plan::column_names(&inner_plan, &state)
+        };
+        let rows = self.execute_plan(inner_plan)?;
+        let mut out = Vec::new();
+        for (i, inner_name) in inner_names.iter().enumerate() {
+            let name = view.columns.get(i).unwrap_or(inner_name);
+            let source = sources.iter().find(|(c, ..)| c.eq_ignore_ascii_case(inner_name));
+            let arg_type = |col: &str| {
+                sources
+                    .iter()
+                    .find(|(c, ..)| c.eq_ignore_ascii_case(col))
+                    .map(|(_, t, _)| t.clone())
+            };
+            // MySQL's aggregate result types.
+            let agg = aggs.get(i).cloned().flatten().and_then(|(f, arg)| {
+                let integral = arg_type(&arg).is_some_and(|t| t.contains("int"));
+                Some(match f.as_str() {
+                    "count" => "bigint".to_string(),
+                    "sum" if integral => "decimal(32,0)".to_string(),
+                    "avg" if integral => "decimal(14,4)".to_string(),
+                    "sum" | "avg" => {
+                        // decimal(p,s): SUM widens to (p+22,s), AVG to (p+4,s+4).
+                        let dec = arg_type(&arg).and_then(|t| {
+                            let (p, s) =
+                                t.strip_prefix("decimal(")?.strip_suffix(')')?.split_once(',')?;
+                            Some((p.trim().parse::<u32>().ok()?, s.trim().parse::<u32>().ok()?))
+                        });
+                        match (f.as_str(), dec) {
+                            ("sum", Some((p, s))) => format!("decimal({},{s})", (p + 22).min(65)),
+                            ("avg", Some((p, s))) => {
+                                format!("decimal({},{})", (p + 4).min(65), (s + 4).min(30))
+                            }
+                            _ => "double".to_string(),
+                        }
+                    }
+                    "min" | "max" => arg_type(&arg)?,
+                    _ => return None,
+                })
+            });
+            let (ty, null) = match (source, agg) {
+                (_, Some(t)) => (
+                    t,
+                    if aggs.get(i).cloned().flatten().is_some_and(|(f, _)| f == "count") {
+                        "NO"
+                    } else {
+                        "YES"
+                    },
+                ),
+                (Some((_, t, nullable)), None) => (t.clone(), if *nullable { "YES" } else { "NO" }),
+                (None, None) => {
+                    let vals: Vec<&Value> =
+                        rows.iter().filter_map(|r| r.get(i)).filter(|v| !v.is_null()).collect();
+                    let ty = match vals.first() {
+                        Some(Value::Int(_)) => "bigint".to_string(),
+                        Some(Value::Float(_)) => "double".to_string(),
+                        Some(Value::Date(_)) => "date".to_string(),
+                        Some(Value::Ts(_)) => "datetime".to_string(),
+                        Some(Value::Time(_)) => "time".to_string(),
+                        Some(Value::Text(_)) => {
+                            let n = vals
+                                .iter()
+                                .map(|v| if let Value::Text(t) = v { t.chars().count() } else { 0 })
+                                .max()
+                                .unwrap_or(0);
+                            format!("varchar({n})")
+                        }
+                        Some(Value::Num(n)) => {
+                            let t = n.to_string();
+                            let digits = t.chars().filter(char::is_ascii_digit).count();
+                            let scale = t.split_once('.').map_or(0, |(_, f)| f.len());
+                            format!("decimal({},{scale})", digits.max(scale + 1))
+                        }
+                        Some(_) => "varchar(255)".to_string(),
+                        None => "binary(0)".to_string(),
+                    };
+                    (ty, "YES")
+                }
+            };
+            let is_count = aggs.get(i).cloned().flatten().is_some_and(|(f, _)| f == "count");
+            out.push(vec![
+                Value::Text(name.clone()),
+                Value::Text(ty),
+                Value::Text(null.into()),
+                Value::Text(String::new()),
+                if is_count { Value::Text("0".into()) } else { Value::Null },
+                Value::Text(String::new()),
+            ]);
+        }
+        Ok(out)
+    }
 }
 
 /// Adds a plain index, named after its first column when unnamed.

@@ -215,6 +215,18 @@ impl Table {
 pub struct Schema {
     pub name: String,
     pub tables: BTreeMap<String, Arc<Table>>,
+    #[serde(default)]
+    pub views: BTreeMap<String, View>,
+}
+
+/// `CREATE VIEW name [(columns)] AS select`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct View {
+    pub name: String,
+    /// The SELECT, as text (bound afresh wherever the view is used).
+    pub sql: String,
+    /// The `(columns)` list, if one was given.
+    pub columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -272,6 +284,18 @@ pub fn row_diff(before: &[Row], after: &[Row]) -> (Vec<Row>, Vec<Row>) {
     let mut removed: Vec<usize> = counts.into_values().flatten().collect();
     removed.sort_unstable();
     (removed.into_iter().map(|i| before[i].clone()).collect(), added)
+}
+
+impl DbState {
+    /// Every view, by (database, name), for the binder.
+    pub fn view_defs(&self) -> std::collections::HashMap<(String, String), View> {
+        self.schemas
+            .iter()
+            .flat_map(|(db, s)| {
+                s.views.values().map(move |v| ((db.clone(), v.name.clone()), v.clone()))
+            })
+            .collect()
+    }
 }
 
 impl DbState {
@@ -402,7 +426,7 @@ impl Default for DbState {
         for name in ["information_schema", "mysql", "performance_schema", "sys", "test"] {
             schemas.insert(
                 name.to_string(),
-                Schema { name: name.to_string(), tables: BTreeMap::new() },
+                Schema { name: name.to_string(), tables: BTreeMap::new(), views: BTreeMap::new() },
             );
         }
         Self { schemas, open_txns: HashMap::new(), waits: HashMap::new() }
