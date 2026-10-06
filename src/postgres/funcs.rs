@@ -1782,6 +1782,25 @@ pub fn call(
                     .map_or_else(String::new, |q| fts::format_query(&q)),
             )));
         }
+        // The functions behind the jsonb operators.
+        "jsonb_contains" | "jsonb_contained" | "jsonb_exists_any" | "jsonb_exists_all"
+        | "jsonb_delete" | "jsonb_delete_path" => {
+            let op = match name {
+                "jsonb_contains" => "@>",
+                "jsonb_contained" => "<@",
+                "jsonb_exists_any" => "?|",
+                "jsonb_exists_all" => "?&",
+                "jsonb_delete" => "-",
+                _ => "#-",
+            };
+            // VARIADIC keys: one delete of them all.
+            if a.len() > 2 {
+                let keys = Array(Box::new(types::Array::new(a[1..].to_vec())));
+                return binop(op, &a[0], &keys, ret, &[tys[0], Type::array_of(Base::Text)], env)
+                    .map(Some);
+            }
+            return binop(op, &a[0], &a[1], ret, tys, env).map(Some);
+        }
         "array_set_element" => {
             // `arr[i] = v`: a NULL array becomes a one-element array at
             // index i; an index past either end pads with NULLs.

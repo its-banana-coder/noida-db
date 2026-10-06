@@ -734,4 +734,18 @@ PG_EDGES.update({
         "SELECT sum(x) OVER (ORDER BY x RANGE BETWEEN 1::int8 PRECEDING AND 2::int2 FOLLOWING) FROM generate_series(1, 5) x",
         "SELECT y, sum(x) FILTER (WHERE x > 10) OVER (ORDER BY y) FROM (VALUES (1, 10), (2, 20)) v(y, x) GROUP BY y, x ORDER BY y",
     ),
+    "pg edge: jsonb operator functions and planner settings": steps(
+        """SELECT jsonb_contains('{"a":1}', '{"a":1}'), jsonb_contained('{"a":1}', '{"a":1,"b":2}'), jsonb_exists('{"a":1}', 'a'), jsonb_exists_any('{"a":1}', array['x','a']), jsonb_exists_all('{"a":1}', array['x','a'])""",
+        """SELECT jsonb_delete('{"a":1,"b":2}', 'a')::text, jsonb_delete('[1,2,3]', 1)::text, jsonb_delete_path('{"a":{"b":1}}', '{a,b}')::text""",
+        """SELECT jsonb_delete('{"a":1,"b":2,"c":3}', 'a', 'b')::text""",
+        """SELECT jsonb_delete('{"a":1,"b":2}', array['a','b'])""",
+        "SET enable_sort = off",
+        "SHOW enable_sort",
+        "SET enable_hashagg TO false",
+        "SHOW enable_hashagg",
+        "RESET enable_sort",
+        "SHOW enable_sort",
+        "SHOW enable_partitionwise_join",
+        "SET enable_bitmapscan = maybe",
+    ),
 })
