@@ -78,6 +78,9 @@ struct AggFrame {
 }
 
 pub struct Binder<'a> {
+    /// Window function calls being bound (their arguments may hold
+    /// aggregates of the query, but not another window call).
+    window_depth: usize,
     pub db: &'a DbState,
     pub sess: &'a SessionInfo,
     /// Parameter types; `unknown` until resolved from context.
@@ -125,6 +128,7 @@ pub fn unsupported(what: &str) -> PgError {
 impl<'a> Binder<'a> {
     pub fn new(db: &'a DbState, sess: &'a SessionInfo, param_hints: &[Type]) -> Binder<'a> {
         Binder {
+            window_depth: 0,
             db,
             sess,
             params: param_hints.to_vec(),
@@ -847,7 +851,7 @@ impl<'a> Binder<'a> {
         }
         let frame = self.frames.last_mut().unwrap();
         let aggs = std::mem::take(&mut frame.aggs);
-        let windows = std::mem::take(&mut frame.wins);
+        let mut windows = std::mem::take(&mut frame.wins);
         let grouped = !group_keys.is_empty() || !aggs.is_empty();
         // Rewrite everything above the aggregation step.
         let mut having = having_te.map(|te| te.e);
@@ -868,6 +872,23 @@ impl<'a> Binder<'a> {
             }
             for te in &mut distinct_on {
                 te.e = self.regroup(te.e.clone(), &group_keys, aggs.len())?;
+            }
+            // Windows run over the grouped rows too.
+            for w in &mut windows {
+                for e in w.args.iter_mut().chain(w.partition.iter_mut()) {
+                    *e = self.regroup(e.clone(), &group_keys, aggs.len())?;
+                }
+                for (e, ..) in &mut w.order {
+                    *e = self.regroup(e.clone(), &group_keys, aggs.len())?;
+                }
+                if let Some(agg) = &mut w.agg {
+                    for e in &mut agg.args {
+                        *e = self.regroup(e.clone(), &group_keys, aggs.len())?;
+                    }
+                    if let Some(f) = &mut agg.filter {
+                        *f = self.regroup(f.clone(), &group_keys, aggs.len())?;
+                    }
+                }
             }
         }
         if let Some(h) = &having {
@@ -3610,6 +3631,12 @@ impl<'a> Binder<'a> {
     ) -> PgResult<TE> {
         let resolved = self.resolve_window(over)?;
         let spec = &resolved;
+        if self.window_depth > 0 {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                "window function calls cannot be nested",
+            ));
+        }
         if self.frames.is_empty() || self.frames.last().unwrap().forbid.is_some() {
             return Err(PgError::new(
                 code::WINDOWING_ERROR,
@@ -3619,8 +3646,9 @@ impl<'a> Binder<'a> {
                 ),
             ));
         }
-        self.frames
-            .push(AggFrame { forbid: Some("a window function argument"), ..Default::default() });
+        // Windows run after grouping: an aggregate in the arguments, PARTITION
+        // BY or ORDER BY is the query's own (`sum(sum(x)) OVER ()`).
+        self.window_depth += 1;
         let bound: PgResult<Vec<TE>> = args.iter().map(|x| self.bind_expr(x)).collect();
         let partition: PgResult<Vec<TE>> =
             spec.partition_by.iter().map(|x| self.bind_expr(x)).collect();
@@ -3635,7 +3663,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let filter_te = filter.as_ref().map(|f| self.bind_expr(f));
-        self.frames.pop();
+        self.window_depth -= 1;
         let bound = bound?;
         let arg_tys: Vec<Type> = bound.iter().map(|t| t.ty).collect();
         let r = if star && name == "count" {
