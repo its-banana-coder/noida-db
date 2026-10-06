@@ -2414,7 +2414,15 @@ impl<'a> Binder<'a> {
             match acc {
                 a::AccessExpr::Subscript(a::Subscript::Index { index }) => {
                     let idx = self.bind_expr(index)?;
-                    let idx = self.coerce(idx, Type::INT4, -1, CastCtx::Assignment, "subscript")?;
+                    // jsonb takes a key (text) or an index (integer).
+                    let json = matches!(te.ty.base, Base::Jsonb | Base::Json) && !te.ty.array;
+                    let key_ty =
+                        if json && !matches!(idx.ty.base, Base::Int2 | Base::Int4 | Base::Int8) {
+                            Type::TEXT
+                        } else {
+                            Type::INT4
+                        };
+                    let idx = self.coerce(idx, key_ty, -1, CastCtx::Assignment, "subscript")?;
                     let vector_elem = casts::vector_as_array(te.ty).map(|a| a.elem());
                     if !te.ty.array
                         && vector_elem.is_none()
@@ -2439,7 +2447,7 @@ impl<'a> Binder<'a> {
                             name: "subscript",
                             args: vec![te.e, idx],
                             ty: ret,
-                            arg_tys: vec![te.ty, Type::INT4],
+                            arg_tys: vec![te.ty, key_ty],
                         },
                         ret,
                     );
