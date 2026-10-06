@@ -723,4 +723,15 @@ PG_EDGES.update({
         "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000) SELECT count(*), sum(n) FROM t",
         "WITH RECURSIVE t(n) AS (SELECT 1 UNION SELECT n % 5 + 1 FROM t) SELECT count(*) FROM t",
     ),
+    "pg edge: window functions over grouped rows": steps(
+        "SELECT y, x, rank() OVER (ORDER BY x DESC), sum(x) OVER (PARTITION BY y) FROM (VALUES (1, 10, 'a'), (2, 20, 'b'), (2, 30, 'c')) v(y, x, z) GROUP BY x, y ORDER BY y, x",
+        "SELECT z, count(*), row_number() OVER (ORDER BY z DESC) FROM (VALUES (1, 10, 'a'), (2, 20, 'b'), (2, 30, 'b')) v(y, x, z) GROUP BY z ORDER BY z",
+        "SELECT sum(sum(x)) OVER () FROM (VALUES (1), (2)) v(x)",
+        "SELECT sum(sum(x) OVER ()) OVER () FROM (VALUES (1)) v(x)",
+        "SELECT x, rank() OVER (ORDER BY sum(y) DESC) FROM (VALUES (1, 5), (2, 7), (1, 1)) v(x, y) GROUP BY x ORDER BY x",
+        "SELECT x % 2 g, sum(x), sum(sum(x)) OVER (ORDER BY x % 2), avg(count(*)) OVER () FROM generate_series(1, 10) x GROUP BY x % 2 ORDER BY 1",
+        "SELECT x, sum(x) OVER (ORDER BY d RANGE BETWEEN '1 day'::interval PRECEDING AND '1 day'::interval FOLLOWING) FROM (VALUES (1, date '2020-01-01'), (2, date '2020-01-02'), (3, date '2020-01-05')) v(x, d) ORDER BY d",
+        "SELECT sum(x) OVER (ORDER BY x RANGE BETWEEN 1::int8 PRECEDING AND 2::int2 FOLLOWING) FROM generate_series(1, 5) x",
+        "SELECT y, sum(x) FILTER (WHERE x > 10) OVER (ORDER BY y) FROM (VALUES (1, 10), (2, 20)) v(y, x) GROUP BY y, x ORDER BY y",
+    ),
 })

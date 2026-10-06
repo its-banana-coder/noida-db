@@ -47,6 +47,8 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let sql = after_db.as_deref().unwrap_or(sql);
     let after_ext = rewrite_extension_schema(sql);
     let sql = after_ext.as_deref().unwrap_or(sql);
+    let after_frame = rewrite_frame_casts(sql);
+    let sql = after_frame.as_deref().unwrap_or(sql);
     let after_seq = seqddl::rewrite(sql)?;
     let sql1 = after_seq.as_deref().unwrap_or(sql);
     let after_refresh = refresh::rewrite(sql1)?;
@@ -191,6 +193,21 @@ fn rewrite_extension_schema(sql: &str) -> Option<String> {
     let re = regex_lite::Regex::new(r"(?is)^(\s*create\s+extension\s+(?:if\s+not\s+exists\s+)?(?:\x22[^\x22]+\x22|\S+))\s+schema\b")
         .expect("regex");
     re.is_match(sql).then(|| re.replace(sql, "$1 WITH SCHEMA").into_owned())
+}
+
+/// `'1 year'::interval PRECEDING` in a window frame, which sqlparser
+/// doesn't parse, as `CAST('1 year' AS interval) PRECEDING`.
+fn rewrite_frame_casts(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    if !(lower.contains("preceding") || lower.contains("following")) || !sql.contains("::") {
+        return None;
+    }
+    let re = regex_lite::Regex::new(
+        r"(?is)('(?:[^']|'')*')::([a-z_][a-z0-9_]*(?:\s+[a-z_][a-z0-9_]*)*?)(\s+(?:preceding|following)\b)",
+    )
+    .expect("regex");
+    let out = re.replace_all(sql, "CAST($1 AS $2)$3").into_owned();
+    (out != sql).then_some(out)
 }
 
 /// Parses a single SQL expression (defaults, check constraints).
