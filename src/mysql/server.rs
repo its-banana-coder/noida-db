@@ -17,7 +17,7 @@ use std::thread;
 /// save one back on a clean exit.
 pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
     let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
-    crate::persistence::on_shutdown(save);
+    crate::persistence::on_save("mysql", save);
     Ok(addr)
 }
 
@@ -276,7 +276,9 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 // Stmt Prepare
                 let sql = String::from_utf8_lossy(&payload[1..]).to_string();
                 let dialect = MySqlDialect {};
-                let rewritten = crate::mysql::engine::rewrite_comma_update(&sql);
+                let rewritten = crate::mysql::engine::rewrite_rename_key(&sql)
+                    .or_else(|| crate::mysql::engine::rewrite_trailing_into(&sql))
+                    .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql));
                 match Parser::parse_sql(&dialect, rewritten.as_deref().unwrap_or(&sql)) {
                     Ok(mut asts) => {
                         if asts.is_empty() {
@@ -290,8 +292,11 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                             continue;
                         }
                         let stmt = asts.remove(0);
-                        let mut binder =
-                            Binder::new(session.engine.current_db.clone()).with_sql(&sql);
+                        let views =
+                            std::sync::Arc::new(session.engine.db.lock().unwrap().view_defs());
+                        let mut binder = Binder::new(session.engine.current_db.clone())
+                            .with_sql(&sql)
+                            .with_views(views);
                         match binder.bind_statement(stmt) {
                             Ok(plan) => {
                                 let stmt_id = session.stmt_id_counter;

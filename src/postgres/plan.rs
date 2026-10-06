@@ -258,6 +258,8 @@ pub enum FrameBound {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub rows: bool,
+    /// `GROUPS` (offsets count peer groups).
+    pub groups: bool,
     pub start: FrameBound,
     pub end: FrameBound,
 }

@@ -455,6 +455,9 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     tb.type_oid,
                 );
                 row[20] = b(has_triggers);
+                if tb.temp {
+                    row[15] = ch('t');
+                }
                 out.push(row);
                 for idx in &tb.indexes {
                     out.push(pg_class_row(
@@ -1130,6 +1133,12 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             ]);
         }
         "pg_extension" => {
+            let version = |name: &str| {
+                super::catalog::EXTENSIONS
+                    .iter()
+                    .find(|(n, ..)| *n == name)
+                    .map_or("1.0", |(_, v, _)| *v)
+            };
             out.push(vec![
                 n(13000),
                 t("plpgsql"),
@@ -1140,9 +1149,28 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 NULL,
                 NULL,
             ]);
+            for (name, (oid, schema)) in &db.extensions {
+                out.push(vec![
+                    n(*oid as i64),
+                    t(name),
+                    n(10),
+                    n(*schema as i64),
+                    b(true),
+                    t(version(name)),
+                    NULL,
+                    NULL,
+                ]);
+            }
         }
         "pg_available_extensions" => {
-            out.push(vec![t("plpgsql"), t("1.0"), t("1.0"), t("PL/pgSQL procedural language")]);
+            for &(name, version, comment) in super::catalog::EXTENSIONS {
+                let installed = if name == "plpgsql" || db.extensions.contains_key(name) {
+                    t(version)
+                } else {
+                    NULL
+                };
+                out.push(vec![t(name), t(version), installed, t(comment)]);
+            }
         }
         "pg_tablespace" => {
             out.push(vec![n(1663), t("pg_default"), n(10), NULL, NULL]);

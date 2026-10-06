@@ -36,6 +36,10 @@ impl PgError {
         }
     }
 
+    pub fn notice(message: impl Into<String>) -> PgError {
+        PgError { severity: "NOTICE", ..PgError::new("00000", message) }
+    }
+
     pub fn fatal(code: &'static str, message: impl Into<String>) -> PgError {
         PgError { severity: "FATAL", ..PgError::new(code, message) }
     }
@@ -111,6 +115,7 @@ pub mod code {
     pub const SEQUENCE_GENERATOR_LIMIT_EXCEEDED: &str = "2200H";
     pub const NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
     pub const NULL_VALUE_NOT_ALLOWED: &str = "22004";
+    pub const INVALID_PRECEDING_OR_FOLLOWING_SIZE: &str = "22013";
     pub const INVALID_DATETIME_FORMAT: &str = "22007";
     pub const DATETIME_FIELD_OVERFLOW: &str = "22008";
     pub const INVALID_TIME_ZONE_DISPLACEMENT: &str = "22009";
@@ -131,6 +136,7 @@ pub mod code {
     pub const UNTRANSLATABLE_CHARACTER: &str = "22P05";
     pub const INVALID_JSON_TEXT: &str = "22P02";
     pub const CARDINALITY_VIOLATION: &str = "21000";
+    pub const GENERATED_ALWAYS: &str = "428C9";
     pub const DATA_EXCEPTION: &str = "22000";
     pub const NOT_NULL_VIOLATION: &str = "23502";
     pub const FOREIGN_KEY_VIOLATION: &str = "23503";
@@ -169,6 +175,7 @@ pub mod code {
     pub const DUPLICATE_TABLE: &str = "42P07";
     pub const DUPLICATE_ALIAS: &str = "42712";
     pub const DUPLICATE_OBJECT: &str = "42710";
+    pub const UNDEFINED_FILE: &str = "58P01";
     pub const DUPLICATE_FUNCTION: &str = "42723";
     pub const INVALID_FUNCTION_DEFINITION: &str = "42P13";
     pub const AMBIGUOUS_COLUMN: &str = "42702";
@@ -194,6 +201,7 @@ pub mod code {
     pub const RAISE_EXCEPTION: &str = "P0001";
     pub const INTERNAL_ERROR: &str = "XX000";
     pub const PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+    pub const OUT_OF_MEMORY: &str = "53200";
     pub const TOO_MANY_COLUMNS: &str = "54011";
     pub const STATEMENT_TOO_COMPLEX: &str = "54001";
     pub const CONFIGURATION_LIMIT_EXCEEDED: &str = "53400";

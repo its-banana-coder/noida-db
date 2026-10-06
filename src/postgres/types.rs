@@ -591,11 +591,17 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
 // ---------------------------------------------------------------------------
 // Text output
 
+/// Postgres's MaxArraySize: the most elements an array may have.
+pub const MAX_ARRAY_SIZE: i64 = 134_217_727;
+
 /// Session settings that affect text output.
 #[derive(Clone)]
 pub struct FmtCtx {
     pub zone: Zone,
-    pub interval_iso: bool,
+    pub date_style: datetime::DateStyle,
+    /// DateStyle's order is DMY (day before month in SQL/Postgres output).
+    pub dmy: bool,
+    pub interval_style: datetime::IntervalStyle,
     pub bytea_escape: bool,
     pub extra_float_digits: i32,
     /// Names for reg* values, filled in when a result has such columns.
@@ -630,7 +636,9 @@ impl Default for FmtCtx {
         FmtCtx {
             reg_names: None,
             zone: Zone::utc(),
-            interval_iso: false,
+            date_style: datetime::DateStyle::Iso,
+            dmy: false,
+            interval_style: datetime::IntervalStyle::Postgres,
             bytea_escape: false,
             extra_float_digits: 1,
         }
@@ -745,20 +753,16 @@ pub fn to_text(v: &Value, ty: Type, f: &FmtCtx) -> String {
         Value::Num(n) => n.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bytes(b) => format_bytea(b, f.bytea_escape),
-        Value::Date(d) => datetime::format_date(*d),
+        Value::Date(d) => datetime::format_date_styled(*d, f.date_style, f.dmy),
         Value::Time(t) => datetime::format_time(*t),
         Value::TimeTz(t, o) => datetime::format_timetz(*t, *o),
         Value::Ts(t) => match ty.base {
-            Base::Timestamptz => datetime::format_timestamptz(*t, &f.zone),
-            _ => datetime::format_timestamp(*t),
-        },
-        Value::Interval(iv) => {
-            if f.interval_iso {
-                datetime::format_interval_iso(iv)
-            } else {
-                datetime::format_interval(iv)
+            Base::Timestamptz => {
+                datetime::format_timestamp_styled(*t, Some(&f.zone), f.date_style, f.dmy)
             }
-        }
+            _ => datetime::format_timestamp_styled(*t, None, f.date_style, f.dmy),
+        },
+        Value::Interval(iv) => datetime::format_interval_styled(iv, f.interval_style),
         Value::Uuid(u) => format_uuid(u),
         Value::Jsonb(j) => j.to_jsonb_string(),
         Value::Array(a) => array_to_text(a, ty, f),

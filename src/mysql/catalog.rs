@@ -73,6 +73,10 @@ pub struct Table {
     pub unique_keys: Vec<UniqueKey>,
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKey>,
+    /// Plain (non-unique) `KEY`/`INDEX`es: not used for lookups, kept so
+    /// SHOW INDEX, SHOW CREATE TABLE and schema dumps see them.
+    #[serde(default)]
+    pub indexes: Vec<UniqueKey>,
 }
 
 /// A `FOREIGN KEY (columns) REFERENCES ref_db.ref_table (ref_columns)`.
@@ -118,7 +122,62 @@ impl Table {
             next_auto_increment: 1,
             unique_keys: Vec::new(),
             foreign_keys: Vec::new(),
+            indexes: Vec::new(),
         }
+    }
+
+    /// A copy of everything but the rows (what resolving column names needs).
+    pub fn shape(&self) -> Table {
+        Table {
+            name: self.name.clone(),
+            columns: self.columns.clone(),
+            rows: Vec::new(),
+            next_auto_increment: self.next_auto_increment,
+            unique_keys: self.unique_keys.clone(),
+            foreign_keys: self.foreign_keys.clone(),
+            indexes: self.indexes.clone(),
+        }
+    }
+
+    /// Every index as `(name, column indices, unique)`: PRIMARY, the UNIQUE
+    /// keys, then the plain ones, as MySQL lists them.
+    pub fn all_indexes(&self) -> Vec<(String, Vec<usize>, bool)> {
+        let mut out: Vec<_> = self.keys().into_iter().map(|(n, c)| (n, c, true)).collect();
+        for k in &self.indexes {
+            let idx: Vec<usize> = k
+                .columns
+                .iter()
+                .filter_map(|c| {
+                    self.columns.iter().position(|col| col.name.eq_ignore_ascii_case(c))
+                })
+                .collect();
+            if !idx.is_empty() {
+                out.push((k.name.clone(), idx, false));
+            }
+        }
+        out
+    }
+
+    /// Whether an index (of any kind) is named `name`.
+    pub fn has_index(&self, name: &str) -> bool {
+        (name.eq_ignore_ascii_case("PRIMARY") && self.columns.iter().any(|c| c.primary_key))
+            || self
+                .unique_keys
+                .iter()
+                .chain(&self.indexes)
+                .any(|k| k.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The name MySQL gives an unnamed index: its first column, then
+    /// `_2`, `_3`, ... while that's taken.
+    pub fn index_name_for(&self, first_col: &str) -> String {
+        let mut name = first_col.to_string();
+        let mut n = 2;
+        while self.has_index(&name) {
+            name = format!("{first_col}_{n}");
+            n += 1;
+        }
+        name
     }
 
     /// Every key that must hold unique values, as `(name, column indices)`:
@@ -156,6 +215,18 @@ impl Table {
 pub struct Schema {
     pub name: String,
     pub tables: BTreeMap<String, Arc<Table>>,
+    #[serde(default)]
+    pub views: BTreeMap<String, View>,
+}
+
+/// `CREATE VIEW name [(columns)] AS select`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct View {
+    pub name: String,
+    /// The SELECT, as text (bound afresh wherever the view is used).
+    pub sql: String,
+    /// The `(columns)` list, if one was given.
+    pub columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,6 +284,18 @@ pub fn row_diff(before: &[Row], after: &[Row]) -> (Vec<Row>, Vec<Row>) {
     let mut removed: Vec<usize> = counts.into_values().flatten().collect();
     removed.sort_unstable();
     (removed.into_iter().map(|i| before[i].clone()).collect(), added)
+}
+
+impl DbState {
+    /// Every view, by (database, name), for the binder.
+    pub fn view_defs(&self) -> std::collections::HashMap<(String, String), View> {
+        self.schemas
+            .iter()
+            .flat_map(|(db, s)| {
+                s.views.values().map(move |v| ((db.clone(), v.name.clone()), v.clone()))
+            })
+            .collect()
+    }
 }
 
 impl DbState {
@@ -343,7 +426,7 @@ impl Default for DbState {
         for name in ["information_schema", "mysql", "performance_schema", "sys", "test"] {
             schemas.insert(
                 name.to_string(),
-                Schema { name: name.to_string(), tables: BTreeMap::new() },
+                Schema { name: name.to_string(), tables: BTreeMap::new(), views: BTreeMap::new() },
             );
         }
         Self { schemas, open_txns: HashMap::new(), waits: HashMap::new() }

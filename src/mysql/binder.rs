@@ -1,4 +1,4 @@
-use crate::mysql::catalog::{Column, ColumnType, UniqueKey};
+use crate::mysql::catalog::{Column, ColumnType, UniqueKey, View};
 use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{
     self as plan, AggFunc, AlterOp, ArithOp, CmpOp, ColumnPos, Expr, InsertMode, JoinOp, Plan,
@@ -11,10 +11,17 @@ use sqlparser::ast::{
     ObjectName, OrderByKind, OrderBySort, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
     Statement, TableConstraint, TableFactor, TableWithJoins, UnaryOperator, Value as AstValue,
 };
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct Binder {
+    /// Views by (database, name), expanded where a query names one.
+    views: Arc<HashMap<(String, String), View>>,
+    /// Views being expanded, innermost last.
+    view_stack: Vec<(String, String)>,
     pub current_db: Option<String>,
     pub prepared_types: HashMap<String, Vec<Value>>,
     /// Assigns each `?` placeholder encountered while binding an
@@ -48,8 +55,17 @@ pub struct Binder {
 }
 
 impl Binder {
+    /// Lets the binder expand the views in `views` ((database, name) ->
+    /// definition) where queries name them.
+    pub fn with_views(mut self, views: Arc<HashMap<(String, String), View>>) -> Self {
+        self.views = views;
+        self
+    }
+
     pub fn new(current_db: Option<String>) -> Self {
         Self {
+            views: Default::default(),
+            view_stack: Vec::new(),
             current_db,
             prepared_types: HashMap::new(),
             param_counter: 0,
@@ -218,6 +234,9 @@ impl Binder {
                 if let sqlparser::ast::ShowCreateObject::Table = obj_type {
                     let (db, table) = self.resolve_table_name(&obj_name)?;
                     Ok(Plan::ShowCreateTable { db, table })
+                } else if let sqlparser::ast::ShowCreateObject::View = obj_type {
+                    let (db, name) = self.resolve_table_name(&obj_name)?;
+                    Ok(Plan::ShowCreateView { db, name })
                 } else {
                     Err(MySqlError::unsupported("SHOW CREATE object type"))
                 }
@@ -253,6 +272,64 @@ impl Binder {
                 Ok(plan)
             }
             Statement::AlterTable(alter) => self.bind_alter_table(alter),
+            Statement::CreateView(cv) => {
+                if cv.materialized {
+                    return Err(MySqlError::syntax_error("MATERIALIZED"));
+                }
+                let (db, name) = self.resolve_table_name(&cv.name)?;
+                let sql = cv.query.to_string();
+                // Bound now for its errors; bound again wherever it's used.
+                self.bind_query((*cv.query).clone())?;
+                Ok(Plan::CreateView {
+                    db,
+                    name,
+                    columns: cv.columns.iter().map(|c| c.name.value.clone()).collect(),
+                    sql,
+                    or_replace: cv.or_replace,
+                })
+            }
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::View,
+                if_exists,
+                names,
+                ..
+            } => {
+                let mut db = String::new();
+                let mut out = Vec::new();
+                for n in &names {
+                    let (d, name) = self.resolve_table_name(n)?;
+                    db = d;
+                    out.push(name);
+                }
+                Ok(Plan::DropView { db, names: out, if_exists })
+            }
+            // `RENAME TABLE a TO b [, c TO d]` (Rails' rename_table).
+            Statement::RenameTable(pairs) => {
+                let mut out = Vec::new();
+                for p in pairs {
+                    let (db, table) = self.resolve_table_name(&p.old_name)?;
+                    let (new_db, new) = self.resolve_table_name(&p.new_name)?;
+                    if new_db != db {
+                        return Err(MySqlError::unsupported("RENAME TABLE across databases"));
+                    }
+                    out.push((db, table, new));
+                }
+                Ok(Plan::RenameTables(out))
+            }
+            // `DROP INDEX name ON t` (Rails' remove_index).
+            Statement::Drop {
+                object_type: sqlparser::ast::ObjectType::Index,
+                names,
+                table: Some(table),
+                ..
+            } => {
+                let (db, table) = self.resolve_table_name(&table)?;
+                let ops = names
+                    .iter()
+                    .map(|n| AlterOp::DropKey(n.to_string().trim_matches('`').to_string()))
+                    .collect();
+                Ok(Plan::AlterTable { db, table, ops })
+            }
             // Found via testing: DROP DATABASE was unsupported, which broke
             // test runners (Django's among them) that create and drop a
             // test database on every run.
@@ -320,12 +397,18 @@ impl Binder {
                         .map(|n| n.to_string().trim_matches('`').to_string())
                         .unwrap_or_default()
                 });
+                let name = ci
+                    .name
+                    .as_ref()
+                    .map(|n| n.to_string().trim_matches('`').to_string())
+                    .unwrap_or_default();
                 Ok(Plan::CreateIndex {
                     db,
                     table,
                     columns,
                     if_not_exists: ci.if_not_exists,
                     unique,
+                    name,
                 })
             }
             Statement::Insert(insert) => self.bind_insert(insert),
@@ -611,6 +694,16 @@ impl Binder {
                         pos: pos(column_position),
                     }
                 }
+                // `RENAME INDEX|KEY a TO b`, rewritten by the engine into a
+                // marked column rename (the SQL parser has no such clause).
+                A::RenameColumn { old_column_name, new_column_name }
+                    if old_column_name.value.starts_with(RENAME_KEY_MARKER) =>
+                {
+                    AlterOp::RenameKey {
+                        old: old_column_name.value[RENAME_KEY_MARKER.len()..].to_string(),
+                        new: new_column_name.value,
+                    }
+                }
                 A::RenameColumn { old_column_name, new_column_name } => {
                     AlterOp::RenameColumn { old: old_column_name.value, new: new_column_name.value }
                 }
@@ -636,7 +729,12 @@ impl Binder {
                     TableConstraint::ForeignKey(fk) => {
                         AlterOp::AddForeignKey(self.bind_foreign_key(&fk)?)
                     }
-                    // INDEX, CHECK: accepted, not enforced.
+                    TableConstraint::Index(ix) => {
+                        let columns = idents(&ix.columns);
+                        let name = ix.name.as_ref().map(|i| i.value.clone()).unwrap_or_default();
+                        AlterOp::AddIndex(UniqueKey { name, columns })
+                    }
+                    // CHECK, FULLTEXT, SPATIAL: accepted, not enforced.
                     _ => AlterOp::Noop,
                 },
                 A::DropIndex { name } | A::DropConstraint { name, .. } => {
@@ -692,6 +790,7 @@ impl Binder {
         let (db, table) = self.resolve_table_name(&name)?;
         let mut cols = Vec::new();
         let mut unique_keys: Vec<UniqueKey> = Vec::new();
+        let mut indexes: Vec<UniqueKey> = Vec::new();
 
         for col_def in columns {
             let col = self.bind_column_def(col_def, &mut unique_keys)?;
@@ -727,6 +826,37 @@ impl Binder {
                     unique_keys.push(UniqueKey { name, columns });
                 }
             }
+            if let TableConstraint::Index(ix) = constraint {
+                let columns: Vec<String> = ix
+                    .columns
+                    .iter()
+                    .filter_map(|c| match &c.column.expr {
+                        AstExpr::Identifier(i) => Some(i.value.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(first) = columns.first().cloned() {
+                    let name = match &ix.name {
+                        Some(n) => n.value.clone(),
+                        None => {
+                            let taken = |n: &str| {
+                                unique_keys
+                                    .iter()
+                                    .chain(&indexes)
+                                    .any(|k: &UniqueKey| k.name.eq_ignore_ascii_case(n))
+                            };
+                            let mut name = first.clone();
+                            let mut n = 2;
+                            while taken(&name) {
+                                name = format!("{first}_{n}");
+                                n += 1;
+                            }
+                            name
+                        }
+                    };
+                    indexes.push(UniqueKey { name, columns });
+                }
+            }
             if let TableConstraint::PrimaryKey(pk) = constraint {
                 for idx_col in &pk.columns {
                     if let AstExpr::Identifier(ident) = &idx_col.column.expr {
@@ -755,6 +885,7 @@ impl Binder {
             table,
             columns: cols,
             unique_keys,
+            indexes,
             foreign_keys,
             if_not_exists: false,
         })
@@ -1092,13 +1223,17 @@ impl Binder {
                     right: Box::new(step),
                 }
             };
-            self.ctes
-                .push((name.clone(), Plan::Derived { plan: Box::new(plan), alias: name, columns }));
+            self.ctes.push((
+                name.clone(),
+                Plan::Derived { plan: Box::new(plan), alias: name, columns, view: None },
+            ));
             return Ok(());
         }
         let plan = self.bind_query(query)?;
-        self.ctes
-            .push((name.clone(), Plan::Derived { plan: Box::new(plan), alias: name, columns }));
+        self.ctes.push((
+            name.clone(),
+            Plan::Derived { plan: Box::new(plan), alias: name, columns, view: None },
+        ));
         Ok(())
     }
 
@@ -1469,7 +1604,9 @@ impl Binder {
             // both are at least as common as the forms that were already
             // handled, if not more so.
             let (op, swap_sides) = match &join.join_operator {
-                JoinOperator::Join(constraint) | JoinOperator::Inner(constraint) => {
+                JoinOperator::Join(constraint)
+                | JoinOperator::Inner(constraint)
+                | JoinOperator::StraightJoin(constraint) => {
                     (JoinOp::Inner(self.bind_join_constraint(constraint)?), false)
                 }
                 JoinOperator::Left(constraint) | JoinOperator::LeftOuter(constraint) => {
@@ -1548,15 +1685,65 @@ impl Binder {
                     plan: Box::new(plan),
                     alias: alias.name.value.clone(),
                     columns: alias.columns.iter().map(|c| c.name.value.clone()).collect(),
+                    view: None,
                 })
             }
             TableFactor::Table { name, alias, .. } => {
                 let (db, table) = self.resolve_table_name(name)?;
                 let alias = alias.as_ref().map(|a| a.name.value.clone());
+                if let Some(view) = self.views.get(&(db.clone(), table.clone())).cloned() {
+                    return self.bind_view(&db, &view, alias);
+                }
                 Ok(Plan::Scan { db, table, alias })
             }
             _ => Err(MySqlError::unsupported("table factor")),
         }
+    }
+
+    /// Binds as if inside view `db.name` (so naming it is recursion).
+    pub fn enter_view(&mut self, db: &str, name: &str) {
+        self.view_stack.push((db.to_string(), name.to_string()));
+    }
+
+    /// A view used in FROM: its SELECT, as a derived table named after it.
+    fn bind_view(
+        &mut self,
+        db: &str,
+        view: &View,
+        alias: Option<String>,
+    ) -> Result<Plan, MySqlError> {
+        let key = (db.to_string(), view.name.clone());
+        if self.view_stack.contains(&key) {
+            return Err(MySqlError::new(
+                1462,
+                "HY000",
+                format!("`{db}`.`{}` contains view recursion", view.name),
+            ));
+        }
+        let stmts = Parser::parse_sql(&MySqlDialect {}, &view.sql)
+            .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
+        let Some(Statement::Query(q)) = stmts.into_iter().next() else {
+            return Err(MySqlError::new(
+                1356,
+                "HY000",
+                format!("View '{db}.{}' references invalid table(s) or column(s)", view.name),
+            ));
+        };
+        // The view's query sees its own database and none of the
+        // enclosing query's CTEs.
+        let saved_db = self.current_db.replace(db.to_string());
+        let saved_ctes = std::mem::take(&mut self.ctes);
+        self.view_stack.push(key);
+        let plan = self.bind_query(*q);
+        self.view_stack.pop();
+        self.ctes = saved_ctes;
+        self.current_db = saved_db;
+        Ok(Plan::Derived {
+            plan: Box::new(plan?),
+            alias: alias.unwrap_or_else(|| view.name.clone()),
+            columns: view.columns.clone(),
+            view: Some(format!("{db}.{}", view.name)),
+        })
     }
 
     /// A window function call: `func(args) OVER (spec)` or `OVER name`.
@@ -1766,7 +1953,9 @@ impl Binder {
     fn bind_join_constraint(&mut self, c: &JoinConstraint) -> Result<Expr, MySqlError> {
         match c {
             JoinConstraint::On(expr) => self.bind_expr(expr.clone()),
-            _ => Err(MySqlError::unsupported("join constraint")),
+            // `a JOIN b` with no ON: every pair, as CROSS JOIN.
+            JoinConstraint::None => Ok(Expr::Const(Value::Int(1))),
+            _ => Err(MySqlError::unsupported("JOIN ... USING / NATURAL JOIN")),
         }
     }
 
@@ -1832,7 +2021,15 @@ impl Binder {
                 if ident.quote_style.is_none()
                     && matches!(
                         ident.value.to_ascii_uppercase().as_str(),
-                        "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "LOCALTIMESTAMP" | "LOCALTIME"
+                        "CURRENT_TIMESTAMP"
+                            | "CURRENT_DATE"
+                            | "CURRENT_TIME"
+                            | "LOCALTIMESTAMP"
+                            | "LOCALTIME"
+                            | "CURRENT_USER"
+                            | "UTC_DATE"
+                            | "UTC_TIME"
+                            | "UTC_TIMESTAMP"
                     ) =>
             {
                 Ok(Expr::Call { name: ident.value.to_ascii_uppercase(), args: vec![] })
@@ -1870,6 +2067,13 @@ impl Binder {
             AstExpr::CompoundIdentifier(idents) => {
                 if idents.is_empty() {
                     return Err(MySqlError::unsupported("empty compound identifier"));
+                }
+                // `@@session.x` / `@@global.x` are system variables.
+                if let [scope, var] = &idents[..]
+                    && let Some(scope) = scope.value.strip_prefix("@@")
+                    && matches!(scope.to_ascii_lowercase().as_str(), "session" | "global" | "local")
+                {
+                    return Ok(Expr::SysVar(var.value.clone()));
                 }
                 let dotted = idents.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
                 Ok(Expr::ColName(dotted))
@@ -2299,6 +2503,9 @@ impl Binder {
             | "SCHEMA"
             | "USER"
             | "CURRENT_USER"
+            | "CURTIME"
+            | "CURRENT_TIME"
+            | "UTC_TIME"
             | "SESSION_USER"
             | "SYSTEM_USER"
             | "CONNECTION_ID"
@@ -2619,3 +2826,7 @@ fn row_query(query: &Query) -> Option<Query> {
     select.distinct = None;
     Some(q)
 }
+
+/// Marks a column rename that is really `RENAME INDEX|KEY old TO new`
+/// (see [`crate::mysql::engine::rewrite_rename_key`]).
+pub const RENAME_KEY_MARKER: &str = "\u{1}noida-rename-key:";

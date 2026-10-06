@@ -78,6 +78,9 @@ struct AggFrame {
 }
 
 pub struct Binder<'a> {
+    /// Window function calls being bound (their arguments may hold
+    /// aggregates of the query, but not another window call).
+    window_depth: usize,
     pub db: &'a DbState,
     pub sess: &'a SessionInfo,
     /// Parameter types; `unknown` until resolved from context.
@@ -89,6 +92,9 @@ pub struct Binder<'a> {
     frames: Vec<AggFrame>,
     /// The current SELECT's `WINDOW name AS (...)` definitions.
     named_windows: Vec<a::NamedWindowDefinition>,
+    /// Views being expanded, innermost last (a cycle is an error, not a
+    /// stack overflow).
+    expanding_views: Vec<u32>,
 }
 
 fn ident(id: &a::Ident) -> String {
@@ -122,6 +128,7 @@ pub fn unsupported(what: &str) -> PgError {
 impl<'a> Binder<'a> {
     pub fn new(db: &'a DbState, sess: &'a SessionInfo, param_hints: &[Type]) -> Binder<'a> {
         Binder {
+            window_depth: 0,
             db,
             sess,
             params: param_hints.to_vec(),
@@ -131,6 +138,7 @@ impl<'a> Binder<'a> {
             cte_slots: 0,
             frames: vec![],
             named_windows: vec![],
+            expanding_views: vec![],
         }
     }
 
@@ -519,6 +527,15 @@ impl<'a> Binder<'a> {
                 }
             }
             if let Some(f) = &q.fetch
+                && f.with_ties
+                && q.order_by.is_none()
+            {
+                return Err(PgError::new(
+                    code::SYNTAX_ERROR,
+                    "WITH TIES cannot be specified without ORDER BY clause",
+                ));
+            }
+            if let Some(f) = &q.fetch
                 && let Some(qty) = &f.quantity
             {
                 let te = self.bind_expr(qty)?;
@@ -834,7 +851,7 @@ impl<'a> Binder<'a> {
         }
         let frame = self.frames.last_mut().unwrap();
         let aggs = std::mem::take(&mut frame.aggs);
-        let windows = std::mem::take(&mut frame.wins);
+        let mut windows = std::mem::take(&mut frame.wins);
         let grouped = !group_keys.is_empty() || !aggs.is_empty();
         // Rewrite everything above the aggregation step.
         let mut having = having_te.map(|te| te.e);
@@ -855,6 +872,23 @@ impl<'a> Binder<'a> {
             }
             for te in &mut distinct_on {
                 te.e = self.regroup(te.e.clone(), &group_keys, aggs.len())?;
+            }
+            // Windows run over the grouped rows too.
+            for w in &mut windows {
+                for e in w.args.iter_mut().chain(w.partition.iter_mut()) {
+                    *e = self.regroup(e.clone(), &group_keys, aggs.len())?;
+                }
+                for (e, ..) in &mut w.order {
+                    *e = self.regroup(e.clone(), &group_keys, aggs.len())?;
+                }
+                if let Some(agg) = &mut w.agg {
+                    for e in &mut agg.args {
+                        *e = self.regroup(e.clone(), &group_keys, aggs.len())?;
+                    }
+                    if let Some(f) = &mut agg.filter {
+                        *f = self.regroup(f.clone(), &group_keys, aggs.len())?;
+                    }
+                }
             }
         }
         if let Some(h) = &having {
@@ -882,6 +916,13 @@ impl<'a> Binder<'a> {
         let mut exprs: Vec<Expr> = proj.iter().map(|p| p.e.clone()).collect();
         let mut order = vec![];
         for (te, desc, nulls_first, existing) in order_specs {
+            // Enums sort by declaration order: sort on a hidden column of
+            // their sort positions.
+            if let (Base::Enum(_), false) = (te.ty.base, te.ty.array) {
+                exprs.push(enum_order(te.e, te.ty));
+                order.push(SortKey { col: exprs.len() - 1, desc, nulls_first });
+                continue;
+            }
             let col = match existing {
                 Some(i) => i,
                 None => {
@@ -1637,13 +1678,21 @@ impl<'a> Binder<'a> {
         };
         let t = self.db.table(oid).unwrap();
         if t.kind == RelKind::View {
+            if self.expanding_views.contains(&oid) {
+                return Err(PgError::new(
+                    code::INVALID_OBJECT_DEFINITION,
+                    format!("infinite recursion detected in rules for relation \"{}\"", t.name),
+                ));
+            }
             let sql = t.view_sql.clone().unwrap_or_default();
             let stmts = super::parse_sql(&sql)?;
             let a::Statement::Query(q) = &stmts[0] else {
                 return Err(PgError::new(code::INTERNAL_ERROR, "bad view definition"));
             };
             let saved = std::mem::take(&mut self.scopes);
+            self.expanding_views.push(oid);
             let bound = self.bind_query(q);
+            self.expanding_views.pop();
             self.scopes = saved;
             let (query, qcols) = bound?;
             let cols: Vec<OutCol> = t
@@ -1774,6 +1823,20 @@ impl<'a> Binder<'a> {
         }
         if let Some((_, te)) = self.lookup_column(name, rel) {
             return Ok(te);
+        }
+        // SQL keywords that are functions without parentheses.
+        if rel.is_none()
+            && matches!(
+                name,
+                "current_schema"
+                    | "current_catalog"
+                    | "current_role"
+                    | "current_user"
+                    | "session_user"
+                    | "user"
+            )
+        {
+            return self.bind_keyword_function(name);
         }
         match rel {
             Some(r) if !self.rel_in_scope(r) => Err(missing_from(r)),
@@ -2322,7 +2385,14 @@ impl<'a> Binder<'a> {
             Some(te) => Some(Box::new(self.coerce(te, ty, -1, CastCtx::Implicit, "CASE")?)),
             None => None,
         };
-        Ok(TE::new(Expr::Case { operand: None, whens: out_whens, else_: else_e }, ty))
+        let case = Expr::Case { operand: None, whens: out_whens, else_: else_e };
+        if expr_has_srf(&case) {
+            return Err(PgError::new(
+                code::FEATURE_NOT_SUPPORTED,
+                "set-returning functions are not allowed in CASE",
+            ));
+        }
+        Ok(TE::new(case, ty))
     }
 
     fn bind_access(&mut self, root: &a::Expr, chain: &[a::AccessExpr]) -> PgResult<TE> {
@@ -2526,17 +2596,105 @@ impl<'a> Binder<'a> {
             }
             return Ok(and_all(conds));
         }
+        // `xid = int4` (Postgres's xideqint4): `RETURNING xmax = 0`.
+        let int_like = |t: Type| matches!(t.base, Base::Int2 | Base::Int4 | Base::Int8) && !t.array;
+        let as_int8 = |te: TE| TE::new(te.e, Type::INT8);
+        let (l, r) = match (l.ty.base, r.ty.base) {
+            (Base::Xid, _) if int_like(r.ty) && matches!(op, CmpOp::Eq | CmpOp::Ne) => {
+                (as_int8(l), r)
+            }
+            (_, Base::Xid) if int_like(l.ty) && matches!(op, CmpOp::Eq | CmpOp::Ne) => {
+                (l, as_int8(r))
+            }
+            _ => (l, r),
+        };
         let ty = self
             .common_type(&[l.ty, r.ty], "comparison", 0)
             .map_err(|_| no_operator(op.symbol(), l.ty, r.ty))?;
         let le = self.coerce(l, ty, -1, CastCtx::Implicit, "comparison")?;
         let re = self.coerce(r, ty, -1, CastCtx::Implicit, "comparison")?;
+        // Enums compare by declaration order, not by label.
+        let (le, re) = (enum_order(le, ty), enum_order(re, ty));
         Ok(Expr::Compare {
             op,
             left: Box::new(le),
             right: Box::new(re),
             bpchar: ty.base == Base::Bpchar,
         })
+    }
+
+    /// `(s1, e1) OVERLAPS (s2, e2)`: each end may be an interval (a
+    /// length from the start); periods are normalized so start <= end and
+    /// overlap when they share an instant (Postgres's definition, with an
+    /// equal start always overlapping).
+    fn bind_overlaps(&mut self, left: &a::Expr, right: &a::Expr) -> PgResult<TE> {
+        let pair = |e: &a::Expr| -> PgResult<(a::Expr, a::Expr)> {
+            match e {
+                a::Expr::Tuple(items) if items.len() == 2 => {
+                    Ok((items[0].clone(), items[1].clone()))
+                }
+                a::Expr::Nested(inner) => match inner.as_ref() {
+                    a::Expr::Tuple(items) if items.len() == 2 => {
+                        Ok((items[0].clone(), items[1].clone()))
+                    }
+                    _ => Err(PgError::new(
+                        code::SYNTAX_ERROR,
+                        "wrong number of parameters on left side of OVERLAPS expression",
+                    )),
+                },
+                _ => Err(PgError::new(
+                    code::SYNTAX_ERROR,
+                    "wrong number of parameters on left side of OVERLAPS expression",
+                )),
+            }
+        };
+        let ((s1, e1), (s2, e2)) = (pair(left)?, pair(right)?);
+        let mut ends = vec![];
+        for (s, e) in [(s1, e1), (s2, e2)] {
+            let st = self.bind_expr(&s)?;
+            let en = self.bind_expr(&e)?;
+            // An interval end is start + interval.
+            let en = if en.ty.base == Base::Interval && !en.ty.array {
+                self.bind_binary(&s, &a::BinaryOperator::Plus, &e)?
+            } else {
+                en
+            };
+            ends.push((st, en));
+        }
+        let tys: Vec<Type> = ends.iter().flat_map(|(a, b)| [a.ty, b.ty]).collect();
+        let ty = self.common_type(&tys, "OVERLAPS", 0)?;
+        let mut ex = vec![];
+        for (st, en) in ends {
+            let st = self.coerce(st, ty, -1, CastCtx::Implicit, "OVERLAPS")?;
+            let en = self.coerce(en, ty, -1, CastCtx::Implicit, "OVERLAPS")?;
+            // NULL in, NULL out (least/greatest would skip it).
+            let any_null = Expr::Or(vec![
+                Expr::IsNull(Box::new(st.clone()), false),
+                Expr::IsNull(Box::new(en.clone()), false),
+            ]);
+            let guard = |e: Expr| Expr::Case {
+                operand: None,
+                whens: vec![(any_null.clone(), Expr::Const(Value::Null))],
+                else_: Some(Box::new(e)),
+            };
+            ex.push((
+                guard(Expr::Greatest(vec![st.clone(), en.clone()], true)),
+                guard(Expr::Greatest(vec![st, en], false)),
+            ));
+        }
+        let ((a1, b1), (a2, b2)) = (ex[0].clone(), ex[1].clone());
+        let cmp = |op: CmpOp, l: &Expr, r: &Expr| Expr::Compare {
+            op,
+            left: Box::new(l.clone()),
+            right: Box::new(r.clone()),
+            bpchar: false,
+        };
+        let e = Expr::Or(vec![
+            Expr::And(vec![cmp(CmpOp::Gt, &a1, &a2), cmp(CmpOp::Lt, &a1, &b2)]),
+            Expr::And(vec![cmp(CmpOp::Gt, &a2, &a1), cmp(CmpOp::Lt, &a2, &b1)]),
+            cmp(CmpOp::Eq, &a1, &a2),
+        ]);
+        Ok(TE::new(e, Type::BOOL))
     }
 
     fn bind_binary(
@@ -2546,6 +2704,9 @@ impl<'a> Binder<'a> {
         right: &a::Expr,
     ) -> PgResult<TE> {
         use a::BinaryOperator as B;
+        if matches!(op, B::Overlaps) {
+            return self.bind_overlaps(left, right);
+        }
         if matches!(op, B::And | B::Or) {
             let l = self.bind_expr(left)?;
             let r = self.bind_expr(right)?;
@@ -2581,6 +2742,7 @@ impl<'a> Binder<'a> {
             B::AtArrow => "@>",
             B::ArrowAt => "<@",
             B::AtAt => "@@",
+            B::AtQuestion => "@?",
             B::Question => "?",
             B::QuestionPipe => "?|",
             B::QuestionAnd => "?&",
@@ -2731,6 +2893,10 @@ impl<'a> Binder<'a> {
             // Either order (`tsvector @@ tsquery` or `tsquery @@ tsvector`);
             // whichever side already resolved to tsquery decides which is
             // which, defaulting to (tsvector, tsquery) when neither has.
+            // jsonb @? jsonpath (does it yield anything) / jsonb @@ jsonpath
+            // (its single boolean).
+            "@?" => (Type::JSONB, Type::TEXT, Type::BOOL),
+            "@@" if lt.base == Base::Jsonb => (Type::JSONB, Type::TEXT, Type::BOOL),
             "@@" => {
                 if lt.base == Base::Tsquery || rt.base == Base::Tsvector {
                     (Type::TSQUERY, Type::TSVECTOR, Type::BOOL)
@@ -2996,6 +3162,15 @@ impl<'a> Binder<'a> {
                 let mut out = vec![];
                 for te in tes {
                     out.push(self.coerce(te, ty, -1, CastCtx::Implicit, &name)?);
+                }
+                if out.iter().any(expr_has_srf) {
+                    return Err(PgError::new(
+                        code::FEATURE_NOT_SUPPORTED,
+                        format!(
+                            "set-returning functions are not allowed in {}",
+                            name.to_uppercase()
+                        ),
+                    ));
                 }
                 let e = match name.as_str() {
                     "coalesce" => Expr::Coalesce(out),
@@ -3288,10 +3463,29 @@ impl<'a> Binder<'a> {
             None => None,
         };
         let order = order_te.into_iter().map(|(te, d, n)| (te.e, d, n)).collect();
+        // min/max over an enum: compare (sort position, label) records,
+        // then take the label back out.
+        let enum_minmax = matches!(r.sig.name, "min" | "max")
+            && r.arg_tys.first().is_some_and(|t| matches!(t.base, Base::Enum(_)) && !t.array);
+        let (out, arg_tys) = if enum_minmax {
+            let t = r.arg_tys[0];
+            let arg = out.into_iter().next().unwrap();
+            let Base::Enum(oid) = t.base else { unreachable!() };
+            // Strict: a NULL label stays NULL, so the aggregate skips it.
+            let key = Expr::Call {
+                name: "__enum_key",
+                args: vec![Expr::Const(Value::Int(oid as i64)), arg],
+                ty: Type::RECORD,
+                arg_tys: vec![Type::INT4, t],
+            };
+            (vec![key], vec![Type::RECORD])
+        } else {
+            (out, r.arg_tys.clone())
+        };
         let call = AggCall {
             name: r.sig.name,
             args: out,
-            arg_tys: r.arg_tys.clone(),
+            arg_tys,
             ty: r.ret,
             distinct,
             filter: filter_e,
@@ -3307,6 +3501,17 @@ impl<'a> Binder<'a> {
                 frame.aggs.len() - 1
             }
         };
+        if enum_minmax {
+            return Ok(TE::new(
+                Expr::Call {
+                    name: "record_field",
+                    args: vec![Expr::AggRef(idx), Expr::Const(Value::Int(1))],
+                    ty: r.ret,
+                    arg_tys: vec![Type::RECORD, Type::INT4],
+                },
+                r.ret,
+            ));
+        }
         Ok(TE::new(Expr::AggRef(idx), r.ret))
     }
 
@@ -3426,6 +3631,12 @@ impl<'a> Binder<'a> {
     ) -> PgResult<TE> {
         let resolved = self.resolve_window(over)?;
         let spec = &resolved;
+        if self.window_depth > 0 {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                "window function calls cannot be nested",
+            ));
+        }
         if self.frames.is_empty() || self.frames.last().unwrap().forbid.is_some() {
             return Err(PgError::new(
                 code::WINDOWING_ERROR,
@@ -3435,8 +3646,9 @@ impl<'a> Binder<'a> {
                 ),
             ));
         }
-        self.frames
-            .push(AggFrame { forbid: Some("a window function argument"), ..Default::default() });
+        // Windows run after grouping: an aggregate in the arguments, PARTITION
+        // BY or ORDER BY is the query's own (`sum(sum(x)) OVER ()`).
+        self.window_depth += 1;
         let bound: PgResult<Vec<TE>> = args.iter().map(|x| self.bind_expr(x)).collect();
         let partition: PgResult<Vec<TE>> =
             spec.partition_by.iter().map(|x| self.bind_expr(x)).collect();
@@ -3451,7 +3663,7 @@ impl<'a> Binder<'a> {
             })
             .collect();
         let filter_te = filter.as_ref().map(|f| self.bind_expr(f));
-        self.frames.pop();
+        self.window_depth -= 1;
         let bound = bound?;
         let arg_tys: Vec<Type> = bound.iter().map(|t| t.ty).collect();
         let r = if star && name == "count" {
@@ -3501,11 +3713,20 @@ impl<'a> Binder<'a> {
     }
 
     fn bind_frame(&mut self, f: &a::WindowFrame) -> PgResult<Frame> {
+        // RANGE offsets are values of the ORDER BY key's type (a number, or
+        // an interval for a date/timestamp key); ROWS/GROUPS offsets count.
+        let range = matches!(f.units, a::WindowFrameUnits::Range);
         let bound = |b: &a::WindowFrameBound, me: &mut Self| -> PgResult<FrameBound> {
             Ok(match b {
                 a::WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
                 a::WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
                 a::WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+                a::WindowFrameBound::Preceding(Some(e)) if range => {
+                    FrameBound::Preceding(me.bind_expr(e)?.e)
+                }
+                a::WindowFrameBound::Following(Some(e)) if range => {
+                    FrameBound::Following(me.bind_expr(e)?.e)
+                }
                 a::WindowFrameBound::Preceding(Some(e)) => {
                     let te = me.bind_expr(e)?;
                     FrameBound::Preceding(me.coerce(
@@ -3529,15 +3750,25 @@ impl<'a> Binder<'a> {
             })
         };
         let rows = matches!(f.units, a::WindowFrameUnits::Rows);
-        if !rows && !matches!(f.units, a::WindowFrameUnits::Range) {
-            return Err(unsupported("GROUPS window frames"));
-        }
+        let groups = matches!(f.units, a::WindowFrameUnits::Groups);
         let start = bound(&f.start_bound, self)?;
         let end = match &f.end_bound {
             Some(b) => bound(b, self)?,
             None => FrameBound::CurrentRow,
         };
-        Ok(Frame { rows, start, end })
+        if matches!(start, FrameBound::UnboundedFollowing) {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                "frame start cannot be UNBOUNDED FOLLOWING",
+            ));
+        }
+        if matches!(end, FrameBound::UnboundedPreceding) {
+            return Err(PgError::new(
+                code::WINDOWING_ERROR,
+                "frame end cannot be UNBOUNDED PRECEDING",
+            ));
+        }
+        Ok(Frame { rows, groups, start, end })
     }
 
     // -----------------------------------------------------------------
@@ -3900,6 +4131,16 @@ impl<'a> Binder<'a> {
         name
     }
 
+    /// Postgres's FigureIndexColname: the name an index expression gives a
+    /// generated index name (`expr` when it has none).
+    pub fn index_column_name(&self, e: &a::Expr) -> String {
+        let te = TE::new(Expr::Const(Value::Null), Type::TEXT);
+        match self.colname_strength(e, &te) {
+            (_, 0) => "expr".into(),
+            (n, _) => n,
+        }
+    }
+
     /// (name, strength): 2 is a name of its own, 1 a fallback from a cast or
     /// CASE, 0 none at all.
     fn colname_strength(&self, e: &a::Expr, te: &TE) -> (String, u8) {
@@ -4077,7 +4318,7 @@ impl<'a> Binder<'a> {
                 defaults,
                 on_conflict,
                 returning,
-                overriding_system: false,
+                overriding_system: ins.overwrite,
             })),
             cols: rcols,
             tag: "INSERT",
@@ -4297,6 +4538,37 @@ impl<'a> Binder<'a> {
                         )
                     })?);
                 }
+                // The columns must be exactly some unique index's.
+                let mut want = idx.clone();
+                want.sort_unstable();
+                let matches = table
+                    .constraints
+                    .iter()
+                    .filter(|c| {
+                        matches!(
+                            c.kind,
+                            super::catalog::ConstraintKind::PrimaryKey
+                                | super::catalog::ConstraintKind::Unique
+                        )
+                    })
+                    .map(|c| c.cols.clone())
+                    .chain(
+                        table
+                            .indexes
+                            .iter()
+                            .filter(|i| i.unique && i.cols.iter().all(Option::is_some))
+                            .map(|i| i.cols.iter().flatten().copied().collect()),
+                    )
+                    .any(|mut c: Vec<usize>| {
+                        c.sort_unstable();
+                        c == want
+                    });
+                if !matches {
+                    return Err(PgError::new(
+                        code::INVALID_COLUMN_REFERENCE,
+                        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                    ));
+                }
                 Some(idx)
             }
             Some(a::ConflictTarget::OnConstraint(name)) => {
@@ -4387,6 +4659,15 @@ impl<'a> Binder<'a> {
         if matches!(&asg.value, a::Expr::Identifier(id) if ident(id) == "default") {
             return Ok((idx, Expr::Default(idx)));
         }
+        if let Some((true, _)) = table.columns[idx].identity {
+            return Err(PgError::new(
+                code::GENERATED_ALWAYS,
+                format!("column \"{col}\" can only be updated to DEFAULT"),
+            )
+            .detail(format!(
+                "Column \"{col}\" is an identity column defined as GENERATED ALWAYS."
+            )));
+        }
         let te = self.bind_expr(&asg.value)?;
         let c = &table.columns[idx];
         let e = self.coerce_assign(te, c.ty, c.typmod, &c.name, &table.name)?;
@@ -4415,6 +4696,9 @@ impl<'a> Binder<'a> {
                 rec: None,
             });
         }
+        // System columns follow the table's (the DML appends their values:
+        // `RETURNING xmax = 0` tells an upsert's insert from its update).
+        push_system_cols(&mut scope, &table.name, oid, table.columns.len());
         scope.rels.push(table.name.clone());
         self.scopes.push(scope);
         self.frames.push(AggFrame { forbid: Some("RETURNING"), ..Default::default() });
@@ -5187,5 +5471,19 @@ fn source_width(q: &a::Query) -> Option<usize> {
             Some(sel.projection.len())
         }
         _ => None,
+    }
+}
+
+/// An enum-typed expression as its label's sort position (enums order by
+/// declaration, not alphabetically); anything else unchanged.
+fn enum_order(e: Expr, ty: Type) -> Expr {
+    match (ty.base, ty.array) {
+        (Base::Enum(oid), false) => Expr::Call {
+            name: "__enum_sortorder",
+            args: vec![Expr::Const(Value::Int(oid as i64)), e],
+            ty: Type::FLOAT8,
+            arg_tys: vec![Type::INT4, ty],
+        },
+        _ => e,
     }
 }

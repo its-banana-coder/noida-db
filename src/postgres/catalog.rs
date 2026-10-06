@@ -107,6 +107,9 @@ pub struct Constraint {
     /// Backing index for PK/UNIQUE.
     pub index_oid: Option<u32>,
     pub deferrable: bool,
+    /// `INITIALLY DEFERRED`: a foreign key checked at COMMIT.
+    #[serde(default)]
+    pub initially_deferred: bool,
     pub comment: Option<String>,
 }
 
@@ -165,9 +168,64 @@ pub struct Table {
     /// A materialized view populated by its own `CREATE`/`REFRESH`
     /// (always `true` for an ordinary table or view).
     pub matview_populated: bool,
+    /// A temporary table's `ON COMMIT` action.
+    #[serde(default)]
+    pub on_commit: OnCommit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum OnCommit {
+    #[default]
+    PreserveRows,
+    DeleteRows,
+    Drop,
+}
+
+thread_local! {
+    /// The temporary schema of the session running on this thread, which
+    /// `pg_temp` names.
+    static TEMP_SCHEMA: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+pub fn set_session_temp_schema(name: &str) {
+    TEMP_SCHEMA.with(|t| {
+        if *t.borrow() != name {
+            *t.borrow_mut() = name.to_string();
+        }
+    });
+}
+
+pub fn session_temp_schema() -> String {
+    TEMP_SCHEMA.with(|t| t.borrow().clone())
+}
+
+/// A session's temporary schema (`pg_temp_N`).
+pub fn is_temp_schema(name: &str) -> bool {
+    name.starts_with("pg_temp_")
 }
 
 impl Table {
+    /// A copy of everything but the rows (cheap: what per-row checks need).
+    pub fn without_rows(&self) -> Table {
+        Table {
+            oid: self.oid,
+            name: self.name.clone(),
+            schema: self.schema,
+            kind: self.kind.clone(),
+            columns: self.columns.clone(),
+            rows: Vec::new(),
+            constraints: self.constraints.clone(),
+            indexes: self.indexes.clone(),
+            view_sql: self.view_sql.clone(),
+            comment: self.comment.clone(),
+            type_oid: self.type_oid,
+            temp: self.temp,
+            owner_session: self.owner_session,
+            matview_populated: self.matview_populated,
+            on_commit: self.on_commit,
+        }
+    }
+
     pub fn col_index(&self, name: &str) -> Option<usize> {
         self.columns.iter().position(|c| !c.dropped && c.name == name)
     }
@@ -276,7 +334,19 @@ pub struct DbState {
     /// Triggers, by OID.
     #[serde(default)]
     pub triggers: BTreeMap<u32, Trigger>,
+    /// Extensions created (beyond the built-in plpgsql): name -> (OID, schema).
+    #[serde(default)]
+    pub extensions: BTreeMap<String, (u32, u32)>,
 }
+
+/// Extensions whose functions and types noida-db provides: (name, version,
+/// description). plpgsql is always installed.
+pub const EXTENSIONS: &[(&str, &str, &str)] = &[
+    ("plpgsql", "1.0", "PL/pgSQL procedural language"),
+    ("pgcrypto", "1.3", "cryptographic functions"),
+    ("uuid-ossp", "1.1", "generate universally unique identifiers (UUIDs)"),
+    ("citext", "1.6", "data type for case-insensitive character strings"),
+];
 
 /// A `CREATE FUNCTION` / `CREATE PROCEDURE`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -371,6 +441,7 @@ impl Default for DbState {
             db_comment: None,
             functions: BTreeMap::new(),
             triggers: BTreeMap::new(),
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -383,7 +454,41 @@ impl DbState {
     }
 
     pub fn schema_by_name(&self, name: &str) -> Option<u32> {
+        if name == "pg_temp" {
+            let own = session_temp_schema();
+            return self.schemas.values().find(|s| !own.is_empty() && s.name == own).map(|s| s.oid);
+        }
         self.schemas.values().find(|s| s.name == name).map(|s| s.oid)
+    }
+
+    /// Drops schema `name` and everything in it (a temporary schema at
+    /// session end).
+    pub fn drop_schema_objects(&mut self, name: &str) {
+        let Some(oid) = self.schemas.values().find(|s| s.name == name).map(|s| s.oid) else {
+            return;
+        };
+        let tables: Vec<u32> =
+            self.tables.values().filter(|t| t.schema == oid).map(|t| t.oid).collect();
+        self.tables.retain(|_, t| t.schema != oid);
+        self.triggers.retain(|_, tr| !tables.contains(&tr.table));
+        self.sequences.retain(|_, s| s.schema != oid);
+        self.enums.retain(|_, e| e.schema != oid);
+        self.domains.retain(|_, d| d.schema != oid);
+        self.functions.retain(|_, f| f.schema != oid);
+        self.schemas.remove(&oid);
+    }
+
+    /// Drops every session's temporary schema (they don't outlive a restart).
+    pub fn drop_temp_schemas(&mut self) {
+        let names: Vec<String> = self
+            .schemas
+            .values()
+            .filter(|s| is_temp_schema(&s.name))
+            .map(|s| s.name.clone())
+            .collect();
+        for n in names {
+            self.drop_schema_objects(&n);
+        }
     }
 
     /// How a relation prints as a `regclass`: schema-qualified unless its

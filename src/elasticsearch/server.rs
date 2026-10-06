@@ -54,7 +54,7 @@ pub fn spawn_persistent_for_test(
 
 pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
     let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
-    crate::persistence::on_shutdown(save);
+    crate::persistence::on_save("elasticsearch", save);
     Ok(addr)
 }
 

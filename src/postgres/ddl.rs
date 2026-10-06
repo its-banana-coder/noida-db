@@ -25,16 +25,29 @@ fn ident(id: &a::Ident) -> String {
 
 impl Ddl<'_, '_> {
     /// The schema a new object goes into, and its name.
-    fn target(&self, parts: &[String]) -> PgResult<(u32, String)> {
+    fn target(&mut self, parts: &[String]) -> PgResult<(u32, String)> {
         let name = parts.last().cloned().unwrap_or_default();
         let schema = if parts.len() > 1 {
             let s = &parts[parts.len() - 2];
-            self.ctx.db.schema_by_name(s).ok_or_else(|| {
-                PgError::new(code::INVALID_SCHEMA_NAME, format!("schema \"{s}\" does not exist"))
-            })?
+            if s == "pg_temp" {
+                self.temp_schema()
+            } else {
+                self.ctx.db.schema_by_name(s).ok_or_else(|| {
+                    PgError::new(
+                        code::INVALID_SCHEMA_NAME,
+                        format!("schema \"{s}\" does not exist"),
+                    )
+                })?
+            }
         } else {
+            // The explicit search_path: the temporary schema is a creation
+            // target only when search_path names it.
             let mut found = None;
-            for s in &self.info.search_path {
+            for s in &self.ctx.rt.settings.search_path(&self.ctx.rt.user) {
+                if s == &self.ctx.rt.settings.temp_schema {
+                    found = Some(self.temp_schema());
+                    break;
+                }
                 if let Some(oid) = self.ctx.db.schema_by_name(s) {
                     found = Some(oid);
                     break;
@@ -45,6 +58,24 @@ impl Ddl<'_, '_> {
             })?
         };
         Ok((schema, types::truncate_name(&name)))
+    }
+
+    /// This session's temporary schema, created on first use.
+    fn temp_schema(&mut self) -> u32 {
+        let name = self.ctx.rt.settings.temp_schema.clone();
+        if let Some(oid) = self.ctx.db.schemas.values().find(|s| s.name == name).map(|s| s.oid) {
+            return oid;
+        }
+        let oid = self.ctx.db.alloc_oid();
+        self.ctx
+            .db
+            .schemas
+            .insert(oid, Schema { oid, name, owner: BOOTSTRAP_SUPERUSER, comment: None });
+        oid
+    }
+
+    fn is_temp_schema(&self, oid: u32) -> bool {
+        super::catalog::is_temp_schema(self.ctx.db.schema_name(oid))
     }
 
     fn binder(&self) -> (DbState, SessionInfo) {
@@ -62,10 +93,27 @@ impl Ddl<'_, '_> {
 
     pub fn create_table(&mut self, ct: &a::CreateTable) -> PgResult<String> {
         let parts = name_parts(&ct.name);
-        let (schema, name) = self.target(&parts)?;
+        let (mut schema, name) = self.target(&parts)?;
         if ct.temporary {
-            // Temporary tables live in the session's own schema; noida-db keeps
-            // them in the normal one, which is fine for a single connection.
+            if parts.len() > 1 && !self.is_temp_schema(schema) {
+                return Err(PgError::new(
+                    code::INVALID_TABLE_DEFINITION,
+                    "cannot create temporary relation in non-temporary schema",
+                ));
+            }
+            schema = self.temp_schema();
+        }
+        let temp = self.is_temp_schema(schema);
+        let on_commit = match ct.on_commit {
+            None | Some(a::OnCommit::PreserveRows) => super::catalog::OnCommit::PreserveRows,
+            Some(a::OnCommit::DeleteRows) => super::catalog::OnCommit::DeleteRows,
+            Some(a::OnCommit::Drop) => super::catalog::OnCommit::Drop,
+        };
+        if ct.on_commit.is_some() && !temp {
+            return Err(PgError::new(
+                code::INVALID_TABLE_DEFINITION,
+                "ON COMMIT can only be used on temporary tables",
+            ));
         }
         if self.ctx.db.relation_exists(schema, &name) {
             if ct.if_not_exists {
@@ -90,9 +138,10 @@ impl Ddl<'_, '_> {
             view_sql: None,
             comment: None,
             type_oid,
-            temp: ct.temporary,
+            temp,
             owner_session: None,
             matview_populated: true,
+            on_commit,
         };
         // CREATE TABLE AS SELECT
         if let Some(q) = &ct.query {
@@ -141,6 +190,7 @@ impl Ddl<'_, '_> {
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
+                                deferral: deferral(&fk.characteristics),
                             },
                         ));
                     }
@@ -279,6 +329,7 @@ impl Ddl<'_, '_> {
                     cols: fk.referred_columns.iter().map(ident).collect(),
                     on_delete: fk_action(&fk.on_delete),
                     on_update: fk_action(&fk.on_update),
+                    deferral: deferral(&fk.characteristics),
                 },
             ),
             a::TableConstraint::Check(chk) => (
@@ -309,12 +360,20 @@ impl Ddl<'_, '_> {
                 )
             })?);
         }
+        let mut fk_deferral = (false, false);
         let (kind, label, nulls_distinct) = match kind {
             PendingConstraint::PrimaryKey => (ConstraintKind::PrimaryKey, "pkey", true),
             PendingConstraint::Unique => (ConstraintKind::Unique, "key", true),
             PendingConstraint::UniqueNulls(nd) => (ConstraintKind::Unique, "key", nd),
             PendingConstraint::Check(sql) => (ConstraintKind::Check(sql), "check", true),
-            PendingConstraint::ForeignKey { table: parts, cols: refcols, on_delete, on_update } => {
+            PendingConstraint::ForeignKey {
+                table: parts,
+                cols: refcols,
+                on_delete,
+                on_update,
+                deferral,
+            } => {
+                fk_deferral = deferral;
                 let rname = parts.last().cloned().unwrap_or_default();
                 let rschema =
                     if parts.len() > 1 { Some(parts[parts.len() - 2].clone()) } else { None };
@@ -449,7 +508,8 @@ impl Ddl<'_, '_> {
             kind,
             cols: idxs,
             index_oid,
-            deferrable: false,
+            deferrable: fk_deferral.0,
+            initially_deferred: fk_deferral.1,
             comment: None,
         });
         // Existing rows must satisfy the new constraint.
@@ -542,6 +602,7 @@ impl Ddl<'_, '_> {
             Err(e) => return Err(e),
         };
         let mut seq = self.ctx.db.sequences.get(&found).cloned().unwrap();
+        let old_text = self.ctx.db.regclass_text(seq.schema, &seq.name, &self.info.search_path);
         apply_seq_options(&mut seq, d, false)?;
         if let Some(new_name) = &d.rename_to {
             if self.ctx.db.relation_exists(seq.schema, new_name) {
@@ -559,6 +620,29 @@ impl Ddl<'_, '_> {
                     format!("schema \"{schema}\" does not exist"),
                 )
             })?;
+        }
+        // Defaults name the sequence as text (Postgres holds its OID):
+        // follow a rename or move.
+        let new_text = self.ctx.db.regclass_text(seq.schema, &seq.name, &self.info.search_path);
+        if new_text != old_text {
+            let (from, to) = (format!("'{old_text}'::regclass"), format!("'{new_text}'::regclass"));
+            let oids: Vec<u32> = self
+                .ctx
+                .db
+                .tables
+                .values()
+                .filter(|t| {
+                    t.columns.iter().any(|c| c.default.as_ref().is_some_and(|d| d.contains(&from)))
+                })
+                .map(|t| t.oid)
+                .collect();
+            for oid in oids {
+                for c in &mut self.ctx.db.table_mut(oid).unwrap().columns {
+                    if let Some(d) = &mut c.default {
+                        *d = d.replace(&from, &to);
+                    }
+                }
+            }
         }
         self.ctx.db.sequences.insert(found, seq);
         if let Some(restart) = d.restart {
@@ -643,9 +727,13 @@ impl Ddl<'_, '_> {
         columns: &[a::ViewColumnDef],
         or_replace: bool,
         materialized: bool,
+        temporary: bool,
     ) -> PgResult<String> {
         let parts = name_parts(name);
-        let (schema, vname) = self.target(&parts)?;
+        let (mut schema, vname) = self.target(&parts)?;
+        if temporary {
+            schema = self.temp_schema();
+        }
         let (db, info) = self.binder();
         let mut b = Binder::new(&db, &info, &[]);
         let (_, cols) = b.bind_query(query)?;
@@ -679,6 +767,7 @@ impl Ddl<'_, '_> {
             temp: false,
             owner_session: None,
             matview_populated: true,
+            on_commit: Default::default(),
         };
         self.ctx.db.tables.insert(oid, std::sync::Arc::new(table));
         if materialized {
@@ -730,6 +819,99 @@ impl Ddl<'_, '_> {
         Ok("REFRESH MATERIALIZED VIEW".into())
     }
 
+    pub fn create_extension(&mut self, ce: &a::CreateExtension) -> PgResult<String> {
+        let name = ce.name.value.clone();
+        if !EXTENSIONS.iter().any(|(n, ..)| *n == name) {
+            return Err(PgError::new(
+                code::UNDEFINED_FILE,
+                format!(
+                    "could not open extension control file \"/usr/share/postgresql/16/extension/{name}.control\": No such file or directory"
+                ),
+            ));
+        }
+        if name == "plpgsql" || self.ctx.db.extensions.contains_key(&name) {
+            if ce.if_not_exists {
+                let msg = format!("extension \"{name}\" already exists, skipping");
+                self.ctx.rt.notices.push(PgError::notice(msg));
+                return Ok("CREATE EXTENSION".into());
+            }
+            return Err(PgError::new(
+                code::DUPLICATE_OBJECT,
+                format!("extension \"{name}\" already exists"),
+            ));
+        }
+        let schema = match &ce.schema {
+            Some(s) => self.ctx.db.schema_by_name(&s.value).ok_or_else(|| {
+                PgError::new(
+                    code::INVALID_SCHEMA_NAME,
+                    format!("schema \"{}\" does not exist", s.value),
+                )
+            })?,
+            None => self.target(std::slice::from_ref(&name))?.0,
+        };
+        let oid = self.ctx.db.alloc_oid();
+        self.ctx.db.extensions.insert(name, (oid, schema));
+        Ok("CREATE EXTENSION".into())
+    }
+
+    pub fn drop_extension(&mut self, de: &a::DropExtension) -> PgResult<String> {
+        for id in &de.names {
+            let name = &id.value;
+            if name == "plpgsql" || self.ctx.db.extensions.remove(name).is_some() {
+                continue;
+            }
+            if de.if_exists {
+                let msg = format!("extension \"{name}\" does not exist, skipping");
+                self.ctx.rt.notices.push(PgError::notice(msg));
+                continue;
+            }
+            return Err(PgError::new(
+                code::UNDEFINED_OBJECT,
+                format!("extension \"{name}\" does not exist"),
+            ));
+        }
+        Ok("DROP EXTENSION".into())
+    }
+
+    /// `ALTER INDEX name RENAME TO new`; a constraint's index renames the
+    /// constraint too, as in Postgres.
+    pub fn rename_index(&mut self, name: &a::ObjectName, new: &a::ObjectName) -> PgResult<String> {
+        let parts = name_parts(name);
+        let n = parts.last().cloned().unwrap_or_default();
+        let schemas: Vec<u32> = if parts.len() > 1 {
+            self.ctx.db.schema_by_name(&parts[parts.len() - 2]).into_iter().collect()
+        } else {
+            self.info.search_path.iter().filter_map(|s| self.ctx.db.schema_by_name(s)).collect()
+        };
+        let found =
+            schemas.iter().find_map(|&s| self.ctx.db.find_index(s, &n).map(|(t, i)| (s, t, i.oid)));
+        let Some((schema, table, idx_oid)) = found else {
+            return Err(PgError::new(
+                code::UNDEFINED_TABLE,
+                format!("relation \"{n}\" does not exist"),
+            ));
+        };
+        let new_name = types::truncate_name(&name_parts(new).pop().unwrap_or_default());
+        if self.ctx.db.relation_exists(schema, &new_name) {
+            return Err(PgError::new(
+                code::DUPLICATE_TABLE,
+                format!("relation \"{new_name}\" already exists"),
+            ));
+        }
+        let t = self.ctx.db.table_mut(table).unwrap();
+        for i in &mut t.indexes {
+            if i.oid == idx_oid {
+                i.name = new_name.clone();
+            }
+        }
+        for c in &mut t.constraints {
+            if c.index_oid == Some(idx_oid) {
+                c.name = new_name.clone();
+            }
+        }
+        Ok("ALTER INDEX".into())
+    }
+
     pub fn create_index(&mut self, ci: &a::CreateIndex) -> PgResult<String> {
         let parts = name_parts(&ci.table_name);
         let tname = parts.last().cloned().unwrap_or_default();
@@ -740,6 +922,7 @@ impl Ddl<'_, '_> {
         let t = db.table(oid).unwrap();
         let mut cols = vec![];
         let mut exprs = vec![];
+        let mut expr_names = vec![];
         let mut desc = vec![];
         for c in &ci.columns {
             desc.push(c.column.options.sort == Some(a::OrderBySort::Desc));
@@ -759,17 +942,19 @@ impl Ddl<'_, '_> {
                     b2.bind_table_expr(t, &other.to_string())?;
                     cols.push(None);
                     exprs.push(other.to_string());
+                    expr_names.push(b2.index_column_name(other));
                 }
             }
         }
         let name = match &ci.name {
             Some(n) => name_parts(n).pop().unwrap_or_default(),
             None => {
+                let mut names = expr_names.into_iter();
                 let base: Vec<String> = cols
                     .iter()
                     .map(|c| match c {
                         Some(i) => t.columns[*i].name.clone(),
-                        None => "expr".into(),
+                        None => names.next().unwrap_or_else(|| "expr".into()),
                     })
                     .collect();
                 self.ctx.db.unique_rel_name(t.schema, &format!("{}_{}_idx", t.name, base.join("_")))
@@ -809,8 +994,8 @@ impl Ddl<'_, '_> {
         if ci.unique {
             let t = self.ctx.db.table(oid).unwrap().clone();
             let idx = t.indexes.last().unwrap().clone();
-            for (i, r) in t.rows.iter().enumerate() {
-                if super::dml::unique_index_conflict(self.ctx, &t, &idx, r, Some(i))?.is_some() {
+            {
+                if super::dml::unique_index_has_duplicate(self.ctx, &t, &idx)? {
                     let names: Vec<String> = idx
                         .cols
                         .iter()
@@ -854,6 +1039,94 @@ impl Ddl<'_, '_> {
         Ok("CREATE TYPE".into())
     }
 
+    /// `ALTER TYPE <enum> ADD VALUE [IF NOT EXISTS] 'v' [BEFORE|AFTER 'x']`
+    /// and `RENAME VALUE 'a' TO 'b'`.
+    pub fn alter_type(
+        &mut self,
+        name: &a::ObjectName,
+        op: &a::AlterTypeOperation,
+    ) -> PgResult<String> {
+        let parts = name_parts(name);
+        let (schema, n) = self.target(&parts)?;
+        let oid = self
+            .ctx
+            .db
+            .find_enum(schema, &n)
+            .or_else(|| {
+                (parts.len() == 1)
+                    .then(|| self.ctx.db.enums.values().find(|e| e.name == n))
+                    .flatten()
+            })
+            .map(|e| e.oid)
+            .ok_or_else(|| {
+                PgError::new(code::UNDEFINED_OBJECT, format!("type \"{n}\" does not exist"))
+            })?;
+        match op {
+            a::AlterTypeOperation::AddValue(add) => {
+                let label = add.value.value.clone();
+                let e = &self.ctx.db.enums[&oid];
+                if e.labels.iter().any(|(_, l, _)| *l == label) {
+                    if add.if_not_exists {
+                        return Ok("ALTER TYPE".into());
+                    }
+                    return Err(PgError::new(
+                        code::DUPLICATE_OBJECT,
+                        format!("enum label \"{label}\" already exists"),
+                    ));
+                }
+                let mut sorted = e.labels.clone();
+                sorted.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+                let order = match &add.position {
+                    None => sorted.last().map_or(1.0, |l| l.0 + 1.0),
+                    Some(pos) => {
+                        let (nb, before) = match pos {
+                            a::AlterTypeAddValuePosition::Before(x) => (&x.value, true),
+                            a::AlterTypeAddValuePosition::After(x) => (&x.value, false),
+                        };
+                        let Some(i) = sorted.iter().position(|(_, l, _)| l == nb) else {
+                            return Err(PgError::new(
+                                code::INVALID_PARAMETER_VALUE,
+                                format!("\"{nb}\" is not an existing enum label"),
+                            ));
+                        };
+                        let here = sorted[i].0;
+                        if before {
+                            let prev = if i == 0 { here - 1.0 } else { sorted[i - 1].0 };
+                            (prev + here) / 2.0
+                        } else {
+                            let next = sorted.get(i + 1).map_or(here + 1.0, |l| l.0);
+                            (here + next) / 2.0
+                        }
+                    }
+                };
+                let loid = self.ctx.db.alloc_oid();
+                self.ctx.db.enums.get_mut(&oid).unwrap().labels.push((order, label, loid));
+                Ok("ALTER TYPE".into())
+            }
+            a::AlterTypeOperation::RenameValue(r) => {
+                let e = self.ctx.db.enums.get_mut(&oid).unwrap();
+                if e.labels.iter().any(|(_, l, _)| *l == r.to.value) {
+                    return Err(PgError::new(
+                        code::DUPLICATE_OBJECT,
+                        format!("enum label \"{}\" already exists", r.to.value),
+                    ));
+                }
+                let Some(slot) = e.labels.iter_mut().find(|(_, l, _)| *l == r.from.value) else {
+                    return Err(PgError::new(
+                        code::INVALID_PARAMETER_VALUE,
+                        format!("\"{}\" is not an existing enum label", r.from.value),
+                    ));
+                };
+                slot.1 = r.to.value.clone();
+                Ok("ALTER TYPE".into())
+            }
+            a::AlterTypeOperation::Rename(r) => {
+                self.ctx.db.enums.get_mut(&oid).unwrap().name = r.new_name.value.clone();
+                Ok("ALTER TYPE".into())
+            }
+        }
+    }
+
     pub fn drop(&mut self, d: &a::Statement) -> PgResult<String> {
         let a::Statement::Drop { object_type, if_exists, names, cascade, .. } = d else {
             return Err(unsupported("DROP"));
@@ -864,9 +1137,33 @@ impl Ddl<'_, '_> {
             let schema = (parts.len() > 1).then(|| parts[parts.len() - 2].clone());
             let found = self.find_object(*object_type, schema.as_deref(), &n)?;
             match found {
-                None if *if_exists => continue,
+                None if *if_exists => {
+                    let msg = match schema.as_deref() {
+                        Some(s) if self.ctx.db.schema_by_name(s).is_none() => {
+                            format!("schema \"{s}\" does not exist, skipping")
+                        }
+                        _ => format!(
+                            "{} \"{n}\" does not exist, skipping",
+                            object_kind_name(*object_type).to_ascii_lowercase()
+                        ),
+                    };
+                    self.ctx.rt.notices.push(PgError::notice(msg));
+                    continue;
+                }
                 None => {
                     return Err(match object_type {
+                        _ if schema
+                            .as_deref()
+                            .is_some_and(|s| self.ctx.db.schema_by_name(s).is_none()) =>
+                        {
+                            PgError::new(
+                                code::INVALID_SCHEMA_NAME,
+                                format!(
+                                    "schema \"{}\" does not exist",
+                                    schema.as_deref().unwrap_or("")
+                                ),
+                            )
+                        }
                         a::ObjectType::Schema => PgError::new(
                             code::INVALID_SCHEMA_NAME,
                             format!("schema \"{n}\" does not exist"),
@@ -878,6 +1175,16 @@ impl Ddl<'_, '_> {
                         a::ObjectType::Index => PgError::new(
                             code::UNDEFINED_OBJECT,
                             format!("index \"{n}\" does not exist"),
+                        ),
+                        a::ObjectType::Table
+                        | a::ObjectType::View
+                        | a::ObjectType::MaterializedView
+                        | a::ObjectType::Sequence => PgError::new(
+                            code::UNDEFINED_TABLE,
+                            format!(
+                                "{} \"{n}\" does not exist",
+                                object_kind_name(*object_type).to_ascii_lowercase()
+                            ),
                         ),
                         _ => undefined_table(&n),
                     });
@@ -1053,10 +1360,43 @@ impl Ddl<'_, '_> {
         let schema = (parts.len() > 1).then(|| parts[parts.len() - 2].clone());
         let (db, info) = self.binder();
         let b = Binder::new(&db, &info, &[]);
+        // `ALTER TABLE` renames an index or a sequence as well.
+        if let [a::AlterTableOperation::RenameTable { table_name }] = ops {
+            let new = match table_name {
+                a::RenameTableNameKind::As(n) | a::RenameTableNameKind::To(n) => n,
+            };
+            let schemas: Vec<u32> = match &schema {
+                Some(s) => self.ctx.db.schema_by_name(s).into_iter().collect(),
+                None => self
+                    .info
+                    .search_path
+                    .iter()
+                    .filter_map(|s| self.ctx.db.schema_by_name(s))
+                    .collect(),
+            };
+            if b.lookup_table_oid(schema.as_deref(), &tname).is_err() {
+                if schemas.iter().any(|&s| self.ctx.db.find_index(s, &tname).is_some()) {
+                    self.rename_index(name, new)?;
+                    return Ok("ALTER TABLE".into());
+                }
+                if schemas.iter().any(|&s| self.ctx.db.find_sequence(s, &tname).is_some()) {
+                    let d = SeqDdl {
+                        name: name_parts(name),
+                        rename_to: name_parts(new).pop(),
+                        ..Default::default()
+                    };
+                    self.alter_sequence(&d)?;
+                    return Ok("ALTER TABLE".into());
+                }
+            }
+        }
         let oid = match b.lookup_table_oid(schema.as_deref(), &tname) {
             Ok(o) => o,
             Err(e) => {
                 if if_exists {
+                    self.ctx.rt.notices.push(PgError::notice(format!(
+                        "relation \"{tname}\" does not exist, skipping"
+                    )));
                     return Ok("ALTER TABLE".into());
                 }
                 return Err(e);
@@ -1106,6 +1446,7 @@ impl Ddl<'_, '_> {
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
+                                deferral: deferral(&fk.characteristics),
                             });
                         }
                         a::ColumnOption::Generated { generation_expr, .. } => {
@@ -1164,23 +1505,46 @@ impl Ddl<'_, '_> {
                     _ => None,
                 };
                 let nrows = self.ctx.db.table(oid).unwrap().rows.len();
-                for i in 0..nrows {
+                let not_null = self.ctx.db.table(oid).unwrap().columns[idx].not_null;
+                let mut values = Vec::with_capacity(nrows);
+                for _ in 0..nrows {
                     let v = match &value {
                         Some(e) => super::exec::eval(e, &[], self.ctx)?,
                         None => Value::Null,
                     };
-                    let v = super::casts::cast(
-                        v,
-                        Type::INT8,
-                        ty,
-                        typmod,
-                        false,
-                        &self.info.fmt,
-                        self.info.now,
-                    )
-                    .unwrap_or(Value::Null);
+                    // nextval() is int8; a default was already coerced.
+                    let v = if default_sql.is_none() && has_identity {
+                        super::casts::cast(
+                            v,
+                            Type::INT8,
+                            ty,
+                            typmod,
+                            false,
+                            &self.info.fmt,
+                            self.info.now,
+                        )
+                        .unwrap_or(Value::Null)
+                    } else {
+                        v
+                    };
+                    values.push(v);
+                }
+                // NOT NULL without a default on a table with rows fails, and
+                // the column isn't added.
+                if not_null && values.iter().any(Value::is_null) {
                     let t = self.ctx.db.table_mut(oid).unwrap();
-                    t.rows[i].push(v);
+                    t.columns.pop();
+                    let tname = t.name.clone();
+                    return Err(PgError::new(
+                        code::NOT_NULL_VIOLATION,
+                        format!("column \"{cname}\" of relation \"{tname}\" contains null values"),
+                    )
+                    .table("public", &tname)
+                    .column(&cname));
+                }
+                let t = self.ctx.db.table_mut(oid).unwrap();
+                for (r, v) in t.rows.iter_mut().zip(values) {
+                    r.push(v);
                 }
                 if nrows == 0 {
                     let t = self.ctx.db.table_mut(oid).unwrap();
@@ -1199,6 +1563,11 @@ impl Ddl<'_, '_> {
                     let t = self.ctx.db.table(oid).unwrap();
                     let Some(idx) = t.col_index(&cname) else {
                         if *if_exists {
+                            let msg = format!(
+                                "column \"{cname}\" of relation \"{}\" does not exist, skipping",
+                                t.name
+                            );
+                            self.ctx.rt.notices.push(PgError::notice(msg));
                             continue;
                         }
                         return Err(PgError::new(
@@ -1379,6 +1748,11 @@ impl Ddl<'_, '_> {
                 let t = self.ctx.db.table(oid).unwrap();
                 if !t.constraints.iter().any(|c| c.name == n) {
                     if *if_exists {
+                        let msg = format!(
+                            "constraint \"{n}\" of relation \"{}\" does not exist, skipping",
+                            t.name
+                        );
+                        self.ctx.rt.notices.push(PgError::notice(msg));
                         return Ok(());
                     }
                     return Err(PgError::new(
@@ -1658,7 +2032,21 @@ enum PendingConstraint {
     Unique,
     UniqueNulls(bool),
     Check(String),
-    ForeignKey { table: Vec<String>, cols: Vec<String>, on_delete: FkAction, on_update: FkAction },
+    ForeignKey {
+        table: Vec<String>,
+        cols: Vec<String>,
+        on_delete: FkAction,
+        on_update: FkAction,
+        /// (DEFERRABLE, INITIALLY DEFERRED)
+        deferral: (bool, bool),
+    },
+}
+
+/// A constraint's `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`.
+fn deferral(c: &Option<a::ConstraintCharacteristics>) -> (bool, bool) {
+    let Some(c) = c else { return (false, false) };
+    let deferred = matches!(c.initially, Some(a::DeferrableInitial::Deferred));
+    (c.deferrable.unwrap_or(false) || deferred, deferred)
 }
 
 fn fk_action(a: &Option<a::ReferentialAction>) -> FkAction {

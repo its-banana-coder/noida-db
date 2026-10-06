@@ -149,18 +149,21 @@ struct Global {
 
 #[derive(Clone)]
 struct SessionHandle {
-    pid: i32,
-    secret: i32,
-    cancel: Arc<AtomicBool>,
     channels: Vec<String>,
     notifications: Arc<Mutex<Vec<(i32, String, String)>>>,
     database: String,
 }
 
+/// Each session's cancel flag, by (pid, secret key).
+type CancelFlags = BTreeMap<(i32, i32), Arc<AtomicBool>>;
+
 #[derive(Clone)]
 pub struct Engine {
     global: Arc<Mutex<Global>>,
     next_pid: Arc<AtomicI32>,
+    /// Cancel flags by (pid, secret), apart from `global`, which a running
+    /// statement holds: a CancelRequest must get through meanwhile.
+    cancels: Arc<Mutex<CancelFlags>>,
 }
 
 impl Default for Engine {
@@ -179,7 +182,12 @@ impl Engine {
                 SnapshotDb {
                     oid: db.oid,
                     name: db.name.clone(),
-                    db: db.db.clone(),
+                    db: {
+                        // Temporary objects don't outlive their sessions.
+                        let mut d = db.db.clone();
+                        d.drop_temp_schemas();
+                        d
+                    },
                     seqs: db.seqs.clone(),
                 },
             );
@@ -189,7 +197,8 @@ impl Engine {
 
     pub fn new_persistent(snapshot: Snapshot) -> Engine {
         let mut databases = BTreeMap::new();
-        for (name, db) in snapshot.databases {
+        for (name, mut db) in snapshot.databases {
+            db.db.drop_temp_schemas();
             databases.insert(
                 name.clone(),
                 GlobalDb { oid: db.oid, name: db.name, db: db.db, seqs: db.seqs },
@@ -204,6 +213,7 @@ impl Engine {
                 next_db_oid: snapshot.next_db_oid,
             })),
             next_pid: Arc::new(AtomicI32::new(10_000)),
+            cancels: Default::default(),
         }
     }
 
@@ -227,6 +237,7 @@ impl Engine {
                 next_db_oid: super::catalog::DATABASE_OID + 1,
             })),
             next_pid: Arc::new(AtomicI32::new(10_000)),
+            cancels: Default::default(),
         }
     }
 
@@ -243,19 +254,19 @@ impl Engine {
         let pid = self.next_pid.fetch_add(1, AtomicOrdering::SeqCst);
         let secret = (super::funcs::random_u64() as i32) | 1;
         let cancel = Arc::new(AtomicBool::new(false));
+        self.cancels.lock().unwrap().insert((pid, secret), cancel.clone());
         let notifications = Arc::new(Mutex::new(vec![]));
         g.sessions.insert(
             id,
             SessionHandle {
-                pid,
-                secret,
-                cancel: cancel.clone(),
                 channels: vec![],
                 notifications: notifications.clone(),
                 database: database.to_string(),
             },
         );
         let now = super::datetime::now_micros();
+        let mut settings = Settings::default();
+        settings.temp_schema = format!("pg_temp_{id}");
         Ok(Session {
             id,
             pid,
@@ -264,13 +275,16 @@ impl Engine {
                 pid,
                 user: user.to_string(),
                 database: database.to_string(),
-                settings: Settings::default(),
+                settings,
                 currval: BTreeMap::new(),
                 lastval: None,
                 now,
                 stmt_now: now,
                 listening: vec![],
                 notices: vec![],
+                cancel: cancel.clone(),
+                deadline: None,
+                ticks: 0,
             },
             status: TxStatus::Idle,
             txn: None,
@@ -283,19 +297,33 @@ impl Engine {
         })
     }
 
+    /// Ends a session: its temporary schema is dropped (once no other
+    /// transaction is writing, since a commit replaces the whole state).
     pub fn disconnect(&self, s: &Session) {
-        let mut g = self.global.lock().unwrap();
-        if g.writer == Some(s.id) {
-            g.writer = None;
+        self.cancels.lock().unwrap().remove(&(s.pid, s.secret));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let mut g = self.global.lock().unwrap();
+            let free = g.writer.is_none() || g.writer == Some(s.id);
+            if free && let Some(d) = g.databases.get_mut(&s.rt.database) {
+                d.db.drop_schema_objects(&s.rt.settings.temp_schema);
+            }
+            if free || std::time::Instant::now() > deadline {
+                if g.writer == Some(s.id) {
+                    g.writer = None;
+                }
+                g.sessions.remove(&s.id);
+                return;
+            }
+            drop(g);
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        g.sessions.remove(&s.id);
     }
 
     /// Handles a CancelRequest: flags the matching session.
     pub fn cancel(&self, pid: i32, secret: i32) {
-        let g = self.global.lock().unwrap();
-        if let Some(h) = g.sessions.values().find(|h| h.pid == pid && h.secret == secret) {
-            h.cancel.store(true, AtomicOrdering::SeqCst);
+        if let Some(c) = self.cancels.lock().unwrap().get(&(pid, secret)) {
+            c.store(true, AtomicOrdering::SeqCst);
         }
     }
 
@@ -306,6 +334,7 @@ impl Engine {
 
     /// Plans a statement, returning its parameter and result types.
     pub fn prepare(&self, s: &mut Session, sql: &str, param_hints: &[Type]) -> PgResult<Prepared> {
+        super::catalog::set_session_temp_schema(&s.rt.settings.temp_schema);
         let stmts = self.parse_sql(sql)?;
         if stmts.len() > 1 {
             return Err(PgError::new(
@@ -351,7 +380,7 @@ impl Engine {
         SessionInfo {
             user: s.rt.user.clone(),
             database: s.rt.database.clone(),
-            search_path: s.rt.settings.search_path(&s.rt.user),
+            search_path: s.rt.settings.lookup_path(&s.rt.user),
             fmt: s.rt.settings.fmt(),
             now: s.rt.now,
         }
@@ -375,6 +404,7 @@ impl Engine {
         params: &[Value],
         param_types: &[Type],
     ) -> PgResult<StmtResult> {
+        super::catalog::set_session_temp_schema(&s.rt.settings.temp_schema);
         if s.status == TxStatus::Failed && !is_transaction_control(stmt) {
             return Err(PgError::new(
                 code::IN_FAILED_SQL_TRANSACTION,
@@ -382,6 +412,7 @@ impl Engine {
             ));
         }
         s.rt.stmt_now = super::datetime::now_micros();
+        s.rt.start_statement();
         if s.txn.is_none() {
             s.rt.now = s.rt.stmt_now;
         }
@@ -433,6 +464,7 @@ impl Engine {
                         GlobalDb { oid, name, db: DbState::default(), seqs: BTreeMap::new() },
                     );
                 }
+                crate::persistence::mark("postgres");
                 Ok(StmtResult::tag("CREATE DATABASE"))
             }
             S::Drop { object_type: a::ObjectType::Database, if_exists, names, .. } => {
@@ -443,6 +475,7 @@ impl Engine {
                     ));
                 }
                 let mut g = self.global.lock().unwrap();
+                let mut r = StmtResult::tag("DROP DATABASE");
                 for name in names {
                     let n = super::binder::name_parts(name).pop().unwrap_or_default();
                     if g.sessions.values().any(|h| h.database == n) {
@@ -451,14 +484,20 @@ impl Engine {
                             "cannot drop the currently open database".to_string(),
                         ));
                     }
-                    if g.databases.remove(&n).is_none() && !if_exists {
-                        return Err(PgError::new(
-                            code::INVALID_CATALOG_NAME,
-                            format!("database \"{n}\" does not exist"),
-                        ));
+                    if g.databases.remove(&n).is_none() {
+                        if !if_exists {
+                            return Err(PgError::new(
+                                code::INVALID_CATALOG_NAME,
+                                format!("database \"{n}\" does not exist"),
+                            ));
+                        }
+                        r.notices.push(PgError::notice(format!(
+                            "database \"{n}\" does not exist, skipping"
+                        )));
                     }
                 }
-                Ok(StmtResult::tag("DROP DATABASE"))
+                crate::persistence::mark("postgres");
+                Ok(r)
             }
             S::StartTransaction { .. } => {
                 if s.txn.is_some() && s.status != TxStatus::Idle {
@@ -758,8 +797,6 @@ impl Engine {
             S::Revoke { .. } => Ok(StmtResult::tag("REVOKE")),
             S::Lock { .. } => Ok(StmtResult::tag("LOCK TABLE")),
             S::CreateRole { .. } => Ok(StmtResult::tag("CREATE ROLE")),
-            S::CreateExtension { .. } => Ok(StmtResult::tag("CREATE EXTENSION")),
-            S::DropExtension { .. } => Ok(StmtResult::tag("DROP EXTENSION")),
             other => self.run_data_statement(s, other, params, param_types),
         }
     }
@@ -819,11 +856,13 @@ impl Engine {
             notifies: vec![],
             affected: 0,
             databases: databases_info,
+            subq_cache: vec![],
+            min_outer: usize::MAX,
         };
         let info = SessionInfo {
             user: ctx.rt.user.clone(),
             database: ctx.rt.database.clone(),
-            search_path: ctx.rt.settings.search_path(&ctx.rt.user),
+            search_path: ctx.rt.settings.lookup_path(&ctx.rt.user),
             fmt: ctx.rt.settings.fmt(),
             now: ctx.rt.now,
         };
@@ -1023,6 +1062,7 @@ impl Engine {
                     }
                 }
             }
+            s.rt.check_interrupt()?;
             if std::time::Instant::now() > deadline {
                 return Err(PgError::new(
                     code::LOCK_NOT_AVAILABLE,
@@ -1034,12 +1074,25 @@ impl Engine {
     }
 
     fn commit(&self, s: &mut Session) -> PgResult<()> {
-        let Some(tx) = s.txn.take() else { return Ok(()) };
+        // Deferred constraints are checked now; a violation rolls back.
+        if let Some(tx) = s.txn.as_ref()
+            && tx.wrote
+            && let Err(e) = super::dml::check_deferred(&tx.state)
+        {
+            self.rollback(s);
+            s.status = TxStatus::Idle;
+            return Err(e);
+        }
+        let Some(mut tx) = s.txn.take() else { return Ok(()) };
+        if tx.wrote {
+            on_commit_actions(&mut tx.state, &s.rt.settings.temp_schema);
+        }
         let mut g = self.global.lock().unwrap();
         if tx.wrote
             && let Some(global_db) = g.databases.get_mut(&s.rt.database)
         {
             global_db.db = tx.state;
+            crate::persistence::mark("postgres");
         }
         if g.writer == Some(s.id) {
             g.writer = None;
@@ -1080,6 +1133,7 @@ impl Engine {
 
     /// A snapshot of the database for read-only inspection (Describe).
     pub fn with_db<T>(&self, s: &Session, f: impl FnOnce(&DbState) -> T) -> T {
+        super::catalog::set_session_temp_schema(&s.rt.settings.temp_schema);
         match &s.txn {
             Some(tx) => f(&tx.state),
             None => {
@@ -1095,13 +1149,38 @@ impl Engine {
             return None;
         }
         Some(Arc::new(self.with_db(s, |db| {
-            super::exec::build_reg_names(db, &s.rt.user, &s.rt.settings.search_path(&s.rt.user))
+            super::exec::build_reg_names(db, &s.rt.user, &s.rt.settings.lookup_path(&s.rt.user))
         })))
     }
 }
 
 /// The single string-literal argument of a `CALL x('...')` synthesized by
 /// `seqddl.rs`/`refresh.rs` to carry text sqlparser can't parse directly.
+/// Temporary tables' `ON COMMIT DELETE ROWS` / `ON COMMIT DROP`.
+fn on_commit_actions(db: &mut DbState, temp_schema: &str) {
+    use super::catalog::OnCommit;
+    let Some(ns) = db.schemas.values().find(|s| s.name == temp_schema).map(|s| s.oid) else {
+        return;
+    };
+    let mut dropped = vec![];
+    for t in db.tables.values_mut() {
+        if t.schema != ns {
+            continue;
+        }
+        match t.on_commit {
+            OnCommit::PreserveRows => {}
+            OnCommit::DeleteRows => {
+                if !t.rows.is_empty() {
+                    Arc::make_mut(t).rows.clear();
+                }
+            }
+            OnCommit::Drop => dropped.push(t.oid),
+        }
+    }
+    db.tables.retain(|oid, _| !dropped.contains(oid));
+    db.triggers.retain(|_, tr| !dropped.contains(&tr.table));
+}
+
 fn call_arg_text(f: &a::Function) -> String {
     match &f.args {
         a::FunctionArguments::List(l) => l.args.iter().find_map(|x| match x {
@@ -1257,8 +1336,29 @@ pub(crate) fn run_one(
         }
         S::CreateView(cv) => {
             let mut d = ddl(ctx, info);
-            let tag =
-                d.create_view(&cv.name, &cv.query, &cv.columns, cv.or_replace, cv.materialized)?;
+            let tag = d.create_view(
+                &cv.name,
+                &cv.query,
+                &cv.columns,
+                cv.or_replace,
+                cv.materialized,
+                cv.temporary,
+            )?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::AlterIndex { name, operation: a::AlterIndexOperation::RenameIndex { index_name } } => {
+            let mut d = ddl(ctx, info);
+            let tag = d.rename_index(name, index_name)?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::CreateExtension(ce) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.create_extension(ce)?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::DropExtension(de) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.drop_extension(de)?;
             Ok(StmtResult::tag(tag))
         }
         S::CreateIndex(ci) => {
@@ -1296,6 +1396,11 @@ pub(crate) fn run_one(
             };
             let mut d = ddl(ctx, info);
             let tag = d.create_enum(name, labels)?;
+            Ok(StmtResult::tag(tag))
+        }
+        S::AlterType(at) => {
+            let mut d = ddl(ctx, info);
+            let tag = d.alter_type(&at.name, &at.operation)?;
             Ok(StmtResult::tag(tag))
         }
         S::AlterTable(at) => {

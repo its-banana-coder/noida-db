@@ -687,6 +687,10 @@ impl Engine {
             Err(e) if in_multi => return self.multi_reject(session.id, &name, e),
             Err(e) => return e,
         };
+        // Anything not read-only (scripts and EXEC included) may change data.
+        if !command_meta::lookup(&name).is_some_and(|m| m.has_flag("readonly")) {
+            crate::persistence::mark("redis");
+        }
         // Commands flagged no_auth (AUTH, HELLO, QUIT, RESET) work before
         // authenticating; everything else is refused. Unknown commands and bad
         // arity were already reported above, as in Redis.

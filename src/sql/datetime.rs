@@ -262,13 +262,229 @@ pub fn format_timestamptz(ts: i64, zone: &Zone) -> String {
         TS_NEG_INF => return "-infinity".into(),
         _ => {}
     }
-    let off = zone.offset_at_utc(ts.div_euclid(USECS_PER_SEC) - PG_EPOCH_DAYS * 86400);
+    let off = zone.offset_at_utc(ts.div_euclid(USECS_PER_SEC) + PG_EPOCH_DAYS * 86400);
     let (s, bc) = format_ts_parts(ts + off as i64 * USECS_PER_SEC);
     format!("{s}{}{}", tz::format_offset(off, false), if bc { " BC" } else { "" })
 }
 
 pub fn format_timetz(us: i64, off: i32) -> String {
     format!("{}{}", format_time(us), tz::format_offset(off, false))
+}
+
+/// DateStyle's output half: how dates and timestamps print.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DateStyle {
+    #[default]
+    Iso,
+    Sql,
+    Postgres,
+    German,
+}
+
+const DOW: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MON: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// A date in the given DateStyle (`dmy`: day before month).
+pub fn format_date_styled(d: i32, style: DateStyle, dmy: bool) -> String {
+    if style == DateStyle::Iso || d == DATE_INF || d == DATE_NEG_INF {
+        return format_date(d);
+    }
+    let (y, m, day) = ymd_from_date(d);
+    let (ys, bc) = year_str(y);
+    let s = match style {
+        DateStyle::German => format!("{day:02}.{m:02}.{ys}"),
+        DateStyle::Sql if dmy => format!("{day:02}/{m:02}/{ys}"),
+        DateStyle::Sql => format!("{m:02}/{day:02}/{ys}"),
+        _ if dmy => format!("{day:02}-{m:02}-{ys}"),
+        _ => format!("{m:02}-{day:02}-{ys}"),
+    };
+    if bc { format!("{s} BC") } else { s }
+}
+
+/// A timestamp (`zone` given: timestamptz, shown in that zone with its
+/// abbreviation) in the given DateStyle.
+pub fn format_timestamp_styled(
+    ts: i64,
+    zone: Option<&Zone>,
+    style: DateStyle,
+    dmy: bool,
+) -> String {
+    if style == DateStyle::Iso || ts == TS_INF || ts == TS_NEG_INF {
+        return match zone {
+            Some(z) => format_timestamptz(ts, z),
+            None => format_timestamp(ts),
+        };
+    }
+    let (off, abbrev) = match zone {
+        Some(z) => {
+            let (o, _, a) = z.info_at_utc(ts.div_euclid(USECS_PER_SEC) + PG_EPOCH_DAYS * 86400);
+            (o, Some(if a.is_empty() { tz::format_offset(o, false) } else { a }))
+        }
+        None => (0, None),
+    };
+    let local = ts + off as i64 * USECS_PER_SEC;
+    let days = local.div_euclid(USECS_PER_DAY) + PG_EPOCH_DAYS;
+    let time = format_time(local.rem_euclid(USECS_PER_DAY));
+    let (y, m, d) = civil_from_days(days);
+    let (ys, bc) = year_str(y);
+    let mut s = match style {
+        DateStyle::German => format!("{d:02}.{m:02}.{ys} {time}"),
+        DateStyle::Sql if dmy => format!("{d:02}/{m:02}/{ys} {time}"),
+        DateStyle::Sql => format!("{m:02}/{d:02}/{ys} {time}"),
+        _ => {
+            // 1970-01-01 was a Thursday.
+            let dow = DOW[(days + 4).rem_euclid(7) as usize];
+            let mon = MON[m as usize - 1];
+            if dmy {
+                format!("{dow} {d:02} {mon} {time} {ys}")
+            } else {
+                format!("{dow} {mon} {d:02} {time} {ys}")
+            }
+        }
+    };
+    if let Some(a) = abbrev {
+        s.push(' ');
+        s.push_str(&a);
+    }
+    if bc {
+        s.push_str(" BC");
+    }
+    s
+}
+
+/// IntervalStyle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IntervalStyle {
+    #[default]
+    Postgres,
+    PostgresVerbose,
+    SqlStandard,
+    Iso8601,
+}
+
+pub fn format_interval_styled(iv: &Interval, style: IntervalStyle) -> String {
+    match style {
+        IntervalStyle::Postgres => format_interval(iv),
+        IntervalStyle::Iso8601 => format_interval_iso(iv),
+        IntervalStyle::PostgresVerbose => format_interval_verbose(iv),
+        IntervalStyle::SqlStandard => format_interval_sql(iv),
+    }
+}
+
+/// Postgres's interval2itm fields: year, mon, mday, hour, min, sec, fsec
+/// (every time field carries the time's sign).
+fn interval_fields(iv: &Interval) -> (i64, i64, i64, i64, i64, i64, i64) {
+    let t = iv.micros;
+    let hour = t / 3_600_000_000;
+    let rem = t % 3_600_000_000;
+    (
+        (iv.months / 12) as i64,
+        (iv.months % 12) as i64,
+        iv.days as i64,
+        hour,
+        rem / 60_000_000,
+        rem % 60_000_000 / USECS_PER_SEC,
+        rem % USECS_PER_SEC,
+    )
+}
+
+/// Postgres's AppendSeconds: |sec| (2 digits when `fill`) and the trimmed
+/// fraction.
+fn append_seconds(out: &mut String, sec: i64, fsec: i64, fill: bool) {
+    if fill {
+        out.push_str(&format!("{:02}", sec.abs()));
+    } else {
+        out.push_str(&sec.abs().to_string());
+    }
+    push_frac(out, fsec);
+}
+
+/// IntervalStyle = postgres_verbose: `@ 1 day 2 hours ago`.
+pub fn format_interval_verbose(iv: &Interval) -> String {
+    let (year, mon, mday, hour, min, sec, fsec) = interval_fields(iv);
+    let mut out = String::from("@");
+    let mut is_zero = true;
+    let mut is_before = false;
+    for (v, unit) in [(year, "year"), (mon, "mon"), (mday, "day"), (hour, "hour"), (min, "min")] {
+        if v == 0 {
+            continue;
+        }
+        let v = if is_zero {
+            is_before = v < 0;
+            v.abs()
+        } else if is_before {
+            -v
+        } else {
+            v
+        };
+        out.push_str(&format!(" {v} {unit}{}", if v == 1 { "" } else { "s" }));
+        is_zero = false;
+    }
+    if sec != 0 || fsec != 0 {
+        out.push(' ');
+        if sec < 0 || (sec == 0 && fsec < 0) {
+            if is_zero {
+                is_before = true;
+            } else if !is_before {
+                out.push('-');
+            }
+        } else if is_before {
+            out.push('-');
+        }
+        append_seconds(&mut out, sec, fsec, false);
+        out.push_str(if sec.abs() != 1 || fsec != 0 { " secs" } else { " sec" });
+        is_zero = false;
+    }
+    if is_zero {
+        out.push_str(" 0");
+    }
+    if is_before {
+        out.push_str(" ago");
+    }
+    out
+}
+
+/// IntervalStyle = sql_standard: `1-2`, `3 4:05:06`, `+1-2 +3 +4:05:06`.
+pub fn format_interval_sql(iv: &Interval) -> String {
+    let (mut year, mut mon, mut mday, mut hour, mut min, mut sec, mut fsec) = interval_fields(iv);
+    let neg = [year, mon, mday, hour, min, sec, fsec].iter().any(|&v| v < 0);
+    let pos = [year, mon, mday, hour, min, sec, fsec].iter().any(|&v| v > 0);
+    let has_ym = year != 0 || mon != 0;
+    let has_dt = mday != 0 || hour != 0 || min != 0 || sec != 0 || fsec != 0;
+    let standard = !(neg && pos) && !(has_ym && has_dt);
+    let mut out = String::new();
+    if neg && standard {
+        out.push('-');
+        for v in [&mut year, &mut mon, &mut mday, &mut hour, &mut min, &mut sec, &mut fsec] {
+            *v = -*v;
+        }
+    }
+    if !neg && !pos {
+        out.push('0');
+    } else if !standard {
+        let ys = if year < 0 || mon < 0 { '-' } else { '+' };
+        let ds = if mday < 0 { '-' } else { '+' };
+        let ss = if hour < 0 || min < 0 || sec < 0 || fsec < 0 { '-' } else { '+' };
+        out.push_str(&format!(
+            "{ys}{}-{} {ds}{} {ss}{}:{:02}:",
+            year.abs(),
+            mon.abs(),
+            mday.abs(),
+            hour.abs(),
+            min.abs()
+        ));
+        append_seconds(&mut out, sec, fsec, true);
+    } else if has_ym {
+        out.push_str(&format!("{year}-{mon}"));
+    } else {
+        if mday != 0 {
+            out.push_str(&format!("{mday} "));
+        }
+        out.push_str(&format!("{hour}:{min:02}:"));
+        append_seconds(&mut out, sec, fsec, true);
+    }
+    out
 }
 
 /// Postgres-style interval text (IntervalStyle = postgres).
@@ -712,7 +928,7 @@ pub fn utc_to_local(ts: i64, zone: &Zone) -> i64 {
     if ts == TS_INF || ts == TS_NEG_INF {
         return ts;
     }
-    ts + zone.offset_at_utc(ts.div_euclid(USECS_PER_SEC) - PG_EPOCH_DAYS * 86400) as i64
+    ts + zone.offset_at_utc(ts.div_euclid(USECS_PER_SEC) + PG_EPOCH_DAYS * 86400) as i64
         * USECS_PER_SEC
 }
 
@@ -721,7 +937,7 @@ pub fn local_to_utc(local: i64, zone: &Zone) -> i64 {
         return local;
     }
     local
-        - zone.offset_for_local(local.div_euclid(USECS_PER_SEC) - PG_EPOCH_DAYS * 86400) as i64
+        - zone.offset_for_local(local.div_euclid(USECS_PER_SEC) + PG_EPOCH_DAYS * 86400) as i64
             * USECS_PER_SEC
 }
 
@@ -812,7 +1028,7 @@ pub fn parse_timetz(s: &str, ctx: &Ctx) -> Result<(i64, i32), DtErr> {
     let t = p.time.ok_or(DtErr::Syntax)?;
     let off = match &p.tz {
         Some(TzSpec::Offset(o)) => *o,
-        Some(TzSpec::Named(z)) => z.offset_at_utc(ctx.now / USECS_PER_SEC),
+        Some(TzSpec::Named(z)) => z.offset_at_utc(ctx.now / USECS_PER_SEC + PG_EPOCH_DAYS * 86400),
         None => ctx.zone.offset_at_utc(ctx.now / USECS_PER_SEC + PG_EPOCH_DAYS * 86400),
     };
     Ok((t, off))
@@ -1330,6 +1546,102 @@ mod tests {
 
     fn ctx_utc() -> (i64, Zone) {
         (0, Zone::utc())
+    }
+
+    #[test]
+    fn date_styles() {
+        // Expected values from Postgres 14, TimeZone America/Los_Angeles.
+        let la = tz::lookup("America/Los_Angeles").unwrap();
+        let (now, u) = ctx_utc();
+        let ctx = Ctx { now, zone: &u };
+        let d = parse_date("2001-12-27", &ctx).unwrap();
+        let bc = parse_date("0044-03-15 BC", &ctx).unwrap();
+        let ts = parse_timestamp("2001-12-27 04:05:06.789", &ctx).unwrap();
+        let tz = parse_timestamptz("2001-07-04 23:00:00+00", &ctx).unwrap();
+        use DateStyle::*;
+        let cases = [
+            (
+                Sql,
+                false,
+                "12/27/2001",
+                "03/15/0044 BC",
+                "12/27/2001 04:05:06.789",
+                "07/04/2001 16:00:00 PDT",
+            ),
+            (
+                Sql,
+                true,
+                "27/12/2001",
+                "15/03/0044 BC",
+                "27/12/2001 04:05:06.789",
+                "04/07/2001 16:00:00 PDT",
+            ),
+            (
+                Postgres,
+                false,
+                "12-27-2001",
+                "03-15-0044 BC",
+                "Thu Dec 27 04:05:06.789 2001",
+                "Wed Jul 04 16:00:00 2001 PDT",
+            ),
+            (
+                Postgres,
+                true,
+                "27-12-2001",
+                "15-03-0044 BC",
+                "Thu 27 Dec 04:05:06.789 2001",
+                "Wed 04 Jul 16:00:00 2001 PDT",
+            ),
+            (
+                German,
+                true,
+                "27.12.2001",
+                "15.03.0044 BC",
+                "27.12.2001 04:05:06.789",
+                "04.07.2001 16:00:00 PDT",
+            ),
+            (
+                Iso,
+                true,
+                "2001-12-27",
+                "0044-03-15 BC",
+                "2001-12-27 04:05:06.789",
+                "2001-07-04 16:00:00-07",
+            ),
+        ];
+        for (st, dmy, ed, ebc, ets, etz) in cases {
+            assert_eq!(format_date_styled(d, st, dmy), ed);
+            assert_eq!(format_date_styled(bc, st, dmy), ebc);
+            assert_eq!(format_timestamp_styled(ts, None, st, dmy), ets);
+            assert_eq!(format_timestamp_styled(tz, Some(&la), st, dmy), etz);
+        }
+        assert_eq!(format_timestamp_styled(TS_INF, Some(&la), Postgres, false), "infinity");
+    }
+
+    #[test]
+    fn interval_styles() {
+        // Expected values from Postgres 14.
+        let cases = [
+            (
+                "1 year 2 mons 3 days 04:05:06.5",
+                "@ 1 year 2 mons 3 days 4 hours 5 mins 6.5 secs",
+                "+1-2 +3 +4:05:06.5",
+            ),
+            ("-1 day", "@ 1 day ago", "-1 0:00:00"),
+            ("1 day -00:00:01", "@ 1 day -1 sec", "+0-0 +1 -0:00:01"),
+            ("-1 year -2 mons", "@ 1 year 2 mons ago", "-1-2"),
+            ("0", "@ 0", "0"),
+            ("-00:00:00.25", "@ 0.25 secs ago", "-0:00:00.25"),
+            ("1 sec", "@ 1 sec", "0:00:01"),
+            ("3 days 04:05:06", "@ 3 days 4 hours 5 mins 6 secs", "3 4:05:06"),
+            ("-3 days -04:05:06", "@ 3 days 4 hours 5 mins 6 secs ago", "-3 4:05:06"),
+            ("1 year -1 day", "@ 1 year -1 days", "+1-0 -1 +0:00:00"),
+        ];
+        for (input, verbose, sql) in cases {
+            let iv = parse_interval(input).unwrap();
+            assert_eq!(format_interval_verbose(&iv), verbose, "{input}");
+            assert_eq!(format_interval_sql(&iv), sql, "{input}");
+        }
     }
 
     #[test]

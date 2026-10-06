@@ -40,11 +40,11 @@ answer as *unknown*.
 The full list, with how it is verified, is in [`src/redis/README.md`](../src/redis/README.md).
 
 Storage is now persistent (on-disk) and is saved to
-`<data_dir>/redis.json` upon a clean process exit (SIGINT/SIGTERM), with
-no incremental autosave -- see `src/persistence.rs`. All 16 logical
-databases, every key's value (strings, hashes, lists, sets, sorted sets,
-streams including consumer groups) and its expiry survive a clean
-restart; real RDB/AOF *files* aren't written or read (a value's RDB
+`<data_dir>/redis.json` about a second after each write and at a clean
+exit -- see `src/persistence.rs`; a hard kill loses at most the last
+second. All 16 logical databases, every key's value (strings, hashes,
+lists, sets, sorted sets, streams including consumer groups) and its
+expiry survive a restart; real RDB/AOF *files* aren't written or read (a value's RDB
 serialization is, through `DUMP`/`RESTORE`).
 
 Target: Redis 7.2 behaviour, RESP2 and RESP3. Of Redis 7.2's 242 commands,
@@ -91,12 +91,11 @@ current count).
 ## Postgres
 
 Storage is now persistent (on-disk) and is saved to
-`<data_dir>/postgres.json` upon a clean process exit (SIGINT/SIGTERM),
-with no incremental autosave -- see `src/persistence.rs`. Everything
-transactional (schemas, tables and their rows, sequences, enum types,
-domains) survives a clean restart; a hard kill (`kill -9`) loses
-whatever changed since the last clean shutdown but never corrupts the
-on-disk snapshot.
+`<data_dir>/postgres.json` about a second after each commit and at a
+clean exit -- see `src/persistence.rs`. Everything transactional
+(schemas, tables and their rows, sequences, enum types, domains)
+survives a restart; a hard kill (`kill -9`, a crash, closing WSL) loses
+at most the last second and never corrupts the on-disk snapshot.
 
 User functions, procedures, `DO` blocks and triggers work for the common
 cases. `CREATE [OR REPLACE] FUNCTION`/`PROCEDURE` in `LANGUAGE plpgsql` or
@@ -165,11 +164,18 @@ shifted), and `websearch_to_tsquery`'s web-search syntax (`"phrases"`,
 `word1 OR word2`, `-excluded`); verified against Django's
 `django.contrib.postgres.search` (`SearchVector`/`SearchQuery`/
 `SearchRank`) and Miniflux's own full-text index (title/content combined
-via `setweight`+`||`) end to end. `ts_rank`'s exact number is a documented
-approximation (it orders matches sensibly but doesn't reproduce Postgres's
-own formula, which weights lexeme importance labels and document length
-nothing here tracks); GIN/GiST indexes and `ts_headline` are not
-implemented.
+via `setweight`+`||`) end to end. `ts_rank` follows Postgres's own
+formula (label weights, proximity for AND/phrase queries, normalization
+flags) and matches it to the last digit; `ts_headline` highlights with the
+usual options (StartSel/StopSel/MaxWords/MinWords/HighlightAll) but picks
+the excerpt of a long document more simply than Postgres's cover search.
+GIN/GiST indexes are accepted as plain indexes.
+
+SQL/JSON path (`jsonb_path_query`/`_array`/`_first`/`_exists`/`_match`,
+`@?`, `@@`) supports lax and strict modes, accessors, filters,
+`like_regex`, `starts with`, arithmetic, variables and the item methods
+`type`, `size`, `double`, `ceiling`, `floor`, `abs`, `keyvalue`; not
+`.datetime()` or `.**{n to m}` level ranges.
 
 `REFRESH MATERIALIZED VIEW [CONCURRENTLY] name [WITH [NO] DATA]` works: a
 materialized view keeps its rows from `CREATE`/the last `REFRESH` until
@@ -210,10 +216,14 @@ constraints.
   before assignment, transition tables (`REFERENCING NEW TABLE`), triggers
   on views (`INSTEAD OF`) and `TRUNCATE` triggers, and event triggers.
   Extensions (`CREATE EXTENSION` is accepted and does nothing).
-- Full-text search: GIN/GiST indexes, `ts_headline`, any text search
-  config other than `'english'`/`'simple'`.
+- Full-text search: any text search config other than
+  `'english'`/`'simple'`; `ts_rank_cd`.
 - `COPY` to/from a server-side file or program; `FORMAT BINARY`.
 - Concurrency is one writer at a time.
+- Results are built in memory, not streamed: `generate_series` past
+  10,000,000 rows, or a recursive CTE past 1,000,000, fails with `53200
+  out of memory` (Postgres would stream it, so `LIMIT` would stop a
+  non-terminating recursion there).
 
 - A set-returning user function in a select list (it works in `FROM`).
 - `BETWEEN SYMMETRIC` (the SQL parser rejects it) and the `GROUPING()`
@@ -239,7 +249,7 @@ Target: Apache Kafka 3.8 KRaft mode (single-broker, node ID 1). Speaks native Ka
 
 The transaction APIs (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `TxnOffsetCommit`, `EndTxn`, `DescribeTransactions`) are functionally real: a `read_committed` fetch never returns a still-open or aborted transaction's records (tracked per-partition via a last-stable-offset and an aborted-transactions list, reported in `FetchResponse` for API version 4+), a `read_uncommitted` fetch (the default) is unaffected, and a stale producer epoch — a zombie instance superseded by a newer `InitProducerId` for the same `transactional.id` — is fenced (`INVALID_PRODUCER_EPOCH`) on `Produce`, `AddPartitionsToTxn` and `EndTxn`. `EndTxn` appends a control batch to every partition the transaction touched, same as real Kafka. Verified by an engine-level test that produces, aborts and commits real transactional record batches and checks both isolation levels see exactly what they should.
  
-Storage is now persistent (on-disk) and is saved to `<data_dir>/kafka.json` upon a clean process exit (SIGINT/SIGTERM), with no incremental autosave -- see `src/persistence.rs`. Topics, record batches, committed consumer group offsets, and idempotent producer sequence state survive a clean restart; open in-flight transactions are resolved to aborted at save time, and live consumer group membership is reset (members transparently rejoin on restart). A hard kill (`kill -9`) loses whatever changed since the last clean shutdown but never corrupts the on-disk snapshot.
+Storage is now persistent (on-disk) and is saved to `<data_dir>/kafka.json` about a second after each change and at a clean process exit (SIGINT/SIGTERM) -- see `src/persistence.rs`. Topics, record batches, committed consumer group offsets, and idempotent producer sequence state survive a restart; open in-flight transactions are resolved to aborted at save time, and live consumer group membership is reset (members transparently rejoin on restart). A hard kill (`kill -9`) loses at most the last second and never corrupts the on-disk snapshot.
 
 Retention and compaction are real, segment by segment as in Kafka (segments are bookkeeping over the stored batches, rolled by `segment.ms`/`segment.bytes`): `cleanup.policy=delete` drops the oldest segments past `retention.ms` (by their newest record timestamp) or while the log is over `retention.bytes`; `cleanup.policy=compact` keeps the newest record per key in closed segments once `min.cleanable.dirty.ratio` is reached, honours `min.compaction.lag.ms`, keeps a tombstone through its first clean and drops it on the first clean after `delete.retention.ms`, and never moves offsets or touches the active segment. `DeleteRecords` moves the log start offset (`POLICY_VIOLATION` on a compact-only topic), and `Fetch`/`ListOffsets` honour it. Topic configs are validated like the broker's (`INVALID_CONFIG` with Kafka's message for an unknown name or bad value; `AlterConfigs` replaces the override set, `IncrementalAlterConfigs` supports `APPEND`/`SUBTRACT` on list configs), `DescribeConfigs` lists every topic config, `message.timestamp.type=LogAppendTime` and `max.message.bytes` are enforced, a compacted topic rejects keyless records (`INVALID_RECORD`), topic names follow Kafka's rules, and a produce payload must be a well-formed v2 batch with a valid CRC (`CORRUPT_MESSAGE` otherwise). All of this is compared against a real Kafka 3.8 broker by `tests/failure-diff/kafka_edges.py` and `tests/kafka_diff.rs`.
 
@@ -253,7 +263,7 @@ Retention and compaction are real, segment by segment as in Kafka (segments are 
 - Multiple brokers, replication factor > 1, Kafka Connect, Schema Registry, ksqlDB, MirrorMaker.
 
 **Not yet**
-- Kafka's on-disk log segment format — data persists as a JSON snapshot on clean shutdown.
+- Kafka's on-disk log segment format — data persists as a JSON snapshot.
 
 ## ClickHouse
 
@@ -439,7 +449,7 @@ Verified against the official MongoDB Rust driver and a differential test agains
 
 ## MySQL
 
-Storage is now persistent (on-disk) and is saved to `<data_dir>/mysql.json` upon a clean process exit (SIGINT/SIGTERM), with no incremental autosave -- see `src/persistence.rs`. All schemas, tables, rows, and schema-level `AUTO_INCREMENT` state survive a clean restart; session-scoped fields (`current_db`, `last_insert_id`, mid-transaction uncommitted state) are deliberately excluded and reset on reconnect. A hard kill (`kill -9`) loses whatever changed since the last clean shutdown but never corrupts the on-disk snapshot.
+Storage is now persistent (on-disk) and is saved to `<data_dir>/mysql.json` about a second after each change and at a clean process exit (SIGINT/SIGTERM) -- see `src/persistence.rs`. All schemas, tables, rows, and schema-level `AUTO_INCREMENT` state survive a restart; session-scoped fields (`current_db`, `last_insert_id`, mid-transaction uncommitted state) are deliberately excluded and reset on reconnect. A hard kill (`kill -9`) loses at most the last second and never corrupts the on-disk snapshot.
 
 The database is shared across every connection to the same server (one
 `CREATE TABLE`/`INSERT` on one connection is visible from any other,
@@ -645,9 +655,9 @@ never a silent NULL.
 
 DDL and introspection: `CREATE TABLE [IF NOT EXISTS]`, `ALTER TABLE`
 (`ADD`/`DROP`/`MODIFY`/`CHANGE`/`RENAME COLUMN`, `RENAME TO`, `ADD`/`DROP`
-`UNIQUE`/`PRIMARY KEY`/`INDEX`, `ALTER COLUMN SET`/`DROP DEFAULT`,
+`UNIQUE`/`PRIMARY KEY`/`INDEX`, `RENAME INDEX`/`KEY`, `ALTER COLUMN SET`/`DROP DEFAULT`,
 `AUTO_INCREMENT =`; foreign keys, enforced (below)), `CREATE [UNIQUE]
-INDEX`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
+INDEX`, `DROP INDEX ... ON`, `RENAME TABLE`, `DROP TABLE [IF EXISTS]`, `TRUNCATE`, `CREATE DATABASE`, `DESCRIBE`, `SHOW [FULL] TABLES
 [LIKE]`, `SHOW COLUMNS`, `SHOW CREATE TABLE`, `SHOW INDEX`, `SHOW
 DATABASES`, `SHOW VARIABLES`/`STATUS`/`COLLATION`/`WARNINGS`/`ENGINES`,
 `SET` (`sql_mode` and `autocommit` take effect; other variables are
@@ -738,9 +748,17 @@ Decimal arithmetic keeps MySQL's hidden precision: `1/3` displays as
   `regex` syntax, which covers ICU's common subset (classes, POSIX
   `[[:alpha:]]`, anchors, groups, repetition) but not look-around or
   backreferences in the pattern.
-- Plain `KEY`/`INDEX`/`FULLTEXT` declarations are accepted and ignored;
-  nothing is indexed, so a foreign key may reference any column (MySQL
-  requires an index there, error 1822).
+- Views are read-only (INSERT/UPDATE/DELETE through a view aren't
+  supported), and `SHOW CREATE VIEW` shows the SELECT as written where
+  MySQL prints its canonical form. `JOIN ... USING` and `NATURAL JOIN`
+  aren't supported yet (`JOIN ... ON` and a bare `JOIN` are).
+- A recursive CTE is held in memory: past 1,000,000 rows it fails with
+  1114 "The table ... is full" (MySQL would spill to disk).
+- Plain `KEY`/`INDEX` declarations are recorded (SHOW INDEX, SHOW CREATE
+  TABLE, `information_schema.STATISTICS`, renames and drops) but not used
+  for lookups; `FULLTEXT`/`SPATIAL` are accepted and ignored. A foreign key
+  may reference an unindexed column (MySQL requires an index there, error
+  1822).
 - `ON UPDATE`/`ON DELETE SET DEFAULT` (InnoDB rejects it too) and checks
   that a foreign key's column types are compatible (3780).
 - `REPEATABLE READ` snapshots: every statement reads the latest committed

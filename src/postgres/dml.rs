@@ -52,8 +52,22 @@ fn after_rows(
 
 pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
     match d {
-        Dml::Insert { table, cols, source, defaults, on_conflict, returning, .. } => {
+        Dml::Insert {
+            table,
+            cols,
+            source,
+            defaults,
+            on_conflict,
+            returning,
+            overriding_system,
+        } => {
+            // Subqueries in RETURNING see the table as it was when the
+            // statement started (its snapshot), not the rows it wrote.
+            let mut snap = returning_snapshot(returning, ctx);
             let rows = exec::run_query(source, ctx)?;
+            // Rows this statement inserted or updated: an ON CONFLICT DO
+            // UPDATE may not touch one twice.
+            let mut touched: std::collections::HashSet<usize> = Default::default();
             plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Insert, &[])?;
             let mut out = vec![];
             let mut count = 0;
@@ -68,6 +82,20 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     // DEFAULT in a VALUES list.
                     if matches!(source_default(source, i), Some(col) if col == c) && v.is_null() {
                         continue;
+                    }
+                    if !*overriding_system {
+                        let t = table_of(ctx, *table)?;
+                        if let Some((true, _)) = t.columns[c].identity {
+                            let name = t.columns[c].name.clone();
+                            return Err(PgError::new(
+                                code::GENERATED_ALWAYS,
+                                format!("cannot insert a non-DEFAULT value into column \"{name}\""),
+                            )
+                            .detail(format!(
+                                "Column \"{name}\" is an identity column defined as GENERATED ALWAYS."
+                            ))
+                            .hint("Use OVERRIDING SYSTEM VALUE to override."));
+                        }
                     }
                     row[c] = v;
                     given[c] = true;
@@ -98,6 +126,13 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         match &oc.action {
                             ConflictAction::Nothing => continue,
                             ConflictAction::Update { sets, filter } => {
+                                if touched.contains(&idx) {
+                                    return Err(PgError::new(
+                                        code::CARDINALITY_VIOLATION,
+                                        "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                                    )
+                                    .hint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values."));
+                                }
                                 let existing = t.rows[idx].clone();
                                 let mut combined = existing.clone();
                                 combined.extend(row.clone());
@@ -118,9 +153,14 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                                 check_row(ctx, *table, &updated, Some(idx))?;
                                 let t = ctx.db.table_mut(*table).unwrap();
                                 t.rows[idx] = updated.clone();
+                                touched.insert(idx);
                                 count += 1;
                                 if !returning.is_empty() {
-                                    out.push(project(returning, &updated, ctx)?);
+                                    let mut r = with_system(ctx, *table, &updated, idx);
+                                    // An updated row's xmax is the updating
+                                    // transaction (non-zero).
+                                    set_xmax(ctx, *table, &mut r, 1);
+                                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                                 }
                                 continue;
                             }
@@ -130,9 +170,12 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 check_row(ctx, *table, &row, None)?;
                 let t = ctx.db.table_mut(*table).unwrap();
                 t.rows.push(row.clone());
+                let pos = t.rows.len() - 1;
+                touched.insert(pos);
                 count += 1;
                 if !returning.is_empty() {
-                    out.push(project(returning, &row, ctx)?);
+                    let r = with_system(ctx, *table, &row, pos);
+                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                 }
                 written.push((None, Some(row)));
             }
@@ -141,6 +184,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             Ok(out)
         }
         Dml::Update { table, from, filter, sets, defaults, returning } => {
+            // Subqueries in RETURNING see the table as it was when the
+            // statement started (its snapshot), not the rows it wrote.
+            let mut snap = returning_snapshot(returning, ctx);
             let set_cols: Vec<usize> = sets.iter().map(|(c, _)| *c).collect();
             plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Update, &set_cols)?;
             let t = table_of(ctx, *table)?;
@@ -209,7 +255,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 let t = ctx.db.table_mut(*table).unwrap();
                 t.rows[*i] = new.clone();
                 if !returning.is_empty() {
-                    out.push(project(returning, new, ctx)?);
+                    let mut r = with_system(ctx, *table, new, *i);
+                    set_xmax(ctx, *table, &mut r, 1);
+                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                 }
             }
             let written: Vec<(Option<Row>, Option<Row>)> = updates
@@ -221,6 +269,9 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             Ok(out)
         }
         Dml::Delete { table, using, filter, returning } => {
+            // Subqueries in RETURNING see the table as it was when the
+            // statement started (its snapshot), not the rows it wrote.
+            let mut snap = returning_snapshot(returning, ctx);
             plpgsql::fire_statement(ctx, *table, "BEFORE", Event::Delete, &[])?;
             let t = table_of(ctx, *table)?;
             let base = t.rows.clone();
@@ -259,7 +310,8 @@ pub fn run_dml(d: &Dml, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
             if !returning.is_empty() {
                 for &i in &doomed {
-                    out.push(project(returning, &base[i], ctx)?);
+                    let r = with_system(ctx, *table, &base[i], i);
+                    out.push(project_snap(returning, &r, ctx, &mut snap)?);
                 }
             }
             for &i in &doomed {
@@ -379,6 +431,46 @@ fn table_of<'a>(ctx: &'a Ctx, oid: u32) -> PgResult<&'a Table> {
     })
 }
 
+/// A stored row followed by its system column values (as RETURNING sees
+/// them).
+fn with_system(ctx: &Ctx, table: u32, row: &Row, pos: usize) -> Row {
+    let mut r = row.clone();
+    if let Ok(t) = table_of(ctx, table) {
+        r.extend(t.system_col_values(pos));
+    }
+    r
+}
+
+/// Sets `xmax` in a row built by `with_system`.
+fn set_xmax(ctx: &Ctx, table: u32, row: &mut Row, v: i64) {
+    if let Ok(t) = table_of(ctx, table) {
+        let i = t.columns.len() + 3;
+        if i < row.len() {
+            row[i] = Value::Int(v);
+        }
+    }
+}
+
+fn returning_snapshot(returning: &[Expr], ctx: &Ctx) -> Option<super::catalog::DbState> {
+    let has_sub = returning
+        .iter()
+        .any(|e| e.contains(&|x| matches!(x, Expr::Sub { .. } | Expr::InSub { .. })));
+    has_sub.then(|| ctx.db.clone())
+}
+
+fn project_snap(
+    exprs: &[Expr],
+    row: &Row,
+    ctx: &mut Ctx,
+    snap: &mut Option<super::catalog::DbState>,
+) -> PgResult<Row> {
+    let Some(db) = snap.as_mut() else { return project(exprs, row, ctx) };
+    std::mem::swap(ctx.db, db);
+    let r = project(exprs, row, ctx);
+    std::mem::swap(ctx.db, db);
+    r
+}
+
 fn project(exprs: &[Expr], row: &Row, ctx: &mut Ctx) -> PgResult<Row> {
     let mut out = vec![];
     for e in exprs {
@@ -403,7 +495,7 @@ pub fn session_info(ctx: &Ctx) -> SessionInfo {
     SessionInfo {
         user: ctx.rt.user.clone(),
         database: ctx.rt.database.clone(),
-        search_path: ctx.rt.settings.search_path(&ctx.rt.user),
+        search_path: ctx.rt.settings.lookup_path(&ctx.rt.user),
         fmt: ctx.rt.settings.fmt(),
         now: ctx.rt.now,
     }
@@ -444,7 +536,16 @@ fn apply_generated(ctx: &mut Ctx, table: u32, row: &mut Row) -> PgResult<()> {
 
 /// Checks NOT NULL, unique/primary key, CHECK and foreign keys.
 pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> PgResult<()> {
-    let t = table_of(ctx, table)?.clone();
+    // The table's definition only: copying its rows for every row checked
+    // made bulk INSERT/COPY quadratic. Uniqueness checks read the rows
+    // in place below; only a unique index that isn't a constraint's
+    // (it may evaluate expressions against the row) needs a full copy.
+    let full = table_of(ctx, table)?;
+    let needs_rows = full
+        .indexes
+        .iter()
+        .any(|i| i.unique && !full.constraints.iter().any(|c| c.index_oid == Some(i.oid)));
+    let t = if needs_rows { full.clone() } else { full.without_rows() };
     let schema = ctx.db.schema_name(t.schema).to_string();
     for (i, c) in t.live_columns() {
         if c.not_null && row[i].is_null() {
@@ -492,7 +593,7 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
                     .and_then(|o| t.indexes.iter().find(|i| i.oid == o))
                     .is_some_and(|i| i.nulls_not_distinct);
                 if let Some(other) = super::catalog::check_unique_violation(
-                    &t,
+                    table_of(ctx, table)?,
                     &cons.cols,
                     row,
                     skip,
@@ -536,7 +637,8 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
                 }
             }
             ConstraintKind::ForeignKey { ref_table, ref_cols, .. } => {
-                if cons.cols.iter().any(|&c| row[c].is_null()) {
+                // INITIALLY DEFERRED: checked at COMMIT (`check_deferred`).
+                if cons.cols.iter().any(|&c| row[c].is_null()) || cons.initially_deferred {
                     continue;
                 }
                 let parent = table_of(ctx, *ref_table)?;
@@ -573,31 +675,51 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
 }
 
 /// The key `idx` stores for `row`: `None` when a partial index excludes it.
+/// An index's predicate and key expressions, bound once.
+struct BoundIndex {
+    pred: Option<Expr>,
+    exprs: Vec<Expr>,
+}
+
+fn bind_index(ctx: &mut Ctx, t: &Table, idx: &super::catalog::Index) -> PgResult<BoundIndex> {
+    let pred = idx.predicate.as_ref().map(|p| bind_check(ctx, t, p)).transpose()?;
+    let exprs = idx.exprs.iter().map(|e| bind_check(ctx, t, e)).collect::<PgResult<_>>()?;
+    Ok(BoundIndex { pred, exprs })
+}
+
+/// `row`'s key in the index (`None`: outside a partial index's predicate).
 fn index_key(
     ctx: &mut Ctx,
-    t: &Table,
+    b: &BoundIndex,
     idx: &super::catalog::Index,
     row: &Row,
 ) -> PgResult<Option<Vec<Value>>> {
-    if let Some(pred) = &idx.predicate {
-        let e = bind_check(ctx, t, pred)?;
-        if !matches!(exec::eval(&e, row, ctx)?, Value::Bool(true)) {
-            return Ok(None);
-        }
+    if let Some(e) = &b.pred
+        && !matches!(exec::eval(e, row, ctx)?, Value::Bool(true))
+    {
+        return Ok(None);
     }
-    let mut exprs = idx.exprs.iter();
+    let mut exprs = b.exprs.iter();
     let mut key = vec![];
     for c in &idx.cols {
         match c {
             Some(i) => key.push(row[*i].clone()),
-            None => {
-                let sql = exprs.next().expect("expression index key");
-                let e = bind_check(ctx, t, sql)?;
-                key.push(exec::eval(&e, row, ctx)?);
-            }
+            None => key.push(exec::eval(exprs.next().expect("expression index key"), row, ctx)?),
         }
     }
     Ok(Some(key))
+}
+
+/// A key that unique index `idx` can't hold twice (nulls are distinct
+/// unless NULLS NOT DISTINCT).
+fn unique_key(
+    ctx: &mut Ctx,
+    b: &BoundIndex,
+    idx: &super::catalog::Index,
+    row: &Row,
+) -> PgResult<Option<Vec<Value>>> {
+    Ok(index_key(ctx, b, idx, row)?
+        .filter(|k| idx.nulls_not_distinct || !k.iter().any(|v| v.is_null())))
 }
 
 /// The row of `t` (other than `skip`) that `row` collides with in the unique
@@ -609,21 +731,39 @@ pub fn unique_index_conflict(
     row: &Row,
     skip: Option<usize>,
 ) -> PgResult<Option<Vec<Value>>> {
-    let Some(key) = index_key(ctx, t, idx, row)? else { return Ok(None) };
-    if !idx.nulls_not_distinct && key.iter().any(|v| v.is_null()) {
-        return Ok(None);
-    }
+    let b = bind_index(ctx, t, idx)?;
+    let Some(key) = unique_key(ctx, &b, idx, row)? else { return Ok(None) };
     for (i, other) in t.rows.iter().enumerate() {
         if Some(i) == skip {
             continue;
         }
-        if let Some(k) = index_key(ctx, t, idx, other)?
+        if let Some(k) = index_key(ctx, &b, idx, other)?
             && k.iter().zip(&key).all(|(a, b)| types::values_equal(a, b))
         {
             return Ok(Some(key));
         }
     }
     Ok(None)
+}
+
+/// Whether two of `t`'s rows already collide in unique index `idx` (each
+/// row's key computed once).
+pub fn unique_index_has_duplicate(
+    ctx: &mut Ctx,
+    t: &Table,
+    idx: &super::catalog::Index,
+) -> PgResult<bool> {
+    let b = bind_index(ctx, t, idx)?;
+    let mut keys: Vec<Vec<Value>> = vec![];
+    for r in &t.rows {
+        if let Some(k) = unique_key(ctx, &b, idx, r)? {
+            if keys.iter().any(|o| o.iter().zip(&k).all(|(a, b)| types::values_equal(a, b))) {
+                return Ok(true);
+            }
+            keys.push(k);
+        }
+    }
+    Ok(false)
 }
 
 fn bind_check(ctx: &mut Ctx, t: &Table, sql: &str) -> PgResult<Expr> {
@@ -672,6 +812,9 @@ fn cascade_delete(ctx: &mut Ctx, table: u32, row: &Row) -> PgResult<()> {
             .map(|(i, _)| i)
             .collect();
         if matching.is_empty() {
+            continue;
+        }
+        if cons.initially_deferred && matches!(on_delete, FkAction::NoAction) {
             continue;
         }
         match on_delete {
@@ -812,4 +955,56 @@ fn referencing(ctx: &Ctx, table: u32) -> Vec<(u32, Constraint)> {
         }
     }
     out
+}
+
+/// At COMMIT: every `INITIALLY DEFERRED` foreign key must hold for every
+/// row (Postgres checks the rows it queued; checking them all gives the
+/// same answer).
+pub fn check_deferred(db: &super::catalog::DbState) -> PgResult<()> {
+    for t in db.tables.values() {
+        for cons in &t.constraints {
+            let ConstraintKind::ForeignKey { ref_table, ref_cols, .. } = &cons.kind else {
+                continue;
+            };
+            if !cons.initially_deferred {
+                continue;
+            }
+            let Some(parent) = db.tables.get(ref_table) else { continue };
+            for row in &t.rows {
+                if cons.cols.iter().any(|&c| row[c].is_null()) {
+                    continue;
+                }
+                let found = parent.rows.iter().any(|pr| {
+                    cons.cols
+                        .iter()
+                        .zip(ref_cols)
+                        .all(|(&c, &p)| types::cmp_values(&row[c], &pr[p]) == Ordering::Equal)
+                });
+                if !found {
+                    let keys: Vec<String> =
+                        cons.cols.iter().map(|&c| t.columns[c].name.clone()).collect();
+                    let vals: Vec<String> = cons
+                        .cols
+                        .iter()
+                        .map(|&c| types::to_text(&row[c], t.columns[c].ty, &Default::default()))
+                        .collect();
+                    return Err(PgError::new(
+                        code::FOREIGN_KEY_VIOLATION,
+                        format!(
+                            "insert or update on table \"{}\" violates foreign key constraint \"{}\"",
+                            t.name, cons.name
+                        ),
+                    )
+                    .detail(format!(
+                        "Key ({})=({}) is not present in table \"{}\".",
+                        keys.join(", "),
+                        vals.join(", "),
+                        parent.name
+                    ))
+                    .constraint(&cons.name));
+                }
+            }
+        }
+    }
+    Ok(())
 }

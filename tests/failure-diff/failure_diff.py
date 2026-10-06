@@ -66,6 +66,13 @@ def run(port, scenario):
     for step in scenario:
         who, action = step[0], step[1]
         c = conn(who)
+        if isinstance(action, tuple) and action[0] == "reconnect":
+            # Ends the session (what lives only for it goes) and opens a new one.
+            c.close()
+            del conns[who]
+            time.sleep(0.2)
+            trace.append((who, "reconnect", "ok"))
+            continue
         if isinstance(action, tuple) and action[0] == "sleep":
             time.sleep(action[1])
             continue
@@ -660,6 +667,95 @@ MYSQL_QUERIES = {
         (A, "SELECT id FROM t WHERE v = @m"),
         (A, "UPDATE t SET v = @m + 1 WHERE id = 1"),
         (A, "SELECT v FROM t ORDER BY id"),
+    ],
+    "rails migrations: indexes, renames, bare keywords": [
+        # CURRENT_USER is left out: the account's host differs by environment.
+        (A, "SELECT DATABASE(), CURRENT_USER = CURRENT_USER(), current_date = curdate(), curtime() = current_time"),
+        (A, "SELECT nosuchcol"),
+        (A, "CREATE TABLE ra (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, a int, b varchar(10), KEY index_ra_on_a (a), INDEX (b), KEY (b))"),
+        (A, "CREATE INDEX index_ra_on_a_b ON ra (a, b)"),
+        (A, "CREATE INDEX index_ra_on_a_b ON ra (b)"),
+        (A, "CREATE UNIQUE INDEX uq_ab ON ra (a, b)"),
+        (A, "ALTER TABLE ra ADD INDEX idx_x (b, a), ADD KEY (a)"),
+        (A, "SELECT index_name, non_unique, column_name, seq_in_index FROM information_schema.statistics "
+            "WHERE table_schema = DATABASE() AND table_name = 'ra' ORDER BY index_name, seq_in_index"),
+        (A, "INSERT INTO ra (a, b) VALUES (1, 'x'), (2, 'y')"),
+        (A, "SHOW CREATE TABLE ra"),
+        (A, "RENAME TABLE ra TO rb"),
+        (A, "ALTER TABLE rb RENAME INDEX index_ra_on_a TO index_rb_on_a, RENAME KEY index_ra_on_a_b TO index_rb_on_a_b"),
+        (A, "ALTER TABLE rb RENAME INDEX nope TO x"),
+        (A, "ALTER TABLE rb RENAME INDEX index_rb_on_a TO idx_x"),
+        (A, "DROP INDEX index_rb_on_a ON rb"),
+        (A, "ALTER TABLE rb DROP INDEX b"),
+        (A, "ALTER TABLE rb DROP INDEX nope"),
+        (A, "DROP INDEX nope ON rb"),
+        (A, "ALTER TABLE rb DROP COLUMN b"),
+        (A, "INSERT INTO rb (a) VALUES (3)"),
+        (A, "SELECT id, a FROM rb ORDER BY id"),
+        (A, "SHOW CREATE TABLE rb"),
+        (A, "RENAME TABLE rb TO rc, rc TO rd"),
+        (A, "CREATE TABLE d (id int AUTO_INCREMENT PRIMARY KEY, a int, b int, UNIQUE KEY uab (a, b))"),
+        (A, "INSERT INTO d (a, b) VALUES (1, 1), (1, 2)"),
+        (A, "ALTER TABLE d DROP COLUMN b"),
+    ],
+    "joins without ON, recursion limits": [
+        (A, "SELECT count(*) FROM (SELECT 1 a UNION ALL SELECT 2) x JOIN (SELECT 1 b UNION ALL SELECT 2 UNION ALL SELECT 3) y"),
+        (A, "SELECT x.a, y.b FROM (SELECT 1 a UNION ALL SELECT 2) x JOIN (SELECT 5 b) y WHERE x.a = 2"),
+        (A, "SELECT count(*) FROM (SELECT 1 a) x STRAIGHT_JOIN (SELECT 2 b) y"),
+        (A, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 1000) SELECT count(*) FROM t"),
+        (A, "WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM t) SELECT count(*) FROM t"),
+    ],
+    "views": [
+        (A, "CREATE TABLE vt (id int PRIMARY KEY, a int, b varchar(10) NOT NULL, p decimal(8,2))"),
+        (A, "INSERT INTO vt VALUES (1, 10, 'x', 1.5), (2, 20, 'y', 2.25), (3, 30, 'z', NULL)"),
+        (A, "CREATE VIEW v1 AS SELECT id, a * 2 AS a2 FROM vt WHERE a > 10"),
+        (A, "SELECT * FROM v1 ORDER BY id"),
+        (A, "CREATE VIEW v2 (k, total) AS SELECT b, sum(a) FROM vt GROUP BY b"),
+        (A, "SELECT * FROM v2 ORDER BY k"),
+        (A, "SELECT v1.id, vt.b FROM v1 JOIN vt ON vt.id = v1.id ORDER BY v1.id"),
+        (A, "CREATE VIEW v3 AS SELECT * FROM v1 WHERE a2 > 50"),
+        (A, "SELECT * FROM v3"),
+        (A, "CREATE VIEW v4 AS SELECT count(*) c, avg(a) av, max(b) mb, min(p) mp, sum(p) sp, avg(p) ap FROM vt"),
+        (A, "SELECT * FROM v4"),
+        (A, "DESCRIBE v1"),
+        (A, "DESCRIBE v2"),
+        (A, "SHOW COLUMNS FROM v3"),
+        (A, "DESCRIBE v4"),
+        (A, "CREATE VIEW v1 AS SELECT 1"),
+        (A, "CREATE VIEW vbad AS SELECT nope FROM vt"),
+        (A, "CREATE VIEW vbad2 (x) AS SELECT id, a FROM vt"),
+        (A, "CREATE VIEW vdup AS SELECT id, id FROM vt"),
+        (A, "CREATE VIEW vt AS SELECT 1"),
+        (A, "CREATE OR REPLACE VIEW vt AS SELECT 1"),
+        (A, "CREATE TABLE v1 (x int)"),
+        (A, "SELECT table_name, table_type, table_comment FROM information_schema.tables "
+            "WHERE table_schema = DATABASE() ORDER BY 1"),
+        (A, "SELECT table_name, check_option, is_updatable, security_type FROM information_schema.views "
+            "WHERE table_schema = DATABASE() ORDER BY 1"),
+        (A, "SHOW FULL TABLES"),
+        (A, "CREATE OR REPLACE VIEW v1 AS SELECT id FROM vt"),
+        (A, "SELECT * FROM v3"),
+        (A, "DROP VIEW v3, v2"),
+        (A, "DROP VIEW nope"),
+        (A, "DROP VIEW IF EXISTS nope, v1"),
+        (A, "DROP VIEW vt"),
+        (A, "SHOW TABLES"),
+    ],
+    "select into user variables": [
+        (A, "CREATE TABLE si (a int, b varchar(5))"),
+        (A, "INSERT INTO si VALUES (1, 'x'), (2, 'y')"),
+        (A, "SELECT 1, 'a' INTO @x, @y"),
+        (A, "SELECT @x, @y"),
+        (A, "SELECT count(*) INTO @c FROM si"),
+        (A, "SELECT @c"),
+        (A, "SELECT 1, 2 INTO @only_one"),
+        (A, "SELECT a INTO @m FROM si"),
+        (A, "SELECT @m"),
+        (A, "SET @z = 5"),
+        (A, "SELECT a INTO @z FROM si WHERE a > 99"),
+        (A, "SELECT @z"),
+        (A, "SELECT a, b FROM si WHERE a = 2 INTO @ta, @tb"),
+        (A, "SELECT @ta, @tb"),
     ],
 }
 MYSQL.update(MYSQL_QUERIES)

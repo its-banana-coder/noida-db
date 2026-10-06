@@ -329,6 +329,17 @@ pub fn binop(
         // Full-text search: whichever operand resolved to tsquery names
         // the query side, the other is the tsvector side (Postgres allows
         // either order, `tsvector @@ tsquery` and `tsquery @@ tsvector`).
+        ("@?", Jsonb(j), Text(p)) => {
+            let path = super::jsonpath::parse(p)?;
+            Bool(!path.query(j, &Json::Object(vec![]), true)?.is_empty())
+        }
+        ("@@", Jsonb(j), Text(p)) => {
+            let path = super::jsonpath::parse(p)?;
+            match path.matches(j, &Json::Object(vec![]), true)? {
+                Some(b) => Bool(b),
+                None => Null,
+            }
+        }
         ("@@", Text(x), Text(y)) => {
             let (vec_text, q_text) = if tys[0].base == Base::Tsquery { (y, x) } else { (x, y) };
             let vec = fts::parse_vector(vec_text)?;
@@ -465,6 +476,23 @@ fn numeric_power(x: &Numeric, y: &Numeric) -> PgResult<Numeric> {
         let rscale = 16i64.max(x.scale() as i64);
         if e == 0 {
             return Ok(Numeric::from_i64(1).round(rscale));
+        }
+        // The result's size in decimal digits, before computing it: one
+        // that can't fit numeric's 131072 integer digits overflows, one
+        // smaller than the result scale rounds to zero (Postgres does the
+        // same estimate; computing these exactly never finishes).
+        let ax = x.abs().to_f64();
+        if ax > 0.0 && ax.is_finite() {
+            let digits = e as f64 * ax.log10();
+            if digits > 131_072.0 {
+                return Err(err(
+                    code::NUMERIC_VALUE_OUT_OF_RANGE,
+                    "value overflows numeric format",
+                ));
+            }
+            if digits < -(rscale as f64) - 2.0 {
+                return Ok(Numeric::zero().round(rscale));
+            }
         }
         let mut result = Numeric::from_i64(1);
         let mut base = x.clone();
@@ -977,7 +1005,7 @@ pub fn json_timestamp(t: i64, tz: bool, env: &Env) -> String {
         let off = env
             .fmt
             .zone
-            .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+            .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
         let local =
             datetime::format_timestamp(t + off as i64 * USECS_PER_SEC).replacen(' ', "T", 1);
         let sign = if off < 0 { '-' } else { '+' };
@@ -1498,6 +1526,14 @@ pub fn call(
                     "factorial of a negative number is undefined",
                 ));
             }
+            // 32177! is the largest that fits numeric's 131072 digits;
+            // computing beyond it (as Postgres refuses to) takes minutes.
+            if n > 32177 {
+                return Err(err(
+                    code::NUMERIC_VALUE_OUT_OF_RANGE,
+                    "value overflows numeric format",
+                ));
+            }
             let mut r = Numeric::from_i64(1);
             for i in 2..=n {
                 r = r.mul(&Numeric::from_i64(i));
@@ -1620,6 +1656,10 @@ pub fn call(
             Text(trim_chars(&s, chars, name != "rtrim", name != "ltrim"))
         }
         "lpad" | "rpad" => {
+            // Postgres (16) sizes the result for 4-byte characters (UTF-8).
+            if int(&a[1]).max(0) * 4 + 4 > 0x3FFF_FFFF {
+                return Err(err(code::PROGRAM_LIMIT_EXCEEDED, "requested length too large"));
+            }
             Text(pad(text(&a[0]), int(&a[1]), a.get(2).map_or(" ", text), name == "lpad"))
         }
         "left" | "right" => {
@@ -1742,11 +1782,121 @@ pub fn call(
                     .map_or_else(String::new, |q| fts::format_query(&q)),
             )));
         }
+        "array_set_element" => {
+            // `arr[i] = v`: a NULL array becomes a one-element array at
+            // index i; an index past either end pads with NULLs.
+            let Some(i) = a[1].as_int() else {
+                return Err(err(
+                    code::NULL_VALUE_NOT_ALLOWED,
+                    "array subscript in assignment must not be null",
+                ));
+            };
+            let v = a[2].clone();
+            let mut arr = match &a[0] {
+                Array(x) => (**x).clone(),
+                _ => types::Array::empty(),
+            };
+            if arr.dims.len() > 1 {
+                return Err(err(code::ARRAY_SUBSCRIPT_ERROR, "wrong number of array subscripts"));
+            }
+            if arr.dims.is_empty() {
+                arr.dims = vec![(1, i as i32)];
+                arr.items = vec![v];
+                return Ok(Some(Array(Box::new(arr))));
+            }
+            let (len, lo) = arr.dims[0];
+            let (lo, hi) = (lo as i64, lo as i64 + len as i64 - 1);
+            if hi.max(i) - lo.min(i) + 1 > types::MAX_ARRAY_SIZE {
+                return Err(array_too_big());
+            }
+            if i < lo {
+                let pad = (lo - i) as usize;
+                let mut items = vec![Null; pad];
+                items.append(&mut arr.items);
+                items[0] = v;
+                arr.items = items;
+                arr.dims = vec![(len + pad as i32, i as i32)];
+            } else if i > hi {
+                arr.items.resize((i - lo) as usize, Null);
+                arr.items.push(v);
+                arr.dims = vec![(arr.items.len() as i32, lo as i32)];
+            } else {
+                arr.items[(i - lo) as usize] = v;
+            }
+            return Ok(Some(Array(Box::new(arr))));
+        }
         "ts_rank" => {
-            let vec = fts::parse_vector(text(&a[0]))?;
-            let q = fts::parse_query_text(text(&a[1]))?
+            // ([weights,] vector, query [, normalization])
+            let (weights, rest) = match &a[0] {
+                Array(arr) => {
+                    let w: Vec<f32> = arr
+                        .items
+                        .iter()
+                        .map(|v| match v {
+                            Float(f) => *f as f32,
+                            Int(i) => *i as f32,
+                            Num(n) => n.to_f64() as f32,
+                            _ => 0.0,
+                        })
+                        .collect();
+                    if w.len() < 4 {
+                        return Err(err(
+                            code::ARRAY_SUBSCRIPT_ERROR,
+                            "array of weight is too short",
+                        ));
+                    }
+                    ([w[0], w[1], w[2], w[3]], &a[1..])
+                }
+                _ => (fts::DEFAULT_WEIGHTS, a),
+            };
+            let norm = rest.get(2).and_then(Value::as_int).unwrap_or(0) as i32;
+            let q = fts::parse_query_text(text(&rest[1]))?
                 .unwrap_or(fts::Query::Lexeme(String::new(), false));
-            return Ok(Some(Float(fts::rank(&vec, &q) as f64)));
+            return Ok(Some(Float(fts::ts_rank(text(&rest[0]), &q, weights, norm)? as f64)));
+        }
+        "jsonb_path_exists"
+        | "jsonb_path_match"
+        | "jsonb_path_query_array"
+        | "jsonb_path_query_first" => {
+            let path = super::jsonpath::parse(text(&a[1]))?;
+            let vars = a.get(2).map_or(Json::Object(vec![]), |v| jv(v).clone());
+            if !matches!(vars, Json::Object(_)) {
+                return Err(err(
+                    code::INVALID_PARAMETER_VALUE,
+                    "\"vars\" argument is not an object",
+                ));
+            }
+            let silent = a.get(3).and_then(Value::as_bool).unwrap_or(false);
+            let doc = jv(&a[0]);
+            return Ok(Some(match name {
+                "jsonb_path_exists" => Bool(!path.query(doc, &vars, silent)?.is_empty()),
+                "jsonb_path_match" => match path.matches(doc, &vars, silent)? {
+                    Some(b) => Bool(b),
+                    None => Null,
+                },
+                "jsonb_path_query_array" => {
+                    Jsonb(Box::new(Json::Array(path.query(doc, &vars, silent)?)))
+                }
+                _ => match path.query(doc, &vars, silent)?.into_iter().next() {
+                    Some(j) => Jsonb(Box::new(j)),
+                    None => Null,
+                },
+            }));
+        }
+        "numnode" => {
+            let q = fts::parse_query_text(text(&a[0]))?;
+            return Ok(Some(Int(q.as_ref().map_or(0, fts::numnode) as i64)));
+        }
+        "ts_headline" => {
+            // ([config,] document, query [, options])
+            let (config, rest) = if tys.get(2).is_some_and(|t| t.base == Base::Tsquery) {
+                (text(&a[0]).to_string(), &a[1..])
+            } else {
+                ("english".to_string(), a)
+            };
+            let q = fts::parse_query_text(text(&rest[1]))?;
+            let opts = rest.get(2).map_or("", text);
+            return Ok(Some(Text(fts::headline(text(&rest[0]), q.as_ref(), &config, opts)?)));
         }
         "setweight" => {
             let weight = text(&a[1]).chars().next().unwrap_or('\0');
@@ -2369,11 +2519,45 @@ pub fn call(
             ))),
         },
         "array_fill" => {
-            let dims: Vec<i64> = arr_items(&a[1]).iter().map(int).collect();
-            let total: i64 = dims.iter().product();
+            // array_fill(value, dims [, lower bounds])
+            let ints = |v: &Value| -> PgResult<Vec<i64>> {
+                arr_items(v)
+                    .iter()
+                    .map(|x| {
+                        x.as_int().ok_or_else(|| {
+                            err(code::NULL_VALUE_NOT_ALLOWED, "dimension values cannot be null")
+                        })
+                    })
+                    .collect()
+            };
+            let dims = ints(&a[1])?;
+            let lbs = match a.get(2) {
+                Some(l) => ints(l)?,
+                None => vec![1; dims.len()],
+            };
+            if lbs.len() != dims.len() {
+                return Err(err(code::ARRAY_SUBSCRIPT_ERROR, "wrong number of array subscripts")
+                    .detail("Low bound array has different size than dimensions array."));
+            }
+            let mut total: i64 = 1;
+            for (&d, &lb) in dims.iter().zip(&lbs) {
+                total = total.saturating_mul(d);
+                if d < 0 || total > types::MAX_ARRAY_SIZE {
+                    return Err(array_too_big());
+                }
+                if lb + d - 1 > i32::MAX as i64 {
+                    return Err(err(
+                        code::PROGRAM_LIMIT_EXCEEDED,
+                        format!("array lower bound is too large: {lb}"),
+                    ));
+                }
+            }
+            if dims.is_empty() || total == 0 {
+                return Ok(Some(Array(Box::new(types::Array::empty()))));
+            }
             Array(Box::new(types::Array {
-                dims: dims.iter().map(|&d| (d as i32, 1)).collect(),
-                items: vec![a[0].clone(); total.max(0) as usize],
+                dims: dims.iter().zip(&lbs).map(|(&d, &lb)| (d as i32, lb as i32)).collect(),
+                items: vec![a[0].clone(); total as usize],
             }))
         }
         "trim_array" => match arr(&a[0]) {
@@ -2623,7 +2807,7 @@ pub fn extract_value(field: &str, v: &Value, ty: Type, env: &Env) -> PgResult<Nu
                 let off = env
                     .fmt
                     .zone
-                    .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+                    .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
                 (t + off as i64 * USECS_PER_SEC, Some(*t), Some(off))
             } else {
                 (*t, None, None)
@@ -2670,7 +2854,7 @@ fn to_char(v: &Value, ty: Type, fmt: &str, env: &Env) -> PgResult<Value> {
             let off = env
                 .fmt
                 .zone
-                .offset_at_utc(t.div_euclid(USECS_PER_SEC) - datetime::PG_EPOCH_DAYS * 86400);
+                .offset_at_utc(t.div_euclid(USECS_PER_SEC) + datetime::PG_EPOCH_DAYS * 86400);
             (t + off as i64 * USECS_PER_SEC, Some(off), None)
         }
         (Value::Ts(t), _) => (*t, None, None),
@@ -2834,7 +3018,7 @@ fn to_char(v: &Value, ty: Type, fmt: &str, env: &Env) -> PgResult<Value> {
             } else {
                 let (_, _, ab) = env.fmt.zone.info_at_utc(
                     (local - o as i64 * USECS_PER_SEC).div_euclid(USECS_PER_SEC)
-                        - datetime::PG_EPOCH_DAYS * 86400,
+                        + datetime::PG_EPOCH_DAYS * 86400,
                 );
                 if off.is_some() { ab } else { String::new() }
             };
@@ -3144,6 +3328,14 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Postgres's MaxArraySize error.
+fn array_too_big() -> PgError {
+    PgError::new(
+        code::PROGRAM_LIMIT_EXCEEDED,
+        format!("array size exceeds the maximum allowed ({})", types::MAX_ARRAY_SIZE),
+    )
 }
 
 #[cfg(test)]
