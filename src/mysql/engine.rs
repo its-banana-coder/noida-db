@@ -346,7 +346,9 @@ impl Engine {
     /// error (CLIENT_MULTI_STATEMENTS).
     pub fn execute_multi(&mut self, sql: &str) -> Vec<StatementResult> {
         let dialect = MySqlDialect {};
-        let rewritten = rewrite_rename_key(sql).or_else(|| rewrite_comma_update(sql));
+        let rewritten = rewrite_rename_key(sql)
+            .or_else(|| rewrite_trailing_into(sql))
+            .or_else(|| rewrite_comma_update(sql));
         let text = rewritten.as_deref().unwrap_or(sql);
         let asts = match Parser::parse_sql(&dialect, text) {
             Ok(a) => a,
@@ -374,7 +376,9 @@ impl Engine {
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
-        let rewritten = rewrite_rename_key(sql).or_else(|| rewrite_comma_update(sql));
+        let rewritten = rewrite_rename_key(sql)
+            .or_else(|| rewrite_trailing_into(sql))
+            .or_else(|| rewrite_comma_update(sql));
         let sql = rewritten.as_deref().unwrap_or(sql);
         let mut asts = Parser::parse_sql(&dialect, sql)
             .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
@@ -411,6 +415,56 @@ impl Engine {
         stmt: Statement,
         sql: &str,
     ) -> Result<Vec<Vec<Value>>, MySqlError> {
+        // `SELECT ... INTO @a, @b`: the row goes into user variables
+        // instead of a result set.
+        if let Statement::Query(q) = &stmt
+            && let sqlparser::ast::SetExpr::Select(sel) = q.body.as_ref()
+            && let Some(into) = &sel.into
+        {
+            let mut targets = Vec::new();
+            for t in &into.targets {
+                match t {
+                    sqlparser::ast::Expr::Identifier(id) if id.value.starts_with('@') => {
+                        targets.push(id.value[1..].trim_matches('`').to_ascii_lowercase());
+                    }
+                    _ => {
+                        return Err(MySqlError::unsupported(
+                            "SELECT ... INTO other than user variables",
+                        ));
+                    }
+                }
+            }
+            let mut plain = q.clone();
+            if let sqlparser::ast::SetExpr::Select(s) = plain.body.as_mut() {
+                s.into = None;
+            }
+            let rows = self.execute_statement_inner(Statement::Query(plain), sql)?;
+            if self.last_column_names.len() != targets.len() {
+                return Err(MySqlError::new(
+                    1222,
+                    "21000",
+                    "The used SELECT statements have a different number of columns",
+                ));
+            }
+            // The first row is assigned (even when more follow, which is
+            // then an error); no row leaves the variables as they were.
+            let more = rows.len() > 1;
+            self.last_affected_rows = rows.len() as u64;
+            if let Some(row) = rows.into_iter().next() {
+                for (name, v) in targets.into_iter().zip(row) {
+                    self.user_vars.insert(name, v);
+                }
+            }
+            if more {
+                return Err(MySqlError::new(
+                    1172,
+                    "42000",
+                    "Result consisted of more than one row",
+                ));
+            }
+            self.last_column_names = Vec::new();
+            return Ok(vec![]);
+        }
         // Transaction control statements are handled here, at the
         // session/engine level, rather than as a `Plan` variant: they need
         // state (`tx_snapshot`) that lives across separate `execute` calls,
@@ -920,6 +974,59 @@ fn sql_mode_assignment(set: &sqlparser::ast::Set) -> Option<crate::mysql::sqlmod
         .or(out);
     }
     out
+}
+
+/// `SELECT ... FROM ... INTO @a, @b` (MySQL also takes INTO last): moved
+/// before the top-level FROM, where the SQL parser expects it.
+pub fn rewrite_trailing_into(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?is)\s+into\s+(@[A-Za-z0-9_$.`@]+(?:\s*,\s*@[A-Za-z0-9_$.`@]+)*)\s*;?\s*$",
+    )
+    .expect("regex");
+    let trimmed = sql.trim_start();
+    if trimmed.len() < 6 || !trimmed[..6].eq_ignore_ascii_case("SELECT") {
+        return None;
+    }
+    let m = re.captures(sql)?;
+    let head = &sql[..m.get(0)?.start()];
+    // The top-level FROM: outside parentheses and quotes.
+    let bytes = head.as_bytes();
+    let (mut depth, mut quote) = (0i32, None::<u8>);
+    let mut from = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' | b'`' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ if depth == 0
+                    && head[i..].len() >= 4
+                    && head[i..i + 4].eq_ignore_ascii_case("FROM")
+                    && (i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')')
+                    && head
+                        .as_bytes()
+                        .get(i + 4)
+                        .is_none_or(|b| b.is_ascii_whitespace() || *b == b'(') =>
+                {
+                    from = Some(i);
+                    break;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    let from = from?;
+    Some(format!("{}INTO {} {}", &head[..from], &m[1], &head[from..]))
 }
 
 /// `ALTER TABLE t ... RENAME {INDEX|KEY} a TO b ...`, which the SQL parser

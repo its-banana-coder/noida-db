@@ -741,6 +741,22 @@ MYSQL_QUERIES = {
         (A, "DROP VIEW vt"),
         (A, "SHOW TABLES"),
     ],
+    "select into user variables": [
+        (A, "CREATE TABLE si (a int, b varchar(5))"),
+        (A, "INSERT INTO si VALUES (1, 'x'), (2, 'y')"),
+        (A, "SELECT 1, 'a' INTO @x, @y"),
+        (A, "SELECT @x, @y"),
+        (A, "SELECT count(*) INTO @c FROM si"),
+        (A, "SELECT @c"),
+        (A, "SELECT 1, 2 INTO @only_one"),
+        (A, "SELECT a INTO @m FROM si"),
+        (A, "SELECT @m"),
+        (A, "SET @z = 5"),
+        (A, "SELECT a INTO @z FROM si WHERE a > 99"),
+        (A, "SELECT @z"),
+        (A, "SELECT a, b FROM si WHERE a = 2 INTO @ta, @tb"),
+        (A, "SELECT @ta, @tb"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 
