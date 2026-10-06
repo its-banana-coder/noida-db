@@ -38,3 +38,15 @@ tests/official/redis/run.sh 6379
   psql's `\copy` for every server.
 - **Redis**: the suite's own `[ok]`/`[err]` counts; tests tagged
   `external:skip` are skipped by Redis's runner itself.
+
+## Results so far
+
+| Suite | Real server (ceiling here) | noida-db | Date |
+|---|---|---|---|
+| Postgres `pg_regress` (REL_14_STABLE, 216 files, ~40k statements) | PostgreSQL 14: 99.3% of statements, 179/216 files identical | 44.9% of statements, no crashes (before #109/#113) | 2026-10-06 |
+| Elasticsearch YAML REST tests (v8.15.3) | Elasticsearch 8.15.3: 90.4% on a subset (full calibration pending) | not run yet | 2026-10-05 |
+| Redis TCL suite (7.2) | not run yet | not run yet | — |
+
+What the real server misses here is environmental (Postgres's C test
+library isn't built; ES features needing a capabilities API) and is the
+ceiling for noida-db, not a gap.
