@@ -1,6 +1,6 @@
 [package]
 name = "noida-db"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "One tiny local binary that speaks Postgres, MySQL, Redis, Kafka, Elasticsearch and ClickHouse."
 license = "MIT"
