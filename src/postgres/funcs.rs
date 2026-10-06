@@ -1782,6 +1782,29 @@ pub fn call(
                     .map_or_else(String::new, |q| fts::format_query(&q)),
             )));
         }
+        // `col[s1][s2]... = v` (see `arrayset`): jsonb or array assignment.
+        "subscript_set" => {
+            if ret.base == types::Base::Jsonb {
+                let value = match &a[1] {
+                    Jsonb(j) => (**j).clone(),
+                    _ => crate::sql::json::Json::Null,
+                };
+                let root = match &a[0] {
+                    Jsonb(j) => Some((**j).clone()),
+                    _ => None,
+                };
+                let out = jsonb_assign(root, &a[2..], 1, value)?.normalize();
+                return Ok(Some(Jsonb(Box::new(out))));
+            }
+            if a.len() != 3 {
+                return Err(err(
+                    code::FEATURE_NOT_SUPPORTED,
+                    "assignment to a nested array subscript is not supported",
+                ));
+            }
+            let args = [a[0].clone(), a[2].clone(), a[1].clone()];
+            return call("array_set_element", &args, &[tys[0], Type::INT4, tys[1]], ret, env);
+        }
         "array_set_element" => {
             // `arr[i] = v`: a NULL array becomes a one-element array at
             // index i; an index past either end pads with NULLs.
@@ -3336,6 +3359,101 @@ fn array_too_big() -> PgError {
         code::PROGRAM_LIMIT_EXCEEDED,
         format!("array size exceeds the maximum allowed ({})", types::MAX_ARRAY_SIZE),
     )
+}
+
+/// Postgres's jsonb subscript assignment: `subs` from position `pos` (1
+/// based, for errors) into `cur` (`None`: missing, so created by the
+/// subscript's type -- object for text, array for integer).
+fn jsonb_assign(
+    cur: Option<crate::sql::json::Json>,
+    subs: &[Value],
+    pos: usize,
+    value: crate::sql::json::Json,
+) -> PgResult<crate::sql::json::Json> {
+    use crate::sql::json::Json;
+    let Some(sub) = subs.first() else { return Ok(value) };
+    enum K {
+        Key(String),
+        Idx(i64),
+    }
+    let k = match sub {
+        Value::Int(i) => K::Idx(*i),
+        Value::Text(t) => K::Key(t.clone()),
+        Value::Null => {
+            return Err(err(
+                code::NULL_VALUE_NOT_ALLOWED,
+                "jsonb subscript in assignment must not be null",
+            ));
+        }
+        _ => {
+            return Err(err(code::DATATYPE_MISMATCH, "subscript type is not supported")
+                .hint("jsonb subscript must be coercible to either integer or text."));
+        }
+    };
+    let index = |k: &K| -> PgResult<i64> {
+        match k {
+            K::Idx(i) => Ok(*i),
+            K::Key(t) => t.trim().parse::<i64>().map_err(|_| {
+                err(
+                    code::INVALID_TEXT_REPRESENTATION,
+                    format!("path element at position {pos} is not an integer: \"{t}\""),
+                )
+            }),
+        }
+    };
+    let rest = &subs[1..];
+    match cur {
+        None | Some(Json::Null) => match k {
+            K::Key(key) => Ok(Json::Object(vec![(key, jsonb_assign(None, rest, pos + 1, value)?)])),
+            K::Idx(i) => {
+                if i < 0 {
+                    return Err(err(
+                        code::INVALID_PARAMETER_VALUE,
+                        format!("path element at position {pos} is out of range: {i}"),
+                    ));
+                }
+                let mut items = vec![Json::Null; i as usize];
+                items.push(jsonb_assign(None, rest, pos + 1, value)?);
+                Ok(Json::Array(items))
+            }
+        },
+        Some(Json::Object(mut pairs)) => {
+            let key = match k {
+                K::Key(s) => s,
+                K::Idx(i) => i.to_string(),
+            };
+            match pairs.iter().position(|(n, _)| *n == key) {
+                Some(p) => {
+                    let old = std::mem::replace(&mut pairs[p].1, Json::Null);
+                    pairs[p].1 = jsonb_assign(Some(old), rest, pos + 1, value)?;
+                }
+                None => pairs.push((key, jsonb_assign(None, rest, pos + 1, value)?)),
+            }
+            Ok(Json::Object(pairs))
+        }
+        Some(Json::Array(mut items)) => {
+            let i = index(&k)?;
+            let real = if i < 0 { items.len() as i64 + i } else { i };
+            if real < 0 {
+                return Err(err(
+                    code::INVALID_PARAMETER_VALUE,
+                    format!("path element at position {pos} is out of range: {i}"),
+                ));
+            }
+            let real = real as usize;
+            if real >= items.len() {
+                items.resize(real, Json::Null);
+                items.push(jsonb_assign(None, rest, pos + 1, value)?);
+            } else {
+                let old = std::mem::replace(&mut items[real], Json::Null);
+                items[real] = jsonb_assign(Some(old), rest, pos + 1, value)?;
+            }
+            Ok(Json::Array(items))
+        }
+        Some(_) if subs.is_empty() => Ok(value),
+        Some(_) => Err(err(code::INVALID_PARAMETER_VALUE, "cannot replace existing key")
+            .detail("The path assumes key is a composite object, but it is a scalar value.")),
+    }
 }
 
 #[cfg(test)]
