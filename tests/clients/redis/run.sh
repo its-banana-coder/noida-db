@@ -85,7 +85,11 @@ if command -v ruby >/dev/null && command -v gem >/dev/null; then
   export GEM_PATH="$GEM_HOME"
   export PATH="$GEM_HOME/bin:$PATH"
   if [ ! -x "$GEM_HOME/bin/sidekiq" ]; then
-    gem install -N sidekiq redis >/dev/null 2>&1
+    # Pinned together: redis 6.0.0 needs redis-client 0.30.1 exactly, and a
+    # newer redis-client pulled in by sidekiq would conflict at require.
+    gem install -N redis-client -v 0.30.1 >/dev/null 2>&1
+    gem install -N redis -v 6.0.0 --conservative >/dev/null 2>&1
+    gem install -N sidekiq --conservative >/dev/null 2>&1
   fi
   if [ -x "$GEM_HOME/bin/sidekiq" ]; then
     (cd "$here" && "$GEM_HOME/bin/sidekiq" -r ./sidekiq_jobs.rb -c 2 -q default \
