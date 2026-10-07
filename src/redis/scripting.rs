@@ -144,7 +144,7 @@ pub struct Scripts {
 }
 
 impl Engine {
-    fn script_body(&self, sha: &str) -> Option<Vec<u8>> {
+    pub(crate) fn script_body(&self, sha: &str) -> Option<Vec<u8>> {
         self.scripts.cache.get(&sha.to_ascii_lowercase()).cloned()
     }
 }
@@ -188,7 +188,27 @@ fn eval_generic(ctx: &mut Ctx, a: &[Vec<u8>], by_sha: bool, read_only: bool) -> 
     };
     let keys = &a[3..3 + numkeys];
     let args = &a[3 + numkeys..];
-    let reply = run_script(ctx, &body, &sha, keys, args, read_only)?;
+    let (skip, read_only) =
+        match parse_shebang(&body).map_err(|e| Value::err(format!("ERR {e}")))? {
+            None => (0, read_only),
+            Some((len, flags)) => {
+                let no_writes = flags.iter().any(|f| f == "no-writes");
+                if !no_writes && read_only {
+                    return Err(Value::err(
+                        "ERR Can not execute a script with write flag using *_ro command.",
+                    ));
+                }
+                if ctx.engine.oom && !no_writes && !flags.iter().any(|f| f == "allow-oom") {
+                    return Err(Value::err(
+                        "OOM allow-oom flag is not set on the script, can not run it when used \
+                     memory > 'maxmemory'",
+                    ));
+                }
+                (len, read_only || no_writes)
+            }
+        };
+    // The shebang line is skipped, its newline kept so line numbers match.
+    let reply = run_script(ctx, &body[skip..], &sha, keys, args, read_only)?;
     if !by_sha {
         ctx.engine.scripts.cache.insert(sha, body);
     }
@@ -262,8 +282,47 @@ fn new_lua() -> Lua {
 
 /// Compiles `body` to check it, as SCRIPT LOAD does.
 fn compile_check(body: &[u8]) -> Result<(), Value> {
+    let skip = parse_shebang(body).map_err(|e| Value::err(format!("ERR {e}")))?.map_or(0, |s| s.0);
     let lua = new_lua();
-    load_script(&lua, body).map(|_| ())
+    load_script(&lua, &body[skip..]).map(|_| ())
+}
+
+/// An EVAL script's `#!lua flags=...` first line (`evalExtractShebangFlags`):
+/// None without one (backwards-compatible mode), else the line's length and
+/// the declared flags.
+pub(crate) fn parse_shebang(body: &[u8]) -> Result<Option<(usize, Vec<String>)>, String> {
+    if !body.starts_with(b"#!") {
+        return Ok(None);
+    }
+    let Some(end) = body.iter().position(|&b| b == b'\n') else {
+        return Err("Invalid script shebang".into());
+    };
+    let line = String::from_utf8_lossy(&body[..end]);
+    let mut parts = line.split_ascii_whitespace();
+    let Some(engine) = parts.next() else {
+        return Err("Invalid engine in script shebang".into());
+    };
+    if engine != "#!lua" {
+        return Err(format!("Unexpected engine in script shebang: {engine}"));
+    }
+    let mut flags = Vec::new();
+    for part in parts {
+        let Some(list) = part.strip_prefix("flags=") else {
+            return Err(format!("Unknown lua shebang option: {part}"));
+        };
+        for f in list.split(',').filter(|f| !f.is_empty()) {
+            if !super::functions::FLAGS.contains(&f) {
+                return Err(format!("Unexpected flag in script shebang: {f}"));
+            }
+            flags.push(f.to_string());
+        }
+    }
+    Ok(Some((end, flags)))
+}
+
+/// Whether a script declares `no-writes` (None: it declares no flags).
+pub(crate) fn shebang_no_writes(body: &[u8]) -> Option<bool> {
+    parse_shebang(body).ok().flatten().map(|(_, flags)| flags.iter().any(|f| f == "no-writes"))
 }
 
 fn load_script(lua: &Lua, body: &[u8]) -> Result<mlua::Function, Value> {
@@ -513,7 +572,7 @@ fn do_call(lua: &Lua, ctx: &mut Ctx, args: Variadic<Lv>, read_only: bool, resp: 
         }
         Err(_) => return fail(lua, "Unknown Redis command called from script"),
     };
-    if read_only && meta.has_flag("write") {
+    if read_only && (meta.has_flag("write") || meta.has_flag("may_replicate")) {
         return fail(lua, "Write commands are not allowed from read-only scripts.");
     }
     let Ctx { engine, session, .. } = ctx;

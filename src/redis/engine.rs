@@ -306,6 +306,12 @@ pub struct Engine {
     pub evicted_keys: u64,
     /// `DEBUG SET-SKIP-CHECKSUM-VALIDATION`: RESTORE ignores payload CRCs.
     pub(crate) skip_checksum: bool,
+    /// Connections whose command CLIENT PAUSE is holding (counted as
+    /// blocked clients, as Redis does).
+    pub paused_clients: usize,
+    /// Used memory was over `maxmemory` before the current command
+    /// (Redis's `pre_command_oom_state`).
+    pub(crate) oom: bool,
 }
 
 pub type Reply = Result<Value, Value>;
@@ -525,6 +531,8 @@ impl Engine {
             scripts: Default::default(),
             evicted_keys: 0,
             skip_checksum: false,
+            paused_clients: 0,
+            oom: false,
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
             watchers: HashMap::new(),
@@ -627,17 +635,53 @@ impl Engine {
     }
 
     /// Whether CLIENT PAUSE holds back this command right now. The server
-    /// waits and retries until it doesn't.
-    pub fn is_paused_for(&mut self, args: &[Vec<u8>]) -> bool {
+    /// waits and retries until it doesn't. Like Redis, commands that fail
+    /// their name or arity checks answer right away, and WRITE pauses hold
+    /// what may write: write commands, EXEC of a transaction that has one,
+    /// scripts unless their shebang declares `no-writes`.
+    pub fn is_paused_for(&mut self, session: &Session, args: &[Vec<u8>]) -> bool {
         let Some(pause) = &self.pause else { return false };
         if self.now() >= pause.until {
             self.pause = None;
+            return false;
+        }
+        if resolve(args).is_err() {
             return false;
         }
         if pause.all {
             return true;
         }
         let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
+        if name == "exec" {
+            let queued = self.clients.get(&session.id).and_then(|c| c.multi.clone());
+            return queued.is_some_and(|q| q.iter().any(|cmd| self.may_write(cmd)));
+        }
+        self.may_write(args)
+    }
+
+    /// Redis's `CMD_WRITE | CMD_MAY_REPLICATE`, with scripts' declared flags.
+    fn may_write(&self, args: &[Vec<u8>]) -> bool {
+        let Some(first) = args.first() else { return false };
+        let name = String::from_utf8_lossy(first).to_ascii_lowercase();
+        let declared_no_writes = match name.as_str() {
+            "eval" if args.len() > 1 => super::scripting::shebang_no_writes(&args[1]),
+            "evalsha" if args.len() > 1 => {
+                let sha = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
+                self.script_body(&sha).and_then(|b| super::scripting::shebang_no_writes(&b))
+            }
+            "fcall" if args.len() > 1 => {
+                let f = String::from_utf8_lossy(&args[1]);
+                self.scripts
+                    .libraries
+                    .iter()
+                    .find_map(|l| l.functions.iter().find(|x| x.name == *f))
+                    .map(|x| x.flags.iter().any(|fl| fl == "no-writes"))
+            }
+            _ => None,
+        };
+        if let Some(no_writes) = declared_no_writes {
+            return !no_writes;
+        }
         command_meta::lookup(&name)
             .is_some_and(|m| m.has_flag("write") || m.has_flag("may_replicate"))
     }
@@ -739,10 +783,8 @@ impl Engine {
         // maxmemory: evict first; a command that may grow memory is refused
         // if that wasn't enough (`processCommand`'s OOM check).
         let maxmemory = self.config_num("maxmemory");
-        if maxmemory > 0
-            && !self.perform_evictions(maxmemory as u64)
-            && command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("denyoom"))
-        {
+        self.oom = maxmemory > 0 && !self.perform_evictions(maxmemory as u64);
+        if self.oom && command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("denyoom")) {
             let e = Value::err("OOM command not allowed when used memory > 'maxmemory'.");
             return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
         }
