@@ -19,7 +19,10 @@ out=$(mktemp)
 # One file at a time: a test that can't run against an external server
 # (it needs the server's pid, say) raises an exception that would end a
 # whole-suite run, so it only costs its own file here.
-files=$(cd "$src/tests" && find unit integration -name '*.tcl' | sed 's/\.tcl$//' | sort)
+# unit/moduleapi is skipped: those tests load Redis modules compiled from
+# tests/modules (a .so into the server via MODULE LOAD), which only a real
+# Redis can do. Against real Redis in external mode they fail anyway.
+files=$(cd "$src/tests" && find unit integration -name '*.tcl' | grep -v '^unit/moduleapi/' | sed 's/\.tcl$//' | sort)
 for f in $files; do
   echo "=== $f" >>"$out"
   (cd "$src" && timeout 900 ./runtest --host 127.0.0.1 --port "$port" --clients 1 --timeout 300 --single "$f" "$@") >>"$out" 2>&1
