@@ -143,6 +143,15 @@ impl Db {
         self.map.get_mut(key)
     }
 
+    /// Like `get`, without counting as an access.
+    pub fn peek(&mut self, key: &[u8], now: u64) -> Option<&mut Entry> {
+        if self.map.get(key).is_some_and(|e| e.is_expired(now)) {
+            self.map.remove(key);
+            self.access.remove(key);
+        }
+        self.map.get_mut(key)
+    }
+
     /// A key's (last access, access count) without touching it.
     pub fn access_of(&self, key: &[u8]) -> Option<(u64, u8)> {
         self.map.contains_key(key).then(|| self.access.get(key).copied().unwrap_or((0, 0)))
@@ -414,12 +423,30 @@ impl Ctx<'_> {
     }
 
     pub fn lookup(&mut self, key: &[u8]) -> Option<&mut Entry> {
+        // CLIENT NO-TOUCH: the client's reads leave keys' access time alone.
+        let touch = !self.engine.clients.get(&self.session.id).is_some_and(|c| c.no_touch);
+        self.lookup_with(key, touch)
+    }
+
+    /// `lookup` without updating the key's last access (Redis's
+    /// LOOKUP_NOTOUCH): TYPE, TTL, EXISTS, OBJECT, DEBUG OBJECT.
+    pub fn lookup_notouch(&mut self, key: &[u8]) -> Option<&mut Entry> {
+        self.lookup_with(key, false)
+    }
+
+    /// `lookup` that always updates the access time (TOUCH, even from a
+    /// NO-TOUCH client).
+    pub fn lookup_touch(&mut self, key: &[u8]) -> Option<&mut Entry> {
+        self.lookup_with(key, true)
+    }
+
+    fn lookup_with(&mut self, key: &[u8], touch: bool) -> Option<&mut Entry> {
         let now = self.now;
         let expired = self.db().map.get(key).is_some_and(|e| e.is_expired(now));
         if expired {
             self.notify_keyspace_event('g', "expired", key);
         }
-        self.db().get(key, now)
+        if touch { self.db().get(key, now) } else { self.db().peek(key, now) }
     }
 
     /// The string at `key`, `None` if missing, WRONGTYPE for other types.

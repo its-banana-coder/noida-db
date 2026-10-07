@@ -382,3 +382,32 @@ fn wrong_arity_uses_lowercase_name() {
     assert_eq!(t.run("GET"), err("ERR wrong number of arguments for 'get' command"));
     assert_eq!(t.run("SeT k"), err("ERR wrong number of arguments for 'set' command"));
 }
+
+#[test]
+fn reads_that_do_not_touch_keys() {
+    let mut t = T::new();
+    t.run("SET foo bar");
+    t.run("GET foo");
+    t.advance(3000);
+    // TTL, TYPE, EXISTS, OBJECT and DEBUG OBJECT leave the access time.
+    for cmd in
+        ["TTL foo", "PTTL foo", "TYPE foo", "EXISTS foo", "OBJECT ENCODING foo", "DEBUG OBJECT foo"]
+    {
+        t.run(cmd);
+    }
+    t.run("SCAN 0 TYPE string");
+    assert_eq!(t.run("OBJECT IDLETIME foo"), int(3));
+    assert_eq!(t.run("TOUCH foo nokey"), int(1));
+    assert_eq!(t.run("OBJECT IDLETIME foo"), int(0));
+    // CLIENT NO-TOUCH: reads don't count; TOUCH still does.
+    t.run("CLIENT NO-TOUCH on");
+    t.advance(2000);
+    t.run("GET foo");
+    assert_eq!(t.run("OBJECT IDLETIME foo"), int(2));
+    t.run("TOUCH foo");
+    assert_eq!(t.run("OBJECT IDLETIME foo"), int(0));
+    t.run("CLIENT NO-TOUCH off");
+    t.advance(2000);
+    t.run("GET foo");
+    assert_eq!(t.run("OBJECT IDLETIME foo"), int(0));
+}
