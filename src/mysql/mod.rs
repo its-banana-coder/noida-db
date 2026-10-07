@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod engine;
 pub mod error;
 pub mod exec;
+pub mod explain;
 pub mod funcs;
 pub mod infoschema;
 pub mod plan;

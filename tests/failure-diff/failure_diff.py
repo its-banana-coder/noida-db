@@ -828,6 +828,26 @@ MYSQL_QUERIES = {
         (A, "UPDATE dd SET a = DEFAULT, b = 'zz' WHERE id = 2"),
         (A, "SELECT * FROM dd ORDER BY id"),
     ],
+    "EXPLAIN access paths": [
+        (A, "CREATE TABLE tg (id int primary key, name varchar(20), k int, email varchar(50) NOT NULL, big bigint, KEY kk (k), UNIQUE KEY ue (email))"),
+        (A, "CREATE TABLE tp (id int primary key auto_increment, tg_id int, KEY fk (tg_id))"),
+        (A, "INSERT INTO tg VALUES (1,'a',1,'a@x',1),(2,'b',2,'b@x',2),(3,'c',2,'c@x',3)"),
+        (A, "INSERT INTO tp (tg_id) VALUES (1),(1),(2)"),
+        (A, "EXPLAIN SELECT 1"),
+        (A, "EXPLAIN SELECT * FROM tg"),
+        (A, "EXPLAIN SELECT * FROM tg WHERE k = 2"),
+        (A, "EXPLAIN SELECT * FROM tg WHERE email = 'a@x'"),
+        (A, "EXPLAIN SELECT * FROM tg WHERE email = 'zz'"),
+        (A, "EXPLAIN SELECT * FROM tg WHERE big = 2 ORDER BY name"),
+        (A, "EXPLAIN SELECT * FROM tg LEFT JOIN tp ON tp.id = tg.k"),
+        (A, "EXPLAIN DELETE FROM tg WHERE k = 1"),
+        (A, "EXPLAIN INSERT INTO tp (tg_id) VALUES (3)"),
+        (A, "EXPLAIN FORMAT=TRADITIONAL SELECT DISTINCT name FROM tg LIMIT 2"),
+        (A, "DESCRIBE SELECT * FROM tg WHERE id = 1"),
+        (A, "EXPLAIN ANALYZE DELETE FROM tg"),
+        (A, "EXPLAIN SELECT * FROM nope"),
+        (A, "SELECT count(*) FROM tg"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

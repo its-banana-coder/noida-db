@@ -279,7 +279,8 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 let rewritten = crate::mysql::engine::rewrite_table_comment(&sql)
                     .or_else(|| crate::mysql::engine::rewrite_rename_key(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_trailing_into(&sql))
-                    .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql));
+                    .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql))
+                    .or_else(|| crate::mysql::engine::rewrite_explain_format(&sql));
                 match Parser::parse_sql(&dialect, rewritten.as_deref().unwrap_or(&sql)) {
                     Ok(mut asts) => {
                         if asts.is_empty() {

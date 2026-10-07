@@ -1170,6 +1170,20 @@ impl Executor {
                     Value::Text("utf8mb4_0900_ai_ci".into()),
                 ]])
             }
+            Plan::Explain { format, analyze, inner } => {
+                // ANALYZE runs the query; plain EXPLAIN never executes it.
+                let actual = if analyze {
+                    Some(self.execute_plan((*inner).clone())?.len() as u64)
+                } else {
+                    None
+                };
+                let db = self.db.clone();
+                let lookup = move |schema: &str, table: &str| {
+                    let state = db.lock().unwrap();
+                    crate::mysql::infoschema::lookup_table(&state, schema, table)
+                };
+                crate::mysql::explain::explain(&inner, &lookup, format, actual)
+            }
             Plan::ShowColumns { db, table } => {
                 let view = self
                     .db

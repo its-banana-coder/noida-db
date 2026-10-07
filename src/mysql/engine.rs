@@ -349,7 +349,8 @@ impl Engine {
         let rewritten = rewrite_table_comment(sql)
             .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
-            .or_else(|| rewrite_comma_update(sql));
+            .or_else(|| rewrite_comma_update(sql))
+            .or_else(|| rewrite_explain_format(sql));
         let text = rewritten.as_deref().unwrap_or(sql);
         let asts = match Parser::parse_sql(&dialect, text) {
             Ok(a) => a,
@@ -380,7 +381,8 @@ impl Engine {
         let rewritten = rewrite_table_comment(sql)
             .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
-            .or_else(|| rewrite_comma_update(sql));
+            .or_else(|| rewrite_comma_update(sql))
+            .or_else(|| rewrite_explain_format(sql));
         let sql = rewritten.as_deref().unwrap_or(sql);
         let mut asts = Parser::parse_sql(&dialect, sql)
             .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
@@ -1040,6 +1042,16 @@ pub fn rewrite_trailing_into(sql: &str) -> Option<String> {
 /// `ALTER TABLE t ... RENAME {INDEX|KEY} a TO b ...`, which the SQL parser
 /// doesn't know, as a column rename of a marked name that the binder turns
 /// back into an index rename.
+/// `EXPLAIN [ANALYZE] FORMAT=TRADITIONAL stmt`, which sqlparser doesn't
+/// take: TRADITIONAL is the default, so the clause is dropped.
+pub fn rewrite_explain_format(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?is)^(\s*(?:explain|describe|desc)(?:\s+analyze)?)\s+format\s*=\s*traditional\b",
+    )
+    .expect("regex");
+    re.is_match(sql).then(|| re.replace(sql, "$1").into_owned())
+}
+
 pub fn rewrite_rename_key(sql: &str) -> Option<String> {
     let trimmed = sql.trim_start();
     if trimmed.len() < 11 || !trimmed[..11].eq_ignore_ascii_case("ALTER TABLE") {
