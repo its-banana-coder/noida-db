@@ -1350,9 +1350,11 @@ pub fn extract(
 ) -> Option<Numeric> {
     let f = fields(local);
     let n = Numeric::from_i64;
+    // `micros` microseconds as a number of seconds (scale 6) or
+    // milliseconds (scale 3).
     let sec_scaled = |micros: i64, scale: u32| {
         let v = Numeric::from_i64(micros);
-        let d = Numeric::from_i64(10i64.pow(6 - scale));
+        let d = Numeric::from_i64(10i64.pow(scale));
         v.div_scale(&d, scale as i64, false).unwrap()
     };
     Some(match field {
@@ -1362,7 +1364,7 @@ pub fn extract(
         "hour" if !is_date => n(f.hour),
         "minute" if !is_date => n(f.minute),
         "second" if !is_date => sec_scaled(f.micros, 6),
-        "milliseconds" if !is_date => sec_scaled(f.micros * 1000, 6).round(3),
+        "milliseconds" if !is_date => sec_scaled(f.micros, 3),
         "microseconds" if !is_date => n(f.micros),
         "quarter" => n((f.month as i64 - 1) / 3 + 1),
         "dow" => n((f.days + PG_EPOCH_DAYS + 4).rem_euclid(7)),
