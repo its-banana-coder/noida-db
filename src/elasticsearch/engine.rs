@@ -187,8 +187,16 @@ impl Engine {
         if !read {
             crate::persistence::mark("elasticsearch");
         }
-        let segments: Vec<&str> =
-            path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+        // Each path segment is percent-decoded on its own (an encoded `/`
+        // inside a document id stays inside that id), as Elasticsearch
+        // does: `PUT /test-%E4%B8%AD` creates the index `test-中`.
+        let decoded: Vec<String> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(percent_decode_segment)
+            .collect();
+        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let q = query_params(query);
         if path == "/" || path.is_empty() {
             return (
@@ -223,6 +231,15 @@ impl Engine {
         }
         if segments.first() == Some(&"_search") || segments.first() == Some(&"_count") {
             return self.search_or_count(method, segments[0], "*", &q, body);
+        }
+        if let Some(action @ ("_refresh" | "_flush" | "_forcemerge")) = segments.first().copied()
+            && segments.len() == 1
+            && matches!(method, "POST" | "GET")
+        {
+            return self.index_action("_all", action, &q);
+        }
+        if segments.first() == Some(&"_cache") && segments.get(1) == Some(&"clear") {
+            return self.index_action("_all", "_cache", &q);
         }
         if segments.first() == Some(&"_analyze") {
             return self.analyze(body);
@@ -276,8 +293,14 @@ impl Engine {
         match segments[1] {
             "_mapping" => self.mapping_api(method, index_name, body),
             "_settings" => self.settings_api(method, index_name, body),
-            "_refresh" | "_flush" | "_open" | "_close" => {
-                self.index_action(method, index_name, segments[1])
+            "_refresh" | "_flush" | "_open" | "_close" | "_forcemerge"
+                if method == "POST"
+                    || (method == "GET" && matches!(segments[1], "_refresh" | "_flush")) =>
+            {
+                self.index_action(segments[0], segments[1], &q)
+            }
+            "_cache" if segments.get(2) == Some(&"clear") && method == "POST" => {
+                self.index_action(segments[0], "_cache", &q)
             }
             "_search" | "_count" => self.search_or_count(method, segments[1], index_name, &q, body),
             "_pit" if method == "POST" => self.open_pit(index_name, &q),
@@ -315,19 +338,28 @@ impl Engine {
     /// rather than only letting `_aliases`/`_alias` manage the alias
     /// metadata without `_search` ever being able to use it.
     fn resolve_indices(s: &State, pattern: &str) -> Vec<String> {
-        if pattern == "_all" || pattern == "*" {
-            let mut names: Vec<String> = s.indices.keys().cloned().collect();
-            names.sort();
-            return names;
-        }
-        let mut names = Vec::new();
-        for part in pattern.split(',') {
-            let part = part.trim();
+        let mut names: Vec<String> = Vec::new();
+        for (n, part) in pattern.split(',').map(str::trim).enumerate() {
             if part.is_empty() {
                 continue;
             }
-            if let Some(prefix) = part.strip_suffix('*') {
-                names.extend(s.indices.keys().filter(|k| k.starts_with(prefix)).cloned());
+            // `-name` / `-pat*` after an earlier expression excludes.
+            if n > 0
+                && let Some(ex) = part.strip_prefix('-')
+            {
+                names.retain(|k| !glob_match(ex, k));
+                continue;
+            }
+            if part == "_all" || part == "*" {
+                names.extend(s.indices.keys().cloned());
+            } else if part.contains('*') {
+                names.extend(s.indices.keys().filter(|k| glob_match(part, k)).cloned());
+                names.extend(
+                    s.indices
+                        .iter()
+                        .filter(|(_, i)| i.aliases.keys().any(|a| glob_match(part, a)))
+                        .map(|(name, _)| name.clone()),
+                );
             } else if s.indices.contains_key(part) {
                 names.push(part.to_string());
             } else {
@@ -342,6 +374,35 @@ impl Engine {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// An index expression for an index-level admin action (`_refresh`,
+    /// `_flush`, `_forcemerge`, `_cache/clear`, `_open`, `_close`): like
+    /// `resolve_indices`, but a concrete name that matches nothing is a
+    /// 404 `index_not_found_exception` unless `ignore_unavailable=true`,
+    /// and `allow_no_indices=false` refuses an expression matching none.
+    fn resolve_targets(
+        s: &State,
+        expr: &str,
+        q: &HashMap<String, String>,
+    ) -> Result<Vec<String>, (u16, Value)> {
+        let ignore_unavailable = q.get("ignore_unavailable").is_some_and(|v| v == "true");
+        if !ignore_unavailable {
+            for (n, part) in expr.split(',').map(str::trim).enumerate() {
+                let excluded = n > 0 && part.starts_with('-');
+                if part.is_empty() || excluded || part == "_all" || part.contains('*') {
+                    continue;
+                }
+                if Self::resolve_indices(s, part).is_empty() {
+                    return Err(missing_index(part));
+                }
+            }
+        }
+        let names = Self::resolve_indices(s, expr);
+        if names.is_empty() && q.get("allow_no_indices").is_some_and(|v| v == "false") {
+            return Err(missing_index(expr));
+        }
+        Ok(names)
     }
 
     fn search_or_count(
@@ -1140,7 +1201,7 @@ impl Engine {
                     merge(&mut index.mappings, m.clone());
                 }
                 if let Some(st) = req.get("settings") {
-                    merge(&mut index.settings, st.clone());
+                    apply_settings(&mut index.settings, st);
                 }
                 if let Some(a) = req.get("aliases").and_then(Value::as_object) {
                     index.aliases.extend(a.clone());
@@ -1200,33 +1261,62 @@ impl Engine {
         match method {
             "GET" => (200, json!({(name):{"settings":i.settings}})),
             "PUT" => {
-                merge(&mut i.settings, parse_json(body).unwrap_or_else(|| json!({})));
+                let Some(req) = parse_json(body) else { return (400, malformed_body()) };
+                let req = match req.get("settings") {
+                    Some(inner) if req.as_object().is_some_and(|m| m.len() == 1) => inner.clone(),
+                    _ => req,
+                };
+                apply_settings(&mut i.settings, &req);
                 (200, json!({"acknowledged":true}))
             }
             _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
         }
     }
 
-    fn index_action(&self, _method: &str, name: &str, action: &str) -> (u16, Value) {
+    /// Index-level admin actions over an index expression (one name, a
+    /// list, wildcards, `_all`, or none for every index).
+    fn index_action(&self, expr: &str, action: &str, q: &HashMap<String, String>) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
-        let Some(i) = s.indices.get_mut(name) else {
-            return missing_index(name);
+        let names = match Self::resolve_targets(&s, expr, q) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
+        let (mut total, mut ok) = (0, 0);
+        for n in &names {
+            if let Some(i) = s.indices.get(n) {
+                let (p, r) = shard_counts(i);
+                total += p * (1 + r);
+                ok += p;
+            }
+        }
+        let shards = json!({"_shards":{"total":total,"successful":ok,"failed":0}});
         match action {
             "_refresh" => {
-                i.refresh(name);
-                (200, json!({"_shards":{"total":1,"successful":1,"failed":0}}))
+                for n in &names {
+                    if let Some(i) = s.indices.get_mut(n) {
+                        i.refresh(n);
+                    }
+                }
+                (200, shards)
             }
-            "_flush" => (200, json!({"_shards":{"total":1,"successful":1,"failed":0}})),
-            "_open" => {
-                i.opened = true;
-                (200, json!({"acknowledged":true,"shards_acknowledged":true}))
+            "_open" | "_close" => {
+                let open = action == "_open";
+                let mut out = serde_json::Map::new();
+                for n in &names {
+                    if let Some(i) = s.indices.get_mut(n) {
+                        i.opened = open;
+                        out.insert(n.clone(), json!({"closed": true}));
+                    }
+                }
+                if open {
+                    (200, json!({"acknowledged":true,"shards_acknowledged":true}))
+                } else {
+                    (200, json!({"acknowledged":true,"shards_acknowledged":true,"indices":out}))
+                }
             }
-            "_close" => {
-                i.opened = false;
-                (200, json!({"acknowledged":true,"shards_acknowledged":true}))
-            }
-            _ => (200, json!({})),
+            // `_flush`, `_forcemerge`, `_cache/clear`: nothing to do in
+            // memory beyond acknowledging every shard.
+            _ => (200, shards),
         }
     }
 
@@ -1872,6 +1962,71 @@ pub fn parse_json(bytes: &[u8]) -> Option<Value> {
 pub fn error(kind: &str, reason: &str, status: u16) -> Value {
     json!({"error":{"root_cause":[{"type":kind,"reason":reason}],"type":kind,"reason":reason},"status":status})
 }
+/// Index settings the way Elasticsearch stores them: `index.`-prefixed,
+/// nested, every value a string (`{"number_of_replicas": 0}` and
+/// `{"index.number_of_replicas": "0"}` are the same setting). A `null`
+/// value resets the setting to its default (drops it).
+fn apply_settings(target: &mut Value, incoming: &Value) {
+    fn flatten(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    flatten(&key, x, out);
+                }
+            }
+            Value::Null => out.push((prefix.to_string(), Value::Null)),
+            Value::String(_) => out.push((prefix.to_string(), v.clone())),
+            Value::Array(a) => out.push((
+                prefix.to_string(),
+                Value::Array(
+                    a.iter()
+                        .map(|x| match x {
+                            Value::String(_) => x.clone(),
+                            other => json!(other.to_string()),
+                        })
+                        .collect(),
+                ),
+            )),
+            other => out.push((prefix.to_string(), json!(other.to_string()))),
+        }
+    }
+    let mut flat = Vec::new();
+    flatten("", incoming, &mut flat);
+    if !target.is_object() {
+        *target = json!({});
+    }
+    for (key, val) in flat {
+        let key = if key.starts_with("index.") { key } else { format!("index.{key}") };
+        let parts: Vec<&str> = key.split('.').collect();
+        let mut node = &mut *target;
+        for p in &parts[..parts.len() - 1] {
+            if !node.get(*p).is_some_and(Value::is_object) {
+                node[*p] = json!({});
+            }
+            node = &mut node[*p];
+        }
+        let last = parts[parts.len() - 1];
+        if val.is_null() {
+            if let Some(m) = node.as_object_mut() {
+                m.remove(last);
+            }
+        } else {
+            node[last] = val;
+        }
+    }
+}
+
+/// (primaries, replicas per primary) from an index's settings; replicas
+/// are never assigned on a single node, so they count as unassigned.
+fn shard_counts(i: &Index) -> (u64, u64) {
+    let num = |key: &str, default: u64| {
+        let v = &i.settings["index"][key];
+        v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).unwrap_or(default)
+    };
+    (num("number_of_shards", 1), num("number_of_replicas", 1))
+}
+
 fn missing_index(name: &str) -> (u16, Value) {
     (
         404,
@@ -1966,6 +2121,53 @@ fn mark_forced_refresh(resp: &mut Value, q: &HashMap<String, String>) {
 
 /// URL query parameters, percent-decoded (`+` is a space); a bare flag
 /// (`?v`, `?pretty`, `?refresh`) has an empty value.
+/// `*` wildcard matching for index and alias names.
+fn glob_match(pat: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pat.split('*').collect();
+    if parts.len() == 1 {
+        return pat == name;
+    }
+    let mut rest = name;
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 {
+            match rest.strip_prefix(p) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        } else if i == parts.len() - 1 {
+            return rest.len() >= p.len() && rest.ends_with(p);
+        } else if let Some(at) = rest.find(p) {
+            rest = &rest[at + p.len()..];
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Percent-decodes one URL path segment (`+` stays a plus sign there).
+fn percent_decode_segment(seg: &str) -> String {
+    if !seg.contains('%') {
+        return seg.to_string();
+    }
+    let b = seg.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Some(v) = seg.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn query_params(q: &str) -> HashMap<String, String> {
     fn decode(s: &str) -> String {
         let b = s.as_bytes();
@@ -2089,7 +2291,7 @@ fn new_index_from_templates(templates: &HashMap<String, Value>, name: &str) -> I
             merge(&mut index.mappings, m.clone());
         }
         if let Some(st) = tpl.get("settings") {
-            merge(&mut index.settings, st.clone());
+            apply_settings(&mut index.settings, st);
         }
         if let Some(a) = tpl.get("aliases").and_then(Value::as_object) {
             index.aliases.extend(a.clone());
