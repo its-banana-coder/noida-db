@@ -5,12 +5,15 @@ use kafka_protocol::messages::{
     ApiKey, ApiVersionsRequest, CreateTopicsRequest, FetchRequest, InitProducerIdRequest,
     ListOffsetsRequest, MetadataRequest, ProduceRequest, RequestHeader, ResponseHeader,
 };
-use kafka_protocol::protocol::{Decodable, Encodable};
+use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 use std::io::{BufReader, BufWriter};
 use std::net::TcpStream;
 
 use super::codec::{read_frame, write_frame};
 use super::engine::Engine;
+
+const SECURITY_DISABLED: i16 = 54;
+const NO_AUTHORIZER: &str = "No Authorizer is configured on the broker";
 
 pub fn handle_connection(stream: TcpStream, engine: Engine) {
     // Best-effort: this connection's own write path already batches a
@@ -606,6 +609,75 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     Err(_) => break,
                 };
                 let resp = engine.handle_describe_producers(&req, header.request_api_version);
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            // noida-db has no authorizer; like a Kafka broker without one
+            // (authorizer.class.name unset), every ACL request fails with
+            // SECURITY_DISABLED rather than the connection dropping.
+            ApiKey::DescribeAcls => {
+                let req = match kafka_protocol::messages::DescribeAclsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let _ = req;
+                let mut resp = kafka_protocol::messages::DescribeAclsResponse::default();
+                resp.error_code = SECURITY_DISABLED;
+                resp.error_message = Some(StrBytes::from_static_str(NO_AUTHORIZER));
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::CreateAcls => {
+                let req = match kafka_protocol::messages::CreateAclsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let mut resp = kafka_protocol::messages::CreateAclsResponse::default();
+                for _ in &req.creations {
+                    let mut r =
+                        kafka_protocol::messages::create_acls_response::AclCreationResult::default(
+                        );
+                    r.error_code = SECURITY_DISABLED;
+                    r.error_message = Some(StrBytes::from_static_str(NO_AUTHORIZER));
+                    resp.results.push(r);
+                }
+                encode_response(
+                    &header,
+                    &resp,
+                    resp_header_version(api_key, header.request_api_version),
+                    header.request_api_version,
+                )
+            }
+            ApiKey::DeleteAcls => {
+                let req = match kafka_protocol::messages::DeleteAclsRequest::decode(
+                    &mut buf,
+                    header.request_api_version,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let mut resp = kafka_protocol::messages::DeleteAclsResponse::default();
+                for _ in &req.filters {
+                    let mut r =
+                        kafka_protocol::messages::delete_acls_response::DeleteAclsFilterResult::default();
+                    r.error_code = SECURITY_DISABLED;
+                    r.error_message = Some(StrBytes::from_static_str(NO_AUTHORIZER));
+                    resp.filter_results.push(r);
+                }
                 encode_response(
                     &header,
                     &resp,

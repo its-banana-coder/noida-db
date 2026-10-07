@@ -542,6 +542,52 @@ def retention_disabled_and_infinite():
     print("wm", watermarks(t))
 
 
+
+@scenario
+def admin_defaults_and_errors():
+    """Topic defaults (-1 partitions/replication), CreatePartitions
+    validate_only, ACLs on a broker without an authorizer."""
+    from confluent_kafka.admin import (
+        AclBindingFilter,
+        AclOperation,
+        AclPermissionType,
+        NewPartitions,
+        ResourcePatternType,
+    )
+
+    t = name("dflt")
+    f = admin.create_topics([NewTopic(t)])  # no partition count / replication factor
+    try:
+        f[t].result()
+        print("create default ok")
+    except KafkaException as e:
+        print("create default", err(e))
+    time.sleep(0.5)
+    print("partitions", len(admin.list_topics(t, timeout=10).topics[t].partitions))
+    for count, validate_only in [(3, True), (1, False), (1, False), (2, False)]:
+        try:
+            admin.create_partitions([NewPartitions(t, count)], validate_only=validate_only)[
+                t
+            ].result()
+            print("create_partitions", count, validate_only, "ok")
+        except KafkaException as e:
+            print("create_partitions", count, validate_only, err(e))
+    time.sleep(0.5)
+    print("partitions", len(admin.list_topics(t, timeout=10).topics[t].partitions))
+    acl_filter = AclBindingFilter(
+        ResourceType.ANY,
+        None,
+        ResourcePatternType.ANY,
+        None,
+        None,
+        AclOperation.ANY,
+        AclPermissionType.ANY,
+    )
+    try:
+        print("acls", admin.describe_acls(acl_filter).result())
+    except KafkaException as e:
+        print("acls", err(e))
+
 for n, fn in SCENARIOS.items():
     if ONLY and n not in ONLY:
         continue

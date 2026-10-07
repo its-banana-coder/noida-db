@@ -374,6 +374,9 @@ impl EngineState {
             (ApiKey::ListTransactions, 0, 0),
             (ApiKey::DescribeProducers, 0, 0),
             (ApiKey::DescribeLogDirs, 0, 2),
+            (ApiKey::DescribeAcls, 0, 3),
+            (ApiKey::CreateAcls, 0, 3),
+            (ApiKey::DeleteAcls, 0, 3),
             (ApiKey::SaslHandshake, 0, 1),
             (ApiKey::SaslAuthenticate, 0, 2),
             (ApiKey::ApiVersions, 0, 3),
@@ -424,7 +427,11 @@ impl EngineState {
             if let Some(state) = self.topics.get(&topic_name) {
                 topic_res.error_code = 0;
                 topic_res.is_internal = state.is_internal;
-                for (p_id, part_state) in &state.partitions {
+                // In partition order, as Kafka lists them (clients such as
+                // Java's RoundRobinPartitioner index into this list).
+                let mut parts: Vec<_> = state.partitions.iter().collect();
+                parts.sort_by_key(|(p, _)| **p);
+                for (p_id, part_state) in parts {
                     let mut part_res = MetadataResponsePartition::default();
                     part_res.partition_index = *p_id;
                     part_res.leader_id = kafka_protocol::messages::BrokerId(part_state.leader);
@@ -434,21 +441,28 @@ impl EngineState {
                         vec![kafka_protocol::messages::BrokerId(part_state.leader)];
                     topic_res.partitions.push(part_res);
                 }
-            } else if req.allow_auto_topic_creation {
+            } else if super::log::validate_topic_name(&topic_name).is_err() {
+                topic_res.error_code = 17; // INVALID_TOPIC_EXCEPTION
+            } else if req.allow_auto_topic_creation
+                && self.broker_configs.get("auto.create.topics.enable").is_none_or(|v| v != "false")
+            {
+                // Auto-created with the broker's num.partitions.
                 let mut topic_state = TopicState {
                     name: topic_name.clone(),
                     is_internal: false,
                     partitions: HashMap::new(),
                     configs: HashMap::new(),
                 };
-                topic_state.partitions.insert(0, PartitionState::new(0, self.broker_id));
-
-                let mut part_res = MetadataResponsePartition::default();
-                part_res.partition_index = 0;
-                part_res.leader_id = kafka_protocol::messages::BrokerId(self.broker_id);
-                part_res.replica_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
-                part_res.isr_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
-                topic_res.partitions.push(part_res);
+                for p in 0..self.default_num_partitions() {
+                    topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
+                    let mut part_res = MetadataResponsePartition::default();
+                    part_res.partition_index = p;
+                    part_res.leader_id = kafka_protocol::messages::BrokerId(self.broker_id);
+                    part_res.replica_nodes =
+                        vec![kafka_protocol::messages::BrokerId(self.broker_id)];
+                    part_res.isr_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
+                    topic_res.partitions.push(part_res);
+                }
                 topic_res.is_internal = false;
 
                 self.topics.insert(topic_name, topic_state);
@@ -461,6 +475,16 @@ impl EngineState {
         }
 
         res
+    }
+
+    /// The broker's `num.partitions`: what a topic created without a
+    /// partition count (CreateTopics with -1, or auto-creation) gets.
+    fn default_num_partitions(&self) -> i32 {
+        self.broker_configs
+            .get("num.partitions")
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &i32| n > 0)
+            .unwrap_or(1)
     }
 
     pub fn handle_create_topics(
@@ -480,20 +504,82 @@ impl EngineState {
                 super::log::validate_topic_config(c.name.as_str(), value).err()
             });
 
-            if let Err(msg) = super::log::validate_topic_name(topic_name_str) {
-                topic_res.error_code = 17; // INVALID_TOPIC_EXCEPTION
-                topic_res.error_message = Some(StrBytes::from_string(msg));
-            } else if let Some(msg) = config_error {
-                topic_res.error_code = 40; // INVALID_CONFIG
-                topic_res.error_message = Some(StrBytes::from_string(msg));
-            } else if topic.num_partitions <= 0 {
-                topic_res.error_code = 37; // INVALID_PARTITIONS
-            } else if topic.replication_factor > 1 {
-                topic_res.error_code = 38; // INVALID_REPLICATION_FACTOR
+            // -1 asks for the broker default (num.partitions /
+            // default.replication.factor); explicit replica assignments
+            // give the partition count instead, as on Kafka.
+            let num_partitions = if !topic.assignments.is_empty() {
+                topic.assignments.len() as i32
+            } else if topic.num_partitions == -1 {
+                self.default_num_partitions()
+            } else {
+                topic.num_partitions
+            };
+            let replication_factor = if !topic.assignments.is_empty() {
+                topic.assignments.iter().map(|a| a.broker_ids.len()).max().unwrap_or(0) as i32
+            } else if topic.replication_factor == -1 {
+                1
+            } else {
+                topic.replication_factor as i32
+            };
+            let fail = |code: i16, msg: String| (code, msg);
+            let error = if let Err(msg) = super::log::validate_topic_name(topic_name_str) {
+                Some(fail(17, msg)) // INVALID_TOPIC_EXCEPTION
             } else if self.topics.contains_key(topic_name_str) {
-                topic_res.error_code = 36; // TOPIC_ALREADY_EXISTS
+                Some(fail(36, format!("Topic '{topic_name_str}' already exists."))) // TOPIC_ALREADY_EXISTS
+            } else if !topic.assignments.is_empty()
+                && (topic.num_partitions != -1 || topic.replication_factor != -1)
+            {
+                Some(fail(
+                    42, // INVALID_REQUEST
+                    "Both numPartitions or replicationFactor and replicasAssignments were set. \
+                     Both cannot be used at the same time."
+                        .into(),
+                ))
+            } else if num_partitions <= 0 {
+                Some(fail(
+                    37, // INVALID_PARTITIONS
+                    "Number of partitions was set to an invalid non-positive value.".into(),
+                ))
+            } else if replication_factor <= 0 {
+                Some(fail(
+                    38, // INVALID_REPLICATION_FACTOR
+                    "Replication factor must be larger than 0, or -1 to use the default value."
+                        .into(),
+                ))
+            } else if let Some(bad) = topic
+                .assignments
+                .iter()
+                .flat_map(|a| a.broker_ids.iter())
+                .find(|b| b.0 != self.broker_id)
+            {
+                Some(fail(
+                    39, // INVALID_REPLICA_ASSIGNMENT
+                    format!(
+                        "The manual partition assignment includes broker {}, but no such broker is registered.",
+                        bad.0
+                    ),
+                ))
+            } else if replication_factor > 1 {
+                Some(fail(
+                    38, // INVALID_REPLICATION_FACTOR
+                    format!(
+                        "Unable to replicate the partition {replication_factor} time(s): The target \
+                         replication factor of {replication_factor} cannot be reached because only 1 \
+                         broker(s) are registered."
+                    ),
+                ))
+            } else {
+                config_error.map(|msg| fail(40, msg)) // INVALID_CONFIG
+            };
+
+            if let Some((code, msg)) = error {
+                topic_res.error_code = code;
+                topic_res.error_message = Some(StrBytes::from_string(msg));
             } else {
                 topic_res.error_code = 0;
+                topic_res.error_message = None;
+                topic_res.num_partitions = num_partitions;
+                topic_res.replication_factor = replication_factor as i16;
                 if !req.validate_only {
                     let mut topic_state = TopicState {
                         name: topic_name_str.to_string(),
@@ -501,7 +587,7 @@ impl EngineState {
                         partitions: HashMap::new(),
                         configs: HashMap::new(),
                     };
-                    for p in 0..topic.num_partitions {
+                    for p in 0..num_partitions {
                         topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
                     }
                     for conf in &topic.configs {
@@ -527,15 +613,30 @@ impl EngineState {
         use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
         let mut res = kafka_protocol::messages::DeleteTopicsResponse::default();
 
-        for topic_name_bytes in &req.topic_names {
-            let topic_name_str = topic_name_bytes.as_str();
+        // v0-5 name topics in `topic_names`; v6+ in `topics`, each by name
+        // or by topic id. noida-db has no topic ids, so a delete by id
+        // can only be for an id this broker never handed out.
+        let by_name = req.topic_names.iter().map(|n| (Some(n.clone()), Default::default()));
+        let by_state = req.topics.iter().map(|t| (t.name.clone(), t.topic_id));
+        for (name, topic_id) in by_name.chain(by_state) {
             let mut topic_res = DeletableTopicResult::default();
-            topic_res.name = Some(topic_name_bytes.clone());
-
-            if self.topics.remove(topic_name_str).is_some() {
-                topic_res.error_code = 0;
-            } else {
-                topic_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+            topic_res.name = name.clone();
+            topic_res.topic_id = topic_id;
+            match name {
+                Some(n) if self.topics.remove(n.as_str()).is_some() => {
+                    topic_res.error_code = 0;
+                }
+                Some(_) => {
+                    topic_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                    topic_res.error_message = Some(StrBytes::from_static_str(
+                        "This server does not host this topic-partition.",
+                    ));
+                }
+                None => {
+                    topic_res.error_code = 100; // UNKNOWN_TOPIC_ID
+                    topic_res.error_message =
+                        Some(StrBytes::from_static_str("This server does not host this topic ID."));
+                }
             }
             res.responses.push(topic_res);
         }
@@ -560,17 +661,35 @@ impl EngineState {
                 let current_count = topic_state.partitions.len() as i32;
                 let new_count = topic_partition_data.count;
 
-                if new_count <= current_count {
-                    // Partitions can only be increased
+                // Partitions can only be increased (messages as Kafka 3.8's).
+                if new_count < current_count {
                     topic_res.error_code = 37; // INVALID_PARTITIONS
+                    topic_res.error_message = Some(StrBytes::from_string(format!(
+                        "The topic {topic_name_str} currently has {current_count} partition(s); \
+                         {new_count} would not be an increase."
+                    )));
+                } else if new_count == current_count {
+                    topic_res.error_code = 37; // INVALID_PARTITIONS
+                    topic_res.error_message = Some(StrBytes::from_string(format!(
+                        "Topic already has {current_count} partition(s)."
+                    )));
                 } else {
-                    for p in current_count..new_count {
-                        topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
+                    // validate_only: report what would happen, change nothing.
+                    if !req.validate_only {
+                        for p in current_count..new_count {
+                            topic_state
+                                .partitions
+                                .insert(p, PartitionState::new(p, self.broker_id));
+                        }
                     }
                     topic_res.error_code = 0;
+                    topic_res.error_message = None;
                 }
             } else {
                 topic_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                topic_res.error_message = Some(StrBytes::from_static_str(
+                    "This server does not host this topic-partition.",
+                ));
             }
 
             res.results.push(topic_res);

@@ -229,3 +229,117 @@ fn test_metadata_internal_topics_and_auto_creation() {
     let no_auto_resp = t.engine.handle_metadata(&no_auto_req, 9);
     assert_eq!(no_auto_resp.topics[0].error_code, 3);
 }
+
+fn create(t: &T, name: &str, partitions: i32, rf: i16) -> (i16, Option<String>, i32) {
+    let mut req = CreateTopicsRequest::default();
+    let mut topic = CreatableTopic::default();
+    topic.name = TopicName::from(StrBytes::from_string(name.to_string()));
+    topic.num_partitions = partitions;
+    topic.replication_factor = rf;
+    req.topics.push(topic);
+    let r = &t.engine.handle_create_topics(&req, 7).topics[0];
+    (r.error_code, r.error_message.as_ref().map(|m| m.to_string()), r.num_partitions)
+}
+
+fn partition_ids(t: &T, name: &str) -> Vec<i32> {
+    let mut req = MetadataRequest::default();
+    let mut mt = MetadataRequestTopic::default();
+    mt.name = Some(TopicName::from(StrBytes::from_string(name.to_string())));
+    req.topics = Some(vec![mt]);
+    let res = t.engine.handle_metadata(&req, 12);
+    res.topics[0].partitions.iter().map(|p| p.partition_index).collect()
+}
+
+/// kafka-topics --create without --partitions/--replication-factor sends
+/// -1 for both: the broker defaults apply (found by the CLI failing).
+#[test]
+fn test_create_topics_minus_one_uses_broker_defaults() {
+    let t = T::new();
+    assert_eq!(create(&t, "dflt", -1, -1), (0, None, 1));
+    assert_eq!(partition_ids(&t, "dflt"), vec![0]);
+    assert_eq!(create(&t, "dflt", -1, -1), (36, Some("Topic 'dflt' already exists.".into()), -1));
+    assert_eq!(create(&t, "zero", 0, 1).0, 37);
+    assert_eq!(create(&t, "neg", -2, 1).0, 37);
+    assert_eq!(create(&t, "rf0", 1, 0).0, 38);
+    let (code, msg, _) = create(&t, "rf3", 1, 3);
+    assert_eq!(code, 38);
+    assert_eq!(
+        msg.unwrap(),
+        "Unable to replicate the partition 3 time(s): The target replication factor of 3 \
+         cannot be reached because only 1 broker(s) are registered."
+    );
+}
+
+/// Metadata lists partitions in order (Java's RoundRobinPartitioner
+/// indexes into that list, so a hash-ordered list scattered records).
+#[test]
+fn test_metadata_partitions_in_order() {
+    let t = T::new();
+    create(&t, "many", 12, 1);
+    assert_eq!(partition_ids(&t, "many"), (0..12).collect::<Vec<_>>());
+}
+
+/// Auto-creation through Metadata validates the name like CreateTopics.
+#[test]
+fn test_metadata_auto_create_rejects_invalid_names() {
+    let t = T::new();
+    let mut req = MetadataRequest::default();
+    let mut mt = MetadataRequestTopic::default();
+    mt.name = Some(TopicName::from(StrBytes::from_static_str("bad name!")));
+    req.topics = Some(vec![mt]);
+    req.allow_auto_topic_creation = true;
+    let res = t.engine.handle_metadata(&req, 12);
+    assert_eq!(res.topics[0].error_code, 17);
+    assert!(res.topics[0].partitions.is_empty());
+}
+
+/// DeleteTopics v6 names topics in `topics`, not `topic_names` (the Java
+/// admin client, so kafka-topics --delete, uses it); a topic id noida-db
+/// never issued is UNKNOWN_TOPIC_ID.
+#[test]
+fn test_delete_topics_v6() {
+    use kafka_protocol::messages::delete_topics_request::DeleteTopicState;
+    let t = T::new();
+    create(&t, "gone", 1, 1);
+    let mut req = DeleteTopicsRequest::default();
+    req.topics.push(
+        DeleteTopicState::default()
+            .with_name(Some(TopicName::from(StrBytes::from_static_str("gone")))),
+    );
+    req.topics.push(
+        DeleteTopicState::default()
+            .with_name(Some(TopicName::from(StrBytes::from_static_str("never")))),
+    );
+    req.topics
+        .push(DeleteTopicState::default().with_topic_id(uuid::Uuid::from_u128(7)).with_name(None));
+    let res = t.engine.handle_delete_topics(&req, 6);
+    let codes: Vec<i16> = res.responses.iter().map(|r| r.error_code).collect();
+    assert_eq!(codes, vec![0, 3, 100]);
+    assert_eq!(create(&t, "gone", 1, 1).0, 0, "deleted, so it can be created again");
+}
+
+/// CreatePartitions honours validate_only and words its errors as Kafka does.
+#[test]
+fn test_create_partitions_validate_only_and_messages() {
+    let t = T::new();
+    create(&t, "cp", 2, 1);
+    let run = |count: i32, validate_only: bool| {
+        let mut req = CreatePartitionsRequest::default();
+        let mut tp = CreatePartitionsTopic::default();
+        tp.name = TopicName::from(StrBytes::from_static_str("cp"));
+        tp.count = count;
+        req.topics.push(tp);
+        req.validate_only = validate_only;
+        let r = &t.engine.handle_create_partitions(&req, 3).results[0];
+        (r.error_code, r.error_message.as_ref().map(|m| m.to_string()))
+    };
+    assert_eq!(run(4, true), (0, None));
+    assert_eq!(partition_ids(&t, "cp"), vec![0, 1]);
+    assert_eq!(run(2, false), (37, Some("Topic already has 2 partition(s).".into())));
+    assert_eq!(
+        run(1, false),
+        (37, Some("The topic cp currently has 2 partition(s); 1 would not be an increase.".into()))
+    );
+    assert_eq!(run(4, false), (0, None));
+    assert_eq!(partition_ids(&t, "cp"), vec![0, 1, 2, 3]);
+}
