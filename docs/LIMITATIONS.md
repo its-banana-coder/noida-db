@@ -60,7 +60,8 @@ current count).
 | `PSYNC` `SYNC` `REPLCONF` `REPLICAOF` `SLAVEOF` `ROLE` `WAIT` `WAITAOF` `FAILOVER` | replication |
 | `SENTINEL` | sentinel |
 | `CLUSTER` `ASKING` `READONLY` `READWRITE` | clustering |
-| `DEBUG` `SHUTDOWN` `PFDEBUG` `PFSELFTEST` | server internals |
+| `SHUTDOWN` `PFDEBUG` `PFSELFTEST` | server internals |
+| `DEBUG` crash/restart/internals subcommands (`SEGFAULT`, `RESTART`, `LOADAOF`, `LISTPACK`, `RELOAD` with options, ...) | server internals; the test-support subset (`SLEEP`, `SET-ACTIVE-EXPIRE`, `RELOAD`, `DIGEST`, `OBJECT`, `POPULATE`, `PROTOCOL`, ...) works |
 | modules (`MODULE LOAD` and friends), RedisJSON, RediSearch | plugins |
 | `ACL SETUSER` `DELUSER` `DRYRUN` `LOAD` `SAVE` | user management |
 
