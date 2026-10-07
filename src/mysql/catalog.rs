@@ -28,6 +28,9 @@ pub enum ColumnType {
     TinyInt,
     SmallInt,
     MediumInt,
+    /// `TIME`: a signed duration in microseconds (`-838:59:59` to
+    /// `838:59:59`), with its fractional-seconds precision (0-6).
+    Time(u8),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +53,9 @@ pub struct Column {
     /// `UNSIGNED` integer: its range starts at 0.
     #[serde(default)]
     pub unsigned: bool,
+    /// `COMMENT '...'` (empty when none).
+    #[serde(default)]
+    pub comment: String,
 }
 
 /// A `UNIQUE` key: a column-level `UNIQUE` (named after its column) or a
@@ -77,6 +83,9 @@ pub struct Table {
     /// SHOW INDEX, SHOW CREATE TABLE and schema dumps see them.
     #[serde(default)]
     pub indexes: Vec<UniqueKey>,
+    /// The table's `COMMENT` (empty when none).
+    #[serde(default)]
+    pub comment: String,
 }
 
 /// A `FOREIGN KEY (columns) REFERENCES ref_db.ref_table (ref_columns)`.
@@ -123,6 +132,7 @@ impl Table {
             unique_keys: Vec::new(),
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
+            comment: String::new(),
         }
     }
 
@@ -136,6 +146,7 @@ impl Table {
             unique_keys: self.unique_keys.clone(),
             foreign_keys: self.foreign_keys.clone(),
             indexes: self.indexes.clone(),
+            comment: self.comment.clone(),
         }
     }
 

@@ -255,15 +255,47 @@ fn pause_blocks_other_clients_until_it_ends() {
     t.run("CLIENT PAUSE 100 WRITE");
     let set = crate::redis::resp::split_inline(b"SET k v").unwrap();
     let get = crate::redis::resp::split_inline(b"GET k").unwrap();
-    assert!(t.engine.is_paused_for(&set));
-    assert!(!t.engine.is_paused_for(&get));
+    assert!(t.engine.is_paused_for(&t.session, &set));
+    assert!(!t.engine.is_paused_for(&t.session, &get));
     t.run("CLIENT PAUSE 100 ALL");
-    assert!(t.engine.is_paused_for(&get));
+    assert!(t.engine.is_paused_for(&t.session, &get));
     t.advance(101);
-    assert!(!t.engine.is_paused_for(&set));
+    assert!(!t.engine.is_paused_for(&t.session, &set));
     t.run("CLIENT PAUSE 100");
     t.run("CLIENT UNPAUSE");
-    assert!(!t.engine.is_paused_for(&set));
+    assert!(!t.engine.is_paused_for(&t.session, &set));
+}
+
+#[test]
+fn pause_write_holds_what_may_write() {
+    let mut t = T::new();
+    let mut other = t.connect();
+    let paused = |t: &mut T, s: &Session, line: &str| {
+        let args = crate::redis::resp::split_inline(line.as_bytes()).unwrap();
+        t.engine.is_paused_for(s, &args)
+    };
+    t.run("CLIENT PAUSE 10000 WRITE");
+    // Errors answer right away.
+    assert!(!paused(&mut t, &other, "SET k"));
+    assert!(!paused(&mut t, &other, "NOSUCHCMD"));
+    assert!(paused(&mut t, &other, "PUBLISH ch m"));
+    assert!(paused(&mut t, &other, "EVAL \"return 1\" 0"));
+    assert!(paused(&mut t, &other, "EVAL \"#!lua\nreturn 1\" 0"));
+    assert!(!paused(&mut t, &other, "EVAL \"#!lua flags=no-writes\nreturn 1\" 0"));
+    assert!(!paused(&mut t, &other, "EVAL_RO \"return 1\" 0"));
+    // EXEC is held only if the transaction may write.
+    t.run_as(&mut other, "MULTI");
+    t.engine.pause = None;
+    t.run_as(&mut other, "GET k");
+    t.run("CLIENT PAUSE 10000 WRITE");
+    assert!(!paused(&mut t, &other, "EXEC"));
+    t.engine.pause = None;
+    t.run_as(&mut other, "SET k v");
+    t.run("CLIENT PAUSE 10000 WRITE");
+    assert!(paused(&mut t, &other, "EXEC"));
+    t.engine.paused_clients = 1;
+    let info = text(&t.run("INFO clients"));
+    assert!(info.contains("blocked_clients:1\r\n"), "{info}");
 }
 
 #[test]

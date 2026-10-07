@@ -706,7 +706,7 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         n(tb.schema as i64),
                         ch(c.contype()),
                         b(c.deferrable),
-                        b(false),
+                        b(c.initially_deferred),
                         b(true),
                         n(tb.oid as i64),
                         n(0),
@@ -1373,7 +1373,7 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         t(&tb.name),
                         t(kind),
                         t(if c.deferrable { "YES" } else { "NO" }),
-                        t("NO"),
+                        t(if c.initially_deferred { "YES" } else { "NO" }),
                         t("YES"),
                         NULL,
                     ]);

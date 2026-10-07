@@ -2,7 +2,7 @@
 //! used by KEYS, SCAN MATCH, PSUBSCRIBE and friends.
 
 pub fn matches(pattern: &[u8], s: &[u8], nocase: bool) -> bool {
-    match_at(pattern, s, nocase, 0)
+    match_at(pattern, s, nocase, &mut false, 0)
 }
 
 /// Key matching as KEYS/SCAN do it: a bare `*` matches everything, even the
@@ -15,7 +15,11 @@ fn eq(a: u8, b: u8, nocase: bool) -> bool {
     if nocase { a.eq_ignore_ascii_case(&b) } else { a == b }
 }
 
-fn match_at(pat: &[u8], s: &[u8], nocase: bool, nesting: usize) -> bool {
+/// `skip_longer` is Redis's `skipLongerMatches`: once the rest of the
+/// pattern after a `*` matched nowhere in the remaining string, no earlier
+/// `*` can help by matching more, so the whole search stops. Without it,
+/// patterns like `a*a*a*...b` take exponential time.
+fn match_at(pat: &[u8], s: &[u8], nocase: bool, skip_longer: &mut bool, nesting: usize) -> bool {
     // Redis caps recursion to protect against pathological patterns.
     if nesting > 1000 {
         return false;
@@ -30,7 +34,16 @@ fn match_at(pat: &[u8], s: &[u8], nocase: bool, nesting: usize) -> bool {
                 if p + 1 == pat.len() {
                     return true;
                 }
-                return (i..s.len()).any(|k| match_at(&pat[p + 1..], &s[k..], nocase, nesting + 1));
+                for k in i..s.len() {
+                    if match_at(&pat[p + 1..], &s[k..], nocase, skip_longer, nesting + 1) {
+                        return true;
+                    }
+                    if *skip_longer {
+                        return false;
+                    }
+                }
+                *skip_longer = true;
+                return false;
             }
             b'?' => i += 1,
             b'[' => {
@@ -116,6 +129,16 @@ mod tests {
 
     fn m(p: &str, s: &str) -> bool {
         matches(p.as_bytes(), s.as_bytes(), false)
+    }
+
+    #[test]
+    fn pathological_patterns_finish() {
+        let key = "a".repeat(40);
+        assert!(!m("a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b", &key));
+        let long = "a".repeat(50000);
+        let pat = "*".to_string() + &"a*".repeat(50000) + "b";
+        assert!(!m(&pat, &long));
+        assert!(m("a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*", &key));
     }
 
     #[test]
