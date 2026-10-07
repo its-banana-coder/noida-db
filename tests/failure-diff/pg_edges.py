@@ -784,4 +784,15 @@ PG_EDGES.update({
         "BEGIN", "SET CONSTRAINTS ALL DEFERRED", "INSERT INTO scc (x) VALUES (5)", "INSERT INTO scp VALUES (5)", "SET CONSTRAINTS ALL IMMEDIATE", "COMMIT",
         "SELECT count(*) FROM scc",
     ),
+    "pg edge: settings are transactional": steps(
+        "SET LOCAL timezone = 'Asia/Tokyo'",
+        "SHOW timezone",
+        "BEGIN", "SET LOCAL timezone = 'Asia/Tokyo'", "SHOW timezone", "COMMIT", "SHOW timezone",
+        "BEGIN", "SET timezone = 'Europe/Paris'", "ROLLBACK", "SHOW timezone",
+        "BEGIN", "SET timezone = 'UTC'", "SAVEPOINT s1", "SET timezone = 'Asia/Kolkata'", "ROLLBACK TO SAVEPOINT s1", "SHOW timezone", "COMMIT", "SHOW timezone",
+        "BEGIN", "SELECT set_config('search_path', 'pg_catalog', true)", "SHOW search_path", "COMMIT", "SHOW search_path",
+        "SELECT set_config('DateStyle', 'German', false)",
+        "SHOW DateStyle",
+        "RESET DateStyle",
+    ),
 })
