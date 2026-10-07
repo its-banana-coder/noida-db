@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use super::engine::{Command, Ctx, Data, Entry, Reply, cmd, eq_ic, help_reply, int_arg};
+use super::engine::{Command, Ctx, Data, Entry, Reply, cmd, eq_ic, help_reply};
 use super::resp::Value;
 
 pub static COMMANDS: &[Command] = &[cmd("debug", debug)];
@@ -45,7 +45,9 @@ fn debug(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         }
         // Knobs for Redis internals noida-db doesn't have: accepted, no effect.
         ("quicklist-packed-threshold", 3) => {
-            int_arg(&a[2]).map_err(|_| Value::err("ERR argument must be a memory value"))?;
+            super::config::memtoull(&String::from_utf8_lossy(&a[2])).ok_or_else(|| {
+                Value::err("ERR argument must be a memory value bigger than 1 and smaller than 4gb")
+            })?;
             Ok(Value::ok())
         }
         ("pause-cron", 3)
@@ -103,6 +105,7 @@ fn protocol(ctx: &mut Ctx, name: &[u8]) -> Reply {
     Ok(match name.as_str() {
         "string" => Value::bulk("Hello World"),
         "integer" => Value::Integer(12345),
+        #[allow(clippy::approx_constant)] // Redis's literal, not pi
         "double" => Value::Double(3.141),
         "bignum" => Value::BigNumber("1234567999999999999999999999999999999".into()),
         "null" => Value::Null,

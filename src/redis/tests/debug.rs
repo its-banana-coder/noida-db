@@ -17,6 +17,11 @@ fn unknown_and_help() {
     let Value::Array(lines) = t.run("DEBUG HELP") else { panic!() };
     assert_eq!(lines[0], simple("DEBUG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"));
     assert_eq!(t.run("DEBUG sleep 0"), ok());
+    assert_eq!(t.run("DEBUG quicklist-packed-threshold 1b"), ok());
+    assert_eq!(
+        t.run("DEBUG quicklist-packed-threshold x"),
+        err("ERR argument must be a memory value bigger than 1 and smaller than 4gb")
+    );
     assert_eq!(t.run("DEBUG error \"FOO bar\""), err("FOO bar"));
 }
 
@@ -107,7 +112,9 @@ fn protocol_replies() {
     let mut t = T::new();
     assert_eq!(t.run("DEBUG protocol string"), bulk("Hello World"));
     assert_eq!(t.run("DEBUG protocol integer"), int(12345));
-    assert_eq!(t.run("DEBUG protocol double"), Value::Double(3.141));
+    #[allow(clippy::approx_constant)]
+    let d = Value::Double(3.141);
+    assert_eq!(t.run("DEBUG protocol double"), d);
     assert_eq!(t.run("DEBUG protocol attrib"), bulk("Some real reply following the attribute"));
     assert_eq!(t.run("DEBUG protocol push"), err("ERR RESP2 is not supported by this command"));
     t.run("HELLO 3");
