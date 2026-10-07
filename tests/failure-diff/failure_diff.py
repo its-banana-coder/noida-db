@@ -778,6 +778,12 @@ MYSQL_QUERIES = {
         (A, "SELECT ja.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
         (A, "SELECT ja.id, jb.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
     ],
+    "hash and encoding functions": [
+        (A, "SELECT MD5('a'), MD5(NULL), MD5(1), SHA1('a'), SHA(''), SHA2('a', 256), SHA2('a', 0), SHA2('a', 224), SHA2('a', 384), SHA2('a', 512), SHA2('a', 7), SHA2('a', NULL)"),
+        (A, "SELECT CRC32('a'), CRC32(''), CRC32(12), CRC32(NULL), TO_BASE64('abc'), TO_BASE64(REPEAT('x', 60)), FROM_BASE64('YWJj'), UNHEX('4142'), UNHEX('zz'), UNHEX('141'), HEX(UNHEX('4142'))"),
+        (A, "SELECT MD5('a', 'b')"),
+        (A, "SELECT SHA2('a')"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

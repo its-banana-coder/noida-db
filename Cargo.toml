@@ -35,7 +35,7 @@ path = "src/main.rs"
 default = ["redis", "postgres"]
 redis = ["dep:mlua"]
 # Shared SQL engine pieces; enabled by every SQL service.
-sql = []
+sql = ["dep:md-5", "dep:sha1", "dep:sha2", "dep:hmac"]
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
 mysql = ["sql", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = ["dep:kafka-protocol", "dep:bytes", "dep:crc32c"]
@@ -46,6 +46,12 @@ mongodb = []
 clickhouse = []
 
 [dependencies]
+# SQL hash functions: pgcrypto's digest()/hmac(), sha224..sha512, and
+# MySQL's SHA1()/SHA2() (already in the tree via other dependencies).
+md-5 = { version = "0.11", optional = true }
+sha1 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", optional = true }
+hmac = { version = "0.13", optional = true }
 # Postgres: wire-protocol message codecs only (no tokio server API).
 pgwire = { version = "0.41", default-features = false, optional = true }
 bytes = { version = "1", optional = true }
