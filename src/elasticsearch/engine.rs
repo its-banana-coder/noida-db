@@ -171,6 +171,26 @@ impl Engine {
 
 impl Engine {
     pub fn dispatch(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
+        let (status, mut resp) = self.route(method, path, query, body);
+        // `rest_total_hits_as_int=true`: `hits.total` as the bare number
+        // (pre-7.0 shape), in a search, scroll or each msearch response.
+        if query.split('&').any(|p| p == "rest_total_hits_as_int=true") {
+            fn flatten_total(v: &mut Value) {
+                if let Some(h) = v.get_mut("hits").and_then(Value::as_object_mut) {
+                    // `track_total_hits: false` reads as -1 in this shape.
+                    let n = h.get("total").map_or(json!(-1), |t| t["value"].clone());
+                    h.insert("total".into(), n);
+                }
+                if let Some(Value::Array(rs)) = v.get_mut("responses") {
+                    rs.iter_mut().for_each(flatten_total);
+                }
+            }
+            flatten_total(&mut resp);
+        }
+        (status, resp)
+    }
+
+    fn route(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
         let read = matches!(method, "GET" | "HEAD")
             || [
                 "_search",
@@ -429,6 +449,43 @@ impl Engine {
             if let Some(n) = q.get(param).and_then(|v| v.parse::<i64>().ok()) {
                 req[key] = json!(n);
             }
+        }
+        // Other body options a client may pass as URL parameters instead.
+        for key in [
+            "track_total_hits",
+            "version",
+            "seq_no_primary_term",
+            "explain",
+            "terminate_after",
+            "track_scores",
+            "timeout",
+            "min_score",
+        ] {
+            if let Some(v) = q.get(key)
+                && req.get(key).is_none()
+            {
+                req[key] = match v.as_str() {
+                    "true" => json!(true),
+                    "false" => json!(false),
+                    other => other
+                        .parse::<i64>()
+                        .map(|n| json!(n))
+                        .or_else(|_| other.parse::<f64>().map(|f| json!(f)))
+                        .unwrap_or_else(|_| json!(other)),
+                };
+            }
+        }
+        for key in ["stored_fields", "docvalue_fields"] {
+            if let Some(v) = q.get(key)
+                && req.get(key).is_none()
+            {
+                req[key] = json!(v.split(',').collect::<Vec<_>>());
+            }
+        }
+        if q.get("rest_total_hits_as_int").is_some_and(|v| v == "true")
+            && req.get("track_total_hits").is_none()
+        {
+            req["track_total_hits"] = json!(true);
         }
         // URI search: `?q=title:quick`, a query_string query.
         if let Some(text) = q.get("q") {
@@ -2119,8 +2176,6 @@ fn mark_forced_refresh(resp: &mut Value, q: &HashMap<String, String>) {
     }
 }
 
-/// URL query parameters, percent-decoded (`+` is a space); a bare flag
-/// (`?v`, `?pretty`, `?refresh`) has an empty value.
 /// `*` wildcard matching for index and alias names.
 fn glob_match(pat: &str, name: &str) -> bool {
     let parts: Vec<&str> = pat.split('*').collect();
@@ -2168,6 +2223,8 @@ fn percent_decode_segment(seg: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// URL query parameters, percent-decoded (`+` is a space); a bare flag
+/// (`?v`, `?pretty`, `?refresh`) has an empty value.
 fn query_params(q: &str) -> HashMap<String, String> {
     fn decode(s: &str) -> String {
         let b = s.as_bytes();
