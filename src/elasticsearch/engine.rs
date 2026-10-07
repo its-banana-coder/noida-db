@@ -335,6 +335,12 @@ impl Engine {
         if segments.first() == Some(&"_cache") && segments.get(1) == Some(&"clear") {
             return self.index_action("_all", "_cache", &q);
         }
+        if segments.len() == 1 && segments[0] == "_field_caps" {
+            return self.field_caps_api(method, "_all", &q, body);
+        }
+        if segments.len() == 1 && segments[0] == "_msearch" {
+            return self.msearch(method, "", &q, body);
+        }
         if segments.first() == Some(&"_mget") && segments.len() == 1 {
             return self.mget(method, "", &q, body);
         }
@@ -429,6 +435,10 @@ impl Engine {
                 self.update(method, index_name, segments[2], &q, body)
             }
             "_mget" => self.mget(method, index_name, &q, body),
+            "_field_caps" if segments.len() == 2 => {
+                self.field_caps_api(method, segments[0], &q, body)
+            }
+            "_msearch" if segments.len() == 2 => self.msearch(method, segments[0], &q, body),
             _ => no_handler(method, path),
         }
     }
@@ -449,6 +459,122 @@ impl Engine {
             return n.to_string();
         }
         with.first().map(|(n, _)| n.to_string()).unwrap_or_else(|| name.to_string())
+    }
+
+    /// `GET|POST [/<index>]/_field_caps?fields=...`.
+    fn field_caps_api(
+        &self,
+        method: &str,
+        expr: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
+        if !matches!(method, "GET" | "POST") {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        let Some(req) = parse_json(body) else { return (400, malformed_body()) };
+        if q.get("fields").is_none_or(|f| f.is_empty()) && req.get("fields").is_none() {
+            return (
+                400,
+                error(
+                    "action_request_validation_exception",
+                    "Validation Failed: 1: no fields specified;",
+                    400,
+                ),
+            );
+        }
+        if let Err(e) = super::field_caps::check_filters(q) {
+            return (400, error("illegal_argument_exception", &e, 400));
+        }
+        let s = self.0.lock().unwrap();
+        let names = match Self::resolve_targets(&s, expr, q) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let mut indices: Vec<(String, Value, Vec<Value>)> = Vec::new();
+        for n in &names {
+            let i = &s.indices[n];
+            // `index_filter`: indices where the query can't match any
+            // document are left out.
+            if let Some(f) = req.get("index_filter")
+                && !index_can_match(i, f)
+            {
+                continue;
+            }
+            let sources = i.docs.values().map(|d| d.source.clone()).collect();
+            indices.push((n.clone(), i.mappings.clone(), sources));
+        }
+        (200, super::field_caps::field_caps(&indices, q, &req))
+    }
+
+    /// `POST [/<index>]/_msearch`: header/body line pairs, each run as a
+    /// search; a failing search is an error entry, not a failed request.
+    fn msearch(
+        &self,
+        method: &str,
+        index: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
+        if !matches!(method, "GET" | "POST") {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        let text = String::from_utf8_lossy(body);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            return (
+                400,
+                error("parse_exception", "request body or source parameter is required", 400),
+            );
+        }
+        if q.get("rest_total_hits_as_int").is_some_and(|v| v == "true") {
+            for pair in lines.chunks(2) {
+                if let Some(Ok(b)) = pair.get(1).map(|l| serde_json::from_str::<Value>(l))
+                    && let Some(err) = total_hits_as_int_error(&b)
+                {
+                    return err;
+                }
+            }
+        }
+        let mut responses = Vec::new();
+        for pair in lines.chunks(2) {
+            let Ok(header) = serde_json::from_str::<Value>(pair[0]) else {
+                return (400, malformed_body());
+            };
+            let target = match header.get("index") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Array(a)) => {
+                    a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")
+                }
+                _ if !index.is_empty() => index.to_string(),
+                _ => "_all".to_string(),
+            };
+            let mut item_q = q.clone();
+            if let Some(h) = header.as_object() {
+                for (k, v) in h {
+                    if k != "index" {
+                        item_q.insert(
+                            k.clone(),
+                            v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()),
+                        );
+                    }
+                }
+            }
+            let data = pair.get(1).copied().unwrap_or("{}");
+            let (status, mut resp) =
+                self.search_or_count("POST", "_search", &target, &item_q, data.as_bytes());
+            if status >= 400 {
+                let mut e = json!({"error": resp["error"].clone(), "status": status});
+                if e["error"].is_null() {
+                    e["error"] = resp;
+                }
+                responses.push(e);
+            } else {
+                resp["status"] = json!(status);
+                responses.push(resp);
+            }
+        }
+        (200, json!({"took": 0, "responses": responses}))
     }
 
     /// For each index an expression reaches: `None` when reached
@@ -625,6 +751,11 @@ impl Engine {
             {
                 req[key] = json!(v.split(',').collect::<Vec<_>>());
             }
+        }
+        if q.get("rest_total_hits_as_int").is_some_and(|v| v == "true")
+            && let Some(err) = total_hits_as_int_error(&req)
+        {
+            return err;
         }
         if q.get("rest_total_hits_as_int").is_some_and(|v| v == "true")
             && req.get("track_total_hits").is_none()
@@ -2755,6 +2886,83 @@ fn missing_aliases(patterns: &[&str], returned: &[String]) -> Vec<String> {
     missing.sort();
     missing.dedup();
     missing
+}
+
+/// Elasticsearch's "can match" pre-filter for `index_filter`: an index
+/// is skipped only when the query provably matches nothing there -- a
+/// query on a field the index doesn't map, or a range on a date field
+/// outside every value the index holds. Anything else may match.
+fn index_can_match(i: &Index, q: &Value) -> bool {
+    let Some((kind, body)) = q.as_object().and_then(|m| m.iter().next()) else { return true };
+    match kind.as_str() {
+        "bool" => {
+            let must: Vec<&Value> = ["must", "filter"]
+                .iter()
+                .filter_map(|k| body.get(*k))
+                .flat_map(|v| match v {
+                    Value::Array(a) => a.iter().collect::<Vec<_>>(),
+                    other => vec![other],
+                })
+                .collect();
+            must.iter().all(|c| index_can_match(i, c))
+        }
+        "match_none" => false,
+        "range" | "term" | "terms" | "match" | "prefix" | "wildcard" | "exists" => {
+            let field = if kind == "exists" {
+                body.get("field").and_then(Value::as_str).map(str::to_string)
+            } else {
+                body.as_object().and_then(|m| m.keys().find(|k| *k != "boost").cloned())
+            };
+            let Some(field) = field else { return true };
+            let (_, ty) = search::resolve_field(&i.mappings, &field);
+            let Some(ty) = ty else { return false };
+            if kind == "range" && matches!(ty.as_str(), "date" | "date_nanos") {
+                let cond = &body[field.as_str()];
+                let format = cond.get("format").and_then(Value::as_str);
+                let bound = |k: &str| {
+                    cond.get(k).and_then(|v| match v {
+                        Value::String(s) => dates::parse_math(
+                            s,
+                            dates::now_ms(),
+                            k == "gt" || k == "lte",
+                            format,
+                            0,
+                        ),
+                        Value::Number(n) => n.as_i64(),
+                        _ => None,
+                    })
+                };
+                let (gte, gt, lte, lt) = (bound("gte"), bound("gt"), bound("lte"), bound("lt"));
+                return i.committed.iter().any(|d| {
+                    search::raw_values(&d.source, &field).into_iter().any(|v| {
+                        let Some(ms) = dates::value_millis(v, None) else { return false };
+                        gte.is_none_or(|b| ms >= b)
+                            && gt.is_none_or(|b| ms > b)
+                            && lte.is_none_or(|b| ms <= b)
+                            && lt.is_none_or(|b| ms < b)
+                    })
+                });
+            }
+            true
+        }
+        _ => true,
+    }
+}
+
+/// `rest_total_hits_as_int` needs exact totals: a numeric
+/// `track_total_hits` is refused.
+fn total_hits_as_int_error(req: &Value) -> Option<(u16, Value)> {
+    let n = req.get("track_total_hits")?.as_i64()?;
+    Some((
+        400,
+        error(
+            "illegal_argument_exception",
+            &format!(
+                "[rest_total_hits_as_int] cannot be used if the tracking of total hits is not accurate, got {n}"
+            ),
+            400,
+        ),
+    ))
 }
 
 /// `{"a": {"b": 1}}` as `[("a.b", 1)]`.

@@ -247,11 +247,23 @@ class Runner:
         if path in ("$body", ""):
             return self.response
         cur = self.response
-        segs = re.split(r"(?<!\\)\.", path)
+        # As the Java runner's ObjectPath: a backslash escapes the next
+        # dot and is itself dropped (`a\.b` and `a\\.b` both name key "a.b").
+        segs, cur_seg, escape = [], [], False
+        for ch in path:
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "." and not escape:
+                segs.append("".join(cur_seg))
+                cur_seg = []
+                continue
+            escape = False
+            cur_seg.append(ch)
+        segs.append("".join(cur_seg))
         for seg in segs:
             if seg == "_arbitrary_key_" and isinstance(cur, dict) and cur:
                 return next(iter(cur))
-            seg = seg.replace("\\.", ".")
             if seg.startswith("$") and seg[1:] in self.stash:
                 seg = str(self.stash[seg[1:]])
             elif "${" in seg:
