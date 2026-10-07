@@ -4,6 +4,7 @@ mod analysis;
 mod cat;
 mod dates;
 mod engine;
+mod fields;
 mod highlight;
 mod painless;
 mod query_string;
@@ -11,6 +12,7 @@ mod scoring;
 mod search;
 mod server;
 mod sorting;
+mod templates;
 
 #[cfg(test)]
 mod tests;

@@ -86,7 +86,7 @@ impl Engine {
 }
 
 /// `memtoull`: 1k = 1000, 1kb = 1024, and so on up to gb.
-fn memtoull(s: &str) -> Option<i64> {
+pub(crate) fn memtoull(s: &str) -> Option<i64> {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
         return None;

@@ -59,6 +59,12 @@ pub fn seal(mut payload: Vec<u8>) -> Vec<u8> {
 /// The body of a sealed payload, if its version is one Redis 7.2 loads and
 /// its checksum is right (a zero checksum means "not computed").
 pub fn unseal(payload: &[u8]) -> Option<&[u8]> {
+    unseal_with(payload, true)
+}
+
+/// `unseal`, optionally without the checksum test (DEBUG
+/// SET-SKIP-CHECKSUM-VALIDATION 1).
+pub fn unseal_with(payload: &[u8], check_crc: bool) -> Option<&[u8]> {
     if payload.len() < 10 {
         return None;
     }
@@ -68,7 +74,7 @@ pub fn unseal(payload: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let crc = u64::from_le_bytes(payload[n - 8..].try_into().ok()?);
-    if crc != 0 && crc != crc64(&payload[..n - 8]) {
+    if check_crc && crc != 0 && crc != crc64(&payload[..n - 8]) {
         return None;
     }
     Some(&payload[..n - 10])

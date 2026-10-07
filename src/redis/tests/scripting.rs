@@ -286,3 +286,59 @@ fn a_resp3_client_still_gets_resp2_replies_inside_scripts() {
     assert!(matches!(t.run_as(&mut c, "ZRANGE z 0 -1 WITHSCORES"), Value::Array(_)));
     assert_eq!(c.resp, 3);
 }
+
+#[test]
+fn shebang_flags() {
+    let mut t = T::new();
+    assert_eq!(t.run("EVAL \"#!lua\\nreturn 1\" 0"), int(1));
+    assert_eq!(t.run("EVAL \"#!lua flags=\\nreturn 1\" 0"), int(1));
+    assert_eq!(
+        t.run("EVAL \"#!not-lua\\nreturn 1\" 0"),
+        err("ERR Unexpected engine in script shebang: #!not-lua")
+    );
+    assert_eq!(
+        t.run("EVAL \"#!lua badger=data\\nreturn 1\" 0"),
+        err("ERR Unknown lua shebang option: badger=data")
+    );
+    assert_eq!(
+        t.run("EVAL \"#!lua flags=allow-oom,what?\\nreturn 1\" 0"),
+        err("ERR Unexpected flag in script shebang: what?")
+    );
+    assert_eq!(t.run("EVAL \"#!lua\" 0"), err("ERR Invalid script shebang"));
+    assert_eq!(t.run("SCRIPT LOAD \"#!lua\""), err("ERR Invalid script shebang"));
+    let Value::Error(e) =
+        t.run("EVAL \"#!lua flags=no-writes\\nreturn redis.call('set','x',1)\" 0")
+    else {
+        panic!()
+    };
+    assert!(e.starts_with("ERR Write commands are not allowed from read-only scripts."), "{e}");
+    let Value::Error(e) = t.run("EVAL_RO \"return redis.call('publish','c','m')\" 0") else {
+        panic!()
+    };
+    assert!(e.starts_with("ERR Write commands are not allowed from read-only scripts."), "{e}");
+    assert_eq!(
+        t.run("EVAL_RO \"#!lua\\nreturn 1\" 0"),
+        err("ERR Can not execute a script with write flag using *_ro command.")
+    );
+    assert_eq!(t.run("EVAL_RO \"#!lua flags=no-writes\\nreturn 1\" 0"), int(1));
+    // Line numbers count the shebang line.
+    let Value::Error(e) = t.run("EVAL \"#!lua\\nreturn error()\" 0") else { panic!() };
+    assert!(e.ends_with("on @user_script:2."), "{e}");
+}
+
+#[test]
+fn shebang_allow_oom() {
+    let mut t = T::new();
+    t.run("SET x 123");
+    t.run("CONFIG SET maxmemory 1");
+    t.run("CONFIG SET maxmemory-policy noeviction");
+    assert_eq!(
+        t.run("EVAL \"#!lua flags=\\nreturn 1\" 0"),
+        err(
+            "OOM allow-oom flag is not set on the script, can not run it when used memory > 'maxmemory'"
+        )
+    );
+    assert_eq!(t.run("EVAL \"#!lua flags=no-writes\\nreturn 1\" 0"), int(1));
+    assert_eq!(t.run("EVAL \"#!lua flags=allow-oom\\nreturn 1\" 0"), int(1));
+    t.run("CONFIG SET maxmemory 0");
+}
