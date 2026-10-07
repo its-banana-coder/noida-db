@@ -138,3 +138,15 @@ fn limits_drive_encodings() {
     t.run("ZADD z 1 a 2 b 3 c");
     assert_eq!(t.run("OBJECT ENCODING z"), bulk("skiplist"));
 }
+
+#[test]
+fn lowering_maxmemory_evicts_right_away() {
+    let mut t = T::new();
+    t.run("CONFIG SET maxmemory-policy allkeys-lru");
+    t.run("SET foo bar");
+    assert_eq!(t.run("CONFIG SET maxmemory 1"), ok());
+    // Before any other command runs.
+    assert_eq!(t.engine.evicted_keys, 1);
+    t.run("CONFIG SET maxmemory 0");
+    assert_eq!(t.run("DBSIZE"), int(0));
+}
