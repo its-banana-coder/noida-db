@@ -280,7 +280,8 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                     .or_else(|| crate::mysql::engine::rewrite_drop_check(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_rename_key(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_trailing_into(&sql))
-                    .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql));
+                    .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql))
+                    .or_else(|| crate::mysql::engine::rewrite_explain_format(&sql));
                 match Parser::parse_sql(&dialect, rewritten.as_deref().unwrap_or(&sql)) {
                     Ok(mut asts) => {
                         if asts.is_empty() {
