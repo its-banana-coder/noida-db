@@ -1419,12 +1419,22 @@ impl Binder {
         order_by: Option<sqlparser::ast::OrderBy>,
         limit_clause: Option<LimitClause>,
     ) -> Result<Plan, MySqlError> {
+        let comma_join = select.from.len() > 1;
         let mut source =
             if select.from.is_empty() { Plan::Dummy } else { self.bind_from(select.from)? };
 
         if let Some(selection) = select.selection {
             let pred = self.bind_expr(selection)?;
-            source = Plan::Filter { source: Box::new(source), predicate: pred };
+            source = match source {
+                // `FROM a, b WHERE ...`: the WHERE as the last comma join's
+                // condition (the same rows), so the cross product of the
+                // two sides is never built -- Django's introspection joins
+                // two information_schema tables this way.
+                Plan::Join { left, right, op: JoinOp::Cross } if comma_join => {
+                    Plan::Join { left, right, op: JoinOp::Inner(pred) }
+                }
+                source => Plan::Filter { source: Box::new(source), predicate: pred },
+            };
         }
 
         let distinct = match &select.distinct {
@@ -1827,12 +1837,23 @@ impl Binder {
             .collect())
     }
 
+    /// `FROM a, b JOIN c ...`: each comma-separated item (with its own
+    /// joins, which bind tighter than the comma) cross-joined left to right.
     fn bind_from(&mut self, from: Vec<TableWithJoins>) -> Result<Plan, MySqlError> {
-        if from.len() != 1 {
-            return Err(MySqlError::unsupported("multiple from clauses"));
+        let mut out: Option<Plan> = None;
+        for twj in &from {
+            let item = self.bind_table_with_joins(twj)?;
+            out = Some(match out {
+                None => item,
+                Some(left) => {
+                    Plan::Join { left: Box::new(left), right: Box::new(item), op: JoinOp::Cross }
+                }
+            });
         }
+        out.ok_or_else(|| MySqlError::unsupported("empty FROM"))
+    }
 
-        let twj = &from[0];
+    fn bind_table_with_joins(&mut self, twj: &TableWithJoins) -> Result<Plan, MySqlError> {
         let mut plan = self.bind_table_factor(&twj.relation)?;
 
         for join in &twj.joins {
@@ -2259,6 +2280,11 @@ impl Binder {
             // (the usual form) arrive as a bare identifier, not a function
             // call -- previously bound as a column name, which silently
             // resolved to NULL.
+            AstExpr::Identifier(ident)
+                if ident.quote_style.is_none() && ident.value.eq_ignore_ascii_case("DEFAULT") =>
+            {
+                Ok(Expr::Default)
+            }
             AstExpr::Identifier(ident)
                 if ident.quote_style.is_none()
                     && matches!(

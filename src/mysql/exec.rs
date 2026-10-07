@@ -1605,7 +1605,10 @@ impl Executor {
                     }
 
                     for (row_no, row_exprs) in rows.iter().enumerate() {
-                        if row_exprs.len() != col_indices.len() {
+                        // `VALUES ()`: every column gets its default.
+                        if !(row_exprs.is_empty() && columns.is_empty())
+                            && row_exprs.len() != col_indices.len()
+                        {
                             return Err(MySqlError::new(
                                 1136,
                                 "21S01",
@@ -1618,6 +1621,10 @@ impl Executor {
                         let mut new_row = vec![Value::Null; work.columns.len()];
                         let mut provided = vec![false; work.columns.len()];
                         for (i, expr) in row_exprs.iter().enumerate() {
+                            // `DEFAULT`: as if the column were left out.
+                            if matches!(expr, Expr::Default) {
+                                continue;
+                            }
                             self.writing.set(true);
                             let v = self.eval_expr(expr, &[], None);
                             self.writing.set(false);
@@ -2612,11 +2619,23 @@ impl Executor {
         for (col_name, expr) in assignments {
             let idx = resolve_column_index(&t.columns, col_name)
                 .ok_or_else(|| MySqlError::unknown_column(col_name))?;
-            self.writing.set(true);
-            let val = self.eval_expr(expr, &t.rows[i], Some(&*t));
-            self.writing.set(false);
-            let val = val?;
             let col = &t.columns[idx];
+            let val = if matches!(expr, Expr::Default) {
+                if col.default_now {
+                    Value::Ts(now_ts())
+                } else if let Some(d) = &col.default {
+                    d.clone()
+                } else if col.not_null {
+                    added_column_value(col)
+                } else {
+                    Value::Null
+                }
+            } else {
+                self.writing.set(true);
+                let val = self.eval_expr(expr, &t.rows[i], Some(&*t));
+                self.writing.set(false);
+                val?
+            };
             if val.is_null() && col.not_null {
                 return Err(column_cannot_be_null(&col.name));
             }
@@ -2647,6 +2666,7 @@ impl Executor {
             Expr::Param(i) => Ok(self.params.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::Col(i) => Ok(row.get(*i).cloned().unwrap_or(Value::Null)),
             Expr::FoundRows => Ok(Value::Int(self.last_found_rows as i64)),
+            Expr::Default => Err(MySqlError::syntax_error("DEFAULT")),
             Expr::ColName(name) => match table {
                 Some(t) => match resolve_column(t, name)? {
                     Some(idx) => Ok(row.get(idx).cloned().unwrap_or(Value::Null)),
