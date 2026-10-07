@@ -26,7 +26,11 @@ files=$(cd "$src/tests" && find unit integration -name '*.tcl' | grep -v '^unit/
 for f in $files; do
   echo "=== $f" >>"$out"
   (cd "$src" && timeout 900 ./runtest --host 127.0.0.1 --port "$port" --clients 1 --timeout 300 --single "$f" "$@") >>"$out" 2>&1
-  redis-cli -p "$port" flushall >/dev/null 2>&1 || true
+  # A file that fails midway can leave the server paused (CLIENT PAUSE)
+  # or with active expire off; reset before the next file.
+  timeout 10 redis-cli -p "$port" client unpause >/dev/null 2>&1 || true
+  timeout 10 redis-cli -p "$port" debug set-active-expire 1 >/dev/null 2>&1 || true
+  timeout 60 redis-cli -p "$port" flushall >/dev/null 2>&1 || true
 done
 strip() { sed 's/\x1b\[[0-9;]*m//g' "$out"; }
 ok=$(strip | grep -c '^\[ok\]')
