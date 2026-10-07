@@ -16,10 +16,27 @@ if [ ! -x "$src/src/redis-cli" ]; then
   make -C "$src" -j2 >/dev/null
 fi
 out=$(mktemp)
-(cd "$src" && ./runtest --host 127.0.0.1 --port "$port" --clients 1 --timeout 900 "$@") >"$out" 2>&1
+# One file at a time: a test that can't run against an external server
+# (it needs the server's pid, say) raises an exception that would end a
+# whole-suite run, so it only costs its own file here.
+# unit/moduleapi is skipped: those tests load Redis modules compiled from
+# tests/modules (a .so into the server via MODULE LOAD), which only a real
+# Redis can do. Against real Redis in external mode they fail anyway.
+files=$(cd "$src/tests" && find unit integration -name '*.tcl' | grep -v '^unit/moduleapi/' | sed 's/\.tcl$//' | sort)
+for f in $files; do
+  echo "=== $f" >>"$out"
+  (cd "$src" && timeout 900 ./runtest --host 127.0.0.1 --port "$port" --clients 1 --timeout 300 --single "$f" "$@") >>"$out" 2>&1
+  # A file that fails midway can leave the server paused (CLIENT PAUSE)
+  # or with active expire off; reset before the next file.
+  timeout 10 redis-cli -p "$port" client unpause >/dev/null 2>&1 || true
+  timeout 10 redis-cli -p "$port" debug set-active-expire 1 >/dev/null 2>&1 || true
+  timeout 60 redis-cli -p "$port" flushall >/dev/null 2>&1 || true
+done
 strip() { sed 's/\x1b\[[0-9;]*m//g' "$out"; }
 ok=$(strip | grep -c '^\[ok\]')
 err=$(strip | grep -c '^\[err\]')
 exc=$(strip | grep -c '^\[exception\]')
 skip=$(strip | grep -c '^\[skip\]')
+failed_files=$(strip | awk '/^=== /{f=$2} /^\[(err|exception)\]/{print f}' | sort -u | tr '\n' ' ')
 echo "redis suite: ok $ok, err $err, exception $exc, skipped $skip (log: $out)"
+echo "files with errors: $failed_files"
