@@ -12,7 +12,7 @@ pub static COMMANDS: &[Command] = &[
     cmd("del", del),
     cmd("unlink", del),
     cmd("exists", exists),
-    cmd("touch", exists),
+    cmd("touch", touch),
     cmd("type", type_cmd),
     cmd("expire", expire),
     cmd("pexpire", pexpire),
@@ -61,12 +61,17 @@ fn del(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
 
 /// EXISTS and TOUCH: counts keys, repeats included.
 fn exists(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    let n = a[1..].iter().filter(|k| ctx.lookup(k).is_some()).count();
+    let n = a[1..].iter().filter(|k| ctx.lookup_notouch(k).is_some()).count();
+    Ok(Value::Integer(n as i64))
+}
+
+fn touch(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
+    let n = a[1..].iter().filter(|k| ctx.lookup_touch(k).is_some()).count();
     Ok(Value::Integer(n as i64))
 }
 
 fn type_cmd(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    let name = ctx.lookup(&a[1]).map_or("none", |e| e.data.type_name());
+    let name = ctx.lookup_notouch(&a[1]).map_or("none", |e| e.data.type_name());
     Ok(Value::Simple(name.into()))
 }
 
@@ -153,7 +158,7 @@ fn expire_generic(ctx: &mut Ctx, a: &[Vec<u8>], base: i64, unit: Unit, cmd: &str
 /// A port of `ttlGenericCommand`.
 fn ttl_generic(ctx: &mut Ctx, key: &[u8], millis: bool, absolute: bool) -> Reply {
     let now = ctx.now;
-    let Some(entry) = ctx.lookup(key) else {
+    let Some(entry) = ctx.lookup_notouch(key) else {
         return Ok(Value::Integer(-2));
     };
     let Some(at) = entry.expires_at else {
@@ -257,7 +262,7 @@ fn scan(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             continue;
         }
         if let Some(t) = &args.type_filter {
-            let ty = ctx.lookup(key).map(|e| e.data.type_name());
+            let ty = ctx.lookup_notouch(key).map(|e| e.data.type_name());
             if ty.map(str::as_bytes) != Some(t.as_slice()) {
                 continue;
             }
@@ -551,18 +556,18 @@ pub fn encoding(data: &Data) -> &'static str {
 }
 
 fn object_encoding(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    Ok(ctx.lookup(&a[2]).map_or(Value::Null, |e| Value::bulk(encoding(&e.data))))
+    Ok(ctx.lookup_notouch(&a[2]).map_or(Value::Null, |e| Value::bulk(encoding(&e.data))))
 }
 
 fn object_refcount(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    Ok(ctx.lookup(&a[2]).map_or(Value::Null, |_| Value::Integer(1)))
+    Ok(ctx.lookup_notouch(&a[2]).map_or(Value::Null, |_| Value::Integer(1)))
 }
 
 fn object_idletime(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     // OBJECT doesn't count as an access itself.
     let now = ctx.now;
     let access = ctx.db().access_of(&a[2]);
-    if ctx.lookup(&a[2]).is_none() {
+    if ctx.lookup_notouch(&a[2]).is_none() {
         return Ok(Value::Null);
     }
     let (last, _) = access.unwrap_or((now, 0));
@@ -575,7 +580,7 @@ to adjust.";
 
 fn object_freq(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let access = ctx.db().access_of(&a[2]);
-    if ctx.lookup(&a[2]).is_none() {
+    if ctx.lookup_notouch(&a[2]).is_none() {
         return Ok(Value::Null);
     }
     let lfu = ctx.engine.config.get("maxmemory-policy").is_some_and(|p| p.ends_with("lfu"));

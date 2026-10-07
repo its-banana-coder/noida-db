@@ -788,6 +788,12 @@ MYSQL_QUERIES = {
         (A, "ALTER TABLE n1 MODIFY a varchar(20)"),
         (A, "SELECT * FROM n1 ORDER BY a"),
     ],
+    "hash and encoding functions": [
+        (A, "SELECT MD5('a'), MD5(NULL), MD5(1), SHA1('a'), SHA(''), SHA2('a', 256), SHA2('a', 0), SHA2('a', 224), SHA2('a', 384), SHA2('a', 512), SHA2('a', 7), SHA2('a', NULL)"),
+        (A, "SELECT CRC32('a'), CRC32(''), CRC32(12), CRC32(NULL), TO_BASE64('abc'), TO_BASE64(REPEAT('x', 60)), FROM_BASE64('YWJj'), UNHEX('4142'), UNHEX('zz'), UNHEX('141'), HEX(UNHEX('4142'))"),
+        (A, "SELECT MD5('a', 'b')"),
+        (A, "SELECT SHA2('a')"),
+    ],
     "time columns (Django TimeField / DurationField-free)": [
         (A, "CREATE TABLE tm (id int, a time(6), b time)"),
         (A, "INSERT INTO tm VALUES (1, '12:34:56.123', '-838:59:59'), (2, '1 02:03', 123456), (3, NULL, '25:00:00')"),
