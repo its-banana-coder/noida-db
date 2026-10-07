@@ -253,6 +253,11 @@ pub fn parse_scan(a: &[Vec<u8>], i: usize, allow_type: bool) -> Result<ScanArgs<
 fn scan(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     let args = parse_scan(a, 1, true)?;
     let now = ctx.now;
+    // Like Redis's SCAN, expire what it walks over (it only matters with
+    // active expiry off; otherwise expired keys are already gone).
+    for key in ctx.db().expired_keys(now) {
+        ctx.lookup_notouch(&key);
+    }
     let all = ctx.db().keys(now);
     let end = (args.cursor + args.count).min(all.len());
     let start = args.cursor.min(end);

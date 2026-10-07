@@ -21,7 +21,7 @@ pub enum Value {
     /// RESP3 double (`,`); a bulk string on RESP2. Formatted like Redis's
     /// `d2string`.
     Double(f64),
-    /// RESP3 boolean (`#`); `:1` or a null bulk string on RESP2.
+    /// RESP3 boolean (`#`); `:1` or `:0` on RESP2.
     Bool(bool),
     /// RESP3 big number (`(`); a bulk string on RESP2.
     BigNumber(String),
@@ -112,7 +112,7 @@ pub fn encode(v: &Value, proto: u8, out: &mut Vec<u8>) {
         Value::Attribute(_) => {}
         Value::Bool(b) if resp3 => line(out, b'#', if *b { b"t" } else { b"f" }),
         Value::Bool(true) => line(out, b':', b"1"),
-        Value::Bool(false) => out.extend_from_slice(b"$-1\r\n"),
+        Value::Bool(false) => line(out, b':', b"0"),
         Value::BigNumber(n) if resp3 => line(out, b'(', n.as_bytes()),
         Value::BigNumber(n) => bulk(out, b'$', n.as_bytes()),
         Value::NoReply => {}

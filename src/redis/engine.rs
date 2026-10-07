@@ -192,6 +192,11 @@ impl Db {
         }
     }
 
+    /// Keys whose time has passed but are still stored (lazy expiry).
+    pub(crate) fn expired_keys(&self, now: u64) -> Vec<Vec<u8>> {
+        self.map.iter().filter(|(_, e)| e.is_expired(now)).map(|(k, _)| k.clone()).collect()
+    }
+
     /// Every entry, for DEBUG RELOAD.
     pub(crate) fn entries_mut(&mut self) -> impl Iterator<Item = (&Vec<u8>, &mut Entry)> {
         self.map.iter_mut()
