@@ -418,8 +418,10 @@ class Runner:
             streams = []
         for ds in streams:
             calls.append(("DELETE", f"/_data_stream/{urllib.parse.quote(ds)}", {}))
+        # Dot-prefixed indices a test created go too (as the Java runner's
+        # wipe does); a real system index just refuses the delete.
         for n in names:
-            if not n.startswith("."):
+            if not n.startswith(".ds-"):
                 calls.append(("DELETE", "/" + urllib.parse.quote(n), {"expand_wildcards": "all"}))
         # Templates by name (wildcard deletes aren't accepted everywhere).
         for listing, key, path in [
