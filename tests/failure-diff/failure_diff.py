@@ -799,6 +799,29 @@ MYSQL_QUERIES = {
         (A, "CREATE TABLE cm2 (a int) COMMENT='x y'"),
         (A, "SHOW CREATE TABLE cm2"),
     ],
+    "comma joins (Django constraint introspection)": [
+        (A, "CREATE TABLE cp (id int PRIMARY KEY, n varchar(5))"),
+        (A, "CREATE TABLE cc (id int PRIMARY KEY, pid int, UNIQUE KEY uq (pid), CONSTRAINT fkp FOREIGN KEY (pid) REFERENCES cp (id))"),
+        (A, "INSERT INTO cp VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+        (A, "INSERT INTO cc VALUES (10, 1), (20, 2)"),
+        (A, "SELECT cp.n, cc.id FROM cp, cc WHERE cc.pid = cp.id ORDER BY cc.id"),
+        (A, "SELECT count(*) FROM cp, cc"),
+        (A, "SELECT a.id, b.id FROM cp a, cp b WHERE a.id < b.id ORDER BY 1, 2"),
+        (A, "SELECT cp.id, x.id FROM cp, cc LEFT JOIN cp x ON x.id = cc.pid WHERE cc.pid = cp.id ORDER BY 1"),
+        (A, "SELECT * FROM cp, cc, cp z WHERE z.id = cc.pid AND cp.id = 3 ORDER BY cc.id"),
+        (A, "SELECT kc.constraint_name AS c, kc.column_name AS col, kc.referenced_table_name AS rt, kc.referenced_column_name AS rc, c.constraint_type AS t FROM information_schema.key_column_usage AS kc, information_schema.table_constraints AS c WHERE kc.table_schema = DATABASE() AND (kc.referenced_table_schema = DATABASE() OR kc.referenced_table_schema IS NULL) AND c.table_schema = kc.table_schema AND c.constraint_name = kc.constraint_name AND c.constraint_type != 'CHECK' AND kc.table_name = 'cc' ORDER BY kc.ordinal_position, c.constraint_type"),
+    ],
+    "DEFAULT as an insert value and update assignment": [
+        (A, "CREATE TABLE dd (id int AUTO_INCREMENT PRIMARY KEY, a int DEFAULT 5, b varchar(5) DEFAULT 'x', c int NOT NULL)"),
+        (A, "INSERT INTO dd (id, a, b, c) VALUES (DEFAULT, DEFAULT, 'q', 1)"),
+        (A, "INSERT INTO dd VALUES (DEFAULT, 7, DEFAULT, 2), (10, default, default, 3)"),
+        (A, "INSERT INTO dd (c) VALUES ()"),
+        (A, "INSERT INTO dd VALUES ()"),
+        (A, "INSERT INTO dd (c, a) VALUES (DEFAULT, 1)"),
+        (A, "SELECT * FROM dd ORDER BY id"),
+        (A, "UPDATE dd SET a = DEFAULT, b = 'zz' WHERE id = 2"),
+        (A, "SELECT * FROM dd ORDER BY id"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

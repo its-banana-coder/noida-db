@@ -56,6 +56,9 @@ pub enum Expr {
     /// protocol field). See `Plan::Finish`'s `calc_found_rows` and
     /// `Executor::last_found_rows`.
     FoundRows,
+    /// The bare keyword `DEFAULT` as an INSERT value or UPDATE assignment:
+    /// the column's default.
+    Default,
     And(Vec<Expr>),
     Or(Vec<Expr>),
     Compare {
