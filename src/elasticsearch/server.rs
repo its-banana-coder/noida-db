@@ -146,6 +146,18 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         } else {
             engine.dispatch(&method, path, query, &body)
         };
+        // Deprecation warnings travel in the payload; they go out as
+        // `Warning` headers.
+        let mut payload = payload;
+        let warnings: Vec<String> = payload
+            .as_object_mut()
+            .and_then(|m| m.remove(super::engine::WARNINGS))
+            .and_then(|w| w.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|w| format!("Warning: 299 Elasticsearch-8.15.3-noida \"{w}\"\r\n"))
+            .collect();
         let head = method == "HEAD";
         let (status, payload) =
             if head && status == 200 { (200, Value::Null) } else { (status, payload) };
@@ -191,8 +203,9 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         let w = reader.get_mut();
         write!(
             w,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Elastic-Product: Elasticsearch\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Elastic-Client-Meta\r\n{}{}\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Elastic-Product: Elasticsearch\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Elastic-Client-Meta\r\n{}{}{}\r\n",
             bytes.len(),
+            warnings.concat(),
             if gzip_out { "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" } else { "" },
             if connection_close { "Connection: close\r\n" } else { "" }
         )?;

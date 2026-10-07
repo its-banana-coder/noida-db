@@ -441,6 +441,18 @@ class Runner:
                     calls.append(("DELETE", "/_template/" + urllib.parse.quote(name), {}))
         except Exception:  # noqa: BLE001
             pass
+        # Cluster settings a test changed go back to their defaults (the
+        # Java runner does the same): a leftover
+        # `cluster.routing.allocation.enable: none` breaks every later test.
+        try:
+            status, raw, _ = self.http("GET", "/_cluster/settings", {"flat_settings": "true"}, None, {}, False)
+            cur = json.loads(raw) if status == 200 else {}
+            keep = {"action.destructive_requires_name"}
+            reset = {k: {n: None for n in (cur.get(k) or {}) if n not in keep} for k in ("persistent", "transient")}
+            if any(reset.values()):
+                self.http("PUT", "/_cluster/settings", {}, reset, {}, False)
+        except Exception:  # noqa: BLE001
+            pass
         for method, path, q in calls:
             try:
                 self.http(method, path, q, None, {}, False)

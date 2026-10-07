@@ -178,6 +178,27 @@ impl Engine {
 impl Engine {
     pub fn dispatch(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
         let (status, mut resp) = self.route(method, path, query, body);
+        // `?local` on the alias reads is deprecated (it has no effect).
+        if query.split('&').any(|p| p == "local" || p.starts_with("local="))
+            && method == "GET"
+            && let Some(m) = resp.as_object_mut()
+        {
+            let what = if path.starts_with("/_cat/aliases") {
+                Some("cat-aliases")
+            } else if path.contains("/_alias") {
+                Some("get-aliases")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                m.insert(
+                    WARNINGS.into(),
+                    json!([format!(
+                        "the [?local=true] query parameter to {what} requests has no effect and will be removed in a future version"
+                    )]),
+                );
+            }
+        }
         // `rest_total_hits_as_int=true`: `hits.total` as the bare number
         // (pre-7.0 shape), in a search, scroll or each msearch response.
         if query.split('&').any(|p| p == "rest_total_hits_as_int=true") {
@@ -283,11 +304,11 @@ impl Engine {
             }
             _ => {}
         }
-        if segments.first() == Some(&"_aliases") {
+        if segments.first() == Some(&"_aliases") && method == "POST" {
             return self.aliases(method, body);
         }
-        if segments.first() == Some(&"_alias") {
-            return self.get_alias(&segments);
+        if matches!(segments.first(), Some(&"_alias") | Some(&"_aliases")) {
+            return self.alias_api(method, "_all", segments.get(1).copied(), &q, body, true);
         }
         if segments.first() == Some(&"_search") && segments.get(1) == Some(&"scroll") {
             return self.scroll_api(method, segments.get(2).copied(), &q, body);
@@ -385,13 +406,17 @@ impl Engine {
             "_cache" if segments.get(2) == Some(&"clear") && method == "POST" => {
                 self.index_action(segments[0], "_cache", &q)
             }
-            "_search" | "_count" => self.search_or_count(method, segments[1], index_name, &q, body),
+            "_search" | "_count" => {
+                self.search_or_count(method, segments[1], segments[0], &q, body)
+            }
             "_pit" if method == "POST" => self.open_pit(index_name, &q),
             "_stats" if method == "GET" => self.stats_api(index_name),
             "_delete_by_query" | "_update_by_query" => {
                 self.by_query(method, segments[1], index_name, &q, body)
             }
-            "_alias" | "_aliases" => self.index_alias(method, index_name, segments.get(2).copied()),
+            "_alias" | "_aliases" => {
+                self.alias_api(method, segments[0], segments.get(2).copied(), &q, body, false)
+            }
             "_analyze" => self.analyze(body),
             "_doc" | "_create" | "_source" if segments.len() == 3 => {
                 self.document_api(method, index_name, segments[2], segments[1], &q, body)
@@ -424,6 +449,40 @@ impl Engine {
             return n.to_string();
         }
         with.first().map(|(n, _)| n.to_string()).unwrap_or_else(|| name.to_string())
+    }
+
+    /// For each index an expression reaches: `None` when reached
+    /// directly (or through an alias without a filter), else the filters
+    /// of the filtered aliases it was reached through.
+    fn alias_filters(s: &State, expr: &str) -> HashMap<String, Option<Vec<Value>>> {
+        let mut out: HashMap<String, Option<Vec<Value>>> = HashMap::new();
+        for part in expr.split(',').map(str::trim).filter(|p| !p.is_empty() && !p.starts_with('-'))
+        {
+            for (n, i) in &s.indices {
+                if part == "_all" || part == "*" || glob_match(part, n) {
+                    out.insert(n.clone(), None);
+                    continue;
+                }
+                for (a, spec) in &i.aliases {
+                    if !glob_match(part, a) {
+                        continue;
+                    }
+                    match spec.get("filter") {
+                        Some(f) => {
+                            if let Some(list) =
+                                out.entry(n.clone()).or_insert_with(|| Some(Vec::new()))
+                            {
+                                list.push(f.clone());
+                            }
+                        }
+                        None => {
+                            out.insert(n.clone(), None);
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn is_alias(&self, name: &str) -> bool {
@@ -667,10 +726,14 @@ impl Engine {
             if let Some(m) = q.get("min_score").and_then(|v| v.parse::<f64>().ok()) {
                 req["min_score"] = json!(m);
             }
+            let filters = Self::alias_filters(&s, index_pattern);
             let counts: Result<Vec<u64>, search::EsError> = names
                 .iter()
-                .filter_map(|n| s.indices.get(n))
-                .map(|i| search::count(&i.mappings, &i.committed, &req))
+                .filter_map(|n| s.indices.get(n).map(|i| (n, i)))
+                .map(|(n, i)| {
+                    let docs = filtered_docs(i, filters.get(n))?;
+                    search::count(&i.mappings, &docs, &req)
+                })
                 .collect();
             let total: u64 = match counts {
                 Ok(cs) => cs.into_iter().sum(),
@@ -685,9 +748,14 @@ impl Engine {
         // A query spanning more than one index may mix mappings, so fields
         // fall back to runtime type inference rather than any one index's
         // explicit mapping (see `search::tokens_for`).
+        let filters = Self::alias_filters(&s, index_pattern);
         let (mappings, docs, typed): (Value, Vec<CommittedDoc>, bool) = if names.len() == 1 {
             let i = &s.indices[&names[0]];
-            (i.mappings.clone(), i.committed.clone(), true)
+            let docs = match filtered_docs(i, filters.get(&names[0])) {
+                Ok(d) => d,
+                Err(e) => return (e.status, e.to_json()),
+            };
+            (i.mappings.clone(), docs, true)
         } else {
             // Several indices: their mappings merged (the first index to
             // map a field wins), so typed fields still sort and range as
@@ -695,7 +763,10 @@ impl Engine {
             let mut docs = Vec::new();
             let mut props = Map::new();
             for n in &names {
-                docs.extend(s.indices[n].committed.iter().cloned());
+                match filtered_docs(&s.indices[n], filters.get(n)) {
+                    Ok(d) => docs.extend(d),
+                    Err(e) => return (e.status, e.to_json()),
+                }
                 if let Some(p) = s.indices[n].mappings.get("properties").and_then(Value::as_object)
                 {
                     for (k, v) in p {
@@ -823,11 +894,18 @@ impl Engine {
                                 .cluster_settings
                                 .entry(key.to_string())
                                 .or_insert_with(|| json!({}));
-                            for (k, v) in m {
+                            // Stored flat (`a.b.c`), values as strings.
+                            let mut flat = Vec::new();
+                            flatten_keys("", &Value::Object(m.clone()), &mut flat);
+                            for (k, v) in &flat {
+                                let v = match v {
+                                    Value::Null | Value::String(_) | Value::Array(_) => v.clone(),
+                                    other => json!(other.to_string()),
+                                };
                                 if v.is_null() {
                                     slot.as_object_mut().unwrap().remove(k);
                                 } else {
-                                    slot[k] = v.clone();
+                                    slot[k.as_str()] = v;
                                 }
                             }
                         }
@@ -835,7 +913,21 @@ impl Engine {
                     let mut out = json!({"acknowledged": true, "persistent": {}, "transient": {}});
                     for key in ["persistent", "transient"] {
                         if let Some(v) = req.get(key) {
-                            out[key] = v.clone();
+                            let mut flat = Vec::new();
+                            flatten_keys("", v, &mut flat);
+                            let kept: Map<String, Value> = flat
+                                .into_iter()
+                                .filter(|(_, x)| !x.is_null())
+                                .map(|(k, x)| {
+                                    let x = if x.is_string() || x.is_array() {
+                                        x
+                                    } else {
+                                        json!(x.to_string())
+                                    };
+                                    (k, x)
+                                })
+                                .collect();
+                            out[key] = nest_keys(&kept);
                         }
                     }
                     return (200, out);
@@ -843,8 +935,8 @@ impl Engine {
                 (
                     200,
                     json!({
-                        "persistent": s.cluster_settings.get("persistent").cloned().unwrap_or_else(|| json!({})),
-                        "transient": s.cluster_settings.get("transient").cloned().unwrap_or_else(|| json!({})),
+                        "persistent": s.cluster_settings.get("persistent").and_then(Value::as_object).map(nest_keys).unwrap_or_else(|| json!({})),
+                        "transient": s.cluster_settings.get("transient").and_then(Value::as_object).map(nest_keys).unwrap_or_else(|| json!({})),
                     }),
                 )
             }
@@ -1023,16 +1115,33 @@ impl Engine {
                 let mut rows = Vec::new();
                 let mut idx: Vec<&String> = s.indices.keys().collect();
                 idx.sort();
+                let patterns: Vec<&str> = segments
+                    .get(2)
+                    .map(|n| n.split(',').map(str::trim).collect())
+                    .unwrap_or_default();
                 for n in idx {
                     let mut aliases: Vec<(&String, &Value)> = s.indices[n].aliases.iter().collect();
                     aliases.sort_by_key(|a| a.0);
                     for (a, spec) in aliases {
+                        if !alias_selected(&patterns, a) {
+                            continue;
+                        }
                         let w = spec
                             .get("is_write_index")
                             .and_then(Value::as_bool)
                             .map_or("-".to_string(), |b| b.to_string());
                         let f = if spec.get("filter").is_some() { "*" } else { "-" };
-                        rows.push(vec![a.clone(), n.clone(), f.into(), "-".into(), "-".into(), w]);
+                        let r = |k: &str| {
+                            spec.get(k).and_then(Value::as_str).unwrap_or("-").to_string()
+                        };
+                        rows.push(vec![
+                            a.clone(),
+                            n.clone(),
+                            f.into(),
+                            r("index_routing"),
+                            r("search_routing"),
+                            w,
+                        ]);
                     }
                 }
                 (
@@ -2225,89 +2334,462 @@ impl Engine {
     }
 
     /// `PUT|DELETE /<index>/_alias/<name>` and `GET /<index>/_alias`.
-    fn index_alias(&self, method: &str, index: &str, alias: Option<&str>) -> (u16, Value) {
-        let mut s = self.0.lock().unwrap();
-        let Some(i) = s.indices.get_mut(index) else { return missing_index(index) };
-        match (method, alias) {
-            ("PUT" | "POST", Some(a)) => {
-                i.aliases.insert(a.to_string(), json!({}));
-                (200, json!({"acknowledged": true}))
+    /// Concrete indices for an alias API's index expression (`_all`, `*`,
+    /// globs, lists); a concrete name that doesn't exist is a 404.
+    /// `expand_wildcards=open` leaves closed indices out of wildcards.
+    fn alias_indices(
+        s: &State,
+        expr: &str,
+        q: &HashMap<String, String>,
+    ) -> Result<Vec<String>, (u16, Value)> {
+        let open_only = q.get("expand_wildcards").is_some_and(|w| w == "open");
+        let mut out = Vec::new();
+        for part in expr.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            if part == "_all" || part.contains('*') {
+                out.extend(
+                    s.indices
+                        .iter()
+                        .filter(|(n, i)| {
+                            (part == "_all" || glob_match(part, n)) && (!open_only || i.opened)
+                        })
+                        .map(|(n, _)| n.clone()),
+                );
+            } else if s.indices.contains_key(part) {
+                out.push(part.to_string());
+            } else {
+                return Err(missing_index(part));
             }
-            ("DELETE", Some(a)) => {
-                if i.aliases.remove(a).is_some() {
-                    (200, json!({"acknowledged": true}))
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// `/{index}/_alias[/{name}]`, `/_alias[/{name}]`: GET, HEAD, PUT,
+    /// POST and DELETE.
+    fn alias_api(
+        &self,
+        method: &str,
+        index_expr: &str,
+        name: Option<&str>,
+        q: &HashMap<String, String>,
+        body: &[u8],
+        no_index: bool,
+    ) -> (u16, Value) {
+        let mut s = self.0.lock().unwrap();
+        match method {
+            "GET" | "HEAD" => {
+                let indices = match Self::alias_indices(&s, index_expr, q) {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                let Some(name) = name.filter(|n| !n.is_empty()) else {
+                    // No alias names: every index, with whatever aliases.
+                    let mut out = Map::new();
+                    for n in &indices {
+                        out.insert(
+                            n.clone(),
+                            json!({"aliases": aliases_out(&s.indices[n].aliases)}),
+                        );
+                    }
+                    return (200, Value::Object(out));
+                };
+                let patterns: Vec<&str> = name.split(',').map(str::trim).collect();
+                let mut out = Map::new();
+                let mut returned: Vec<String> = Vec::new();
+                for n in &indices {
+                    let i = &s.indices[n];
+                    let picked: Map<String, Value> = i
+                        .aliases
+                        .iter()
+                        .filter(|(a, _)| alias_selected(&patterns, a))
+                        .map(|(a, v)| (a.clone(), v.clone()))
+                        .collect();
+                    if !picked.is_empty() {
+                        returned.extend(picked.keys().cloned());
+                        out.insert(n.clone(), json!({"aliases": picked}));
+                    }
+                }
+                let missing = missing_aliases(&patterns, &returned);
+                if missing.is_empty() {
+                    return (200, Value::Object(out));
+                }
+                out.insert(
+                    "error".into(),
+                    json!(if missing.len() == 1 {
+                        format!("alias [{}] missing", missing[0])
+                    } else {
+                        format!("aliases [{}] missing", missing.join(","))
+                    }),
+                );
+                out.insert("status".into(), json!(404));
+                (404, Value::Object(out))
+            }
+            "PUT" | "POST" => {
+                if no_index {
+                    return (
+                        400,
+                        error(
+                            "action_request_validation_exception",
+                            "Validation Failed: 1: [index] is missing;",
+                            400,
+                        ),
+                    );
+                }
+                let Some(name) = name else {
+                    return (
+                        400,
+                        error(
+                            "action_request_validation_exception",
+                            "Validation Failed: 1: [alias] is missing;",
+                            400,
+                        ),
+                    );
+                };
+                let Some(req) = parse_json(body) else { return (400, malformed_body()) };
+                let indices = match Self::alias_indices(&s, index_expr, q) {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                if let Err(e) = validate_alias_name(name, |n| s.indices.contains_key(n)) {
+                    return e;
+                }
+                let spec = alias_spec(&req);
+                for n in indices {
+                    if let Some(i) = s.indices.get_mut(&n) {
+                        i.aliases.insert(name.to_string(), spec.clone());
+                    }
+                }
+                (200, json!({"acknowledged": true, "errors": false}))
+            }
+            "DELETE" => {
+                let (Some(name), false) = (name, no_index) else {
+                    return (
+                        400,
+                        error(
+                            "action_request_validation_exception",
+                            "Validation Failed: 1: [index] and [name] are required;",
+                            400,
+                        ),
+                    );
+                };
+                let indices = match Self::alias_indices(&s, index_expr, q) {
+                    Ok(i) => i,
+                    Err(e) => return e,
+                };
+                let patterns: Vec<&str> = name.split(',').map(str::trim).collect();
+                let mut removed = false;
+                for n in indices {
+                    if let Some(i) = s.indices.get_mut(&n) {
+                        let before = i.aliases.len();
+                        i.aliases.retain(|a, _| !alias_selected(&patterns, a));
+                        removed |= i.aliases.len() != before;
+                    }
+                }
+                if removed {
+                    (200, json!({"acknowledged": true, "errors": false}))
                 } else {
                     (
                         404,
                         error(
                             "aliases_not_found_exception",
-                            &format!("aliases [{a}] missing"),
+                            &format!("aliases [{name}] missing"),
                             404,
                         ),
                     )
                 }
             }
-            ("GET", _) => {
-                let a: Map<String, Value> = i
-                    .aliases
-                    .iter()
-                    .filter(|(k, _)| alias.is_none_or(|x| x == k.as_str()))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                (200, json!({(index): {"aliases": a}}))
-            }
             _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
         }
     }
 
+    /// `POST /_aliases`: add / remove / remove_index actions, applied
+    /// atomically; a `remove` that finds nothing is reported per action
+    /// (or fails the request with `must_exist: true`).
     fn aliases(&self, method: &str, body: &[u8]) -> (u16, Value) {
         if method != "POST" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
-        let req = parse_json(body).unwrap_or_else(|| json!({}));
+        let Some(req) = parse_json(body) else { return (400, malformed_body()) };
         let Some(actions) = req.get("actions").and_then(Value::as_array) else {
             return (
                 400,
                 error("x_content_parse_exception", "Required [actions] field missing", 400),
             );
         };
+        let list = |v: &Value, one: &str, many: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            for k in [one, many] {
+                match v.get(k) {
+                    Some(Value::String(x)) => out.push(x.clone()),
+                    Some(Value::Array(a)) => {
+                        out.extend(a.iter().filter_map(Value::as_str).map(str::to_string))
+                    }
+                    _ => {}
+                }
+            }
+            out
+        };
         let mut s = self.0.lock().unwrap();
+        // Work on a copy; nothing changes unless every action can apply.
+        let mut next: HashMap<String, HashMap<String, Value>> =
+            s.indices.iter().map(|(n, i)| (n.clone(), i.aliases.clone())).collect();
+        let mut drop_indices: Vec<String> = Vec::new();
+        let mut results = Vec::new();
+        let mut errors = false;
+        let no_q = HashMap::new();
         for action in actions {
-            let Some((op, v)) = action.as_object().and_then(|o| o.iter().next()) else { continue };
-            let ix = v.get("index").and_then(Value::as_str).unwrap_or("");
-            let alias = v.get("alias").and_then(Value::as_str).unwrap_or("");
-            if let Some(i) = s.indices.get_mut(ix) {
-                if op == "remove" {
-                    i.aliases.remove(alias);
-                } else if op == "add" {
-                    i.aliases.insert(alias.to_string(), v.clone());
+            let Some((op, v)) = action.as_object().and_then(|o| o.iter().next()) else {
+                continue;
+            };
+            let index_exprs = list(v, "index", "indices");
+            let alias_names = list(v, "alias", "aliases");
+            if index_exprs.is_empty() {
+                return (
+                    400,
+                    error(
+                        "action_request_validation_exception",
+                        "Validation Failed: 1: One of [index/indices] is required;",
+                        400,
+                    ),
+                );
+            }
+            if v.get("must_exist").is_some() && op != "remove" {
+                return (
+                    400,
+                    error(
+                        "x_content_parse_exception",
+                        &format!("[must_exist] is unsupported for [{op}]"),
+                        400,
+                    ),
+                );
+            }
+            let mut indices = Vec::new();
+            for e in &index_exprs {
+                match Self::alias_indices(&s, e, &no_q) {
+                    Ok(i) => indices.extend(i),
+                    Err(err) => return err,
+                }
+            }
+            let mut concrete = indices.clone();
+            concrete.sort();
+            concrete.dedup();
+            let summary = json!({"type": op, "indices": concrete, "aliases": alias_names});
+            match op.as_str() {
+                "add" => {
+                    if alias_names.is_empty() {
+                        return (
+                            400,
+                            error(
+                                "action_request_validation_exception",
+                                "Validation Failed: 1: One of [alias/aliases] is required;",
+                                400,
+                            ),
+                        );
+                    }
+                    let spec = alias_spec(v);
+                    for a in &alias_names {
+                        if let Err(e) = validate_alias_name(a, |n| {
+                            s.indices.contains_key(n) && !drop_indices.iter().any(|d| d == n)
+                        }) {
+                            return e;
+                        }
+                        for n in &indices {
+                            if let Some(m) = next.get_mut(n) {
+                                m.insert(a.clone(), spec.clone());
+                            }
+                        }
+                    }
+                    results.push(json!({"action": summary, "status": 200}));
+                }
+                "remove" => {
+                    let patterns: Vec<&str> = alias_names.iter().map(String::as_str).collect();
+                    let mut removed = false;
+                    for n in &indices {
+                        if let Some(m) = next.get_mut(n) {
+                            let before = m.len();
+                            m.retain(|a, _| !alias_selected(&patterns, a));
+                            removed |= m.len() != before;
+                        }
+                    }
+                    if removed {
+                        results.push(json!({"action": summary, "status": 200}));
+                    } else {
+                        let reason = format!("aliases [{}] missing", alias_names.join(","));
+                        if v.get("must_exist").and_then(Value::as_bool) == Some(true) {
+                            return (404, error("aliases_not_found_exception", &reason, 404));
+                        }
+                        errors = true;
+                        let id = alias_names.join(",");
+                        results.push(json!({"action": summary, "status": 404,
+                            "error": {"type": "aliases_not_found_exception", "reason": reason,
+                                      "resource.type": "aliases", "resource.id": id}}));
+                    }
+                }
+                "remove_index" => {
+                    drop_indices.extend(indices);
+                    results.push(json!({"action": summary, "status": 200}));
+                }
+                other => {
+                    return (
+                        400,
+                        error(
+                            "x_content_parse_exception",
+                            &format!("[1:1] [alias_action] unknown field [{other}]"),
+                            400,
+                        ),
+                    );
                 }
             }
         }
-        (200, json!({"acknowledged":true}))
-    }
-    fn get_alias(&self, segments: &[&str]) -> (u16, Value) {
-        let s = self.0.lock().unwrap();
-        let alias = segments.get(1).copied();
-        let mut out = Map::new();
-        for (name, i) in &s.indices {
-            let a: Map<String, Value> = i
-                .aliases
-                .iter()
-                .filter(|(k, _)| alias.is_none() || Some(k.as_str()) == alias)
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            if !a.is_empty() {
-                out.insert(name.clone(), json!({"aliases":a}));
+        for (n, m) in next {
+            if let Some(i) = s.indices.get_mut(&n) {
+                i.aliases = m;
             }
         }
-        if out.is_empty() {
-            (404, error("alias_missing_exception", "alias does not exist", 404))
+        for n in drop_indices {
+            s.indices.remove(&n);
+        }
+        if errors {
+            (200, json!({"acknowledged": true, "errors": true, "action_results": results}))
         } else {
-            (200, Value::Object(out))
+            (200, json!({"acknowledged": true, "errors": false}))
         }
     }
 }
+
+/// An index's searchable documents, narrowed to those matching any of
+/// the alias filters it was reached through.
+fn filtered_docs(
+    i: &Index,
+    filters: Option<&Option<Vec<Value>>>,
+) -> Result<Vec<CommittedDoc>, search::EsError> {
+    let Some(Some(filters)) = filters else { return Ok(i.committed.clone()) };
+    let mut keep = std::collections::BTreeSet::new();
+    for f in filters {
+        keep.extend(search::eval_root(f, &i.mappings, &i.committed)?.into_keys());
+    }
+    Ok(keep.into_iter().map(|k| i.committed[k].clone()).collect())
+}
+
+/// Alias definitions as GET returns them.
+fn aliases_out(m: &HashMap<String, Value>) -> Map<String, Value> {
+    m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// An alias definition from a request body (`filter`, routing,
+/// `is_write_index`, `is_hidden`), normalized as stored.
+fn alias_spec(v: &Value) -> Value {
+    let mut out = Map::new();
+    for k in ["filter", "routing", "index_routing", "search_routing", "is_write_index", "is_hidden"]
+    {
+        if let Some(x) = v.get(k).filter(|x| !x.is_null()) {
+            out.insert(k.to_string(), x.clone());
+        }
+    }
+    normalize_alias(&Value::Object(out))
+}
+
+fn validate_alias_name(
+    name: &str,
+    index_exists: impl Fn(&str) -> bool,
+) -> Result<(), (u16, Value)> {
+    let bad = |reason: String| Err((400, error("invalid_alias_name_exception", &reason, 400)));
+    if name.chars().any(|c| "\\/*?\"<>| ,#".contains(c)) {
+        return bad(format!(
+            "Invalid alias name [{name}]: must not contain the following characters [ , \", *, \\, <, |, ,, >, /, ?]"
+        ));
+    }
+    if name.starts_with(['_', '-', '+']) {
+        return bad(format!("Invalid alias name [{name}]: must not start with '_', '-', or '+'"));
+    }
+    if index_exists(name) {
+        return bad(format!(
+            "Invalid alias name [{name}]: an index or data stream exists with the same name as the alias"
+        ));
+    }
+    Ok(())
+}
+
+/// Elasticsearch's alias name expressions: names, `*` globs and `_all`;
+/// a `-pattern` at or after the first wildcard excludes. The last
+/// pattern that matches decides.
+fn alias_selected(patterns: &[&str], alias: &str) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let first_wild =
+        patterns.iter().position(|p| *p == "_all" || p.contains('*')).unwrap_or(patterns.len());
+    let mut selected = false;
+    for (i, p) in patterns.iter().enumerate() {
+        let (include, pat) = match p.strip_prefix('-') {
+            Some(rest) if i >= first_wild => (false, rest),
+            _ => (true, *p),
+        };
+        if pat == "_all" || glob_match(pat, alias) {
+            selected = include;
+        }
+    }
+    selected
+}
+
+/// Explicitly named aliases (not globs, not exclusions, not excluded
+/// later) that matched nothing: those make a GET a 404.
+fn missing_aliases(patterns: &[&str], returned: &[String]) -> Vec<String> {
+    let first_wild =
+        patterns.iter().position(|p| *p == "_all" || p.contains('*')).unwrap_or(patterns.len());
+    let mut missing = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
+        if *p == "_all" || p.contains('*') || (i >= first_wild && p.starts_with('-')) {
+            continue;
+        }
+        let excluded = patterns
+            .iter()
+            .enumerate()
+            .skip((i + 1).max(first_wild))
+            .any(|(_, q)| q.strip_prefix('-').is_some_and(|x| x == "_all" || glob_match(x, p)));
+        if !excluded && !returned.iter().any(|r| r == p) {
+            missing.push(p.to_string());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// `{"a": {"b": 1}}` as `[("a.b", 1)]`.
+fn flatten_keys(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                flatten_keys(&key, x, out);
+            }
+        }
+        other => out.push((prefix.to_string(), other.clone())),
+    }
+}
+
+/// Dotted keys as nested objects: `{"a.b": 1}` as `{"a": {"b": 1}}`.
+fn nest_keys(m: &Map<String, Value>) -> Value {
+    let mut out = json!({});
+    for (k, v) in m {
+        let parts: Vec<&str> = k.split('.').collect();
+        let mut node = &mut out;
+        for p in &parts[..parts.len() - 1] {
+            if !node.get(*p).is_some_and(Value::is_object) {
+                node[*p] = json!({});
+            }
+            node = &mut node[*p];
+        }
+        node[parts[parts.len() - 1]] = v.clone();
+    }
+    out
+}
+
+/// The payload key carrying deprecation warnings for the `Warning`
+/// response header.
+pub const WARNINGS: &str = "\u{0}noida_warnings";
 
 pub fn parse_json(bytes: &[u8]) -> Option<Value> {
     if bytes.is_empty() { Some(json!({})) } else { serde_json::from_slice(bytes).ok() }
