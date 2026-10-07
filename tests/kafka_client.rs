@@ -230,7 +230,11 @@ fn test_kafka_milestone_1_and_2() {
         send_request(&mut stream, ApiKey::SyncGroup, 3, 12, Some("test-client"), &sync_req);
     assert_eq!(sync_resp.error_code, 0);
 
-    // 13. OffsetCommit & OffsetFetch
+    // 13. OffsetCommit & OffsetFetch -- on a topic that exists again
+    // (Kafka refuses commits for unknown topics; step 9 deleted it).
+    let recreate_resp: CreateTopicsResponse =
+        send_request(&mut stream, ApiKey::CreateTopics, 5, 30, Some("test-client"), &create_req);
+    assert_eq!(recreate_resp.topics[0].error_code, 0);
     let mut commit_req = kafka_protocol::messages::OffsetCommitRequest::default();
     commit_req.group_id =
         kafka_protocol::messages::GroupId(StrBytes::from_string("test-consumer-group".to_string()));
@@ -398,9 +402,8 @@ fn test_kafka_milestone_1_and_2() {
 
     let del_recs_resp: kafka_protocol::messages::DeleteRecordsResponse =
         send_request(&mut stream, ApiKey::DeleteRecords, 2, 23, Some("test-client"), &del_recs_req);
-    // The topic was deleted in step 9: UNKNOWN_TOPIC_OR_PARTITION, as on a
-    // real broker.
-    assert_eq!(del_recs_resp.topics[0].partitions[0].error_code, 3);
+    // The topic was recreated (empty) in step 13: deleting up to 0 is fine.
+    assert_eq!(del_recs_resp.topics[0].partitions[0].error_code, 0);
 
     // 18. LogDirs & SASL Handshake
     let desc_log_dirs_req = kafka_protocol::messages::DescribeLogDirsRequest::default();

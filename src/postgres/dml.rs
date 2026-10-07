@@ -587,6 +587,8 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
     }
     for cons in &t.constraints {
         match &cons.kind {
+            // A deferred key is checked at COMMIT (`check_deferred`).
+            ConstraintKind::PrimaryKey | ConstraintKind::Unique if is_deferred(cons, ctx.rt) => {}
             ConstraintKind::PrimaryKey | ConstraintKind::Unique => {
                 let nulls_not_distinct = cons
                     .index_oid
@@ -969,6 +971,51 @@ pub fn is_deferred(cons: &super::catalog::Constraint, rt: &super::exec::Runtime)
     rt.deferred_all.unwrap_or(cons.initially_deferred)
 }
 
+/// A deferred key, checked over the whole table: sorted on the key, a
+/// duplicate sits next to its twin.
+fn check_unique_now(
+    db: &super::catalog::DbState,
+    t: &super::catalog::Table,
+    cons: &super::catalog::Constraint,
+) -> PgResult<()> {
+    let nulls_not_distinct = cons
+        .index_oid
+        .and_then(|o| t.indexes.iter().find(|i| i.oid == o))
+        .is_some_and(|i| i.nulls_not_distinct);
+    let mut keyed: Vec<&Row> = t
+        .rows
+        .iter()
+        .filter(|r| nulls_not_distinct || !cons.cols.iter().any(|&c| r[c].is_null()))
+        .collect();
+    let cmp = |a: &Row, b: &Row| {
+        cons.cols
+            .iter()
+            .map(|&c| types::cmp_values(&a[c], &b[c]))
+            .find(|o| *o != Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
+    };
+    keyed.sort_by(|a, b| cmp(a, b));
+    let Some(dup) = keyed
+        .windows(2)
+        .find(|w| cons.cols.iter().all(|&c| types::values_equal(&w[0][c], &w[1][c])))
+    else {
+        return Ok(());
+    };
+    let keys: Vec<String> = cons.cols.iter().map(|&c| t.columns[c].name.clone()).collect();
+    let vals: Vec<String> = cons
+        .cols
+        .iter()
+        .map(|&c| types::to_text(&dup[0][c], t.columns[c].ty, &Default::default()))
+        .collect();
+    Err(PgError::new(
+        code::UNIQUE_VIOLATION,
+        format!("duplicate key value violates unique constraint \"{}\"", cons.name),
+    )
+    .detail(format!("Key ({})=({}) already exists.", keys.join(", "), vals.join(", ")))
+    .table(db.schema_name(t.schema), &t.name)
+    .constraint(&cons.name))
+}
+
 /// At COMMIT (and `SET CONSTRAINTS ... IMMEDIATE`): every deferrable
 /// foreign key (only `names`, when given) must hold for every row
 /// (Postgres checks the rows it queued; checking them all gives the same
@@ -983,6 +1030,14 @@ pub fn check_deferred_named(
 ) -> PgResult<()> {
     for t in db.tables.values() {
         for cons in &t.constraints {
+            if matches!(cons.kind, ConstraintKind::PrimaryKey | ConstraintKind::Unique)
+                && (cons.deferrable || cons.initially_deferred)
+            {
+                if names.is_none_or(|n| n.contains(&cons.name)) {
+                    check_unique_now(db, t, cons)?;
+                }
+                continue;
+            }
             let ConstraintKind::ForeignKey { ref_table, ref_cols, .. } = &cons.kind else {
                 continue;
             };

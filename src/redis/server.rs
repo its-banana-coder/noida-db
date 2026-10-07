@@ -243,9 +243,13 @@ fn serve(
         if args.is_empty() {
             continue;
         }
+        let mut held = false;
         loop {
             let mut e = shared.engine.lock().unwrap();
-            if !e.is_paused_for(&args) {
+            if !e.is_paused_for(session, &args) {
+                if held {
+                    e.paused_clients -= 1;
+                }
                 let reply = e.execute(session, &args);
                 if e.has_replies() {
                     shared.replies.notify_all();
@@ -254,6 +258,11 @@ fn serve(
                     send(out, &reply, session.resp);
                 }
                 break;
+            }
+            // Redis counts clients held by a pause as blocked (INFO).
+            if !held {
+                held = true;
+                e.paused_clients += 1;
             }
             drop(e);
             // CLIENT PAUSE: hold the command until the pause ends.

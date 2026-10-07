@@ -588,6 +588,41 @@ def admin_defaults_and_errors():
     except KafkaException as e:
         print("acls", err(e))
 
+
+@scenario
+def offsets_only_group():
+    """A group only used via manual assignment + commits: listed and
+    described as Empty, its commit metadata kept, deletable exactly once."""
+    from confluent_kafka import ConsumerGroupTopicPartitions
+
+    t = name("oo")
+    create(t, 1)
+    produce(t, [(None, b"a"), (None, b"b")])
+    g = name("grp")
+    c = Consumer({"bootstrap.servers": BS, "group.id": g})
+    c.commit(offsets=[TopicPartition(t, 0, 1, metadata="meta-1")], asynchronous=False)
+    r = c.committed([TopicPartition(t, 0)], timeout=10)
+    print("committed", r[0].offset, r[0].metadata)
+    for tp in [TopicPartition(t, 3, 1), TopicPartition(name("missing"), 0, 1)]:
+        try:
+            c.commit(offsets=[tp], asynchronous=False)
+            print("commit unknown ok?!")
+        except KafkaException as e:
+            print("commit unknown", err(e))
+    c.close()
+    gs = admin.list_consumer_groups().result()
+    print("listed", [(str(x.state), x.is_simple_consumer_group) for x in gs.valid if x.group_id == g])
+    d = admin.describe_consumer_groups([g])[g].result()
+    print("describe", d.state, len(d.members), d.is_simple_consumer_group)
+    r = admin.list_consumer_group_offsets([ConsumerGroupTopicPartitions(g)])[g].result()
+    print("offsets", [(tp.partition, tp.offset, tp.metadata) for tp in r.topic_partitions])
+    for _ in range(2):
+        try:
+            admin.delete_consumer_groups([g])[g].result()
+            print("delete ok")
+        except KafkaException as e:
+            print("delete", err(e))
+
 for n, fn in SCENARIOS.items():
     if ONLY and n not in ONLY:
         continue
