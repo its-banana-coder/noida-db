@@ -101,6 +101,29 @@ pub struct Cursor {
     pub hold: bool,
     /// Declared in the current transaction (a ROLLBACK drops it).
     pub new: bool,
+    /// What `pg_cursors` shows.
+    pub info: super::exec::CursorInfo,
+}
+
+/// Aggregates that make a cursor's plan non-scrollable (a heuristic for
+/// `pg_cursors.is_scrollable`).
+const AGGREGATES: &[&str] = &[
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "array_agg",
+    "string_agg",
+    "bool_and",
+    "bool_or",
+    "json_agg",
+    "jsonb_agg",
+];
+
+/// A cursor's name: folded to lower case unless quoted.
+fn cursor_key(name: &a::Ident) -> String {
+    if name.quote_style.is_some() { name.value.clone() } else { name.value.to_lowercase() }
 }
 
 pub struct Session {
@@ -280,6 +303,7 @@ impl Engine {
             pid,
             secret,
             rt: Runtime {
+                cursors: vec![],
                 pid,
                 user: user.to_string(),
                 database: database.to_string(),
@@ -416,6 +440,7 @@ impl Engine {
         param_types: &[Type],
     ) -> PgResult<StmtResult> {
         super::catalog::set_session_temp_schema(&s.rt.settings.temp_schema);
+        s.rt.cursors = s.cursors.values().map(|c| c.info.clone()).collect();
         if s.status == TxStatus::Failed && !is_transaction_control(stmt) {
             return Err(PgError::new(
                 code::IN_FAILED_SQL_TRANSACTION,
@@ -742,7 +767,7 @@ impl Engine {
                     if d.names.len() != 1 {
                         return Err(unsupported("DECLARE of multiple cursor names"));
                     }
-                    let name = d.names[0].value.to_lowercase();
+                    let name = cursor_key(&d.names[0]);
                     let hold = d.hold == Some(true);
                     if !hold && s.status != TxStatus::InTransaction {
                         return Err(PgError::new(
@@ -757,9 +782,39 @@ impl Engine {
                     // already-materialized rows.
                     let q_stmt = a::Statement::Query(for_query.clone());
                     let result = self.run_data_statement(s, &q_stmt, &[], &[])?;
+                    // Without SCROLL / NO SCROLL, Postgres allows scrolling
+                    // when the plan can run backwards: a plain scan, not a
+                    // FROM-less SELECT or an aggregate.
+                    let scroll = d.scroll.unwrap_or_else(|| match for_query.body.as_ref() {
+                        a::SetExpr::Select(sel) => {
+                            !sel.from.is_empty()
+                                && matches!(&sel.group_by, a::GroupByExpr::Expressions(e, _) if e.is_empty())
+                                && sel.having.is_none()
+                                && !sel.projection.iter().any(|p| {
+                                    let p = p.to_string().to_lowercase();
+                                    AGGREGATES.iter().any(|f| p.contains(&format!("{f}(")))
+                                })
+                        }
+                        _ => false,
+                    });
+                    let info = super::exec::CursorInfo {
+                        name: name.clone(),
+                        statement: a::Statement::Declare { stmts: vec![d.clone()] }.to_string(),
+                        holdable: hold,
+                        binary: d.binary == Some(true),
+                        scrollable: scroll,
+                        created: s.rt.stmt_now,
+                    };
                     s.cursors.insert(
                         name,
-                        Cursor { cols: result.cols, rows: result.rows, pos: 0, hold, new: true },
+                        Cursor {
+                            cols: result.cols,
+                            rows: result.rows,
+                            pos: 0,
+                            hold,
+                            new: true,
+                            info,
+                        },
                     );
                 }
                 Ok(StmtResult::tag("DECLARE CURSOR"))
@@ -768,7 +823,7 @@ impl Engine {
                 if into.is_some() {
                     return Err(unsupported("FETCH ... INTO"));
                 }
-                let key = name.value.to_lowercase();
+                let key = cursor_key(name);
                 let cur = s.cursors.get_mut(&key).ok_or_else(|| {
                     PgError::new(
                         code::INVALID_CURSOR_NAME,
@@ -798,9 +853,12 @@ impl Engine {
             }
             S::Close { cursor } => {
                 match cursor {
-                    a::CloseCursor::All => s.cursors.clear(),
+                    a::CloseCursor::All => {
+                        s.cursors.clear();
+                        return Ok(StmtResult::tag("CLOSE CURSOR ALL"));
+                    }
                     a::CloseCursor::Specific { name } => {
-                        let key = name.value.to_lowercase();
+                        let key = cursor_key(name);
                         if s.cursors.remove(&key).is_none() {
                             return Err(PgError::new(
                                 code::INVALID_CURSOR_NAME,
