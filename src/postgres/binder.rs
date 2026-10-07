@@ -3089,6 +3089,9 @@ impl<'a> Binder<'a> {
         let a::FunctionArguments::List(list) = &f.args else {
             return Err(unsupported("function with subquery arguments"));
         };
+        if let Some(te) = self.bind_sqljson_constructor(&name, list)? {
+            return Ok(te);
+        }
         let distinct = matches!(list.duplicate_treatment, Some(a::DuplicateTreatment::Distinct));
         let mut star = false;
         let mut args = vec![];
@@ -3337,6 +3340,98 @@ impl<'a> Binder<'a> {
     }
 
     /// Binds a call to a built-in function with already-bound arguments.
+    /// Postgres 16's SQL/JSON constructors: `JSON_OBJECT(k VALUE v | k : v,
+    /// ... [NULL | ABSENT ON NULL] [RETURNING t])` (NULL ON NULL by default)
+    /// and `JSON_ARRAY(v, ... [NULL | ABSENT ON NULL] [RETURNING t])` (ABSENT
+    /// ON NULL by default); `None` for the older `json_object(text[])`.
+    fn bind_sqljson_constructor(
+        &mut self,
+        name: &str,
+        list: &a::FunctionArgumentList,
+    ) -> PgResult<Option<TE>> {
+        if !matches!(name, "json_object" | "json_array") {
+            return Ok(None);
+        }
+        let named = list.args.iter().any(|x| {
+            matches!(
+                x,
+                a::FunctionArg::ExprNamed {
+                    operator: a::FunctionArgOperator::Value | a::FunctionArgOperator::Colon,
+                    ..
+                }
+            )
+        });
+        let clauses = list.clauses.iter().any(|c| {
+            matches!(
+                c,
+                a::FunctionArgumentClause::JsonNullClause(_)
+                    | a::FunctionArgumentClause::JsonReturningClause(_)
+            )
+        });
+        if name == "json_object" && !named && !clauses && !list.args.is_empty() {
+            return Ok(None);
+        }
+        let mut absent = name == "json_array";
+        let mut returning: Option<a::DataType> = None;
+        for c in &list.clauses {
+            match c {
+                a::FunctionArgumentClause::JsonNullClause(n) => {
+                    absent = matches!(n, a::JsonNullClause::AbsentOnNull);
+                }
+                a::FunctionArgumentClause::JsonReturningClause(r) => {
+                    returning = Some(r.data_type.clone())
+                }
+                other => return Err(unsupported(&format!("{other}"))),
+            }
+        }
+        let mut tes = vec![];
+        for x in &list.args {
+            match x {
+                a::FunctionArg::ExprNamed { name: k, arg: a::FunctionArgExpr::Expr(v), .. }
+                    if name == "json_object" =>
+                {
+                    let k = self.bind_expr(k)?;
+                    let k = self.coerce(k, Type::TEXT, -1, CastCtx::Assignment, "JSON_OBJECT")?;
+                    tes.push(TE::new(k, Type::TEXT));
+                    tes.push(self.bind_expr(v)?);
+                }
+                a::FunctionArg::Unnamed(a::FunctionArgExpr::Expr(v)) if name == "json_array" => {
+                    tes.push(self.bind_expr(v)?);
+                }
+                _ => return Err(unsupported("JSON_OBJECT/JSON_ARRAY argument")),
+            }
+        }
+        let jsonb = match &returning {
+            Some(t) => {
+                let (ty, _) = self.data_type(t)?;
+                ty.base == Base::Jsonb
+            }
+            None => false,
+        };
+        let f = match (name, jsonb, absent) {
+            ("json_object", false, false) => "json_build_object",
+            ("json_object", true, false) => "jsonb_build_object",
+            ("json_object", false, true) => "json_build_object_absent",
+            ("json_object", true, true) => "jsonb_build_object_absent",
+            (_, false, false) => "json_build_array",
+            (_, true, false) => "jsonb_build_array",
+            (_, false, true) => "json_build_array_absent",
+            (_, true, true) => "jsonb_build_array_absent",
+        };
+        let te = self.call(f, tes)?;
+        Ok(Some(match returning {
+            Some(t) => {
+                let (ty, typmod) = self.data_type(&t)?;
+                if matches!(ty.base, Base::Json | Base::Jsonb) {
+                    te
+                } else {
+                    TE::new(self.coerce(te, ty, typmod, CastCtx::Explicit, "RETURNING")?, ty)
+                }
+            }
+            None => te,
+        }))
+    }
+
     fn call(&mut self, name: &str, args: Vec<TE>) -> PgResult<TE> {
         let arg_tys: Vec<Type> = args.iter().map(|t| t.ty).collect();
         let r = sigs::resolve(name, &arg_tys)?;
