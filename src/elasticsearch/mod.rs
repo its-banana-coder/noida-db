@@ -4,6 +4,7 @@ mod analysis;
 mod cat;
 mod dates;
 mod engine;
+mod fields;
 mod highlight;
 mod painless;
 mod query_string;
