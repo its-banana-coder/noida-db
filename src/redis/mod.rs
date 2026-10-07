@@ -35,6 +35,7 @@ pub mod server;
 mod sets;
 mod sha1;
 mod sort;
+mod stats;
 mod streams;
 mod strings;
 #[cfg(test)]

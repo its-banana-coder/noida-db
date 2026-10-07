@@ -778,6 +778,12 @@ MYSQL_QUERIES = {
         (A, "SELECT ja.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
         (A, "SELECT ja.id, jb.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
     ],
+    "hash and encoding functions": [
+        (A, "SELECT MD5('a'), MD5(NULL), MD5(1), SHA1('a'), SHA(''), SHA2('a', 256), SHA2('a', 0), SHA2('a', 224), SHA2('a', 384), SHA2('a', 512), SHA2('a', 7), SHA2('a', NULL)"),
+        (A, "SELECT CRC32('a'), CRC32(''), CRC32(12), CRC32(NULL), TO_BASE64('abc'), TO_BASE64(REPEAT('x', 60)), FROM_BASE64('YWJj'), UNHEX('4142'), UNHEX('zz'), UNHEX('141'), HEX(UNHEX('4142'))"),
+        (A, "SELECT MD5('a', 'b')"),
+        (A, "SELECT SHA2('a')"),
+    ],
     "time columns (Django TimeField / DurationField-free)": [
         (A, "CREATE TABLE tm (id int, a time(6), b time)"),
         (A, "INSERT INTO tm VALUES (1, '12:34:56.123', '-838:59:59'), (2, '1 02:03', 123456), (3, NULL, '25:00:00')"),
@@ -798,6 +804,29 @@ MYSQL_QUERIES = {
         (A, "SHOW CREATE TABLE cm"),
         (A, "CREATE TABLE cm2 (a int) COMMENT='x y'"),
         (A, "SHOW CREATE TABLE cm2"),
+    ],
+    "comma joins (Django constraint introspection)": [
+        (A, "CREATE TABLE cp (id int PRIMARY KEY, n varchar(5))"),
+        (A, "CREATE TABLE cc (id int PRIMARY KEY, pid int, UNIQUE KEY uq (pid), CONSTRAINT fkp FOREIGN KEY (pid) REFERENCES cp (id))"),
+        (A, "INSERT INTO cp VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+        (A, "INSERT INTO cc VALUES (10, 1), (20, 2)"),
+        (A, "SELECT cp.n, cc.id FROM cp, cc WHERE cc.pid = cp.id ORDER BY cc.id"),
+        (A, "SELECT count(*) FROM cp, cc"),
+        (A, "SELECT a.id, b.id FROM cp a, cp b WHERE a.id < b.id ORDER BY 1, 2"),
+        (A, "SELECT cp.id, x.id FROM cp, cc LEFT JOIN cp x ON x.id = cc.pid WHERE cc.pid = cp.id ORDER BY 1"),
+        (A, "SELECT * FROM cp, cc, cp z WHERE z.id = cc.pid AND cp.id = 3 ORDER BY cc.id"),
+        (A, "SELECT kc.constraint_name AS c, kc.column_name AS col, kc.referenced_table_name AS rt, kc.referenced_column_name AS rc, c.constraint_type AS t FROM information_schema.key_column_usage AS kc, information_schema.table_constraints AS c WHERE kc.table_schema = DATABASE() AND (kc.referenced_table_schema = DATABASE() OR kc.referenced_table_schema IS NULL) AND c.table_schema = kc.table_schema AND c.constraint_name = kc.constraint_name AND c.constraint_type != 'CHECK' AND kc.table_name = 'cc' ORDER BY kc.ordinal_position, c.constraint_type"),
+    ],
+    "DEFAULT as an insert value and update assignment": [
+        (A, "CREATE TABLE dd (id int AUTO_INCREMENT PRIMARY KEY, a int DEFAULT 5, b varchar(5) DEFAULT 'x', c int NOT NULL)"),
+        (A, "INSERT INTO dd (id, a, b, c) VALUES (DEFAULT, DEFAULT, 'q', 1)"),
+        (A, "INSERT INTO dd VALUES (DEFAULT, 7, DEFAULT, 2), (10, default, default, 3)"),
+        (A, "INSERT INTO dd (c) VALUES ()"),
+        (A, "INSERT INTO dd VALUES ()"),
+        (A, "INSERT INTO dd (c, a) VALUES (DEFAULT, 1)"),
+        (A, "SELECT * FROM dd ORDER BY id"),
+        (A, "UPDATE dd SET a = DEFAULT, b = 'zz' WHERE id = 2"),
+        (A, "SELECT * FROM dd ORDER BY id"),
     ],
 }
 MYSQL.update(MYSQL_QUERIES)

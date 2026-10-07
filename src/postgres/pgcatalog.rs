@@ -1217,6 +1217,18 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                 t("client backend"),
             ]);
         }
+        "pg_cursors" => {
+            for c in &ctx.rt.cursors {
+                out.push(vec![
+                    t(&c.name),
+                    t(&c.statement),
+                    b(c.holdable),
+                    b(c.binary),
+                    b(c.scrollable),
+                    Value::Ts(c.created),
+                ]);
+            }
+        }
         "pg_stat_user_tables" | "pg_stat_all_tables" | "pg_statio_user_tables" => {
             let full = name.eq_ignore_ascii_case("pg_stat_user_tables");
             for tb in db.tables.values().filter(|t| t.kind == super::catalog::RelKind::Table) {

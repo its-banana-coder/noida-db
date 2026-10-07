@@ -1719,10 +1719,32 @@ pub fn call(
             Bytes(b) => md5_hex(b),
             v => md5_hex(text(v).as_bytes()),
         }),
-        "sha256" => match &a[0] {
-            Bytes(b) => Bytes(super::auth::sha256(b).to_vec()),
+        "sha224" | "sha256" | "sha384" | "sha512" => match &a[0] {
+            Bytes(b) => Bytes(crate::sql::hash::digest(name, b).unwrap_or_default()),
             _ => Null,
         },
+        // pgcrypto
+        "digest" | "hmac" => {
+            if a.iter().any(Value::is_null) {
+                return Ok(Some(Null));
+            }
+            let bytes = |v: &Value| match v {
+                Bytes(b) => b.clone(),
+                v => text(v).as_bytes().to_vec(),
+            };
+            let alg = text(a.last().unwrap());
+            let out = if name == "digest" {
+                crate::sql::hash::digest(alg, &bytes(&a[0]))
+            } else {
+                crate::sql::hash::hmac(alg, &bytes(&a[1]), &bytes(&a[0]))
+            };
+            Bytes(out.ok_or_else(|| {
+                err(
+                    code::INVALID_PARAMETER_VALUE,
+                    format!("Cannot use \"{alg}\": No such hash algorithm"),
+                )
+            })?)
+        }
         "ascii" => Int(text(&a[0]).chars().next().map_or(0, |c| c as i64)),
         "chr" => {
             let n = int(&a[0]);
@@ -3353,46 +3375,7 @@ pub fn random_uuid() -> [u8; 16] {
     u
 }
 
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-pub fn base64_encode(b: &[u8]) -> String {
-    let mut out = String::new();
-    for (n, chunk) in b.chunks(3).enumerate() {
-        if n > 0 && n % 19 == 0 {
-            out.push('\n');
-        }
-        let v = (chunk[0] as u32) << 16
-            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
-            | *chunk.get(2).unwrap_or(&0) as u32;
-        out.push(B64[(v >> 18) as usize & 63] as char);
-        out.push(B64[(v >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(v >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[v as usize & 63] as char } else { '=' });
-    }
-    out
-}
-
-pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = vec![];
-    let mut buf = 0u32;
-    let mut bits = 0;
-    for c in s.bytes() {
-        if c.is_ascii_whitespace() {
-            continue;
-        }
-        if c == b'=' {
-            break;
-        }
-        let v = B64.iter().position(|&x| x == c)? as u32;
-        buf = buf << 6 | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buf >> bits) as u8);
-        }
-    }
-    Some(out)
-}
+pub use crate::sql::hash::{base64_decode, base64_encode};
 
 /// Postgres's MaxArraySize error.
 fn array_too_big() -> PgError {
