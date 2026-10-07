@@ -73,6 +73,24 @@ const DEFAULTS: &[(&str, &str, bool)] = &[
     ("quote_all_identifiers", "off", false),
     ("enable_seqscan", "on", false),
     ("enable_indexscan", "on", false),
+    ("enable_async_append", "on", false),
+    ("enable_bitmapscan", "on", false),
+    ("enable_gathermerge", "on", false),
+    ("enable_hashagg", "on", false),
+    ("enable_hashjoin", "on", false),
+    ("enable_incremental_sort", "on", false),
+    ("enable_indexonlyscan", "on", false),
+    ("enable_material", "on", false),
+    ("enable_memoize", "on", false),
+    ("enable_mergejoin", "on", false),
+    ("enable_nestloop", "on", false),
+    ("enable_parallel_append", "on", false),
+    ("enable_parallel_hash", "on", false),
+    ("enable_partition_pruning", "on", false),
+    ("enable_partitionwise_aggregate", "off", false),
+    ("enable_partitionwise_join", "off", false),
+    ("enable_sort", "on", false),
+    ("enable_tidscan", "on", false),
     ("log_statement", "none", false),
     ("log_min_duration_statement", "-1", false),
     ("tcp_keepalives_idle", "7200", false),
@@ -517,6 +535,24 @@ fn bool_setting(n: &str) -> bool {
             | "quote_all_identifiers"
             | "enable_seqscan"
             | "enable_indexscan"
+            | "enable_async_append"
+            | "enable_bitmapscan"
+            | "enable_gathermerge"
+            | "enable_hashagg"
+            | "enable_hashjoin"
+            | "enable_incremental_sort"
+            | "enable_indexonlyscan"
+            | "enable_material"
+            | "enable_memoize"
+            | "enable_mergejoin"
+            | "enable_nestloop"
+            | "enable_parallel_append"
+            | "enable_parallel_hash"
+            | "enable_partition_pruning"
+            | "enable_partitionwise_aggregate"
+            | "enable_partitionwise_join"
+            | "enable_sort"
+            | "enable_tidscan"
             | "track_activities"
             | "autovacuum"
             | "transform_null_equals"

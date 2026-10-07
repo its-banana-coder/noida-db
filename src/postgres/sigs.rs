@@ -113,7 +113,7 @@ jsonb_typeof(jsonb)text json_typeof(json)text jsonb_array_length(jsonb)int4 json
 jsonb_extract_path(jsonb,..._text)jsonb jsonb_extract_path_text(jsonb,..._text)text json_extract_path(json,..._text)json json_extract_path_text(json,..._text)text
 jsonb_set(jsonb,_text,jsonb)jsonb jsonb_set(jsonb,_text,jsonb,bool)jsonb jsonb_set_lax(jsonb,_text,jsonb)jsonb jsonb_insert(jsonb,_text,jsonb)jsonb jsonb_insert(jsonb,_text,jsonb,bool)jsonb
 jsonb_pretty(jsonb)text jsonb_strip_nulls(jsonb)jsonb json_strip_nulls(json)json
-jsonb_exists(jsonb,text)bool jsonb_concat(jsonb,jsonb)jsonb
+jsonb_exists(jsonb,text)bool jsonb_concat(jsonb,jsonb)jsonb jsonb_contains(jsonb,jsonb)bool jsonb_contained(jsonb,jsonb)bool jsonb_exists_any(jsonb,_text)bool jsonb_exists_all(jsonb,_text)bool jsonb_delete(jsonb,text)jsonb jsonb_delete(jsonb,int4)jsonb jsonb_delete(jsonb,...text)jsonb jsonb_delete_path(jsonb,_text)jsonb
 s:jsonb_array_elements(jsonb)jsonb s:json_array_elements(json)json
 s:jsonb_array_elements_text(jsonb)text s:json_array_elements_text(json)text
 s:jsonb_each(jsonb)(key text,value jsonb) s:json_each(json)(key text,value json)
