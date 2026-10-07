@@ -167,8 +167,9 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
             for (db, t) in user_tables(state) {
                 let keys = t.keys();
                 for (i, c) in t.columns.iter().enumerate() {
-                    let full = mysql_type_name(&c.ty);
-                    let data_type = full.split('(').next().unwrap_or(&full).to_string();
+                    let base = mysql_type_name(&c.ty);
+                    let data_type = base.split('(').next().unwrap_or(&base).to_string();
+                    let full = crate::mysql::exec::column_type_text(c);
                     let (char_len, num_prec, num_scale) = match &c.ty {
                         ColumnType::Varchar(n) => (Value::Int(*n as i64), Value::Null, Value::Null),
                         ColumnType::Text => (Value::Int(65535), Value::Null, Value::Null),
@@ -415,7 +416,8 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         (key, ty)
                     });
                     let fks = t.foreign_keys.iter().map(|f| (f.name.clone(), "FOREIGN KEY"));
-                    keys.chain(fks).map(move |(key, ty)| {
+                    let checks = t.checks.iter().map(|c| (c.name.clone(), "CHECK"));
+                    keys.chain(fks).chain(checks).map(move |(key, ty)| {
                         vec![
                             text("def"),
                             text(db),
@@ -424,6 +426,23 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                             text(&t.name),
                             text(ty),
                             text("YES"),
+                        ]
+                    })
+                })
+                .collect(),
+        ),
+        // MySQL stores the clause with its quotes backslash-escaped.
+        "CHECK_CONSTRAINTS" => table_of(
+            name,
+            &["CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"],
+            user_tables(state)
+                .flat_map(|(db, t)| {
+                    t.checks.iter().map(move |c| {
+                        vec![
+                            text("def"),
+                            text(db),
+                            text(&c.name),
+                            text(&c.clause.replace('\'', "\\'")),
                         ]
                     })
                 })

@@ -379,6 +379,7 @@ pub enum Plan {
         if_not_exists: bool,
         /// The table option `COMMENT = '...'`.
         comment: String,
+        checks: Vec<crate::mysql::catalog::Check>,
     },
     /// `DROP TABLE [IF EXISTS] a, b`.
     /// `ALTER TABLE t op, op, ...`.
@@ -933,6 +934,12 @@ pub enum AlterOp {
     AutoIncrement(i64),
     /// `COMMENT = '...'` (the table's comment).
     SetComment(String),
+    /// `ADD [CONSTRAINT name] CHECK (expr)` (or a column's own CHECK).
+    AddCheck(crate::mysql::catalog::Check),
+    /// `DROP CHECK name`.
+    DropCheck(String),
+    /// `DROP CONSTRAINT name`: a CHECK, foreign key or index of that name.
+    DropConstraint(String),
     /// Accepted and ignored: foreign keys, plain indexes, ALGORITHM/LOCK.
     Noop,
 }

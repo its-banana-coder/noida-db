@@ -58,6 +58,9 @@ pub struct Binder {
     named_windows: Vec<sqlparser::ast::NamedWindowDefinition>,
     /// Gives each window function in the statement its own id.
     window_counter: usize,
+    /// Column-level `CHECK`s met while binding column definitions, for
+    /// the CREATE/ALTER TABLE being bound to collect.
+    pending_checks: Vec<crate::mysql::catalog::Check>,
 }
 
 impl Binder {
@@ -90,6 +93,7 @@ impl Binder {
             window_ok: false,
             named_windows: Vec::new(),
             window_counter: 0,
+            pending_checks: Vec::new(),
         }
     }
 
@@ -644,6 +648,9 @@ impl Binder {
                     on_update_now = true;
                 }
                 sqlparser::ast::ColumnOption::Comment(c) => comment = c.clone(),
+                sqlparser::ast::ColumnOption::Check(c) => {
+                    self.pending_checks.push(make_check(c.name.as_ref(), &c.expr));
+                }
                 _ => {}
             }
         }
@@ -775,12 +782,19 @@ impl Binder {
                         let name = ix.name.as_ref().map(|i| i.value.clone()).unwrap_or_default();
                         AlterOp::AddIndex(UniqueKey { name, columns })
                     }
+                    TableConstraint::Check(c) => {
+                        AlterOp::AddCheck(make_check(c.name.as_ref(), &c.expr))
+                    }
                     // CHECK, FULLTEXT, SPATIAL: accepted, not enforced.
                     _ => AlterOp::Noop,
                 },
-                A::DropIndex { name } | A::DropConstraint { name, .. } => {
-                    AlterOp::DropKey(name.value)
+                A::DropConstraint { name, .. } => {
+                    match name.value.strip_prefix(DROP_CHECK_MARKER) {
+                        Some(check) => AlterOp::DropCheck(check.to_string()),
+                        None => AlterOp::DropConstraint(name.value),
+                    }
                 }
+                A::DropIndex { name } => AlterOp::DropKey(name.value),
                 A::DropForeignKey { name, .. } => AlterOp::DropForeignKey(name.value),
                 A::DropPrimaryKey { .. } => AlterOp::DropPrimaryKey,
                 // `COMMENT = '...'`, rewritten by the engine into a
@@ -833,6 +847,10 @@ impl Binder {
                 other => return Err(MySqlError::unsupported(&format!("ALTER TABLE {other}"))),
             };
             ops.push(next);
+            // A CHECK written on an added or modified column.
+            for c in std::mem::take(&mut self.pending_checks) {
+                ops.push(AlterOp::AddCheck(c));
+            }
         }
         Ok(Plan::AlterTable { db, table, ops })
     }
@@ -927,6 +945,13 @@ impl Binder {
             }
         }
 
+        let mut checks = std::mem::take(&mut self.pending_checks);
+        for constraint in &constraints {
+            if let TableConstraint::Check(c) = constraint {
+                checks.push(make_check(c.name.as_ref(), &c.expr));
+            }
+        }
+
         // Table-level FOREIGN KEY clauses (an inline column `REFERENCES` is
         // parsed and ignored, as in MySQL).
         let mut foreign_keys = Vec::new();
@@ -945,6 +970,7 @@ impl Binder {
             foreign_keys,
             if_not_exists: false,
             comment: String::new(),
+            checks,
         })
     }
 
@@ -1420,21 +1446,82 @@ impl Binder {
         limit_clause: Option<LimitClause>,
     ) -> Result<Plan, MySqlError> {
         let comma_join = select.from.len() > 1;
-        let mut source =
-            if select.from.is_empty() { Plan::Dummy } else { self.bind_from(select.from)? };
-
-        if let Some(selection) = select.selection {
-            let pred = self.bind_expr(selection)?;
-            source = match source {
-                // `FROM a, b WHERE ...`: the WHERE as the last comma join's
-                // condition (the same rows), so the cross product of the
-                // two sides is never built -- Django's introspection joins
-                // two information_schema tables this way.
-                Plan::Join { left, right, op: JoinOp::Cross } if comma_join => {
-                    Plan::Join { left, right, op: JoinOp::Inner(pred) }
+        let mut selection = select.selection;
+        let mut source = if select.from.is_empty() {
+            Plan::Dummy
+        } else if comma_join {
+            // `FROM a, b WHERE ...`: a WHERE conjunct naming one item's
+            // columns only filters that item before the join; the rest
+            // become the last join's condition, so the cross product is
+            // never built. Django's introspection joins two
+            // information_schema tables this way.
+            let quals: Vec<Option<String>> = select.from.iter().map(comma_item_qualifier).collect();
+            let mut pushed: Vec<Vec<AstExpr>> = vec![Vec::new(); quals.len()];
+            let mut rest = Vec::new();
+            if let Some(w) = selection.take() {
+                let mut conjuncts = Vec::new();
+                split_and(w, &mut conjuncts);
+                for c in conjuncts {
+                    let mut seen = Vec::new();
+                    let target = if expr_qualifiers(&c, &mut seen) {
+                        seen.iter_mut().for_each(|q| q.make_ascii_lowercase());
+                        seen.sort();
+                        seen.dedup();
+                        match seen.as_slice() {
+                            [q] => {
+                                let hits: Vec<usize> = quals
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, x)| {
+                                        x.as_ref().is_some_and(|x| x.eq_ignore_ascii_case(q))
+                                    })
+                                    .map(|(i, _)| i)
+                                    .collect();
+                                if hits.len() == 1 { Some(hits[0]) } else { None }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    match target {
+                        Some(i) => pushed[i].push(c),
+                        None => rest.push(c),
+                    }
                 }
-                source => Plan::Filter { source: Box::new(source), predicate: pred },
-            };
+            }
+            let mut out: Option<Plan> = None;
+            let n = select.from.len();
+            for (i, twj) in select.from.iter().enumerate() {
+                let mut item = self.bind_table_with_joins(twj)?;
+                if let Some(pred) = and_all(std::mem::take(&mut pushed[i])) {
+                    let pred = self.bind_expr(pred)?;
+                    item = Plan::Filter { source: Box::new(item), predicate: pred };
+                }
+                out = Some(match out {
+                    None => item,
+                    Some(left) => {
+                        let op = match (i + 1 == n, and_all(std::mem::take(&mut rest))) {
+                            (true, Some(cond)) => JoinOp::Inner(self.bind_expr(cond)?),
+                            (_, cond) => {
+                                if let Some(c) = cond {
+                                    rest.push(c);
+                                }
+                                JoinOp::Cross
+                            }
+                        };
+                        Plan::Join { left: Box::new(left), right: Box::new(item), op }
+                    }
+                });
+            }
+            out.ok_or_else(|| MySqlError::unsupported("empty FROM"))?
+        } else {
+            self.bind_from(select.from)?
+        };
+
+        if let Some(selection) = selection {
+            let pred = self.bind_expr(selection)?;
+            source = Plan::Filter { source: Box::new(source), predicate: pred };
         }
 
         let distinct = match &select.distinct {
@@ -2224,6 +2311,11 @@ impl Binder {
 
     /// Binds one expression outside any statement (`SET @x = expr`).
     pub fn bind_scalar(&mut self, expr: AstExpr) -> Result<Expr, MySqlError> {
+        self.bind_expr(expr)
+    }
+
+    /// Binds a stand-alone expression (a CHECK constraint's).
+    pub fn bind_standalone_expr(&mut self, expr: AstExpr) -> Result<Expr, MySqlError> {
         self.bind_expr(expr)
     }
 
@@ -3117,3 +3209,185 @@ pub const RENAME_KEY_MARKER: &str = "\u{1}noida-rename-key:";
 /// The column name `ALTER TABLE t COMMENT = '...'` is rewritten to target
 /// (see [`crate::mysql::engine::rewrite_table_comment`]).
 pub const TABLE_COMMENT_MARKER: &str = "\u{1}noida_table_comment";
+
+/// The constraint name `ALTER TABLE t DROP CHECK name` is rewritten to (see
+/// [`crate::mysql::engine::rewrite_drop_check`]).
+pub const DROP_CHECK_MARKER: &str = "\u{1}noida_check:";
+
+fn make_check(name: Option<&Ident>, expr: &AstExpr) -> crate::mysql::catalog::Check {
+    crate::mysql::catalog::Check {
+        name: name.map(|n| n.value.clone()).unwrap_or_default(),
+        expr: expr.to_string(),
+        clause: check_clause(expr),
+    }
+}
+
+/// A CHECK expression the way MySQL prints it back: identifiers quoted,
+/// every comparison/arithmetic parenthesized, `AND`/`OR` chains flattened,
+/// keywords and function names lower-case, strings with their charset
+/// introducer.
+pub fn check_clause(e: &AstExpr) -> String {
+    use sqlparser::ast::{BinaryOperator as B, FunctionArg, FunctionArgExpr, FunctionArguments};
+    let q = |s: &str| format!("`{}`", s.replace('`', "``"));
+    match e {
+        AstExpr::Identifier(i) => q(&i.value),
+        AstExpr::CompoundIdentifier(parts) => parts.last().map(|i| q(&i.value)).unwrap_or_default(),
+        AstExpr::Nested(inner) => check_clause(inner),
+        AstExpr::Value(v) => match &v.value {
+            AstValue::SingleQuotedString(s) | AstValue::DoubleQuotedString(s) => {
+                format!("_utf8mb4'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+            }
+            AstValue::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
+            AstValue::Null => "NULL".to_string(),
+            other => other.to_string(),
+        },
+        AstExpr::BinaryOp { op: op @ (B::And | B::Or), .. } => {
+            fn flatten<'a>(e: &'a AstExpr, want: &B, out: &mut Vec<&'a AstExpr>) {
+                match e {
+                    AstExpr::BinaryOp { left, op, right } if op == want => {
+                        flatten(left, want, out);
+                        flatten(right, want, out);
+                    }
+                    other => out.push(other),
+                }
+            }
+            let mut parts = Vec::new();
+            flatten(e, op, &mut parts);
+            let word = if matches!(op, B::And) { " and " } else { " or " };
+            format!("({})", parts.iter().map(|p| check_clause(p)).collect::<Vec<_>>().join(word))
+        }
+        AstExpr::BinaryOp { left, op, right } => {
+            let o = match op {
+                B::NotEq => "<>".to_string(),
+                B::Xor => "xor".to_string(),
+                other => other.to_string().to_lowercase(),
+            };
+            format!("({} {o} {})", check_clause(left), check_clause(right))
+        }
+        AstExpr::IsNull(x) => format!("({} is null)", check_clause(x)),
+        AstExpr::IsNotNull(x) => format!("({} is not null)", check_clause(x)),
+        AstExpr::Between { expr, negated, low, high } => format!(
+            "({} {}between {} and {})",
+            check_clause(expr),
+            if *negated { "not " } else { "" },
+            check_clause(low),
+            check_clause(high)
+        ),
+        AstExpr::InList { expr, list, negated } => format!(
+            "({} {}in ({}))",
+            check_clause(expr),
+            if *negated { "not " } else { "" },
+            list.iter().map(check_clause).collect::<Vec<_>>().join(",")
+        ),
+        AstExpr::Like { negated, expr, pattern, escape_char: None, any: false } => format!(
+            "({} {}like {})",
+            check_clause(expr),
+            if *negated { "not " } else { "" },
+            check_clause(pattern)
+        ),
+        AstExpr::UnaryOp { op: sqlparser::ast::UnaryOperator::Minus, expr } => {
+            format!("-({})", check_clause(expr))
+        }
+        AstExpr::UnaryOp { op: sqlparser::ast::UnaryOperator::Not, expr } => {
+            format!("(not({}))", check_clause(expr))
+        }
+        AstExpr::Function(f)
+            if let FunctionArguments::List(list) = &f.args
+                && list.duplicate_treatment.is_none()
+                && list.clauses.is_empty() =>
+        {
+            let args: Option<Vec<String>> = list
+                .args
+                .iter()
+                .map(|a| match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => Some(check_clause(x)),
+                    _ => None,
+                })
+                .collect();
+            match args {
+                Some(args) => format!("{}({})", f.name.to_string().to_lowercase(), args.join(",")),
+                None => e.to_string(),
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The name a comma-separated FROM item's columns are qualified with (its
+/// alias, else its table name), when it is a plain table.
+fn comma_item_qualifier(twj: &TableWithJoins) -> Option<String> {
+    if !twj.joins.is_empty() {
+        return None;
+    }
+    match &twj.relation {
+        TableFactor::Table { name, alias, .. } => Some(match alias {
+            Some(a) => a.name.value.clone(),
+            None => match name.0.last()? {
+                sqlparser::ast::ObjectNamePart::Identifier(i) => i.value.clone(),
+                _ => return None,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// `a AND b AND c` as its conjuncts.
+fn split_and(e: AstExpr, out: &mut Vec<AstExpr>) {
+    match e {
+        AstExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            split_and(*left, out);
+            split_and(*right, out);
+        }
+        AstExpr::Nested(inner)
+            if matches!(*inner, AstExpr::BinaryOp { op: BinaryOperator::And, .. }) =>
+        {
+            split_and(*inner, out)
+        }
+        other => out.push(other),
+    }
+}
+
+fn and_all(mut es: Vec<AstExpr>) -> Option<AstExpr> {
+    let first = if es.is_empty() { return None } else { es.remove(0) };
+    Some(es.into_iter().fold(first, |l, r| AstExpr::BinaryOp {
+        left: Box::new(l),
+        op: BinaryOperator::And,
+        right: Box::new(r),
+    }))
+}
+
+/// Collects the qualifiers of every column `e` names; false if `e` has an
+/// unqualified column or anything this can't see into (a subquery, ...).
+fn expr_qualifiers(e: &AstExpr, out: &mut Vec<String>) -> bool {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    match e {
+        AstExpr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            out.push(parts[0].value.clone());
+            true
+        }
+        AstExpr::Value(_) => true,
+        AstExpr::Nested(x) | AstExpr::IsNull(x) | AstExpr::IsNotNull(x) => expr_qualifiers(x, out),
+        AstExpr::UnaryOp { expr, .. } => expr_qualifiers(expr, out),
+        AstExpr::BinaryOp { left, right, .. } => {
+            expr_qualifiers(left, out) && expr_qualifiers(right, out)
+        }
+        AstExpr::Between { expr, low, high, .. } => {
+            expr_qualifiers(expr, out) && expr_qualifiers(low, out) && expr_qualifiers(high, out)
+        }
+        AstExpr::InList { expr, list, .. } => {
+            expr_qualifiers(expr, out) && list.iter().all(|x| expr_qualifiers(x, out))
+        }
+        AstExpr::Like { expr, pattern, .. } => {
+            expr_qualifiers(expr, out) && expr_qualifiers(pattern, out)
+        }
+        AstExpr::Function(f) => match &f.args {
+            FunctionArguments::None => true,
+            FunctionArguments::List(list) => list.args.iter().all(|a| match a {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(x)) => expr_qualifiers(x, out),
+                _ => false,
+            }),
+            FunctionArguments::Subquery(_) => false,
+        },
+        _ => false,
+    }
+}
