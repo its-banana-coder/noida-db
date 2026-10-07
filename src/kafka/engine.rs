@@ -211,6 +211,9 @@ pub struct EngineState {
     pub next_member_counter: u64,
     // (group_id, topic_name, partition) -> offset
     pub committed_offsets: HashMap<(String, String, i32), i64>,
+    // (group_id, topic_name, partition) -> the metadata string committed
+    // with that offset (absent = "").
+    pub offset_metadata: HashMap<(String, String, i32), String>,
     pub groups: HashMap<String, GroupState>,
     pub broker_configs: HashMap<String, String>,
     pub clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
@@ -300,6 +303,7 @@ impl EngineState {
             next_producer_id: 1000,
             next_member_counter: 1,
             committed_offsets: HashMap::new(),
+            offset_metadata: HashMap::new(),
             groups: HashMap::new(),
             broker_configs: HashMap::new(),
             clock: None,
@@ -1075,10 +1079,15 @@ impl EngineState {
         res
     }
 
+    /// `client_id` / `client_host` are the joining connection's, as Kafka
+    /// reports them for each member (and prefixes member ids with the
+    /// client id).
     pub fn handle_join_group(
         &mut self,
         req: &kafka_protocol::messages::JoinGroupRequest,
         version: i16,
+        client_id: &str,
+        client_host: &str,
     ) -> kafka_protocol::messages::JoinGroupResponse {
         let mut res = kafka_protocol::messages::JoinGroupResponse::default();
         let group_id = req.group_id.as_str().to_string();
@@ -1109,17 +1118,16 @@ impl EngineState {
             .entry(group_id.clone())
             .or_insert_with(|| GroupState::new(group_id.clone()));
 
+        // A deleted group's id is free again: joining it starts a new
+        // group, as on Kafka.
         if group.state == GroupLifecycleState::Dead {
-            res.error_code = 25; // UNKNOWN_MEMBER_ID
-            return res;
+            *group = GroupState::new(group_id.clone());
         }
 
         // KIP-394: dynamic member join with empty member_id returns MEMBER_ID_REQUIRED (79)
         // for API version >= 4. For v0-v3, coordinator assigns member_id in the first JoinGroup.
         if version >= 4 && req.member_id.is_empty() {
-            let assigned_id =
-                format!("noida-client-{}-{}", self.next_member_counter, uuid_simple());
-            self.next_member_counter += 1;
+            let assigned_id = new_member_id(client_id, &mut self.next_member_counter);
             group.pending_member_ids.insert(assigned_id.clone());
 
             res.error_code = 79; // MEMBER_ID_REQUIRED
@@ -1130,10 +1138,7 @@ impl EngineState {
         }
 
         let m_id = if req.member_id.is_empty() {
-            let assigned_id =
-                format!("noida-client-{}-{}", self.next_member_counter, uuid_simple());
-            self.next_member_counter += 1;
-            assigned_id
+            new_member_id(client_id, &mut self.next_member_counter)
         } else {
             req.member_id.as_str().to_string()
         };
@@ -1165,8 +1170,8 @@ impl EngineState {
         let member = GroupMember {
             member_id: m_id.clone(),
             group_instance_id: req.group_instance_id.as_ref().map(|s| s.as_str().to_string()),
-            client_id: "test-client".to_string(),
-            client_host: "127.0.0.1".to_string(),
+            client_id: client_id.to_string(),
+            client_host: client_host.to_string(),
             session_timeout_ms: req.session_timeout_ms,
             rebalance_timeout_ms: req.rebalance_timeout_ms,
             protocol_type: req_proto_type,
@@ -1420,6 +1425,38 @@ impl EngineState {
         res
     }
 
+    fn set_offset_metadata(&mut self, key: (String, String, i32), metadata: Option<&str>) {
+        match metadata {
+            Some(m) if !m.is_empty() => {
+                self.offset_metadata.insert(key, m.to_string());
+            }
+            _ => {
+                self.offset_metadata.remove(&key);
+            }
+        }
+    }
+
+    fn offset_metadata_of(&self, key: &(String, String, i32)) -> StrBytes {
+        StrBytes::from_string(self.offset_metadata.get(key).cloned().unwrap_or_default())
+    }
+
+    /// A group Kafka still knows about: one with live state, or -- like a
+    /// group only ever used through manual assignment and commits, or one
+    /// whose membership a restart dropped -- one that only has committed
+    /// offsets, which Kafka reports as an Empty group with no protocol.
+    fn group_is_live(&self, group_id: &str) -> bool {
+        self.groups.get(group_id).is_some_and(|g| g.state != GroupLifecycleState::Dead)
+    }
+
+    fn group_has_offsets(&self, group_id: &str) -> bool {
+        self.committed_offsets.keys().any(|(g, _, _)| g == group_id)
+    }
+
+    fn drop_group_offsets(&mut self, group_id: &str) {
+        self.committed_offsets.retain(|(g, _, _), _| g != group_id);
+        self.offset_metadata.retain(|(g, _, _), _| g != group_id);
+    }
+
     pub fn handle_offset_commit(
         &mut self,
         req: &kafka_protocol::messages::OffsetCommitRequest,
@@ -1472,14 +1509,20 @@ impl EngineState {
                 let mut part_res = OffsetCommitResponsePartition::default();
                 part_res.partition_index = part.partition_index;
 
-                if err == 0 {
-                    self.committed_offsets.insert(
-                        (group_id.clone(), topic_name.clone(), part.partition_index),
-                        part.committed_offset,
-                    );
-                    part_res.error_code = 0;
-                } else {
+                // Kafka rejects a commit for a partition that doesn't exist.
+                let known = self
+                    .topics
+                    .get(&topic_name)
+                    .is_some_and(|t| t.partitions.contains_key(&part.partition_index));
+                if err != 0 {
                     part_res.error_code = err;
+                } else if !known {
+                    part_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                } else {
+                    let key = (group_id.clone(), topic_name.clone(), part.partition_index);
+                    self.committed_offsets.insert(key.clone(), part.committed_offset);
+                    self.set_offset_metadata(key, part.committed_metadata.as_deref());
+                    part_res.error_code = 0;
                 }
 
                 topic_res.partitions.push(part_res);
@@ -1519,12 +1562,10 @@ impl EngineState {
                             let mut part_res = OffsetFetchResponsePartitions::default();
                             part_res.partition_index = partition_index;
 
-                            if let Some(&offset) = self.committed_offsets.get(&(
-                                group_id.clone(),
-                                topic_name.clone(),
-                                partition_index,
-                            )) {
+                            let key = (group_id.clone(), topic_name.clone(), partition_index);
+                            if let Some(&offset) = self.committed_offsets.get(&key) {
                                 part_res.committed_offset = offset;
+                                part_res.metadata = Some(self.offset_metadata_of(&key));
                                 part_res.error_code = 0;
                             } else {
                                 part_res.committed_offset = -1;
@@ -1547,11 +1588,16 @@ impl EngineState {
                     for (t_name, mut parts) in topics_map {
                         parts.sort_by_key(|(p, _)| *p);
                         let mut topic_res = OffsetFetchResponseTopics::default();
-                        topic_res.name = TopicName::from(StrBytes::from_string(t_name));
+                        topic_res.name = TopicName::from(StrBytes::from_string(t_name.clone()));
                         for (partition_index, offset) in parts {
                             let mut part_res = OffsetFetchResponsePartitions::default();
                             part_res.partition_index = partition_index;
                             part_res.committed_offset = offset;
+                            part_res.metadata = Some(self.offset_metadata_of(&(
+                                group_id.clone(),
+                                t_name.clone(),
+                                partition_index,
+                            )));
                             part_res.error_code = 0;
                             topic_res.partitions.push(part_res);
                         }
@@ -1574,12 +1620,10 @@ impl EngineState {
                         let mut part_res = OffsetFetchResponsePartition::default();
                         part_res.partition_index = partition_index;
 
-                        if let Some(&offset) = self.committed_offsets.get(&(
-                            group_id.clone(),
-                            topic_name.clone(),
-                            partition_index,
-                        )) {
+                        let key = (group_id.clone(), topic_name.clone(), partition_index);
+                        if let Some(&offset) = self.committed_offsets.get(&key) {
                             part_res.committed_offset = offset;
+                            part_res.metadata = Some(self.offset_metadata_of(&key));
                             part_res.error_code = 0;
                         } else {
                             // Offset uncommitted: offset -1 with error 0
@@ -1603,11 +1647,16 @@ impl EngineState {
                 for (t_name, mut parts) in topics_map {
                     parts.sort_by_key(|(p, _)| *p);
                     let mut topic_res = OffsetFetchResponseTopic::default();
-                    topic_res.name = TopicName::from(StrBytes::from_string(t_name));
+                    topic_res.name = TopicName::from(StrBytes::from_string(t_name.clone()));
                     for (partition_index, offset) in parts {
                         let mut part_res = OffsetFetchResponsePartition::default();
                         part_res.partition_index = partition_index;
                         part_res.committed_offset = offset;
+                        part_res.metadata = Some(self.offset_metadata_of(&(
+                            group_id.clone(),
+                            t_name.clone(),
+                            partition_index,
+                        )));
                         part_res.error_code = 0;
                         topic_res.partitions.push(part_res);
                     }
@@ -1634,12 +1683,16 @@ impl EngineState {
             let mut desc = DescribedGroup::default();
             desc.group_id = group_id.clone();
 
-            if let Some(group) = self.groups.get(gid_str) {
+            if let Some(group) = self.groups.get(gid_str).filter(|_| self.group_is_live(gid_str)) {
                 desc.error_code = 0;
                 desc.group_state = StrBytes::from_string(group.state.as_str().to_string());
                 desc.protocol_type = StrBytes::from_string(group.protocol_type.clone());
-                desc.protocol_data =
-                    StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+                // A group with no members has no chosen protocol (Kafka
+                // clears it when the last member leaves).
+                if !group.members.is_empty() {
+                    desc.protocol_data =
+                        StrBytes::from_string(group.protocol_name.clone().unwrap_or_default());
+                }
 
                 for (m_id, m) in &group.members {
                     let mut dm = DescribedGroupMember::default();
@@ -1658,6 +1711,9 @@ impl EngineState {
 
                     desc.members.push(dm);
                 }
+            } else if self.group_has_offsets(gid_str) {
+                desc.error_code = 0;
+                desc.group_state = StrBytes::from_static_str("Empty");
             } else {
                 desc.error_code = 0;
                 desc.group_state = StrBytes::from_static_str("Dead");
@@ -1671,21 +1727,37 @@ impl EngineState {
 
     pub fn handle_list_groups(
         &self,
-        _req: &kafka_protocol::messages::ListGroupsRequest,
+        req: &kafka_protocol::messages::ListGroupsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::ListGroupsResponse {
         use kafka_protocol::messages::list_groups_response::ListedGroup;
         let mut res = kafka_protocol::messages::ListGroupsResponse::default();
         res.error_code = 0;
 
+        let mut listed: std::collections::BTreeMap<String, (String, &'static str)> =
+            std::collections::BTreeMap::new();
         for (gid, group) in &self.groups {
             if group.state != GroupLifecycleState::Dead {
-                let mut lg = ListedGroup::default();
-                lg.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string(gid.clone()));
-                lg.protocol_type = StrBytes::from_string(group.protocol_type.clone());
-                lg.group_state = StrBytes::from_string(group.state.as_str().to_string());
-                res.groups.push(lg);
+                listed.insert(gid.clone(), (group.protocol_type.clone(), group.state.as_str()));
             }
+        }
+        for (g, _, _) in self.committed_offsets.keys() {
+            if !listed.contains_key(g) {
+                listed.insert(g.clone(), (String::new(), "Empty"));
+            }
+        }
+        for (gid, (protocol_type, state)) in listed {
+            // v4+: only groups in one of the requested states.
+            if !req.states_filter.is_empty()
+                && !req.states_filter.iter().any(|f| f.as_str().eq_ignore_ascii_case(state))
+            {
+                continue;
+            }
+            let mut lg = ListedGroup::default();
+            lg.group_id = kafka_protocol::messages::GroupId(StrBytes::from_string(gid));
+            lg.protocol_type = StrBytes::from_string(protocol_type);
+            lg.group_state = StrBytes::from_static_str(state);
+            res.groups.push(lg);
         }
 
         res
@@ -1704,17 +1776,17 @@ impl EngineState {
             let mut result = DeletableGroupResult::default();
             result.group_id = group_id.clone();
 
-            if let Some(group) = self.groups.get_mut(&gid_str) {
-                if group.state != GroupLifecycleState::Empty
-                    && group.state != GroupLifecycleState::Dead
-                {
-                    result.error_code = 68; // NON_EMPTY_GROUP
-                } else {
+            let live = self.group_is_live(&gid_str);
+            if live && self.groups[&gid_str].state != GroupLifecycleState::Empty {
+                result.error_code = 68; // NON_EMPTY_GROUP
+            } else if live || self.group_has_offsets(&gid_str) {
+                if let Some(group) = self.groups.get_mut(&gid_str) {
                     group.state = GroupLifecycleState::Dead;
-                    self.committed_offsets.retain(|(g, _, _), _| g != &gid_str);
-                    result.error_code = 0;
                 }
+                self.drop_group_offsets(&gid_str);
+                result.error_code = 0;
             } else {
+                // Never existed, or already deleted.
                 result.error_code = 69; // GROUP_ID_NOT_FOUND
             }
 
@@ -1993,10 +2065,9 @@ impl EngineState {
                 let mut part_res = TxnOffsetCommitResponsePartition::default();
                 part_res.partition_index = part.partition_index;
 
-                self.committed_offsets.insert(
-                    (group_id.clone(), topic_name.clone(), part.partition_index),
-                    part.committed_offset,
-                );
+                let key = (group_id.clone(), topic_name.clone(), part.partition_index);
+                self.committed_offsets.insert(key.clone(), part.committed_offset);
+                self.set_offset_metadata(key, part.committed_metadata.as_deref());
 
                 part_res.error_code = 0;
                 topic_res.partitions.push(part_res);
@@ -2235,7 +2306,7 @@ impl EngineState {
         let mut res = kafka_protocol::messages::OffsetDeleteResponse::default();
         let group_id = req.group_id.as_str().to_string();
 
-        if !self.groups.contains_key(&group_id) {
+        if !self.group_is_live(&group_id) && !self.group_has_offsets(&group_id) {
             res.error_code = 69; // GROUP_ID_NOT_FOUND
             return res;
         }
@@ -2248,11 +2319,9 @@ impl EngineState {
             for part in &topic.partitions {
                 let mut part_res = OffsetDeleteResponsePartition::default();
                 part_res.partition_index = part.partition_index;
-                self.committed_offsets.remove(&(
-                    group_id.clone(),
-                    topic_name.clone(),
-                    part.partition_index,
-                ));
+                let key = (group_id.clone(), topic_name.clone(), part.partition_index);
+                self.committed_offsets.remove(&key);
+                self.offset_metadata.remove(&key);
                 part_res.error_code = 0;
                 topic_res.partitions.push(part_res);
             }
@@ -2381,6 +2450,14 @@ fn uuid_simple() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 
+/// A member id the way Kafka mints one: `<client.id>-<uuid>`.
+fn new_member_id(client_id: &str, counter: &mut u64) -> String {
+    *counter += 1;
+    let x = uuid_simple().wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (*counter as u128) << 64;
+    let h = format!("{x:032x}");
+    format!("{client_id}-{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+}
+
 #[derive(Clone, Debug)]
 pub struct Engine {
     state: Arc<Mutex<EngineState>>,
@@ -2496,7 +2573,19 @@ impl Engine {
         req: &kafka_protocol::messages::JoinGroupRequest,
         version: i16,
     ) -> kafka_protocol::messages::JoinGroupResponse {
-        let mut resp = self.state.lock().unwrap().handle_join_group(req, version);
+        self.handle_join_group_from(req, version, "noida-client", "/127.0.0.1")
+    }
+
+    /// JoinGroup from a connection whose client id and address are known.
+    pub fn handle_join_group_from(
+        &self,
+        req: &kafka_protocol::messages::JoinGroupRequest,
+        version: i16,
+        client_id: &str,
+        client_host: &str,
+    ) -> kafka_protocol::messages::JoinGroupResponse {
+        let mut resp =
+            self.state.lock().unwrap().handle_join_group(req, version, client_id, client_host);
 
         // An old-version JoinGroup (kafka-go) arrives with an empty member
         // id and is assigned one in this same request; it waits for the
@@ -2904,6 +2993,9 @@ pub struct Snapshot {
     pub next_producer_id: i64,
     /// `HashMap<(String, String, i32), i64>` serialized as `Vec` — tuple key (§4).
     pub committed_offsets: Vec<((String, String, i32), i64)>,
+    /// Metadata committed alongside offsets (absent in older snapshots).
+    #[serde(default)]
+    pub offset_metadata: Vec<((String, String, i32), String)>,
     pub broker_configs: HashMap<String, String>,
 }
 
@@ -2989,6 +3081,11 @@ impl EngineState {
             cluster_id: self.cluster_id.clone(),
             next_producer_id: self.next_producer_id,
             committed_offsets,
+            offset_metadata: self
+                .offset_metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
             broker_configs: self.broker_configs.clone(),
         }
     }
@@ -3063,6 +3160,7 @@ impl EngineState {
             next_producer_id: s.next_producer_id,
             next_member_counter: 1, // reset — no old member survives a restart (§3.2)
             committed_offsets,
+            offset_metadata: s.offset_metadata.into_iter().collect(),
             groups: HashMap::new(), // membership reset; offsets are in committed_offsets (§3.2)
             broker_configs: s.broker_configs,
             clock: None,
