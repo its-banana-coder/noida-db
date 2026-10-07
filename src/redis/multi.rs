@@ -149,7 +149,9 @@ impl Engine {
         }
         let name = String::from_utf8_lossy(&args[0]).to_ascii_lowercase();
         let Some(meta) = command_meta::lookup(&name) else { return };
-        if !meta.has_flag("write") {
+        // XREADGROUP only moves the group's cursor: Redis doesn't signal
+        // the stream as modified.
+        if !meta.has_flag("write") || name == "xreadgroup" {
             return;
         }
         for (pos, _) in meta.keys(args) {
