@@ -36,6 +36,12 @@ pub struct Runtime {
     pub deadline: Option<std::time::Instant>,
     /// Work done since the last interrupt check.
     pub ticks: u32,
+    /// `SET CONSTRAINTS ALL DEFERRED|IMMEDIATE` in this transaction.
+    pub deferred_all: Option<bool>,
+    /// `SET CONSTRAINTS name DEFERRED|IMMEDIATE`, by constraint name.
+    pub deferred: BTreeMap<String, bool>,
+    /// Settings set LOCAL in this transaction (restored at its end).
+    pub local_settings: Vec<String>,
 }
 
 impl Runtime {
@@ -636,7 +642,12 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
             let n = text(&a[0]);
             let v = text(&a[1]);
             ctx.rt.settings.set(&n, &v)?;
-            Value::text(v)
+            // is_local: for this transaction only, as SET LOCAL.
+            if matches!(a.get(2), Some(Value::Bool(true))) {
+                ctx.rt.local_settings.push(n.clone());
+            }
+            // The value as SHOW gives it (normalized: 'German' -> 'German, DMY').
+            Value::text(ctx.rt.settings.get(&n).unwrap_or(v))
         }
         "pg_get_expr" => a[0].clone(),
         "pg_table_is_visible" => {

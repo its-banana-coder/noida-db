@@ -61,6 +61,10 @@ struct Txn {
     state: DbState,
     savepoints: Vec<(String, DbState)>,
     wrote: bool,
+    /// Settings as the transaction began (ROLLBACK restores them; COMMIT
+    /// restores those set LOCAL), and as each savepoint was taken.
+    settings: Settings,
+    savepoint_settings: Vec<Settings>,
 }
 
 #[derive(Clone)]
@@ -285,6 +289,9 @@ impl Engine {
                 cancel: cancel.clone(),
                 deadline: None,
                 ticks: 0,
+                deferred_all: None,
+                deferred: BTreeMap::new(),
+                local_settings: vec![],
             },
             status: TxStatus::Idle,
             txn: None,
@@ -416,7 +423,23 @@ impl Engine {
         if s.txn.is_none() {
             s.rt.now = s.rt.stmt_now;
         }
-        let result = self.run_statement(s, stmt, params, param_types);
+        // Reported settings (TimeZone, DateStyle, ...) the statement changed
+        // -- by SET, set_config(), RESET or a transaction ending -- are sent
+        // to the client as ParameterStatus, which drivers act on (psycopg
+        // converts timestamptz with the reported TimeZone).
+        let reported_before: Vec<(String, String)> = super::session::Settings::reported()
+            .map(|n| (n.to_string(), s.rt.settings.get(n).unwrap_or_default()))
+            .collect();
+        let mut result = self.run_statement(s, stmt, params, param_types);
+        if let Ok(r) = &mut result {
+            r.params_changed = reported_before
+                .into_iter()
+                .filter_map(|(n, old)| {
+                    let now = s.rt.settings.get(&n).unwrap_or_default();
+                    (now != old).then_some((n, now))
+                })
+                .collect();
+        }
         match &result {
             Err(e) if e.severity != "NOTICE" => {
                 if s.status == TxStatus::InTransaction {
@@ -552,6 +575,7 @@ impl Engine {
                 };
                 let snapshot = tx.state.clone();
                 tx.savepoints.push((n, snapshot));
+                tx.savepoint_settings.push(s.rt.settings.clone());
                 Ok(StmtResult::tag("SAVEPOINT"))
             }
             S::ReleaseSavepoint { name } => {
@@ -893,15 +917,76 @@ impl Engine {
         }
     }
 
+    /// `SET CONSTRAINTS names|ALL DEFERRED|IMMEDIATE` (see
+    /// `rewrite_set_constraints`): for the rest of the transaction;
+    /// IMMEDIATE also checks those constraints now.
+    fn set_constraints(&self, s: &mut Session, value: &str) -> PgResult<StmtResult> {
+        let mut r = StmtResult::tag("SET CONSTRAINTS");
+        let (names, mode) = value.rsplit_once('|').unwrap_or((value, "immediate"));
+        let deferred = mode == "deferred";
+        if s.status != TxStatus::InTransaction || s.txn.is_none() {
+            r.notices.push(PgError {
+                severity: "WARNING",
+                ..PgError::new("25P01", "SET CONSTRAINTS can only be used in transaction blocks")
+            });
+            return Ok(r);
+        }
+        let state = &s.txn.as_ref().unwrap().state;
+        let names: Vec<String> = names.split(',').map(str::to_string).collect();
+        let all = names.len() == 1 && names[0] == "all";
+        if all {
+            s.rt.deferred_all = Some(deferred);
+            s.rt.deferred.clear();
+        } else {
+            for n in &names {
+                let cons =
+                    state.tables.values().flat_map(|t| &t.constraints).find(|c| &c.name == n);
+                match cons {
+                    None => {
+                        return Err(PgError::new(
+                            code::UNDEFINED_OBJECT,
+                            format!("constraint \"{n}\" does not exist"),
+                        ));
+                    }
+                    Some(c) if !c.deferrable && !c.initially_deferred => {
+                        return Err(PgError::new(
+                            code::WRONG_OBJECT_TYPE,
+                            format!("constraint \"{n}\" is not deferrable"),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            for n in &names {
+                s.rt.deferred.insert(n.clone(), deferred);
+            }
+        }
+        if !deferred {
+            super::dml::check_deferred_named(state, (!all).then_some(&names[..]))?;
+        }
+        Ok(r)
+    }
+
     fn run_set(&self, s: &mut Session, set: &a::Set) -> PgResult<StmtResult> {
         let mut changed = vec![];
         match set {
             a::Set::SingleAssignment { scope, variable, values, .. } => {
-                if matches!(scope, Some(a::ContextModifier::Local)) && s.txn.is_none() {
-                    // SET LOCAL outside a transaction is a no-op with a warning.
-                }
+                let local = matches!(scope, Some(a::ContextModifier::Local));
                 let name = name_parts(variable).join(".");
                 let value = set_value_text(values)?;
+                if local && s.status != TxStatus::InTransaction && name != "noida_set_constraints" {
+                    // Outside a transaction block it would last only for
+                    // this statement: a warning and no effect, as Postgres.
+                    let mut r = StmtResult::tag("SET");
+                    r.notices.push(warning("SET LOCAL can only be used in transaction blocks"));
+                    return Ok(r);
+                }
+                if local {
+                    s.rt.local_settings.push(name.clone());
+                }
+                if name == "noida_set_constraints" {
+                    return self.set_constraints(s, &value);
+                }
                 if let Some(c) = s.rt.settings.set(&name, &value)? {
                     changed.push((c.to_string(), s.rt.settings.get(c)?));
                 }
@@ -1038,7 +1123,14 @@ impl Engine {
         let g = self.global.lock().unwrap();
         s.rt.now = super::datetime::now_micros();
         let db_state = g.databases.get(&s.rt.database).unwrap().db.clone();
-        s.txn = Some(Txn { state: db_state, savepoints: vec![], wrote: false });
+        s.rt.local_settings.clear();
+        s.txn = Some(Txn {
+            state: db_state,
+            savepoints: vec![],
+            wrote: false,
+            settings: s.rt.settings.clone(),
+            savepoint_settings: vec![],
+        });
     }
 
     /// Takes the single write lock, waiting for another transaction to finish.
@@ -1084,6 +1176,12 @@ impl Engine {
             return Err(e);
         }
         let Some(mut tx) = s.txn.take() else { return Ok(()) };
+        // SET LOCAL lasts only for the transaction.
+        for name in std::mem::take(&mut s.rt.local_settings) {
+            s.rt.settings.restore_from(&name, &tx.settings);
+        }
+        s.rt.deferred_all = None;
+        s.rt.deferred.clear();
         if tx.wrote {
             on_commit_actions(&mut tx.state, &s.rt.settings.temp_schema);
         }
@@ -1102,7 +1200,13 @@ impl Engine {
     }
 
     fn rollback(&self, s: &mut Session) {
-        s.txn = None;
+        // Settings changed in the transaction revert with it.
+        if let Some(tx) = s.txn.take() {
+            s.rt.settings = tx.settings;
+        }
+        s.rt.local_settings.clear();
+        s.rt.deferred_all = None;
+        s.rt.deferred.clear();
         let mut g = self.global.lock().unwrap();
         if g.writer == Some(s.id) {
             g.writer = None;
@@ -1121,6 +1225,10 @@ impl Engine {
             Some(i) => {
                 tx.state = tx.savepoints[i].1.clone();
                 tx.savepoints.truncate(i + 1);
+                if let Some(settings) = tx.savepoint_settings.get(i) {
+                    s.rt.settings = settings.clone();
+                }
+                tx.savepoint_settings.truncate(i + 1);
                 s.status = TxStatus::InTransaction;
                 Ok(StmtResult::tag("ROLLBACK"))
             }

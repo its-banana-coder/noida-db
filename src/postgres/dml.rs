@@ -637,8 +637,8 @@ pub fn check_row(ctx: &mut Ctx, table: u32, row: &Row, skip: Option<usize>) -> P
                 }
             }
             ConstraintKind::ForeignKey { ref_table, ref_cols, .. } => {
-                // INITIALLY DEFERRED: checked at COMMIT (`check_deferred`).
-                if cons.cols.iter().any(|&c| row[c].is_null()) || cons.initially_deferred {
+                // Deferred: checked at COMMIT (`check_deferred`).
+                if cons.cols.iter().any(|&c| row[c].is_null()) || is_deferred(cons, ctx.rt) {
                     continue;
                 }
                 let parent = table_of(ctx, *ref_table)?;
@@ -814,7 +814,7 @@ fn cascade_delete(ctx: &mut Ctx, table: u32, row: &Row) -> PgResult<()> {
         if matching.is_empty() {
             continue;
         }
-        if cons.initially_deferred && matches!(on_delete, FkAction::NoAction) {
+        if is_deferred(&cons, ctx.rt) && matches!(on_delete, FkAction::NoAction) {
             continue;
         }
         match on_delete {
@@ -957,16 +957,39 @@ fn referencing(ctx: &Ctx, table: u32) -> Vec<(u32, Constraint)> {
     out
 }
 
-/// At COMMIT: every `INITIALLY DEFERRED` foreign key must hold for every
-/// row (Postgres checks the rows it queued; checking them all gives the
-/// same answer).
+/// Whether a constraint is deferred now: `SET CONSTRAINTS` for it by
+/// name, else `SET CONSTRAINTS ALL`, else its `INITIALLY DEFERRED`.
+pub fn is_deferred(cons: &super::catalog::Constraint, rt: &super::exec::Runtime) -> bool {
+    if !cons.deferrable && !cons.initially_deferred {
+        return false;
+    }
+    if let Some(&d) = rt.deferred.get(&cons.name) {
+        return d;
+    }
+    rt.deferred_all.unwrap_or(cons.initially_deferred)
+}
+
+/// At COMMIT (and `SET CONSTRAINTS ... IMMEDIATE`): every deferrable
+/// foreign key (only `names`, when given) must hold for every row
+/// (Postgres checks the rows it queued; checking them all gives the same
+/// answer).
 pub fn check_deferred(db: &super::catalog::DbState) -> PgResult<()> {
+    check_deferred_named(db, None)
+}
+
+pub fn check_deferred_named(
+    db: &super::catalog::DbState,
+    names: Option<&[String]>,
+) -> PgResult<()> {
     for t in db.tables.values() {
         for cons in &t.constraints {
             let ConstraintKind::ForeignKey { ref_table, ref_cols, .. } = &cons.kind else {
                 continue;
             };
-            if !cons.initially_deferred {
+            if !cons.deferrable && !cons.initially_deferred {
+                continue;
+            }
+            if names.is_some_and(|n| !n.contains(&cons.name)) {
                 continue;
             }
             let Some(parent) = db.tables.get(ref_table) else { continue };
