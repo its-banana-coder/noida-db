@@ -19,6 +19,8 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
     // `src/mysql/server.rs` was measured hitting, but there's no reason
     // to leave Nagle's algorithm enabled for a local-dev tool either.
     let _ = stream.set_nodelay(true);
+    // How Kafka shows a member's host: the peer address with a leading '/'.
+    let client_host = stream.peer_addr().map(|a| format!("/{}", a.ip())).unwrap_or_default();
     let mut reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 
@@ -252,7 +254,12 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
-                let resp = engine.handle_join_group(&req, header.request_api_version);
+                let resp = engine.handle_join_group_from(
+                    &req,
+                    header.request_api_version,
+                    header.client_id.as_deref().unwrap_or(""),
+                    &client_host,
+                );
                 encode_response(
                     &header,
                     &resp,

@@ -38,6 +38,21 @@ impl T {
     pub fn advance(&self, ms: u64) {
         self.now.fetch_add(ms, Ordering::SeqCst);
     }
+
+    /// Creates `name` with `partitions` partitions, asserting it worked.
+    pub fn create_topic(&self, name: &str, partitions: i32) {
+        use kafka_protocol::messages::create_topics_request::CreatableTopic;
+        use kafka_protocol::messages::{CreateTopicsRequest, TopicName};
+        use kafka_protocol::protocol::StrBytes;
+        let mut req = CreateTopicsRequest::default();
+        let mut topic = CreatableTopic::default();
+        topic.name = TopicName::from(StrBytes::from_string(name.to_string()));
+        topic.num_partitions = partitions;
+        topic.replication_factor = 1;
+        req.topics.push(topic);
+        let res = self.engine.handle_create_topics(&req, 5);
+        assert_eq!(res.topics[0].error_code, 0, "create {name}");
+    }
 }
 
 /// A real v2 record batch holding `values` (kafka-protocol's own encoder,

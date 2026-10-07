@@ -67,7 +67,7 @@ fn debug(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
         ("digest-value", _) => {
             let mut out = Vec::new();
             for key in &a[2..] {
-                let d = match ctx.lookup(key) {
+                let d = match ctx.lookup_notouch(key) {
                     Some(e) => value_digest(&e.data),
                     None => [0; 20],
                 };
@@ -154,7 +154,7 @@ fn object(ctx: &mut Ctx, key: &[u8]) -> Reply {
     let now = ctx.now;
     let access = ctx.db().access_of(key);
     let db = ctx.db_index();
-    let Some(entry) = ctx.lookup(key) else {
+    let Some(entry) = ctx.lookup_notouch(key) else {
         return Err(Value::err("ERR no such key"));
     };
     let encoding = super::keys::encoding(&entry.data);
