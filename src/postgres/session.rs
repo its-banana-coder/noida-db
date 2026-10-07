@@ -225,6 +225,27 @@ impl Settings {
         Ok(DEFAULTS.iter().find(|(n, _, r)| *n == c && *r).map(|_| c))
     }
 
+    /// Puts `name` back to its value in `other` (SET LOCAL at transaction end).
+    pub fn restore_from(&mut self, name: &str, other: &Settings) {
+        let Some(c) = canonical(&name.to_ascii_lowercase())
+            .map(str::to_string)
+            .or_else(|| self.values.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned())
+        else {
+            return;
+        };
+        match other.values.get(&c) {
+            Some(v) => {
+                self.values.insert(c.clone(), v.clone());
+            }
+            None => {
+                self.values.remove(&c);
+            }
+        }
+        if c == "TimeZone" {
+            self.zone = other.zone.clone();
+        }
+    }
+
     /// Captures current values as the RESET target (after startup params).
     pub fn mark_session_defaults(&mut self) {
         self.session_defaults = self.values.clone();
