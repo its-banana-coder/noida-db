@@ -525,6 +525,64 @@ scenario("fetch_fields", setup() + [
      {"pick": lambda r: r["hits"]["total"]}),
 ])
 
+# Found by the official YAML REST suite: component templates were stored
+# as index templates, legacy `_template` didn't exist, every matching
+# template was merged (instead of the highest priority one winning), and
+# GET /_index_template (no name) was a 404.
+scenario("templates", [
+    ("DELETE", "/tpl-logs-1"), ("DELETE", "/tpl-other"),
+    ("DELETE", "/_index_template/tpl-*"), ("DELETE", "/_component_template/tpl-*"),
+    ("DELETE", "/_template/tpl-*"),
+    ("PUT", "/_component_template/tpl-ct", {"template": {
+        "settings": {"number_of_replicas": 0},
+        "mappings": {"properties": {"obj.a": {"type": "keyword"}}}}}),
+    ("PUT", "/_index_template/tpl-low", {"index_patterns": "tpl-logs-*", "priority": 1,
+                                          "template": {"settings": {"number_of_shards": 3}}}),
+    ("PUT", "/_index_template/tpl-high", {"index_patterns": ["tpl-logs-*"], "priority": 5,
+                                           "composed_of": ["tpl-ct"],
+                                           "template": {"aliases": {"tpl-alias": {"routing": "b"}},
+                                                        "mappings": {"properties": {"obj.b": {"type": "long"}}}}}),
+    ("PUT", "/_index_template/tpl-clash", {"index_patterns": ["tpl-logs-a*"], "priority": 5}),
+    ("PUT", "/_index_template/tpl-bad", {"index_patterns": ["tpl-x*"], "composed_of": ["tpl-nope"]}),
+    ("PUT", "/_index_template/tpl-nopat", {"template": {}}),
+    ("PUT", "/_index_template/tpl-low?create=true", {"index_patterns": ["tpl-zz*"]}),
+    ("GET", "/_index_template/tpl-high"),
+    ("GET", "/_index_template/tpl-*", None, {"pick": lambda r: sorted(t["name"] for t in r["index_templates"])}),
+    ("GET", "/_index_template/tpl-none*"),
+    ("GET", "/_index_template/tpl-nope"),
+    ("GET", "/_index_template/tpl-a,tpl-b"),
+    ("DELETE", "/_index_template/tpl-nope"),
+    ("DELETE", "/_component_template/tpl-nope"),
+    ("GET", "/_component_template/tpl-ct"),
+    ("DELETE", "/_component_template/tpl-ct"),
+    # (Elasticsearch adds its default `_tier_preference` setting; compared without it.)
+    ("POST", "/_index_template/_simulate_index/tpl-logs-9", None,
+     {"pick": lambda r: (r["template"]["settings"]["index"]["number_of_replicas"],
+                         r["template"]["mappings"], r["template"]["aliases"], r["overlapping"])}),
+    ("POST", "/_index_template/_simulate_index/nothing-matches"),
+    ("PUT", "/tpl-logs-1", {"mappings": {"properties": {"obj.c": {"type": "text"}}}}),
+    ("GET", "/tpl-logs-1", None, {"pick": lambda r: {k: v for k, v in r["tpl-logs-1"].items() if k != "settings"}}),
+    ("GET", "/tpl-logs-1/_settings", None,
+     {"pick": lambda r: {k: r["tpl-logs-1"]["settings"]["index"][k] for k in ("number_of_shards", "number_of_replicas")}}),
+    ("PUT", "/_template/tpl-legacy", {"index_patterns": ["tpl-o*"], "order": 2, "version": 3,
+                                      "settings": {"number_of_shards": 2}}),
+    ("PUT", "/_template/tpl-legacy0", {"index_patterns": ["tpl-*"], "order": 0,
+                                       "settings": {"number_of_shards": 4, "number_of_replicas": 0}}),
+    ("PUT", "/_template/tpl-legacy?create=true", {"index_patterns": ["tpl-o*"]}),
+    ("PUT", "/_template/tpl-nopat", {"order": 1}),
+    ("GET", "/_template/tpl-legacy"),
+    ("GET", "/_template/tpl-legacy?flat_settings=true"),
+    ("GET", "/_template/tpl-missing"),
+    ("HEAD", "/_template/tpl-legacy"),
+    ("PUT", "/tpl-other", {}),
+    ("GET", "/tpl-other/_settings", None,
+     {"pick": lambda r: {k: r["tpl-other"]["settings"]["index"][k] for k in ("number_of_shards", "number_of_replicas")}}),
+    ("DELETE", "/_template/tpl-missing"),
+    ("DELETE", "/tpl-logs-1"), ("DELETE", "/tpl-other"),
+    ("DELETE", "/_index_template/tpl-*"), ("DELETE", "/_component_template/tpl-*"),
+    ("DELETE", "/_template/tpl-*"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

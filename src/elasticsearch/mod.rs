@@ -12,6 +12,7 @@ mod scoring;
 mod search;
 mod server;
 mod sorting;
+mod templates;
 
 #[cfg(test)]
 mod tests;
