@@ -132,3 +132,14 @@ fn persistence_commands_reply_like_redis() {
     assert_eq!(t.run("SAVE"), err("ERR Command not allowed inside a transaction"));
     assert_eq!(t.run("EXEC"), err("EXECABORT Transaction discarded because of previous errors."));
 }
+
+#[test]
+fn sort_store_touches_watched_destination_even_when_empty() {
+    let mut t = T::new();
+    t.run("LPUSH foo bar");
+    t.run("WATCH foo");
+    assert_eq!(t.run("SORT emptylist STORE foo"), int(0));
+    t.run("MULTI");
+    t.run("PING");
+    assert_eq!(t.run("EXEC"), Value::NullArray);
+}

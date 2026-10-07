@@ -384,3 +384,16 @@ fn blocked_xreadgroup_gets_new_entries() {
         arr(vec![arr(vec![bulk("2-1"), bulk("alice"), int(0), int(1)])])
     );
 }
+
+#[test]
+fn xgroup_setid_takes_minus_and_plus() {
+    let mut t = T::new();
+    t.run("XADD e 1-1 a b");
+    t.run("XGROUP CREATE e g 0");
+    assert_eq!(t.run("XGROUP SETID e g -"), ok());
+    assert_eq!(t.run("XGROUP SETID e g +"), ok());
+    assert_eq!(
+        t.run("XGROUP CREATE e g2 -"),
+        err("ERR Invalid stream ID specified as stream command argument")
+    );
+}
