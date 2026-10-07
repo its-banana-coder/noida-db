@@ -788,6 +788,27 @@ MYSQL_QUERIES = {
         (A, "ALTER TABLE n1 MODIFY a varchar(20)"),
         (A, "SELECT * FROM n1 ORDER BY a"),
     ],
+    "time columns (Django TimeField / DurationField-free)": [
+        (A, "CREATE TABLE tm (id int, a time(6), b time)"),
+        (A, "INSERT INTO tm VALUES (1, '12:34:56.123', '-838:59:59'), (2, '1 02:03', 123456), (3, NULL, '25:00:00')"),
+        (A, "INSERT INTO tm VALUES (4, '01:02:03.5', '9:5'), (7, NULL, '-00:00:01.6')"),
+        (A, "SELECT id, a, b FROM tm ORDER BY id"),
+        (A, "SELECT id FROM tm WHERE b > '12:00:00' ORDER BY id"),
+        (A, "INSERT INTO tm VALUES (5, 'abc', NULL)"),
+        (A, "INSERT INTO tm VALUES (6, '10:61:00', NULL)"),
+        (A, "SHOW CREATE TABLE tm"),
+    ],
+    "table and column comments": [
+        (A, "CREATE TABLE cm (a int COMMENT 'it''s a', b int)"),
+        (A, "ALTER TABLE cm COMMENT = 'tbl c'"),
+        (A, "SELECT table_comment AS c FROM information_schema.tables WHERE table_name = 'cm' AND table_schema = database()"),
+        (A, "SELECT column_name AS n, column_comment AS c FROM information_schema.columns WHERE table_name = 'cm' AND table_schema = database() ORDER BY ordinal_position"),
+        (A, "SHOW CREATE TABLE cm"),
+        (A, "ALTER TABLE `cm` COMMENT ''"),
+        (A, "SHOW CREATE TABLE cm"),
+        (A, "CREATE TABLE cm2 (a int) COMMENT='x y'"),
+        (A, "SHOW CREATE TABLE cm2"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

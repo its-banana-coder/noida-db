@@ -173,13 +173,21 @@ impl Ddl<'_, '_> {
                         c.not_null = true;
                         let n =
                             pk.name.as_ref().or(opt.name.as_ref()).map(ident).unwrap_or_default();
-                        pending.push((n, vec![cname.clone()], PendingConstraint::PrimaryKey));
+                        pending.push((
+                            n,
+                            vec![cname.clone()],
+                            with_deferral(PendingConstraint::PrimaryKey, &pk.characteristics),
+                        ));
                     }
                     a::ColumnOption::Unique(u) => {
                         let n =
                             u.name.as_ref().or(opt.name.as_ref()).map(ident).unwrap_or_default();
                         let nd = !matches!(u.nulls_distinct, a::NullsDistinctOption::NotDistinct);
-                        pending.push((n, vec![cname.clone()], PendingConstraint::UniqueNulls(nd)));
+                        pending.push((
+                            n,
+                            vec![cname.clone()],
+                            with_deferral(PendingConstraint::UniqueNulls(nd), &u.characteristics),
+                        ));
                     }
                     a::ColumnOption::ForeignKey(fk) => {
                         pending.push((
@@ -311,15 +319,18 @@ impl Ddl<'_, '_> {
             a::TableConstraint::PrimaryKey(pk) => (
                 pk.name.as_ref().map(ident).unwrap_or_default(),
                 index_column_names(&pk.columns),
-                PendingConstraint::PrimaryKey,
+                with_deferral(PendingConstraint::PrimaryKey, &pk.characteristics),
             ),
             a::TableConstraint::Unique(u) => (
                 u.name.as_ref().map(ident).unwrap_or_default(),
                 index_column_names(&u.columns),
-                PendingConstraint::UniqueNulls(!matches!(
-                    u.nulls_distinct,
-                    a::NullsDistinctOption::NotDistinct
-                )),
+                with_deferral(
+                    PendingConstraint::UniqueNulls(!matches!(
+                        u.nulls_distinct,
+                        a::NullsDistinctOption::NotDistinct
+                    )),
+                    &u.characteristics,
+                ),
             ),
             a::TableConstraint::ForeignKey(fk) => (
                 fk.name.as_ref().map(ident).unwrap_or_default(),
@@ -361,10 +372,18 @@ impl Ddl<'_, '_> {
             })?);
         }
         let mut fk_deferral = (false, false);
+        let kind = match kind {
+            PendingConstraint::Deferrable(inner, d) => {
+                fk_deferral = d;
+                *inner
+            }
+            k => k,
+        };
         let (kind, label, nulls_distinct) = match kind {
             PendingConstraint::PrimaryKey => (ConstraintKind::PrimaryKey, "pkey", true),
             PendingConstraint::Unique => (ConstraintKind::Unique, "key", true),
             PendingConstraint::UniqueNulls(nd) => (ConstraintKind::Unique, "key", nd),
+            PendingConstraint::Deferrable(..) => unreachable!("unwrapped above"),
             PendingConstraint::Check(sql) => (ConstraintKind::Check(sql), "check", true),
             PendingConstraint::ForeignKey {
                 table: parts,
@@ -2079,6 +2098,8 @@ fn rename_ident(sql: &str, old: &str, new: &str) -> String {
 }
 
 enum PendingConstraint {
+    /// A key with `DEFERRABLE [INITIALLY DEFERRED]`.
+    Deferrable(Box<PendingConstraint>, (bool, bool)),
     PrimaryKey,
     Unique,
     UniqueNulls(bool),
@@ -2091,6 +2112,17 @@ enum PendingConstraint {
         /// (DEFERRABLE, INITIALLY DEFERRED)
         deferral: (bool, bool),
     },
+}
+
+/// A key constraint, wrapped when it's `DEFERRABLE`.
+fn with_deferral(
+    p: PendingConstraint,
+    c: &Option<a::ConstraintCharacteristics>,
+) -> PendingConstraint {
+    match deferral(c) {
+        (false, false) => p,
+        d => PendingConstraint::Deferrable(Box::new(p), d),
+    }
 }
 
 /// A constraint's `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`.

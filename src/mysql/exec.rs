@@ -1239,6 +1239,9 @@ impl Executor {
                     if col.on_update_now {
                         l.push_str(" ON UPDATE CURRENT_TIMESTAMP");
                     }
+                    if !col.comment.is_empty() {
+                        l.push_str(&format!(" COMMENT '{}'", col.comment.replace('\'', "''")));
+                    }
                     lines.push(l);
                 }
                 let quote = |cols: &[usize]| {
@@ -1299,8 +1302,13 @@ impl Executor {
                     } else {
                         String::new()
                     };
+                let comment = if t.comment.is_empty() {
+                    String::new()
+                } else {
+                    format!(" COMMENT='{}'", t.comment.replace('\'', "''"))
+                };
                 let sql = format!(
-                    "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{auto} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+                    "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{auto} DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci{comment}",
                     t.name,
                     lines.join(",\n")
                 );
@@ -1314,6 +1322,7 @@ impl Executor {
                 indexes,
                 foreign_keys,
                 if_not_exists,
+                comment,
             } => {
                 if self
                     .db
@@ -1333,6 +1342,7 @@ impl Executor {
                     ));
                 }
                 let mut t = Table::new(table.clone(), columns);
+                t.comment = comment;
                 t.unique_keys = unique_keys;
                 t.indexes = indexes;
                 for fk in foreign_keys {
@@ -3821,7 +3831,7 @@ pub(crate) fn render_text(v: &Value) -> String {
         // MySQL prints fractional seconds as all six digits (`.000600`),
         // never trimmed the way Postgres does (`.0006`).
         Value::Ts(t) => mysql_fraction(crate::sql::datetime::format_timestamp(*t), *t),
-        Value::Time(t) => mysql_fraction(crate::sql::datetime::format_time(*t), *t),
+        Value::Time(t) => format_mysql_time(*t),
         Value::Bytes(b) => String::from_utf8_lossy(b).into_owned(),
         Value::Json(j) => j.to_jsonb_string(),
     }
@@ -3969,6 +3979,35 @@ pub(crate) fn coerce_to_column(
                 Num(n)
             }
         }
+        ColumnType::Time(fsp) => {
+            let parsed = match &v {
+                Time(t) => Some(*t),
+                Ts(t) => Some(t.rem_euclid(crate::sql::datetime::USECS_PER_DAY)),
+                Date(_) => Some(0),
+                Int(i) => parse_mysql_time(&i.to_string()),
+                other => parse_mysql_time(&render_text(other)),
+            };
+            match parsed {
+                Some(t) => {
+                    // Rounded to the column's precision, half away from zero.
+                    let unit = 10i64.pow(6 - u32::from((*fsp).min(6)));
+                    let r = (t.abs() + unit / 2) / unit * unit;
+                    let t = if t < 0 { -r } else { r };
+                    Time(t.clamp(-MAX_MYSQL_TIME, MAX_MYSQL_TIME))
+                }
+                None => {
+                    if strict {
+                        let s = render_text(&v);
+                        return err(
+                            1292,
+                            "22007",
+                            format!("Incorrect time value: '{s}' for column '{name}' at row 1"),
+                        );
+                    }
+                    Time(0)
+                }
+            }
+        }
         ColumnType::Date | ColumnType::Datetime => {
             let is_date = col.ty == ColumnType::Date;
             let parsed = match &v {
@@ -4098,6 +4137,7 @@ fn rowid_column() -> Column {
         default_now: false,
         on_update_now: false,
         unsigned: false,
+        comment: String::new(),
     }
 }
 
@@ -4116,6 +4156,7 @@ fn derived_table(alias: &str, names: &[String]) -> Table {
             default_now: false,
             on_update_now: false,
             unsigned: false,
+            comment: String::new(),
         })
         .collect();
     Table::new(alias.to_string(), columns)
@@ -4298,6 +4339,8 @@ pub(crate) fn mysql_type_name(ty: &ColumnType) -> String {
         ColumnType::Double => "double".into(),
         ColumnType::Decimal(p, s) => format!("decimal({p},{s})"),
         ColumnType::Date => "date".into(),
+        ColumnType::Time(0) => "time".into(),
+        ColumnType::Time(p) => format!("time({p})"),
         ColumnType::Datetime => "datetime".into(),
         ColumnType::Boolean => "tinyint(1)".into(),
         ColumnType::Enum(m) => format!(
@@ -4444,6 +4487,7 @@ fn added_column_value(col: &Column) -> Value {
         ColumnType::Float | ColumnType::Double => Value::Float(0.0),
         ColumnType::Enum(m) => Value::Text(m.first().cloned().unwrap_or_default()),
         ColumnType::Date => Value::Text("0000-00-00".into()),
+        ColumnType::Time(_) => Value::Time(0),
         ColumnType::Datetime => Value::Text("0000-00-00 00:00:00".into()),
         _ => Value::Text(String::new()),
     }
@@ -4842,6 +4886,7 @@ fn alter_table(
             t.columns[i].default_now = now;
         }
         AlterOp::AutoIncrement(n) => t.next_auto_increment = t.next_auto_increment.max(n),
+        AlterOp::SetComment(c) => t.comment = c,
         AlterOp::Noop => {}
         // Handled by the executor, which can see the referenced tables.
         AlterOp::AddForeignKey(_) | AlterOp::DropForeignKey(_) => {}
@@ -4860,4 +4905,81 @@ fn mysql_fraction(text: String, micros: i64) -> String {
         }
         _ => text,
     }
+}
+
+/// The largest magnitude a MySQL `TIME` holds: `838:59:59`.
+pub(crate) const MAX_MYSQL_TIME: i64 = (838 * 3600 + 59 * 60 + 59) * 1_000_000;
+
+/// A MySQL `TIME` as MySQL prints it: `[-]HH:MM:SS[.ffffff]`, hours not
+/// wrapped at 24, fraction always six digits when present.
+pub(crate) fn format_mysql_time(us: i64) -> String {
+    let sign = if us < 0 { "-" } else { "" };
+    let a = us.unsigned_abs();
+    let secs = a / 1_000_000;
+    let frac = a % 1_000_000;
+    let mut s = format!("{sign}{:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60);
+    if frac != 0 {
+        s.push_str(&format!(".{frac:06}"));
+    }
+    s
+}
+
+/// Parses a MySQL `TIME` literal: `[-][D ]HH:MM[:SS[.frac]]`, `SS`,
+/// `MMSS`/`HHMMSS[.frac]` digits, or a datetime string (its time part).
+pub(crate) fn parse_mysql_time(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.len() > 10 && s.as_bytes().get(4) == Some(&b'-') {
+        return parse_mysql_datetime(s).map(|t| t.rem_euclid(crate::sql::datetime::USECS_PER_DAY));
+    }
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(r) => (true, r.trim_start()),
+        None => (false, s),
+    };
+    let (main, frac) = match body.split_once('.') {
+        Some((m, f)) => (m, f),
+        None => (body, ""),
+    };
+    if !frac.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let frac_us: i64 = if frac.is_empty() {
+        0
+    } else {
+        let f: String = frac.chars().chain(std::iter::repeat('0')).take(6).collect();
+        f.parse().ok()?
+    };
+    let (days, hms) = match main.split_once(' ') {
+        Some((d, rest)) => (d.trim().parse::<i64>().ok()?, rest.trim()),
+        None => (0, main),
+    };
+    let num = |x: &str| -> Option<i64> {
+        if x.is_empty() || !x.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        x.parse().ok()
+    };
+    let (h, m, sec) = if hms.contains(':') {
+        let parts: Vec<&str> = hms.split(':').collect();
+        match parts.as_slice() {
+            [h, m] => (num(h)?, num(m)?, 0),
+            [h, m, s] => (num(h)?, num(m)?, num(s)?),
+            _ => return None,
+        }
+    } else {
+        if days != 0 {
+            return Some(
+                (if neg { -1 } else { 1 }) * ((days * 24 + num(hms)?) * 3600 * 1_000_000 + frac_us),
+            );
+        }
+        let n = num(hms)?;
+        (n / 10000, n / 100 % 100, n % 100)
+    };
+    if m > 59 || sec > 59 {
+        return None;
+    }
+    let total = ((days * 24 + h) * 3600 + m * 60 + sec) * 1_000_000 + frac_us;
+    Some(if neg { -total } else { total })
 }

@@ -99,6 +99,10 @@ pub struct Db {
     /// Keys added since the engine last looked, in order: they may wake
     /// blocked clients (Redis's `signalKeyAsReady` from `dbAdd`).
     pub(crate) added: Vec<Vec<u8>>,
+    /// `DEBUG SET-ACTIVE-EXPIRE 0`: expired keys stay until a command
+    /// touches them (counted by DBSIZE, like Redis without its expire
+    /// cycle). Otherwise they go eagerly.
+    pub(crate) lazy_expire_only: bool,
 }
 
 // `map`'s `Vec<u8>` keys aren't valid JSON object keys (serde_json errors
@@ -117,7 +121,12 @@ impl Serialize for Db {
 impl<'de> Deserialize<'de> for Db {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let entries: Vec<(Vec<u8>, Entry)> = Vec::deserialize(d)?;
-        Ok(Db { map: entries.into_iter().collect(), added: Vec::new(), access: HashMap::new() })
+        Ok(Db {
+            map: entries.into_iter().collect(),
+            added: Vec::new(),
+            access: HashMap::new(),
+            lazy_expire_only: false,
+        })
     }
 }
 
@@ -169,7 +178,14 @@ impl Db {
     }
 
     pub fn purge_expired(&mut self, now: u64) {
-        self.map.retain(|_, e| !e.is_expired(now));
+        if !self.lazy_expire_only {
+            self.map.retain(|_, e| !e.is_expired(now));
+        }
+    }
+
+    /// Every entry, for DEBUG RELOAD.
+    pub(crate) fn entries_mut(&mut self) -> impl Iterator<Item = (&Vec<u8>, &mut Entry)> {
+        self.map.iter_mut()
     }
 
     pub fn len(&mut self, now: u64) -> usize {
@@ -186,7 +202,8 @@ impl Db {
     /// Live keys in a stable (sorted) order, which SCAN cursors rely on.
     pub fn keys(&mut self, now: u64) -> Vec<Vec<u8>> {
         self.purge_expired(now);
-        let mut keys: Vec<_> = self.map.keys().cloned().collect();
+        let mut keys: Vec<_> =
+            self.map.iter().filter(|(_, e)| !e.is_expired(now)).map(|(k, _)| k.clone()).collect();
         keys.sort();
         keys
     }
@@ -287,6 +304,8 @@ pub struct Engine {
     rng: u64,
     /// Keys evicted for maxmemory (INFO stats `evicted_keys`).
     pub evicted_keys: u64,
+    /// `DEBUG SET-SKIP-CHECKSUM-VALIDATION`: RESTORE ignores payload CRCs.
+    pub(crate) skip_checksum: bool,
 }
 
 pub type Reply = Result<Value, Value>;
@@ -315,6 +334,7 @@ fn command_table() -> impl Iterator<Item = &'static Command> {
         .iter()
         .chain(admin::COMMANDS)
         .chain(devtools::COMMANDS)
+        .chain(super::debug::COMMANDS)
         .chain(monitor::COMMANDS)
         .chain(sort::COMMANDS)
         .chain(hll::COMMANDS)
@@ -504,6 +524,7 @@ impl Engine {
             last_save: now / 1000,
             scripts: Default::default(),
             evicted_keys: 0,
+            skip_checksum: false,
             waiting: (0..NUM_DBS).map(|_| HashMap::new()).collect(),
             replies: HashMap::new(),
             watchers: HashMap::new(),
@@ -524,6 +545,9 @@ impl Engine {
     pub fn purge_expired(&mut self) {
         let now = self.now();
         for i in 0..self.dbs.len() {
+            if self.dbs[i].lazy_expire_only {
+                continue;
+            }
             let mut expired = Vec::new();
             for (k, e) in self.dbs[i].map.iter() {
                 if e.is_expired(now) {

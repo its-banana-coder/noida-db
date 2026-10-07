@@ -9,6 +9,7 @@ mod command_meta;
 mod config;
 mod config_table;
 mod connection;
+mod debug;
 mod devtools;
 mod double;
 mod engine;
