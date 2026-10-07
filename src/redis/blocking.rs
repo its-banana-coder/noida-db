@@ -203,7 +203,7 @@ impl Engine {
     }
 
     pub fn blocked_count(&self) -> usize {
-        self.clients.values().filter(|c| c.blocked.is_some()).count()
+        self.clients.values().filter(|c| c.blocked.is_some()).count() + self.paused_clients
     }
 
     /// Blocked clients with a timeout (INFO's `clients_in_timeout_table`).

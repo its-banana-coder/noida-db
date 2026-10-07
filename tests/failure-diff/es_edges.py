@@ -494,6 +494,37 @@ scenario("errors", setup() + [
     ("DELETE", "/missing-index"),
 ])
 
+def fields_of(r):
+    return [(h["_id"], h.get("fields"), "_source" in h, h.get("_version"), h.get("_seq_no"))
+            for h in r["hits"]["hits"]]
+
+
+# Found by the official YAML REST suite: `fields`, `docvalue_fields`,
+# `stored_fields`, `version`/`seq_no_primary_term`, `rest_total_hits_as_int`
+# and term/exists queries on `_id`/`_index` were ignored.
+scenario("fetch_fields", setup() + [
+    ("POST", S, {"query": {"ids": {"values": ["1"]}}, "fields": ["title*", "price", "date", "tags"]},
+     {"pick": fields_of}),
+    ("POST", S, {"query": {"ids": {"values": ["1"]}}, "fields": [{"field": "date", "format": "yyyy/MM/dd"}],
+                 "_source": False}, {"pick": fields_of}),
+    ("POST", S, {"query": {"ids": {"values": ["1"]}}, "fields": [{"field": "status", "format": "yyyy"}]}),
+    ("POST", S, {"query": {"ids": {"values": ["1"]}}, "docvalue_fields": ["price", "tags"]}, {"pick": fields_of}),
+    ("POST", S, {"query": {"ids": {"values": ["1"]}}, "docvalue_fields": ["body"]}),
+    ("POST", S, {"query": {"ids": {"values": ["2"]}}, "stored_fields": ["_none_"]},
+     {"pick": lambda r: r["hits"]["hits"]}),
+    ("POST", S, {"query": {"ids": {"values": ["2"]}}, "stored_fields": []}, {"pick": fields_of}),
+    ("POST", S, {"query": {"ids": {"values": ["2"]}}, "version": True, "seq_no_primary_term": True},
+     {"pick": fields_of}),
+    ("POST", S + "?rest_total_hits_as_int=true", {"query": {"term": {"_id": "3"}}},
+     {"pick": lambda r: (r["hits"]["total"], ids(r))}),
+    ("POST", S + "?rest_total_hits_as_int=true&track_total_hits=false", {},
+     {"pick": lambda r: r["hits"]["total"]}),
+    ("POST", S + "?rest_total_hits_as_int=true", {"query": {"exists": {"field": "_index"}}},
+     {"pick": lambda r: r["hits"]["total"]}),
+    ("POST", S, {"query": {"terms": {"_index": ["edge"]}}, "size": 0},
+     {"pick": lambda r: r["hits"]["total"]}),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:
