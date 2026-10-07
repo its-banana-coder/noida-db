@@ -481,3 +481,51 @@ fn arrays_multi_fields_and_document_apis_behave_like_elasticsearch() {
     assert_eq!(r["logs-1"]["mappings"]["properties"]["level"]["type"], "keyword");
     assert_eq!(r["logs-1"]["mappings"]["properties"]["at"]["type"], "date");
 }
+
+#[test]
+fn admin_actions_take_index_lists_wildcards_and_no_index() {
+    let engine = Engine::default();
+    call(&engine, "PUT", "/a1", r#"{"settings":{"number_of_replicas":0}}"#);
+    call(&engine, "PUT", "/a2", "");
+    // No index in the path: every index.
+    let (status, body) = call(&engine, "POST", "/_refresh", "");
+    assert_eq!(status, 200);
+    assert_eq!(body["_shards"], json!({"total":3,"successful":2,"failed":0}));
+    assert_eq!(call(&engine, "POST", "/a1,a2/_flush", "").0, 200);
+    assert_eq!(call(&engine, "POST", "/a*/_forcemerge", "").0, 200);
+    assert_eq!(call(&engine, "POST", "/_cache/clear", "").0, 200);
+    // A concrete missing name is a 404 unless ignore_unavailable.
+    let (status, body) = call(&engine, "POST", "/a1,nope/_refresh", "");
+    assert_eq!(status, 404);
+    assert_eq!(body["error"]["index"], "nope");
+    let (status, _) = engine.dispatch("POST", "/a1,nope/_refresh", "ignore_unavailable=true", b"");
+    assert_eq!(status, 200);
+    // A wildcard matching nothing is fine.
+    assert_eq!(call(&engine, "POST", "/zz*/_refresh", "").0, 200);
+}
+
+#[test]
+fn settings_are_normalized_and_path_segments_percent_decoded() {
+    let engine = Engine::default();
+    call(
+        &engine,
+        "PUT",
+        "/s1",
+        r#"{"settings":{"number_of_replicas":0,"index.refresh_interval":"5s"}}"#,
+    );
+    let (_, body) = call(&engine, "GET", "/s1/_settings", "");
+    assert_eq!(
+        body["s1"]["settings"]["index"],
+        json!({"number_of_shards":"1","number_of_replicas":"0","refresh_interval":"5s"})
+    );
+    // Single node, no replicas wanted: green.
+    let (status, health) = engine.dispatch("GET", "/_cluster/health", "wait_for_status=green", b"");
+    assert_eq!(status, 200);
+    assert_eq!(health["status"], "green");
+    call(&engine, "PUT", "/s1/_settings", r#"{"index":{"refresh_interval":null}}"#);
+    let (_, body) = call(&engine, "GET", "/s1/_settings", "");
+    assert!(body["s1"]["settings"]["index"].get("refresh_interval").is_none());
+
+    assert_eq!(call(&engine, "PUT", "/t-%E4%B8%AD", "").0, 200);
+    assert_eq!(call(&engine, "HEAD", "/t-中", "").0, 200);
+}
