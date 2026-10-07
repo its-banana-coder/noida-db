@@ -16,6 +16,7 @@ pub mod dml;
 pub mod engine;
 pub mod error;
 pub mod exec;
+pub mod explain;
 pub mod fts;
 pub mod funcs;
 pub mod jsonpath;
@@ -43,6 +44,8 @@ use sqlparser::parser::Parser;
 
 /// Parses a SQL string into statements.
 pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
+    let after_explain = rewrite_explain_paren(sql);
+    let sql = after_explain.as_deref().unwrap_or(sql);
     let after_db = rewrite_create_database(sql)?;
     let sql = after_db.as_deref().unwrap_or(sql);
     let after_ext = rewrite_extension_schema(sql);
@@ -64,6 +67,24 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let after_subscripts = arrayset::rewrite(sql4);
     let sql = after_subscripts.as_deref().unwrap_or(sql4);
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(syntax_error)
+}
+
+/// `EXPLAIN [ANALYZE] [VERBOSE] (SELECT ...) UNION (...)`: sqlparser reads
+/// the parenthesis as an option list. Postgres's own option list is
+/// written out instead (`COSTS` is on by default, so it changes nothing).
+fn rewrite_explain_paren(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?is)^(\s*)explain((?:\s+(?:analyze|analyse|verbose))*)\s*\((\s*(?:select|with|values|table|\())",
+    )
+    .expect("regex");
+    let c = re.captures(sql)?;
+    let mut opts: Vec<String> = c[2]
+        .split_whitespace()
+        .map(|k| if k.eq_ignore_ascii_case("verbose") { "VERBOSE" } else { "ANALYZE" }.to_string())
+        .collect();
+    opts.push("COSTS true".into());
+    let head = format!("{}EXPLAIN ({}) ({}", &c[1], opts.join(", "), &c[3]);
+    Some(format!("{head}{}", &sql[c.get(0).unwrap().end()..]))
 }
 
 /// `INSERT ... OVERRIDING SYSTEM VALUE ...`, which sqlparser doesn't
