@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::analysis;
 use super::dates;
+use super::fields;
 use super::highlight;
 use super::query_string;
 use super::scoring;
@@ -431,6 +432,15 @@ pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> 
     out
 }
 
+/// `tokens_for`, plus the `_id` and `_index` metadata fields.
+fn meta_tokens(mappings: &Value, d: &CommittedDoc, field: &str) -> Vec<String> {
+    match field {
+        "_id" => vec![d.id.clone()],
+        "_index" => vec![d.index.clone()],
+        _ => tokens_for(mappings, &d.source, field),
+    }
+}
+
 fn doc_tokens(mappings: &Value, docs: &[CommittedDoc], field: &str) -> Vec<Vec<String>> {
     docs.iter().map(|d| tokens_for(mappings, &d.source, field)).collect()
 }
@@ -496,7 +506,7 @@ fn eval_term(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
     let target = value_to_term(&value);
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
-        if tokens_for(mappings, &d.source, field).contains(&target) {
+        if meta_tokens(mappings, d, field).contains(&target) {
             out.insert(idx, boost);
         }
     }
@@ -513,7 +523,7 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
         arr.as_array().map(|a| a.iter().map(value_to_term).collect()).unwrap_or_default();
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
-        let toks = tokens_for(mappings, &d.source, field);
+        let toks = meta_tokens(mappings, d, field);
         if targets.iter().any(|t| toks.contains(t)) {
             out.insert(idx, 1.0);
         }
@@ -621,7 +631,7 @@ fn eval_fuzzy(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
     let prefix: String = value.chars().take(prefix_len).collect();
     let mut candidates: HashSet<String> = HashSet::new();
     for d in docs {
-        for t in tokens_for(mappings, &d.source, field) {
+        for t in meta_tokens(mappings, d, field) {
             if t.starts_with(&prefix) && edit_distance(&t, &value) <= edits {
                 candidates.insert(t);
             }
@@ -835,7 +845,7 @@ fn eval_wildcard(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<
     let pattern_chars: Vec<char> = pattern.chars().collect();
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
-        let matched = tokens_for(mappings, &d.source, field).iter().any(|t| {
+        let matched = meta_tokens(mappings, d, field).iter().any(|t| {
             let t_chars: Vec<char> = t.chars().collect();
             glob_match(&pattern_chars, &t_chars)
         });
@@ -859,7 +869,7 @@ fn eval_regexp(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<us
     };
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
-        if tokens_for(mappings, &d.source, field).iter().any(|t| re.is_match(t)) {
+        if meta_tokens(mappings, d, field).iter().any(|t| re.is_match(t)) {
             out.insert(idx, boost);
         }
     }
@@ -998,8 +1008,10 @@ fn date_bounds(
 fn eval_exists(v: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some(field) = v.get("field").and_then(Value::as_str) else { return HashMap::new() };
     let mut out = HashMap::new();
+    // Every document has these metadata fields.
+    let always = matches!(field, "_id" | "_index" | "_seq_no" | "_version" | "_primary_term");
     for (idx, d) in docs.iter().enumerate() {
-        if raw_values(&d.source, field).into_iter().any(|v| !v.is_null()) {
+        if always || raw_values(&d.source, field).into_iter().any(|v| !v.is_null()) {
             out.insert(idx, 1.0);
         }
     }
@@ -1012,7 +1024,7 @@ fn eval_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<us
     let prefix = value_to_term(&value);
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
-        if tokens_for(mappings, &d.source, field).iter().any(|t| t.starts_with(&prefix)) {
+        if meta_tokens(mappings, d, field).iter().any(|t| t.starts_with(&prefix)) {
             out.insert(idx, boost);
         }
     }
@@ -2184,18 +2196,72 @@ pub fn search_with(
     }
 
     let source_filter = body.get("_source");
+    let stored = body.get("stored_fields");
+    let stored_none = match stored {
+        Some(Value::String(s)) => s == "_none_",
+        Some(Value::Array(a)) => a.iter().any(|v| v == "_none_"),
+        _ => false,
+    };
+    // `stored_fields` without `_source` among them loads no `_source`
+    // (unless `_source` filtering asks for it explicitly).
+    let stored_wants_source = match stored {
+        None => true,
+        Some(Value::String(s)) => s == "_source" || s == "*",
+        Some(Value::Array(a)) => a.iter().any(|v| v == "_source" || v == "*"),
+        Some(_) => false,
+    };
+    let show_version = body.get("version").and_then(Value::as_bool).unwrap_or(false);
+    let show_seq = body.get("seq_no_primary_term").and_then(Value::as_bool).unwrap_or(false);
     let (from, size) = if opts.all_hits { (0, usize::MAX) } else { (from as usize, size as usize) };
-    let hits: Vec<Value> = ranked
+    let hits: Result<Vec<Value>, EsError> = ranked
         .iter()
         .skip(from)
         .take(size)
         .map(|(idx, score, keys)| {
             let d = &originals[*idx];
-            let mut hit = json!({"_index": d.index, "_id": d.id});
+            let mut hit = if stored_none {
+                json!({"_index": d.index})
+            } else {
+                json!({"_index": d.index, "_id": d.id})
+            };
+            if show_version {
+                hit["_version"] = json!(d.version);
+            }
+            if show_seq {
+                hit["_seq_no"] = json!(d.seq);
+                hit["_primary_term"] = json!(1);
+            }
             hit["_score"] = if shows_scores { json!(score) } else { Value::Null };
             // `"_source": false` omits the key, as Elasticsearch does.
-            if !matches!(source_filter, Some(Value::Bool(false))) {
+            let source_enabled = mappings
+                .get("_source")
+                .and_then(|s| s.get("enabled"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if !matches!(source_filter, Some(Value::Bool(false)))
+                && !stored_none
+                && source_enabled
+                && (stored_wants_source || source_filter.is_some())
+            {
                 hit["_source"] = apply_source_filter(&d.source, source_filter);
+            }
+            let mut fetched = Map::new();
+            for (key, kind) in [
+                ("stored_fields", fields::Kind::Stored),
+                ("docvalue_fields", fields::Kind::DocValue),
+                ("fields", fields::Kind::Fields),
+            ] {
+                if let Some(spec) = body.get(key)
+                    && !(kind == fields::Kind::Stored && stored_none)
+                {
+                    let f = fields::fetch(mappings, d, spec, kind)?;
+                    for (k, v) in f {
+                        fetched.entry(k).or_insert(v);
+                    }
+                }
+            }
+            if !fetched.is_empty() {
+                hit["fields"] = Value::Object(fetched);
             }
             if let Some(hl) = body.get("highlight")
                 && let Some(h) = highlight::highlight(hl, &query, mappings, &d.source)
@@ -2210,9 +2276,10 @@ pub fn search_with(
                     hit["inner_hits"][name.as_str()] = h.clone();
                 }
             }
-            hit
+            Ok(hit)
         })
         .collect();
+    let hits = hits?;
 
     let mut hits_obj = json!({"max_score": max_score, "hits": hits});
     if let Some(t) = total_hits(body, total) {

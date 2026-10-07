@@ -14,10 +14,13 @@ pub struct Engine(Arc<Mutex<State>>);
 
 use serde::{Deserialize, Serialize};
 
+use super::templates::Templates;
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     indices: HashMap<String, Index>,
-    templates: HashMap<String, Value>,
+    #[serde(flatten)]
+    templates: Templates,
     /// `PUT _cluster/settings` values (persistent, transient).
     #[serde(default)]
     cluster_settings: HashMap<String, Value>,
@@ -171,6 +174,67 @@ impl Engine {
 
 impl Engine {
     pub fn dispatch(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
+        let (status, mut resp) = self.route(method, path, query, body);
+        // `rest_total_hits_as_int=true`: `hits.total` as the bare number
+        // (pre-7.0 shape), in a search, scroll or each msearch response.
+        if query.split('&').any(|p| p == "rest_total_hits_as_int=true") {
+            fn flatten_total(v: &mut Value) {
+                if let Some(h) = v.get_mut("hits").and_then(Value::as_object_mut) {
+                    // `track_total_hits: false` reads as -1 in this shape.
+                    let n = h.get("total").map_or(json!(-1), |t| t["value"].clone());
+                    h.insert("total".into(), n);
+                }
+                if let Some(Value::Array(rs)) = v.get_mut("responses") {
+                    rs.iter_mut().for_each(flatten_total);
+                }
+            }
+            flatten_total(&mut resp);
+        }
+        // `flat_settings=true`: settings objects as dotted keys.
+        if query.split('&').any(|p| p == "flat_settings=true") {
+            fn flat(prefix: &str, v: &Value, out: &mut serde_json::Map<String, Value>) {
+                match v {
+                    Value::Object(m) if !m.is_empty() => {
+                        for (k, x) in m {
+                            let key =
+                                if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                            flat(&key, x, out);
+                        }
+                    }
+                    other => {
+                        out.insert(prefix.to_string(), other.clone());
+                    }
+                }
+            }
+            fn walk(v: &mut Value) {
+                if let Value::Object(m) = v {
+                    for (k, x) in m.iter_mut() {
+                        if matches!(
+                            k.as_str(),
+                            "settings" | "persistent" | "transient" | "defaults"
+                        ) && x.is_object()
+                        {
+                            let mut out = serde_json::Map::new();
+                            if let Value::Object(inner) = &*x {
+                                for (ik, iv) in inner {
+                                    flat(ik, iv, &mut out);
+                                }
+                            }
+                            *x = Value::Object(out);
+                        } else {
+                            walk(x);
+                        }
+                    }
+                } else if let Value::Array(a) = v {
+                    a.iter_mut().for_each(walk);
+                }
+            }
+            walk(&mut resp);
+        }
+        (status, resp)
+    }
+
+    fn route(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
         let read = matches!(method, "GET" | "HEAD")
             || [
                 "_search",
@@ -204,11 +268,17 @@ impl Engine {
                 json!({"name":"noida-db","cluster_name":"docker-cluster","cluster_uuid":"noida-local","version":{"number":"8.15.3","build_flavor":"default","build_type":"docker","build_hash":"noida","build_date":"2024-09-05T00:00:00.000Z","build_snapshot":false,"lucene_version":"9.11.1","minimum_wire_compatibility_version":"7.17.0","minimum_index_compatibility_version":"7.0.0"},"tagline":"You Know, for Search"}),
             );
         }
-        if segments.first() == Some(&"_index_template") {
-            return self.template(method, &segments, body);
-        }
-        if segments.first() == Some(&"_component_template") {
-            return self.template(method, &segments, body);
+        match segments.first() {
+            Some(&"_index_template") => {
+                return self.0.lock().unwrap().templates.index_api(method, &segments, &q, body);
+            }
+            Some(&"_component_template") => {
+                return self.0.lock().unwrap().templates.component_api(method, &segments, &q, body);
+            }
+            Some(&"_template") => {
+                return self.0.lock().unwrap().templates.legacy_api(method, &segments, &q, body);
+            }
+            _ => {}
         }
         if segments.first() == Some(&"_aliases") {
             return self.aliases(method, body);
@@ -429,6 +499,43 @@ impl Engine {
             if let Some(n) = q.get(param).and_then(|v| v.parse::<i64>().ok()) {
                 req[key] = json!(n);
             }
+        }
+        // Other body options a client may pass as URL parameters instead.
+        for key in [
+            "track_total_hits",
+            "version",
+            "seq_no_primary_term",
+            "explain",
+            "terminate_after",
+            "track_scores",
+            "timeout",
+            "min_score",
+        ] {
+            if let Some(v) = q.get(key)
+                && req.get(key).is_none()
+            {
+                req[key] = match v.as_str() {
+                    "true" => json!(true),
+                    "false" => json!(false),
+                    other => other
+                        .parse::<i64>()
+                        .map(|n| json!(n))
+                        .or_else(|_| other.parse::<f64>().map(|f| json!(f)))
+                        .unwrap_or_else(|_| json!(other)),
+                };
+            }
+        }
+        for key in ["stored_fields", "docvalue_fields"] {
+            if let Some(v) = q.get(key)
+                && req.get(key).is_none()
+            {
+                req[key] = json!(v.split(',').collect::<Vec<_>>());
+            }
+        }
+        if q.get("rest_total_hits_as_int").is_some_and(|v| v == "true")
+            && req.get("track_total_hits").is_none()
+        {
+            req["track_total_hits"] = json!(true);
         }
         // URI search: `?q=title:quick`, a query_string query.
         if let Some(text) = q.get("q") {
@@ -721,7 +828,11 @@ impl Engine {
             n.sort();
             n
         };
-        if segments.len() > 2 && names.is_empty() && !pattern.contains('*') {
+        if segments.len() > 2
+            && names.is_empty()
+            && !pattern.contains('*')
+            && !matches!(segments[1], "templates" | "aliases")
+        {
             return missing_index(pattern);
         }
         for n in &names {
@@ -895,28 +1006,10 @@ impl Engine {
                 )
             }
             Some("templates") => {
-                let mut rows: Vec<Vec<String>> = s
-                    .templates
-                    .iter()
-                    .map(|(n, t)| {
-                        let pats = match t.get("index_patterns") {
-                            Some(Value::Array(a)) => format!(
-                                "[{}]",
-                                a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
-                            ),
-                            Some(Value::String(p)) => format!("[{p}]"),
-                            _ => "[]".into(),
-                        };
-                        vec![
-                            n.clone(),
-                            pats,
-                            t.get("priority").map(|p| p.to_string()).unwrap_or_else(|| "0".into()),
-                            "".into(),
-                            "[]".into(),
-                        ]
-                    })
-                    .collect();
-                rows.sort();
+                let rows = match s.templates.cat_rows(segments.get(2).copied()) {
+                    Ok(r) => r,
+                    Err(e) => return e,
+                };
                 (
                     200,
                     cat::render(
@@ -1198,13 +1291,13 @@ impl Engine {
                 let req: Value = parse_json(body).unwrap_or_else(|| json!({}));
                 let mut index = new_index_from_templates(&s.templates, name);
                 if let Some(m) = req.get("mappings") {
-                    merge(&mut index.mappings, m.clone());
+                    merge(&mut index.mappings, expand_dotted(m));
                 }
                 if let Some(st) = req.get("settings") {
                     apply_settings(&mut index.settings, st);
                 }
                 if let Some(a) = req.get("aliases").and_then(Value::as_object) {
-                    index.aliases.extend(a.clone());
+                    index.aliases.extend(a.iter().map(|(k, v)| (k.clone(), normalize_alias(v))));
                 }
                 s.indices.insert(name.to_string(), index);
                 (200, json!({"acknowledged":true,"shards_acknowledged":true,"index":name}))
@@ -1246,7 +1339,7 @@ impl Engine {
             "GET" => (200, json!({(name): {"mappings": i.mappings}})),
             "PUT" | "POST" => {
                 let next = parse_json(body).unwrap_or_else(|| json!({}));
-                merge(&mut i.mappings, next);
+                merge(&mut i.mappings, expand_dotted(&next));
                 (200, json!({"acknowledged":true}))
             }
             _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
@@ -1932,28 +2025,6 @@ impl Engine {
             (200, Value::Object(out))
         }
     }
-
-    fn template(&self, method: &str, segments: &[&str], body: &[u8]) -> (u16, Value) {
-        let name = segments.get(1).copied().unwrap_or("");
-        let mut s = self.0.lock().unwrap();
-        match method {
-            "PUT" => {
-                s.templates.insert(name.to_string(), parse_json(body).unwrap_or_else(|| json!({})));
-                (200, json!({"acknowledged":true}))
-            }
-            "GET" => s.templates.get(name).map(|v| (200, json!({(name):v}))).unwrap_or_else(|| {
-                (404, error("resource_not_found_exception", "index template missing", 404))
-            }),
-            "DELETE" => {
-                if s.templates.remove(name).is_some() {
-                    (200, json!({"acknowledged":true}))
-                } else {
-                    (404, error("resource_not_found_exception", "index template missing", 404))
-                }
-            }
-            _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
-        }
-    }
 }
 
 pub fn parse_json(bytes: &[u8]) -> Option<Value> {
@@ -1966,7 +2037,7 @@ pub fn error(kind: &str, reason: &str, status: u16) -> Value {
 /// nested, every value a string (`{"number_of_replicas": 0}` and
 /// `{"index.number_of_replicas": "0"}` are the same setting). A `null`
 /// value resets the setting to its default (drops it).
-fn apply_settings(target: &mut Value, incoming: &Value) {
+pub(super) fn apply_settings(target: &mut Value, incoming: &Value) {
     fn flatten(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
         match v {
             Value::Object(m) => {
@@ -2119,8 +2190,6 @@ fn mark_forced_refresh(resp: &mut Value, q: &HashMap<String, String>) {
     }
 }
 
-/// URL query parameters, percent-decoded (`+` is a space); a bare flag
-/// (`?v`, `?pretty`, `?refresh`) has an empty value.
 /// `*` wildcard matching for index and alias names.
 fn glob_match(pat: &str, name: &str) -> bool {
     let parts: Vec<&str> = pat.split('*').collect();
@@ -2168,6 +2237,8 @@ fn percent_decode_segment(seg: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// URL query parameters, percent-decoded (`+` is a space); a bare flag
+/// (`?v`, `?pretty`, `?refresh`) has an empty value.
 fn query_params(q: &str) -> HashMap<String, String> {
     fn decode(s: &str) -> String {
         let b = s.as_bytes();
@@ -2197,7 +2268,53 @@ fn query_params(q: &str) -> HashMap<String, String> {
         })
         .collect()
 }
-fn merge(a: &mut Value, b: Value) {
+/// An alias definition as stored: `routing` expands to `index_routing`
+/// and `search_routing`; routing values are strings.
+pub(super) fn normalize_alias(v: &Value) -> Value {
+    let mut v = v.clone();
+    if let Some(m) = v.as_object_mut() {
+        if let Some(r) = m.remove("routing") {
+            m.entry("index_routing").or_insert_with(|| r.clone());
+            m.entry("search_routing").or_insert(r);
+        }
+        for k in ["index_routing", "search_routing"] {
+            if let Some(x) = m.get_mut(k)
+                && !x.is_string()
+            {
+                *x = json!(x.to_string());
+            }
+        }
+    }
+    v
+}
+
+/// A mapping with dotted field names (`"object1.red": {...}`) expanded
+/// into object fields, as Elasticsearch stores it -- except under
+/// `subobjects: false`, where dotted names are leaf names.
+pub(super) fn expand_dotted(m: &Value) -> Value {
+    let mut out = m.clone();
+    let subobjects = m.get("subobjects").and_then(Value::as_bool).unwrap_or(true);
+    if let Some(Value::Object(props)) = m.get("properties") {
+        let mut np = json!({});
+        for (k, v) in props {
+            let v = expand_dotted(v);
+            let parts: Vec<&str> =
+                if subobjects { k.split('.').collect() } else { vec![k.as_str()] };
+            let mut node = json!({});
+            // Build {"a": {"properties": {"b": v}}} from the inside out.
+            let mut cur = v;
+            for p in parts[1..].iter().rev() {
+                cur = json!({"properties": {(*p): cur}});
+            }
+            node[parts[0]] = cur;
+            merge(&mut np, node);
+        }
+        out["properties"] = np;
+    }
+    out
+}
+
+pub(super) fn merge(a: &mut Value, b: Value) {
     if let (Some(x), Some(y)) = (a.as_object_mut(), b.as_object()) {
         for (k, v) in y {
             if let Some(existing) = x.get_mut(k) {
@@ -2256,12 +2373,10 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
     }
 }
 
-/// A new index's starting state: every composable index template whose
-/// `index_patterns` match `name`, lowest `priority` first so the highest
-/// wins. Applies to explicit creation and to auto-creation on first write.
-/// Found via testing before a public release: templates were stored but
-/// never applied.
-fn new_index_from_templates(templates: &HashMap<String, Value>, name: &str) -> Index {
+/// A new index's starting state: the defaults, then whatever the
+/// matching templates give it (see `templates::Templates::resolve`).
+/// Applies to explicit creation and to auto-creation on first write.
+fn new_index_from_templates(templates: &Templates, name: &str) -> Index {
     let mut index = Index {
         mappings: json!({"properties": {}}),
         settings: json!({"index": {"number_of_shards": "1", "number_of_replicas": "1"}}),
@@ -2270,32 +2385,10 @@ fn new_index_from_templates(templates: &HashMap<String, Value>, name: &str) -> I
         seq: -1,
         ..Index::default()
     };
-    let mut matching: Vec<&Value> = templates
-        .values()
-        .filter(|t| {
-            let pats: Vec<&str> = match t.get("index_patterns") {
-                Some(Value::String(p)) => vec![p.as_str()],
-                Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
-                _ => vec![],
-            };
-            pats.iter().any(|p| match p.strip_suffix('*') {
-                Some(prefix) => name.starts_with(prefix),
-                None => *p == name,
-            })
-        })
-        .collect();
-    matching.sort_by_key(|t| t.get("priority").and_then(Value::as_i64).unwrap_or(0));
-    for t in matching {
-        let Some(tpl) = t.get("template") else { continue };
-        if let Some(m) = tpl.get("mappings") {
-            merge(&mut index.mappings, m.clone());
-        }
-        if let Some(st) = tpl.get("settings") {
-            apply_settings(&mut index.settings, st);
-        }
-        if let Some(a) = tpl.get("aliases").and_then(Value::as_object) {
-            index.aliases.extend(a.clone());
-        }
+    if let Some(r) = templates.resolve(name) {
+        merge(&mut index.mappings, r.mappings);
+        apply_settings(&mut index.settings, &r.settings);
+        index.aliases.extend(r.aliases);
     }
     index
 }

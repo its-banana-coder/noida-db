@@ -14,6 +14,12 @@ pub fn render(
     rows: Vec<Vec<String>>,
     q: &HashMap<String, String>,
 ) -> Value {
+    // `?help`: one line per column (name | aliases | description).
+    if q.contains_key("help") {
+        let w = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+        let text: String = columns.iter().map(|c| format!("{c:<w$} | {c} | {c}\n")).collect();
+        return json!({ RAW_TEXT: text });
+    }
     let wanted: Vec<usize> = match q.get("h") {
         Some(h) => {
             h.split(',').filter_map(|c| columns.iter().position(|col| *col == c.trim())).collect()
@@ -59,7 +65,9 @@ pub fn render(
                 out.push(' ');
             }
         }
-        out.trim_end().to_string() + "\n"
+        // Elasticsearch writes the separator before an empty last cell
+        // too, so such a row ends in a space.
+        out + "\n"
     };
     let mut text = String::new();
     if header {
