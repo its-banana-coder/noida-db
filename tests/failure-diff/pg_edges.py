@@ -810,4 +810,17 @@ PG_EDGES.update({
         "SELECT a.name FROM dj1 a, dj1 b WHERE a.id = b.id ORDER BY a.id FOR UPDATE OF a, b",
         "SELECT name FROM dj1 ORDER BY 1 FOR KEY SHARE",
     ),
+    "pg edge: deferrable unique and primary keys": steps(
+        "CREATE TABLE du (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, k int UNIQUE DEFERRABLE, CONSTRAINT du_kk UNIQUE (k, id) DEFERRABLE INITIALLY IMMEDIATE)",
+        "INSERT INTO du VALUES (1, 1), (2, 2)",
+        "SELECT conname, condeferrable, condeferred FROM pg_constraint WHERE conrelid = 'du'::regclass ORDER BY 1",
+        "SELECT constraint_name, is_deferrable, initially_deferred FROM information_schema.table_constraints WHERE table_name = 'du' AND constraint_type <> 'CHECK' ORDER BY 1",
+        "BEGIN", "UPDATE du SET id = 3 - id", "COMMIT",
+        "SELECT * FROM du ORDER BY id",
+        "BEGIN", "INSERT INTO du VALUES (1, 5)", "SELECT count(*) FROM du", "COMMIT",
+        "BEGIN", "SET CONSTRAINTS du_k_key DEFERRED", "UPDATE du SET k = 1 WHERE id = 2", "SET CONSTRAINTS du_k_key IMMEDIATE", "ROLLBACK",
+        "BEGIN", "SET CONSTRAINTS ALL DEFERRED", "UPDATE du SET k = 1 WHERE id = 2", "UPDATE du SET k = 9 WHERE id = 1", "COMMIT",
+        "SELECT * FROM du ORDER BY id",
+        "INSERT INTO du VALUES (9, 1)",
+    ),
 })
