@@ -253,7 +253,7 @@ pub struct Client {
     /// Passed the `requirepass` check (true from the start when none is set).
     pub authenticated: bool,
     pub reply_off: bool,
-    reply_skip: bool,
+    pub(crate) reply_skip: bool,
     pub reply_skip_next: bool,
     /// Waiting in a blocking command (BLPOP and friends).
     pub blocked: Option<BlockState>,
@@ -862,7 +862,7 @@ impl Engine {
         let suppressed = client.reply_off || client.reply_skip;
         client.reply_skip = std::mem::take(&mut client.reply_skip_next);
         session.resp = client.resp;
-        if suppressed { Value::NoReply } else { reply }
+        if suppressed { pushes_only(reply) } else { reply }
     }
 
     /// Runs one command handler. If it blocks, the client is registered as
@@ -916,6 +916,20 @@ impl Engine {
             self.touch_written(args, db, before);
         }
         reply
+    }
+}
+
+/// What CLIENT REPLY OFF/SKIP still sends: pub/sub notifications go out
+/// regardless (Redis's `CLIENT_PUSHING`).
+fn pushes_only(reply: Value) -> Value {
+    match reply {
+        Value::Push(_) => reply,
+        Value::Many(items) => {
+            let pushes: Vec<Value> =
+                items.into_iter().filter(|v| matches!(v, Value::Push(_))).collect();
+            if pushes.is_empty() { Value::NoReply } else { Value::Many(pushes) }
+        }
+        _ => Value::NoReply,
     }
 }
 
