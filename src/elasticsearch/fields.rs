@@ -315,10 +315,11 @@ pub fn fetch(
             let mut src = Vec::new();
             source_leaves(source, "", &mut src);
             for (name, v) in src {
-                if glob(pat, &name) && !all.iter().any(|l| l.name == name) {
-                    if let Some(a) = out.entry(name).or_insert_with(|| json!([])).as_array_mut() {
-                        a.push(v);
-                    }
+                if glob(pat, &name)
+                    && !all.iter().any(|l| l.name == name)
+                    && let Some(a) = out.entry(name).or_insert_with(|| json!([])).as_array_mut()
+                {
+                    a.push(v);
                 }
             }
         }
