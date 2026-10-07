@@ -583,6 +583,57 @@ scenario("templates", [
     ("DELETE", "/_template/tpl-*"),
 ])
 
+# Found by the official YAML REST suite: global /_mget, mget validation and
+# per-doc errors, _source path filtering, external versions, op_type,
+# delete of a missing doc, routing (on a multi-shard index a GET without
+# the routing value misses the document), require_alias, update `_source`
+# and unknown fields, count min_score / body validation, realtime=false.
+scenario("document_apis", [
+    ("DELETE", "/docs-a"), ("DELETE", "/docs-r"),
+    ("PUT", "/docs-a", {"settings": {"number_of_replicas": 0, "refresh_interval": "-1"}}),
+    ("PUT", "/docs-a/_doc/1", {"include": {"field1": "v1", "field2": "v2"}, "count": 1}),
+    ("GET", "/docs-a/_doc/1?realtime=false"),
+    ("GET", "/docs-a/_doc/1?realtime=false&refresh=true"),
+    ("GET", "/docs-a/_doc/1?_source=include.field1"),
+    ("GET", "/docs-a/_doc/1?_source_includes=include&_source_excludes=*.field2"),
+    ("GET", "/docs-a/_source/1?_source_includes=include.field2"),
+    ("GET", "/docs-a/_doc/1?version=7"),
+    ("POST", "/_mget", {"docs": [{"_index": "docs-a", "_id": "1"}, {"_index": "docs-a", "_id": "9"},
+                                 {"_index": "docs-missing", "_id": "1"},
+                                 {"_index": "docs-a", "_id": "1", "_source": ["count"]}]}),
+    ("POST", "/docs-a/_mget", {"ids": [1, 2]}),
+    ("POST", "/_mget", {"docs": [{"_index": "docs-a"}]}),
+    ("POST", "/_mget", {"docs": [{"_id": "1"}]}),
+    ("POST", "/_mget", {}),
+    ("PUT", "/docs-a/_doc/2?version=5&version_type=external", {"a": 1}),
+    ("PUT", "/docs-a/_doc/2?version=5&version_type=external", {"a": 2}),
+    ("PUT", "/docs-a/_doc/2?version=5&version_type=external_gte", {"a": 3}),
+    ("PUT", "/docs-a/_doc/2?version=6", {"a": 4}),
+    ("PUT", "/docs-a/_doc/2?op_type=create", {"a": 5}),
+    ("PUT", "/docs-a/_create/3?version=1&version_type=external", {"a": 6}),
+    ("DELETE", "/docs-a/_doc/2?version=4&version_type=external"),
+    ("DELETE", "/docs-a/_doc/2?if_seq_no=99&if_primary_term=1"),
+    ("DELETE", "/docs-a/_doc/2?version=9&version_type=external"),
+    ("DELETE", "/docs-a/_doc/nope"),
+    ("PUT", "/docs-a/_doc/" + "x" * 513, {"a": 1}),
+    ("POST", "/docs-a/_update/1?_source=count", {"doc": {"count": 2}}),
+    ("POST", "/docs-a/_update/1", {"dac": {"count": 3}}),
+    ("PUT", "/docs-a/_doc/5?require_alias=true", {"a": 1}),
+    ("POST", "/docs-a/_refresh"),
+    ("POST", "/docs-a/_count?min_score=1", {"query": {"match_all": {}}}),
+    ("POST", "/docs-a/_count", {"match": {"a": 1}}),
+    ("PUT", "/docs-r", {"settings": {"number_of_shards": 5, "number_of_routing_shards": 5, "number_of_replicas": 0},
+                        "mappings": {"_routing": {"required": False}}}),
+    ("PUT", "/docs-r/_doc/1?routing=5", {"foo": "bar"}),
+    ("GET", "/docs-r/_doc/1?routing=5"),
+    ("GET", "/docs-r/_doc/1"),
+    ("POST", "/docs-r/_mget", {"docs": [{"_id": "1"}, {"_id": "1", "routing": "4"}, {"_id": "1", "routing": "5"}]}),
+    ("POST", "/docs-r/_update/1", {"doc": {"foo": "baz"}}),
+    ("DELETE", "/docs-r/_doc/1"),
+    ("DELETE", "/docs-r/_doc/1?routing=5"),
+    ("DELETE", "/docs-a"), ("DELETE", "/docs-r"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

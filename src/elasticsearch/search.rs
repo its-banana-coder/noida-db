@@ -95,7 +95,7 @@ pub struct CommittedDoc {
 }
 
 impl CommittedDoc {
-    fn full(&self) -> &Value {
+    pub(crate) fn full(&self) -> &Value {
         self.full_source.as_ref().unwrap_or(&self.source)
     }
 }
@@ -1258,26 +1258,78 @@ fn sort_ranked(ranked: &mut [(usize, f32)], spec: &Value, mappings: &Value, docs
     });
 }
 
-fn pick_fields(source: &Value, fields: &[String]) -> Value {
-    let mut m = Map::new();
-    if let Value::Object(src) = source {
-        for (k, v) in src {
-            if fields.iter().any(|f| field_pattern_matches(f, k)) {
-                m.insert(k.clone(), v.clone());
-            }
-        }
+/// Whether a `_source` pattern (`*` wildcards, matched against the full
+/// dotted path) matches `path`.
+fn source_pattern(pattern: &str, path: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == path;
     }
-    Value::Object(m)
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = path.chars().collect();
+    glob_match(&p, &t)
 }
 
-/// A `_source` include/exclude pattern: an exact field, a `prefix*`
-/// wildcard, or a dotted path naming a field inside an object (matched at
-/// its top-level key).
-fn field_pattern_matches(pattern: &str, key: &str) -> bool {
-    match pattern.strip_suffix('*') {
-        Some(prefix) => key.starts_with(prefix),
-        None => pattern == key || pattern.split('.').next() == Some(key),
+/// Whether `path` is an object some include pattern may reach into.
+fn may_contain_match(includes: &[String], path: &str) -> bool {
+    let prefix = format!("{path}.");
+    includes.iter().any(|p| {
+        p.starts_with(&prefix) || p.split('.').next().is_some_and(|first| first.contains('*'))
+    })
+}
+
+/// Elasticsearch's `_source` filtering: includes and excludes are paths
+/// (with `*` wildcards) into the document; an included object keeps its
+/// whole subtree, minus any excluded paths.
+fn filter_value(
+    v: &Value,
+    path: &str,
+    includes: &[String],
+    excludes: &[String],
+    included: bool,
+) -> Option<Value> {
+    match v {
+        Value::Object(m) => {
+            let mut out = Map::new();
+            for (k, x) in m {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                if excludes.iter().any(|e| source_pattern(e, &p)) {
+                    continue;
+                }
+                let inc = included || includes.iter().any(|i| source_pattern(i, &p));
+                if !inc && !x.is_object() && !x.is_array() {
+                    continue;
+                }
+                if !inc && x.is_object() && !may_contain_match(includes, &p) {
+                    continue;
+                }
+                if let Some(f) = filter_value(x, &p, includes, excludes, inc) {
+                    out.insert(k.clone(), f);
+                }
+            }
+            if out.is_empty() && !included && !path.is_empty() {
+                None
+            } else {
+                Some(Value::Object(out))
+            }
+        }
+        Value::Array(a) => {
+            let items: Vec<Value> = a
+                .iter()
+                .filter_map(|x| match x {
+                    Value::Object(_) | Value::Array(_) => {
+                        filter_value(x, path, includes, excludes, included)
+                    }
+                    other => included.then(|| other.clone()),
+                })
+                .collect();
+            if items.is_empty() && !included { None } else { Some(Value::Array(items)) }
+        }
+        other => included.then(|| other.clone()),
     }
+}
+
+fn filter_paths(source: &Value, includes: &[String], excludes: &[String]) -> Value {
+    filter_value(source, "", includes, excludes, includes.is_empty()).unwrap_or_else(|| json!({}))
 }
 
 pub fn filter_source(source: &Value, filter: Option<&Value>) -> Value {
@@ -1285,35 +1337,26 @@ pub fn filter_source(source: &Value, filter: Option<&Value>) -> Value {
 }
 
 fn apply_source_filter(source: &Value, filter: Option<&Value>) -> Value {
+    let strings = |v: Option<&Value>| -> Vec<String> {
+        match v {
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => {
+                a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
     match filter {
         None => source.clone(),
         Some(Value::Bool(false)) => Value::Null,
         Some(Value::Bool(true)) => source.clone(),
-        Some(Value::String(s)) => pick_fields(source, std::slice::from_ref(s)),
-        Some(Value::Array(a)) => {
-            let fields: Vec<String> =
-                a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect();
-            pick_fields(source, &fields)
+        Some(v @ (Value::String(_) | Value::Array(_))) => {
+            filter_paths(source, &strings(Some(v)), &[])
         }
         Some(Value::Object(o)) => {
-            let includes: Vec<String> = o
-                .get("includes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let excludes: Vec<String> = o
-                .get("excludes")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            let mut result =
-                if includes.is_empty() { source.clone() } else { pick_fields(source, &includes) };
-            if let Value::Object(m) = &mut result {
-                m.retain(|k, _| {
-                    !excludes.iter().any(|e| field_pattern_matches(e, k) && !e.contains('.'))
-                });
-            }
-            result
+            let includes = strings(o.get("includes").or_else(|| o.get("include")));
+            let excludes = strings(o.get("excludes").or_else(|| o.get("exclude")));
+            filter_paths(source, &includes, &excludes)
         }
         _ => source.clone(),
     }
@@ -2313,7 +2356,11 @@ pub fn count(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<u6
     let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
     let view = root_view(mappings, docs);
     let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
-    Ok(eval(&query, mappings, docs)?.len() as u64)
+    let scores = eval(&query, mappings, docs)?;
+    Ok(match body.get("min_score").and_then(Value::as_f64) {
+        Some(min) => scores.values().filter(|s| **s >= min as f32).count() as u64,
+        None => scores.len() as u64,
+    })
 }
 
 #[cfg(test)]
