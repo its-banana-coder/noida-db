@@ -122,3 +122,17 @@ fn searches_that_store() {
         err("ERR GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options")
     );
 }
+
+#[test]
+fn count_without_order_sorts_nearest_first() {
+    let mut t = T::new();
+    t.run(
+        "GEOADD nyc -73.9454966 40.747533 \"lic market\" -73.9733487 40.7648057 \"central park n/q/r\" \
+         -73.9903085 40.7362513 \"union square\" -74.0131604 40.7126674 \"wtc one\" \
+         -73.7858139 40.6428986 jfk -73.9375699 40.7498929 q4 -73.9564142 40.7480973 4545",
+    );
+    assert_eq!(
+        t.run("GEORADIUS nyc -73.9798091 40.7598464 10 km COUNT 3"),
+        bulks(&["central park n/q/r", "4545", "union square"])
+    );
+}

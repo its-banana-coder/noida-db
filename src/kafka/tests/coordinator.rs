@@ -358,3 +358,84 @@ fn test_concurrent_join_blocks_until_rebalance_completes() {
     assert_eq!(resp1.generation_id, 1);
     assert_eq!(resp2.generation_id, 1);
 }
+
+/// KIP-345 static membership, as a consumer with group.instance.id sees it
+/// on Kafka 3.8: no MEMBER_ID_REQUIRED round; a restarted instance (same
+/// group.instance.id) replaces the old member without a rebalance and keeps
+/// its assignment; the old member id is fenced; it can be removed by
+/// instance id. (Found: noida treated the restarted instance as a second
+/// member and never reported the instance id.)
+#[test]
+fn test_static_membership_replaces_member_without_rebalance() {
+    use kafka_protocol::messages::DescribeGroupsRequest;
+    use kafka_protocol::messages::leave_group_request::MemberIdentity;
+    let t = T::new();
+    let mut join = JoinGroupRequest::default();
+    join.group_id = GroupId(StrBytes::from_static_str("static-grp"));
+    join.group_instance_id = Some(StrBytes::from_static_str("inst-1"));
+    join.session_timeout_ms = 10_000;
+    join.rebalance_timeout_ms = 10_000;
+    join.protocol_type = StrBytes::from_static_str("consumer");
+    join.protocols.push(
+        JoinGroupRequestProtocol::default()
+            .with_name(StrBytes::from_static_str("range"))
+            .with_metadata(bytes::Bytes::from_static(b"sub")),
+    );
+    let first = t.engine.handle_join_group(&join, 5);
+    assert_eq!(first.error_code, 0, "a static member needs no MEMBER_ID_REQUIRED round");
+    assert_eq!(first.leader, first.member_id);
+    let generation = first.generation_id;
+
+    let mut sync = SyncGroupRequest::default();
+    sync.group_id = join.group_id.clone();
+    sync.member_id = first.member_id.clone();
+    sync.group_instance_id = Some(StrBytes::from_static_str("inst-1"));
+    sync.generation_id = generation;
+    sync.assignments.push(
+        SyncGroupRequestAssignment::default()
+            .with_member_id(first.member_id.clone())
+            .with_assignment(bytes::Bytes::from_static(b"p0,p1")),
+    );
+    assert_eq!(t.engine.handle_sync_group(&sync, 3).error_code, 0);
+
+    // The same instance restarts: a new member id, same generation.
+    let second = t.engine.handle_join_group(&join, 5);
+    assert_eq!(second.error_code, 0);
+    assert_ne!(second.member_id, first.member_id);
+    assert_eq!(second.generation_id, generation, "no rebalance");
+
+    let mut describe = DescribeGroupsRequest::default();
+    describe.groups.push(join.group_id.clone());
+    let d = t.engine.handle_describe_groups(&describe, 5);
+    let g = &d.groups[0];
+    assert_eq!(g.group_state.as_str(), "Stable");
+    assert_eq!(g.members.len(), 1);
+    assert_eq!(g.members[0].member_id, second.member_id);
+    assert_eq!(g.members[0].group_instance_id.as_deref(), Some("inst-1"));
+
+    // The old instance is fenced; the new one keeps the assignment.
+    let mut hb = HeartbeatRequest::default();
+    hb.group_id = join.group_id.clone();
+    hb.member_id = first.member_id.clone();
+    hb.group_instance_id = Some(StrBytes::from_static_str("inst-1"));
+    hb.generation_id = generation;
+    assert_eq!(t.engine.handle_heartbeat(&hb, 3).error_code, 82);
+    hb.member_id = second.member_id.clone();
+    assert_eq!(t.engine.handle_heartbeat(&hb, 3).error_code, 0);
+    sync.member_id = second.member_id.clone();
+    sync.assignments.clear();
+    let s2 = t.engine.handle_sync_group(&sync, 3);
+    assert_eq!(s2.error_code, 0);
+    assert_eq!(&s2.assignment[..], b"p0,p1");
+
+    // Removed by instance id (AdminClient.removeMembersFromConsumerGroup).
+    let mut leave = LeaveGroupRequest::default();
+    leave.group_id = join.group_id.clone();
+    leave.members.push(
+        MemberIdentity::default().with_group_instance_id(Some(StrBytes::from_static_str("inst-1"))),
+    );
+    let l = t.engine.handle_leave_group(&leave, 4);
+    assert_eq!(l.members[0].error_code, 0);
+    let d = t.engine.handle_describe_groups(&describe, 5);
+    assert_eq!(d.groups[0].group_state.as_str(), "Empty");
+}

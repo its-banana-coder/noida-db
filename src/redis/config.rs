@@ -331,8 +331,16 @@ fn config_set(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             Err(msg) => return Err(fail(&msg)),
         }
     }
+    let mut maxmemory_changed = false;
     for (p, v) in pending {
+        maxmemory_changed |= canonical(p).name == "maxmemory";
         ctx.engine.config.set(p, v);
+    }
+    // A lower maxmemory evicts right away (Redis starts its eviction cycle
+    // on the change), not only when the next command comes in.
+    let maxmemory = ctx.engine.config_num("maxmemory");
+    if maxmemory_changed && maxmemory > 0 {
+        ctx.engine.perform_evictions(maxmemory as u64);
     }
     Ok(Value::ok())
 }

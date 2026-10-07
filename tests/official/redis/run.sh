@@ -30,6 +30,7 @@ for f in $files; do
   # or with active expire off; reset before the next file.
   timeout 10 redis-cli -p "$port" client unpause >/dev/null 2>&1 || true
   timeout 10 redis-cli -p "$port" debug set-active-expire 1 >/dev/null 2>&1 || true
+  timeout 10 redis-cli -p "$port" config set maxmemory 0 >/dev/null 2>&1 || true
   timeout 60 redis-cli -p "$port" flushall >/dev/null 2>&1 || true
 done
 strip() { sed 's/\x1b\[[0-9;]*m//g' "$out"; }

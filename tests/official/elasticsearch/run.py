@@ -247,11 +247,23 @@ class Runner:
         if path in ("$body", ""):
             return self.response
         cur = self.response
-        segs = re.split(r"(?<!\\)\.", path)
+        # As the Java runner's ObjectPath: a backslash escapes the next
+        # dot and is itself dropped (`a\.b` and `a\\.b` both name key "a.b").
+        segs, cur_seg, escape = [], [], False
+        for ch in path:
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "." and not escape:
+                segs.append("".join(cur_seg))
+                cur_seg = []
+                continue
+            escape = False
+            cur_seg.append(ch)
+        segs.append("".join(cur_seg))
         for seg in segs:
             if seg == "_arbitrary_key_" and isinstance(cur, dict) and cur:
                 return next(iter(cur))
-            seg = seg.replace("\\.", ".")
             if seg.startswith("$") and seg[1:] in self.stash:
                 seg = str(self.stash[seg[1:]])
             elif "${" in seg:
@@ -439,6 +451,18 @@ class Runner:
             for name in json.loads(raw) if status == 200 else {}:
                 if not name.startswith("."):
                     calls.append(("DELETE", "/_template/" + urllib.parse.quote(name), {}))
+        except Exception:  # noqa: BLE001
+            pass
+        # Cluster settings a test changed go back to their defaults (the
+        # Java runner does the same): a leftover
+        # `cluster.routing.allocation.enable: none` breaks every later test.
+        try:
+            status, raw, _ = self.http("GET", "/_cluster/settings", {"flat_settings": "true"}, None, {}, False)
+            cur = json.loads(raw) if status == 200 else {}
+            keep = {"action.destructive_requires_name"}
+            reset = {k: {n: None for n in (cur.get(k) or {}) if n not in keep} for k in ("persistent", "transient")}
+            if any(reset.values()):
+                self.http("PUT", "/_cluster/settings", {}, reset, {}, False)
         except Exception:  # noqa: BLE001
             pass
         for method, path, q in calls:

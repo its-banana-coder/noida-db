@@ -178,13 +178,16 @@ fn generic(ctx: &mut Ctx, a: &[Vec<u8>], read_only: bool) -> Reply {
     let n = values.len() as i64;
     let list: VecDeque<Vec<u8>> = values.into_iter().map(Option::unwrap_or_default).collect();
     let now = ctx.now;
+    let db = ctx.db_index();
     if list.is_empty() {
         if ctx.db().remove(&dest, now).is_some() {
             ctx.notify_keyspace_event('g', "del", &dest);
+            ctx.engine.touch(db, &dest);
         }
     } else {
         ctx.db().insert(dest.clone(), Entry::new(Data::List(list)));
         ctx.notify_keyspace_event('l', "sortstore", &dest);
+        ctx.engine.touch(db, &dest);
     }
     Ok(Value::Integer(n))
 }

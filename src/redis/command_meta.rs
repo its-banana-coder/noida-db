@@ -433,6 +433,99 @@ fn getkeys_proc(name: &str, argv: &[Vec<u8>]) -> Vec<(usize, &'static [&'static 
                 if has_get { &["rw", "access", "update"] } else { &["ow", "update"] };
             vec![(1, flags)]
         }
+        "sortGetKeys" => {
+            const RO: &[&str] = &["ro", "access"];
+            const OW: &[&str] = &["ow", "update"];
+            let mut keys = vec![(1, RO)];
+            let mut store = None;
+            let mut i = 2;
+            while i < argv.len() {
+                let a = &argv[i];
+                if a.eq_ignore_ascii_case(b"limit") {
+                    i += 2;
+                } else if a.eq_ignore_ascii_case(b"get") || a.eq_ignore_ascii_case(b"by") {
+                    i += 1;
+                } else if a.eq_ignore_ascii_case(b"store") && i + 1 < argv.len() {
+                    // The last STORE wins, as in SORT.
+                    store = Some(i + 1);
+                }
+                i += 1;
+            }
+            if let Some(pos) = store {
+                keys.push((pos, OW));
+            }
+            keys
+        }
+        "georadiusGetKeys" => {
+            let mut keys = vec![(1, &["ro", "access"][..])];
+            let mut stored = None;
+            let mut i = 5;
+            while i < argv.len() {
+                let a = &argv[i];
+                if (a.eq_ignore_ascii_case(b"store") || a.eq_ignore_ascii_case(b"storedist"))
+                    && i + 1 < argv.len()
+                {
+                    stored = Some(i + 1);
+                    i += 1;
+                }
+                i += 1;
+            }
+            if let Some(pos) = stored {
+                keys.push((pos, &["ow", "update"][..]));
+            }
+            keys
+        }
+        "xreadGetKeys" => {
+            let mut streams = None;
+            let mut i = 1;
+            while i < argv.len() {
+                let a = &argv[i];
+                if a.eq_ignore_ascii_case(b"block") || a.eq_ignore_ascii_case(b"count") {
+                    i += 1;
+                } else if a.eq_ignore_ascii_case(b"group") {
+                    i += 2;
+                } else if a.eq_ignore_ascii_case(b"noack") {
+                } else if a.eq_ignore_ascii_case(b"streams") {
+                    streams = Some(i);
+                    break;
+                } else {
+                    break;
+                }
+                i += 1;
+            }
+            let Some(sp) = streams else { return vec![] };
+            let num = argv.len() - sp - 1;
+            if num == 0 || !num.is_multiple_of(2) {
+                return vec![];
+            }
+            // XREADGROUP's keys are reported RO too, as Redis does.
+            (sp + 1..sp + 1 + num / 2).map(|p| (p, &["ro", "access"][..])).collect()
+        }
+        "bitfieldGetKeys" => {
+            let mut readonly = true;
+            let mut i = 2;
+            while i < argv.len() {
+                let rem = argv.len() - i - 1;
+                let a = &argv[i];
+                if a.eq_ignore_ascii_case(b"get") && rem >= 2 {
+                    i += 2;
+                } else if (a.eq_ignore_ascii_case(b"set") || a.eq_ignore_ascii_case(b"incrby"))
+                    && rem >= 3
+                {
+                    readonly = false;
+                    break;
+                } else if a.eq_ignore_ascii_case(b"overflow") && rem >= 1 {
+                    i += 1;
+                } else {
+                    readonly = false;
+                    break;
+                }
+                i += 1;
+            }
+            let flags: &'static [&'static str] =
+                if readonly { &["ro", "access"] } else { &["rw", "access", "update"] };
+            vec![(1, flags)]
+        }
         _ => vec![],
     }
 }

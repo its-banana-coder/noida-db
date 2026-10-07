@@ -2470,6 +2470,12 @@ impl Binder {
                         );
                     }
                     BinaryOperator::MyIntegerDivide => return call("DIV", vec![l, r]),
+                    BinaryOperator::BitwiseAnd => return call("&", vec![l, r]),
+                    BinaryOperator::BitwiseOr => return call("|", vec![l, r]),
+                    BinaryOperator::BitwiseXor => return call("^", vec![l, r]),
+                    BinaryOperator::PGBitwiseShiftLeft => return call("<<", vec![l, r]),
+                    BinaryOperator::PGBitwiseShiftRight => return call(">>", vec![l, r]),
+                    BinaryOperator::Xor => return call("XOR", vec![l, r]),
                     _ => {}
                 }
                 match op {
@@ -2606,6 +2612,9 @@ impl Binder {
                 })
             }
             AstExpr::UnaryOp { op: UnaryOperator::Plus, expr } => self.bind_expr(*expr),
+            AstExpr::UnaryOp { op: UnaryOperator::BitwiseNot, expr } => {
+                Ok(Expr::Call { name: "~".into(), args: vec![self.bind_expr(*expr)?] })
+            }
             AstExpr::IsNull(e) => Ok(Expr::IsNull(Box::new(self.bind_expr(*e)?), false)),
             AstExpr::IsNotNull(e) => Ok(Expr::IsNull(Box::new(self.bind_expr(*e)?), true)),
             AstExpr::Between { expr, negated, low, high } => {
@@ -2734,7 +2743,8 @@ impl Binder {
                     Err(MySqlError::unsupported("COUNT argument list"))
                 }
             }
-            "SUM" | "AVG" | "MIN" | "MAX" => {
+            "SUM" | "AVG" | "MIN" | "MAX" | "STD" | "STDDEV" | "STDDEV_POP" | "STDDEV_SAMP"
+            | "VARIANCE" | "VAR_POP" | "VAR_SAMP" | "BIT_AND" | "BIT_OR" | "BIT_XOR" => {
                 if args.len() != 1 {
                     return Err(MySqlError::unsupported(&format!("{upper} argument list")));
                 }
@@ -2744,6 +2754,13 @@ impl Binder {
                     "AVG" => AggFunc::Avg,
                     "MIN" => AggFunc::Min,
                     "MAX" => AggFunc::Max,
+                    "STD" | "STDDEV" | "STDDEV_POP" => AggFunc::StdPop,
+                    "STDDEV_SAMP" => AggFunc::StdSamp,
+                    "VARIANCE" | "VAR_POP" => AggFunc::VarPop,
+                    "VAR_SAMP" => AggFunc::VarSamp,
+                    "BIT_AND" => AggFunc::BitAnd,
+                    "BIT_OR" => AggFunc::BitOr,
+                    "BIT_XOR" => AggFunc::BitXor,
                     _ => unreachable!(),
                 };
                 Ok(Expr::Agg { func: agg_func, arg: Some(Box::new(arg)), distinct: agg_distinct })
@@ -2966,9 +2983,6 @@ impl Binder {
             | "JSON_OVERLAPS"
             | "JSON_PRETTY"
             | "NOIDA_EXTRACT"
-            | "WEEK"
-            | "WEEKOFYEAR"
-            | "YEARWEEK"
             | "MICROSECOND"
             | "MD5"
             | "SHA"
@@ -2977,7 +2991,31 @@ impl Binder {
             | "CRC32"
             | "TO_BASE64"
             | "FROM_BASE64"
-            | "UNHEX" => {
+            | "UNHEX"
+            | "PI"
+            | "ACOS"
+            | "ASIN"
+            | "ATAN"
+            | "ATAN2"
+            | "COS"
+            | "COT"
+            | "SIN"
+            | "TAN"
+            | "DEGREES"
+            | "RADIANS"
+            | "EXP"
+            | "LN"
+            | "LOG"
+            | "LOG2"
+            | "LOG10"
+            | "RAND"
+            | "ORD"
+            | "WEEK"
+            | "YEARWEEK"
+            | "WEEKOFYEAR"
+            | "MAKEDATE"
+            | "TIME_TO_SEC"
+            | "SEC_TO_TIME" => {
                 let bound_args =
                     args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<_, _>>()?;
                 Ok(Expr::Call { name: upper, args: bound_args })

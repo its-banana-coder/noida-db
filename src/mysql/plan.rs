@@ -34,6 +34,16 @@ pub enum AggFunc {
     Max,
     /// `GROUP_CONCAT`; its argument is a `GROUP_CONCAT` call (see the binder).
     GroupConcat,
+    /// `STDDEV_POP`/`STD`/`STDDEV`, `STDDEV_SAMP`, `VAR_POP`/`VARIANCE`,
+    /// `VAR_SAMP`: DOUBLE results.
+    StdPop,
+    StdSamp,
+    VarPop,
+    VarSamp,
+    /// `BIT_AND`/`BIT_OR`/`BIT_XOR`: unsigned 64-bit.
+    BitAnd,
+    BitOr,
+    BitXor,
 }
 
 #[derive(Clone, Debug, PartialEq)]

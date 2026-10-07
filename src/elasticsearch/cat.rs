@@ -20,6 +20,38 @@ pub fn render(
         let text: String = columns.iter().map(|c| format!("{c:<w$} | {c} | {c}\n")).collect();
         return json!({ RAW_TEXT: text });
     }
+    // `?s=col[:asc|desc],...` sorts the rows.
+    let mut rows = rows;
+    if let Some(spec) = q.get("s") {
+        let keys: Vec<(usize, bool)> = spec
+            .split(',')
+            .filter_map(|k| {
+                let (name, dir) = k.trim().split_once(':').unwrap_or((k.trim(), "asc"));
+                let name = match name {
+                    "a" => "alias",
+                    "i" | "idx" => "index",
+                    "n" => "name",
+                    other => other,
+                };
+                columns.iter().position(|c| *c == name).map(|i| (i, dir == "desc"))
+            })
+            .collect();
+        rows.sort_by(|x, y| {
+            for &(i, desc) in &keys {
+                let ord = if numeric.contains(&columns[i]) {
+                    let p = |s: &str| s.parse::<f64>().unwrap_or(f64::MIN);
+                    p(&x[i]).partial_cmp(&p(&y[i])).unwrap_or(std::cmp::Ordering::Equal)
+                } else {
+                    x[i].cmp(&y[i])
+                };
+                let ord = if desc { ord.reverse() } else { ord };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
     let wanted: Vec<usize> = match q.get("h") {
         Some(h) => {
             h.split(',').filter_map(|c| columns.iter().position(|col| *col == c.trim())).collect()

@@ -159,6 +159,150 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             }
             Value::Float(value_to_f64(&a[0]).powf(value_to_f64(&a[1])))
         }
+        // ---- bit operators (unsigned 64-bit, as in MySQL) ----
+        "&" | "|" | "^" | "<<" | ">>" => {
+            need(2)?;
+            if any_null(2) {
+                return Ok(Value::Null);
+            }
+            let (x, y) = (to_u64(&a[0]), to_u64(&a[1]));
+            from_u64(match name {
+                "&" => x & y,
+                "|" => x | y,
+                "^" => x ^ y,
+                "<<" => x.checked_shl(y.min(64) as u32).unwrap_or(0),
+                _ => x.checked_shr(y.min(64) as u32).unwrap_or(0),
+            })
+        }
+        "~" => {
+            need(1)?;
+            if any_null(1) {
+                return Ok(Value::Null);
+            }
+            from_u64(!to_u64(&a[0]))
+        }
+        "XOR" => {
+            need(2)?;
+            if any_null(2) {
+                return Ok(Value::Null);
+            }
+            Value::Int(i64::from(truthy(&a[0]) != truthy(&a[1])))
+        }
+
+        // ---- floating-point math (NULL outside the domain) ----
+        "PI" => Value::Float(std::f64::consts::PI),
+        "ACOS" | "ASIN" | "ATAN" | "ATAN2" | "COS" | "COT" | "SIN" | "TAN" | "DEGREES"
+        | "RADIANS" | "EXP" | "LN" | "LOG" | "LOG2" | "LOG10" => {
+            need(1)?;
+            let two = a.len() == 2 && matches!(name, "ATAN" | "ATAN2" | "LOG");
+            if a.len() > 1 + usize::from(two) || (name == "ATAN2" && !two) {
+                return Err(MySqlError::new(
+                    1582,
+                    "42000",
+                    format!("Incorrect parameter count in the call to native function '{name}'"),
+                ));
+            }
+            if any_null(a.len()) {
+                return Ok(Value::Null);
+            }
+            let x = value_to_f64(&a[0]);
+            let r = if two {
+                let y = value_to_f64(&a[1]);
+                match name {
+                    // LOG(b, x): log of x in base b.
+                    "LOG" => {
+                        if x <= 0.0 || x == 1.0 || y <= 0.0 {
+                            return Ok(Value::Null);
+                        }
+                        y.ln() / x.ln()
+                    }
+                    _ => x.atan2(y),
+                }
+            } else {
+                match name {
+                    "ACOS" | "ASIN" if !(-1.0..=1.0).contains(&x) => return Ok(Value::Null),
+                    "ACOS" => x.acos(),
+                    "ASIN" => x.asin(),
+                    "ATAN" => x.atan(),
+                    "COS" => x.cos(),
+                    "SIN" => x.sin(),
+                    "TAN" => x.tan(),
+                    "COT" => {
+                        let t = x.tan();
+                        if t == 0.0 {
+                            return Err(MySqlError::new(
+                                1690,
+                                "22003",
+                                format!(
+                                    "DOUBLE value is out of range in 'cot({})'",
+                                    render_text(&a[0])
+                                ),
+                            ));
+                        }
+                        1.0 / t
+                    }
+                    "DEGREES" => x.to_degrees(),
+                    "RADIANS" => x.to_radians(),
+                    "EXP" => {
+                        let r = x.exp();
+                        if r.is_infinite() {
+                            return Err(MySqlError::new(
+                                1690,
+                                "22003",
+                                format!(
+                                    "DOUBLE value is out of range in 'exp({})'",
+                                    render_text(&a[0])
+                                ),
+                            ));
+                        }
+                        r
+                    }
+                    _ if x <= 0.0 => return Ok(Value::Null),
+                    "LN" | "LOG" => x.ln(),
+                    "LOG2" => x.log2(),
+                    _ => x.log10(),
+                }
+            };
+            Value::Float(r)
+        }
+        // RAND(): uniform in [0, 1). RAND(n) uses MySQL's own generator,
+        // so it gives the same first value MySQL does for that seed.
+        "RAND" => {
+            let seed = match a.first() {
+                Some(v) if !v.is_null() => Some(value_to_f64(v) as i64 as u64),
+                Some(_) => Some(0),
+                None => None,
+            };
+            Value::Float(match seed {
+                Some(s) => {
+                    const MAX: u64 = 0x3FFF_FFFF;
+                    // MySQL seeds in 32-bit arithmetic.
+                    let s = s as u32;
+                    let mut s1 = u64::from(s.wrapping_mul(0x10001).wrapping_add(55_555_555)) % MAX;
+                    let s2 = u64::from(s.wrapping_mul(0x1000_0001)) % MAX;
+                    s1 = (s1 * 3 + s2) % MAX;
+                    s1 as f64 / MAX as f64
+                }
+                None => random_f64(),
+            })
+        }
+        "ORD" => {
+            need(1)?;
+            match &a[0] {
+                Value::Null => Value::Null,
+                v => {
+                    let bytes: Vec<u8> = match v {
+                        Value::Bytes(b) => b.first().map(|b| vec![*b]).unwrap_or_default(),
+                        v => render_text(v)
+                            .chars()
+                            .next()
+                            .map(|c| c.to_string().into_bytes())
+                            .unwrap_or_default(),
+                    };
+                    Value::Int(bytes.iter().fold(0i64, |acc, b| acc * 256 + i64::from(*b)))
+                }
+            }
+        }
         "SQRT" => {
             need(1)?;
             if any_null(1) {
@@ -360,24 +504,6 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             Some(t) => Value::Int(field(name, t)),
             None => Value::Null,
         },
-        "WEEK" | "WEEKOFYEAR" | "YEARWEEK" => {
-            need(1)?;
-            let mode = match name {
-                "WEEKOFYEAR" => Some(3),
-                _ => match a.get(1) {
-                    Some(v) if v.is_null() => None,
-                    Some(v) => Some(value_to_f64(v) as i64),
-                    None => Some(0),
-                },
-            };
-            match (to_ts(&arg(0)), mode) {
-                (Some(t), Some(mode)) => {
-                    let (y, w) = week(t, mode, name == "YEARWEEK");
-                    Value::Int(if name == "YEARWEEK" { y * 100 + w } else { w })
-                }
-                _ => Value::Null,
-            }
-        }
         "EXTRACT" | "NOIDA_EXTRACT" => {
             need(2)?;
             let unit = text(0).unwrap_or_default();
@@ -385,6 +511,67 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
                 Some(t) => Value::Int(field(&unit, t)),
                 None => Value::Null,
             }
+        }
+        // WEEK(d[, mode]) / YEARWEEK(d[, mode]) / WEEKOFYEAR(d): MySQL's
+        // own week numbering (`calc_week`).
+        "WEEK" | "YEARWEEK" | "WEEKOFYEAR" => {
+            need(1)?;
+            let Some(t) = to_ts(&arg(0)) else { return Ok(Value::Null) };
+            let mode = match name {
+                "WEEKOFYEAR" => 3,
+                _ => match a.get(1) {
+                    Some(Value::Null) => return Ok(Value::Null),
+                    Some(v) => value_to_f64(v) as i64,
+                    None => 0,
+                },
+            };
+            let mut behaviour = week_mode(mode);
+            if name == "YEARWEEK" {
+                behaviour |= WEEK_YEAR;
+            }
+            let (year, week) = calc_week(t.div_euclid(USECS_PER_DAY) as i32, behaviour);
+            Value::Int(if name == "YEARWEEK" { year * 100 + week } else { week })
+        }
+        // MAKEDATE(year, dayofyear).
+        "MAKEDATE" => {
+            need(2)?;
+            let (Some(y), Some(n)) = (int(0), int(1)) else { return Ok(Value::Null) };
+            let y = match y {
+                0..=69 => y + 2000,
+                70..=99 => y + 1900,
+                _ => y,
+            };
+            if n <= 0 || !(0..=9999).contains(&y) {
+                return Ok(Value::Null);
+            }
+            let d = date_from_ymd(y, 1, 1) as i64 + n - 1;
+            if ymd_from_date(d as i32).0 > 9999 {
+                return Ok(Value::Null);
+            }
+            Value::Date(d as i32)
+        }
+        "TIME_TO_SEC" => {
+            need(1)?;
+            let us = match &a[0] {
+                Value::Null => return Ok(Value::Null),
+                Value::Time(t) => *t,
+                Value::Ts(t) => t.rem_euclid(USECS_PER_DAY),
+                v => match crate::mysql::exec::parse_mysql_time(&render_text(v)) {
+                    Some(t) => t,
+                    None => return Ok(Value::Null),
+                },
+            };
+            // Whole seconds: a fraction is dropped.
+            Value::Int(us / USECS_PER_SEC)
+        }
+        "SEC_TO_TIME" => {
+            need(1)?;
+            if any_null(1) {
+                return Ok(Value::Null);
+            }
+            let us = (value_to_f64(&a[0]) * 1e6).round() as i64;
+            let max = crate::mysql::exec::MAX_MYSQL_TIME;
+            Value::Time(us.clamp(-max, max))
         }
         "LAST_DAY" => match to_ts(&arg(0)) {
             Some(t) => {
@@ -892,7 +1079,7 @@ fn field(unit: &str, t: i64) -> i64 {
         "DAYOFWEEK" => dow + 1,
         "WEEKDAY" => (dow + 6) % 7,
         "DAYOFYEAR" => days - date_from_ymd(y, 1, 1) as i64 + 1,
-        "WEEK" => week(t, 0, false).1,
+        "WEEK" => calc_week(days as i32, week_mode(0)).1,
         // Compound units: the fields' digits run together.
         "YEAR_MONTH" => y * 100 + m as i64,
         _ => compound(unit, d as i64, us).unwrap_or(0),
@@ -916,56 +1103,6 @@ fn compound(unit: &str, day: i64, us: i64) -> Option<i64> {
         (us % USECS_PER_SEC, 1_000_000),
     ];
     Some(vals[lo..=hi].iter().fold(0, |acc, (v, width)| acc * width + v))
-}
-
-/// MySQL's `calc_week`: (year, week) of timestamp `t` in `WEEK()` mode
-/// `mode` (0-7); `year_week` is YEARWEEK's behaviour (weeks belong to
-/// the year they mostly fall in, never week 0).
-fn week(t: i64, mode: i64, year_week: bool) -> (i64, i64) {
-    const MONDAY_FIRST: i64 = 1;
-    const WEEK_YEAR: i64 = 2;
-    const FIRST_WEEKDAY: i64 = 4;
-    let mut b = mode & 7;
-    if b & MONDAY_FIRST == 0 {
-        b ^= FIRST_WEEKDAY;
-    }
-    if year_week {
-        b |= WEEK_YEAR;
-    }
-    let daynr = t.div_euclid(USECS_PER_DAY);
-    let (y, m, d) = ymd_from_date(daynr as i32);
-    let mut year = y;
-    let mut first_daynr = date_from_ymd(y, 1, 1) as i64;
-    let monday_first = b & MONDAY_FIRST != 0;
-    let mut week_year = b & WEEK_YEAR != 0;
-    let first_weekday = b & FIRST_WEEKDAY != 0;
-    // 0 = the week's first day (2000-01-01 was a Saturday).
-    let weekday_of = |n: i64| (n + if monday_first { 5 } else { 6 }).rem_euclid(7);
-    let days_in = |yr: i64| if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
-    let mut weekday = weekday_of(first_daynr);
-    let short_first = |wd: i64| (first_weekday && wd != 0) || (!first_weekday && wd >= 4);
-    if m == 1 && (d as i64) <= 7 - weekday {
-        if !week_year && short_first(weekday) {
-            return (year, 0);
-        }
-        week_year = true;
-        year -= 1;
-        let n = days_in(year);
-        first_daynr -= n;
-        weekday = (weekday + 53 * 7 - n) % 7;
-    }
-    let days = if short_first(weekday) {
-        daynr - (first_daynr + (7 - weekday))
-    } else {
-        daynr - (first_daynr - weekday)
-    };
-    if week_year && days >= 52 * 7 {
-        let wd = (weekday + days_in(year)) % 7;
-        if (!first_weekday && wd < 4) || (first_weekday && wd == 0) {
-            return (year + 1, 1);
-        }
-    }
-    (year, days / 7 + 1)
 }
 
 const MONTHS: [&str; 12] = [
@@ -1555,4 +1692,118 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !c
+}
+
+/// A value as MySQL's bit operators see it: an unsigned 64-bit integer
+/// (negative integers wrap, fractions round, strings read their number).
+pub(crate) fn to_u64(v: &Value) -> u64 {
+    match v {
+        Value::Int(i) => *i as u64,
+        Value::Bool(b) => u64::from(*b),
+        Value::Num(n) => {
+            let r = n.round(0);
+            match r.to_i64() {
+                Some(i) => i as u64,
+                None if r.is_negative() => i64::MIN as u64,
+                None => r.to_string().parse::<u64>().unwrap_or(u64::MAX),
+            }
+        }
+        other => {
+            let f = value_to_f64(other).round();
+            if f < 0.0 {
+                (f.max(i64::MIN as f64) as i64) as u64
+            } else if f >= u64::MAX as f64 {
+                u64::MAX
+            } else {
+                f as u64
+            }
+        }
+    }
+}
+
+/// An unsigned 64-bit result: an integer when it fits, else a DECIMAL.
+pub(crate) fn from_u64(u: u64) -> Value {
+    match i64::try_from(u) {
+        Ok(i) => Value::Int(i),
+        Err(_) => Value::Num(Numeric::parse(&u.to_string()).unwrap_or_else(|_| Numeric::zero())),
+    }
+}
+
+/// A pseudo-random double in [0, 1) for `RAND()` (no seed).
+fn random_f64() -> f64 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new({
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15);
+            t | 1
+        });
+    }
+    STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
+const WEEK_MONDAY_FIRST: u32 = 1;
+const WEEK_YEAR: u32 = 2;
+const WEEK_FIRST_WEEKDAY: u32 = 4;
+
+/// MySQL's `week_mode`: WEEK()'s mode argument as calc_week flags.
+fn week_mode(mode: i64) -> u32 {
+    let mut f = (mode & 7) as u32;
+    if f & WEEK_MONDAY_FIRST == 0 {
+        f ^= WEEK_FIRST_WEEKDAY;
+    }
+    f
+}
+
+fn days_in_year(y: i64) -> i64 {
+    if crate::sql::datetime::is_leap(y) { 366 } else { 365 }
+}
+
+/// Day-of-week index of an epoch day: 0 = Monday (or 0 = Sunday when
+/// `sunday_first`). Day 0 (2000-01-01) was a Saturday.
+fn weekday(day: i64, sunday_first: bool) -> i64 {
+    (day + 5 + i64::from(sunday_first)).rem_euclid(7)
+}
+
+/// MySQL's `calc_week`: (year, week) of an epoch day.
+fn calc_week(day: i32, behaviour: u32) -> (i64, i64) {
+    let (y, m, d) = ymd_from_date(day);
+    let daynr = day as i64;
+    let mut first_daynr = date_from_ymd(y, 1, 1) as i64;
+    let monday_first = behaviour & WEEK_MONDAY_FIRST != 0;
+    let mut week_year = behaviour & WEEK_YEAR != 0;
+    let first_weekday = behaviour & WEEK_FIRST_WEEKDAY != 0;
+    let mut wd = weekday(first_daynr, !monday_first);
+    let mut year = y;
+    if m == 1 && (d as i64) <= 7 - wd {
+        if !week_year && ((first_weekday && wd != 0) || (!first_weekday && wd >= 4)) {
+            return (year, 0);
+        }
+        week_year = true;
+        year -= 1;
+        let days = days_in_year(year);
+        first_daynr -= days;
+        wd = (wd + 53 * 7 - days) % 7;
+    }
+    let days = if (first_weekday && wd != 0) || (!first_weekday && wd >= 4) {
+        daynr - (first_daynr + (7 - wd))
+    } else {
+        daynr - (first_daynr - wd)
+    };
+    if week_year && days >= 52 * 7 {
+        let wd2 = (wd + days_in_year(year)) % 7;
+        if (!first_weekday && wd2 < 4) || (first_weekday && wd2 == 0) {
+            return (year + 1, 1);
+        }
+    }
+    (year, days / 7 + 1)
 }

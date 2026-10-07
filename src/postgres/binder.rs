@@ -839,12 +839,50 @@ impl<'a> Binder<'a> {
         // DISTINCT
         let mut distinct = Distinct::None;
         let mut distinct_on: Vec<TE> = vec![];
+        // Output positions DISTINCT ON names by ordinal or output name,
+        // resolved like ORDER BY's.
+        let mut distinct_pos: Vec<Option<usize>> = vec![];
         match &sel.distinct {
             None | Some(a::Distinct::All) => {}
             Some(a::Distinct::Distinct) => distinct = Distinct::All,
             Some(a::Distinct::On(exprs)) => {
                 for e in exprs {
+                    if let a::Expr::Value(v) = e
+                        && let a::Value::Number(n, _) = &v.value
+                        && let Ok(idx) = n.parse::<usize>()
+                    {
+                        if idx < 1 || idx > out_cols.len() {
+                            return Err(PgError::new(
+                                code::INVALID_COLUMN_REFERENCE,
+                                format!("DISTINCT ON position {idx} is not in select list"),
+                            ));
+                        }
+                        distinct_on.push(proj[idx - 1].clone());
+                        distinct_pos.push(Some(idx - 1));
+                        continue;
+                    }
+                    if let a::Expr::Identifier(id) = e {
+                        let n = ident(id);
+                        let hits: Vec<usize> = out_cols
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, c)| c.name == n)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if hits.len() > 1 {
+                            return Err(PgError::new(
+                                code::AMBIGUOUS_COLUMN,
+                                format!("DISTINCT ON \"{n}\" is ambiguous"),
+                            ));
+                        }
+                        if let Some(&p) = hits.first() {
+                            distinct_on.push(proj[p].clone());
+                            distinct_pos.push(Some(p));
+                            continue;
+                        }
+                    }
                     distinct_on.push(self.bind_expr(e)?);
+                    distinct_pos.push(None);
                 }
                 distinct = Distinct::On(vec![]);
             }
@@ -948,8 +986,8 @@ impl<'a> Binder<'a> {
         }
         if let Distinct::On(_) = distinct {
             let mut idxs = vec![];
-            for te in distinct_on {
-                let i = match exprs.iter().position(|e| *e == te.e) {
+            for (te, pos) in distinct_on.into_iter().zip(distinct_pos) {
+                let i = match pos.or_else(|| exprs.iter().position(|e| *e == te.e)) {
                     Some(i) => i,
                     None => {
                         exprs.push(te.e);

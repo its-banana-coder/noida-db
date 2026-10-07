@@ -634,6 +634,86 @@ scenario("document_apis", [
     ("DELETE", "/docs-a"), ("DELETE", "/docs-r"),
 ])
 
+# Found by the official YAML REST suite: alias APIs only took one
+# concrete index, ignored filters/routing/is_write_index, alias name
+# expressions (globs, exclusions, lists) and missing-alias 404s; a search
+# through a filtered alias returned unfiltered documents.
+scenario("aliases", [
+    ("DELETE", "/al-1"), ("DELETE", "/al-2"), ("DELETE", "/al-3"),
+    ("PUT", "/al-1", {"settings": {"number_of_replicas": 0}, "aliases": {"al_a": {}, "al_b": {}}}),
+    ("PUT", "/al-2", {"settings": {"number_of_replicas": 0}, "aliases": {"al_a": {}}}),
+    ("PUT", "/al-3", {"settings": {"number_of_replicas": 0}}),
+    ("PUT", "/al-1/_alias/al_f", {"filter": {"term": {"kind": "x"}}, "routing": 5, "is_write_index": True}),
+    ("PUT", "/al-1/_alias/al_*", {}),
+    ("PUT", "/al-1/_alias/al-2", {}),
+    ("PUT", "/al-*/_alias/al_all", {}),
+    ("GET", "/_alias/al_a"),
+    ("GET", "/_alias/al_*,-al_a"),
+    ("GET", "/_alias/al_a,nope"),
+    ("GET", "/_alias/al_a,nope,nope2"),
+    ("GET", "/al-1/_alias"),
+    ("GET", "/al-3/_alias"),
+    ("GET", "/al-1/_alias/al_f"),
+    ("HEAD", "/_alias/al_f"),
+    ("HEAD", "/_alias/nope"),
+    ("GET", "/nope-index/_alias/al_a"),
+    ("POST", "/al-1/_doc/1?refresh=true", {"kind": "x"}),
+    ("POST", "/al-1/_doc/2?refresh=true", {"kind": "y"}),
+    ("POST", "/al_f/_count", {}),
+    ("POST", "/al-1/_count", {}),
+    ("POST", "/al_f,al-1/_count", {}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "al-3", "alias": "al_c"}},
+                                       {"remove": {"index": "al-3", "alias": "nope"}}]}),
+    ("POST", "/_aliases", {"actions": [{"remove": {"index": "al-3", "alias": "nope", "must_exist": True}},
+                                       {"add": {"index": "al-3", "alias": "al_d"}}]}),
+    ("HEAD", "/_alias/al_d"),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "al-3", "alias": "al_e", "must_exist": True}}]}),
+    ("POST", "/_aliases", {"actions": [{"remove_index": {"index": "al-3"}},
+                                       {"add": {"index": "al-2", "alias": "al-3"}}]}),
+    ("GET", "/al-2/_alias"),
+    ("DELETE", "/al-*/_alias/al_a"),
+    ("DELETE", "/al-*/_alias/al_a"),
+    ("GET", "/_cat/aliases?h=alias,index,filter,routing.index,routing.search,is_write_index&s=index,alias", None,
+     {"pick": lambda r: r}),
+    ("DELETE", "/al-1"), ("DELETE", "/al-2"), ("DELETE", "/al-3"),
+])
+
+# Found by the official YAML REST suite: _field_caps and _msearch didn't
+# exist ("no handler").
+scenario("field_caps_msearch", [
+    ("DELETE", "/fc-1"), ("DELETE", "/fc-2"),
+    ("PUT", "/fc-1", {"settings": {"number_of_replicas": 0}, "mappings": {"properties": {
+        "t": {"type": "text", "fields": {"k": {"type": "keyword"}}}, "n": {"type": "double"},
+        "o": {"properties": {"a": {"type": "long", "index": False, "meta": {"unit": "ms"}},
+                             "b": {"type": "keyword", "doc_values": False}}},
+        "nest": {"type": "nested", "properties": {"x": {"type": "keyword"}}}}}}),
+    ("PUT", "/fc-2", {"settings": {"number_of_replicas": 0}, "mappings": {"properties": {
+        "t": {"type": "text"}, "n": {"type": "long"}, "d": {"type": "date"},
+        "o": {"properties": {"a": {"type": "long", "meta": {"unit": "s"}}, "b": {"type": "keyword"}}}}}}),
+    ("GET", "/fc-1,fc-2/_field_caps?fields=t,t.k,n,d,o.a,o.b"),
+    ("GET", "/fc-*/_field_caps?fields=*&filters=-metadata"),
+    ("GET", "/fc-1/_field_caps?fields=*&filters=-metadata,-multifield,-parent,-nested"),
+    ("GET", "/fc-1/_field_caps?fields=*&types=keyword,long"),
+    ("GET", "/fc-1,fc-2/_field_caps?fields=d&include_unmapped=true"),
+    ("GET", "/fc-1/_field_caps"),
+    ("GET", "/fc-1,nope/_field_caps?fields=t"),
+    ("GET", "/fc-1,nope/_field_caps?fields=t&ignore_unavailable=true"),
+    ("POST", "/fc-1/_doc/1?refresh=true", {"t": "hello", "n": 1}),
+    ("POST", "/fc-2/_doc/1?refresh=true", {"t": "bye", "n": 5, "d": "2020-01-01"}),
+    ("POST", "/fc-*/_field_caps?fields=n", {"index_filter": {"range": {"n": {"gte": 3}}}}),
+    ("POST", "/fc-*/_field_caps?fields=n", {"index_filter": {"term": {"d": "2020-01-01"}}}),
+    ("POST", "/fc-*/_field_caps?fields=n", {"index_filter": {"range": {"d": {"gte": "2030"}}}}),
+    ("GET", "/fc-1/_field_caps?fields=*&filters=-metadata,-bogus"),
+    ("GET", "/fc-1/_field_caps?fields=*&filters=-metadata&include_empty_fields=false"),
+    ("POST", "/_msearch", [{"index": "fc-1"}, {"query": {"match_all": {}}},
+                           {"index": "nope"}, {"query": {"match_all": {}}},
+                           {"index": ["fc-1", "fc-2"]}, {"size": 0, "aggs": {"m": {"max": {"field": "n"}}}}]),
+    ("POST", "/fc-2/_msearch?rest_total_hits_as_int=true", [{}, {"query": {"match_all": {}}}]),
+    ("POST", "/fc-2/_msearch?rest_total_hits_as_int=true", [{}, {"track_total_hits": 10}]),
+    ("POST", "/_msearch", b""),
+    ("DELETE", "/fc-1"), ("DELETE", "/fc-2"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

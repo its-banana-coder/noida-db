@@ -411,3 +411,15 @@ fn reads_that_do_not_touch_keys() {
     t.run("GET foo");
     assert_eq!(t.run("OBJECT IDLETIME foo"), int(0));
 }
+
+#[test]
+fn scan_expires_the_keys_it_walks() {
+    let mut t = T::new();
+    t.run("DEBUG SET-ACTIVE-EXPIRE 0");
+    t.run("SET a 1");
+    t.run("SET b 1 PX 1");
+    t.advance(10);
+    assert_eq!(t.run("DBSIZE"), int(2));
+    assert_eq!(t.run("SCAN 0"), arr(vec![bulk("0"), bulks(&["a"])]));
+    assert_eq!(t.run("DBSIZE"), int(1));
+}

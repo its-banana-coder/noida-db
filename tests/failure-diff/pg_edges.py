@@ -879,4 +879,15 @@ PG_EDGES.update({
         "SELECT EXTRACT(MILLISECONDS FROM timestamp '2015-06-15 14:30:50.000321'), EXTRACT(MICROSECONDS FROM timestamp '2015-06-15 14:30:50.000321'), EXTRACT(SECOND FROM timestamp '2015-06-15 14:30:05')",
         "SELECT date_part('milliseconds', timestamptz '2015-06-15 14:30:50.5+00'), EXTRACT(MILLISECONDS FROM time '01:02:03.5'), EXTRACT(SECOND FROM interval '1 minute 2.5 seconds')",
     ),
+    "pg edge: DISTINCT ON output names and positions": steps(
+        "CREATE TABLE dd (id int, name text)",
+        "INSERT INTO dd VALUES (1, 'B'), (2, 'a'), (3, 'b')",
+        'SELECT DISTINCT ON ("nAmEAlIaS") lower(name) AS "nAmEAlIaS", id FROM dd ORDER BY "nAmEAlIaS", id',
+        "SELECT DISTINCT ON (name_lower) lower(name) AS name_lower, id FROM dd ORDER BY name_lower ASC, id",
+        "SELECT DISTINCT ON (2) id, lower(name) FROM dd ORDER BY 2, 1",
+        "SELECT DISTINCT ON (3) 1 AS a ORDER BY 1",
+        "SELECT DISTINCT ON (a) 1 AS a, 2 AS a",
+        "SELECT DISTINCT ON (id) id, name FROM dd ORDER BY id DESC",
+        "SELECT DISTINCT ON (name) id FROM dd ORDER BY name, id",
+    ),
 })

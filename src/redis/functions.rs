@@ -111,17 +111,20 @@ fn install(libs: &mut Vec<Library>, lib: Library, replace: bool) -> Result<(), V
 }
 
 fn function_load(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
-    let (replace, code) = match a.len() {
-        3 => (false, &a[2]),
-        4 if eq_ic(&a[2], "replace") => (true, &a[3]),
-        4 => {
+    // FUNCTION LOAD [REPLACE] code: every argument before the code must be
+    // an option.
+    let code = &a[a.len() - 1];
+    let mut replace = false;
+    for opt in &a[2..a.len() - 1] {
+        if eq_ic(opt, "replace") {
+            replace = true;
+        } else {
             return Err(Value::err(format!(
                 "ERR Unknown option given: {}",
-                String::from_utf8_lossy(&a[2])
+                String::from_utf8_lossy(opt)
             )));
         }
-        _ => return Err(super::engine::syntax()),
-    };
+    }
     let name = metadata(code)?;
     let lib = register(code, &name)?;
     install(&mut ctx.engine.scripts.libraries, lib, replace)?;
