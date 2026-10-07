@@ -873,6 +873,22 @@ MYSQL_QUERIES = {
         (A, "SHOW CREATE TABLE ck2"),
         (A, "DESCRIBE ck1"),
     ],
+    "bit operators, math, week and statistics functions": [
+        (A, "SELECT 1 & 3 AS a, 5 | 2 AS b, 6 ^ 3 AS c, ~0 AS d, 1 << 3 AS e, 8 >> 1 AS f, -1 & 255 AS g, 1.6 | 0 AS h, '7' & 3 AS i, NULL & 1 AS j, 1 << 64 AS k, ~5 AS l"),
+        (A, "SELECT 1 XOR 0 AS a, 1 XOR 1 AS b, NULL XOR 1 AS c, 0 XOR 0 AS d"),
+        (A, "SELECT acos(0.5) AS a, acos(2) AS b, asin(0.5) AS c, atan(1) AS d, atan(1, 2) AS e, atan2(1, 2) AS f, sin(1) AS g, cos(1) AS h, tan(1) AS i, cot(1) AS j, degrees(1) AS k, radians(180) AS l"),
+        (A, "SELECT exp(1) AS a, ln(2) AS b, ln(0) AS c, log(8) AS d, log(2, 8) AS e, log(1, 8) AS f, log2(8) AS g, log10(100) AS h, log(-1) AS i, cot(0) AS j"),
+        (A, "SELECT rand(1) AS a, rand(0) AS b, rand(42) AS c, rand(NULL) AS d, rand() < 1 AS e"),
+        (A, "SELECT ord('ab') AS a, ord('\u00e9') AS b, ord('') AS c, ord(NULL) AS d, ord(65) AS e"),
+        (A, "SELECT week('2024-01-01') AS a, week('2024-01-01', 3) AS b, week('2021-01-03', 0) AS c, week('2021-01-03', 1) AS d, week('2021-01-03', 2) AS e, week('2021-01-03', 3) AS f, week('2021-01-03', 4) AS g, week('2021-01-03', 5) AS h, week('2021-01-03', 6) AS i, week('2021-01-03', 7) AS j, week('2020-12-31', 3) AS k, week('2019-12-30', 3) AS l"),
+        (A, "SELECT yearweek('2021-01-03') AS a, yearweek('2021-01-03', 3) AS b, yearweek('2019-12-30', 3) AS c, yearweek('2024-12-30', 1) AS d, weekofyear('2021-01-03') AS e, week(NULL) AS f"),
+        (A, "SELECT makedate(2024, 60) AS a, makedate(24, 1) AS b, makedate(2024, 0) AS c, makedate(2023, 400) AS d, makedate(NULL, 1) AS e"),
+        (A, "SELECT time_to_sec('01:00:00') AS a, time_to_sec('-01:00:01') AS b, time_to_sec('10:00:00.5') AS c, time_to_sec(NULL) AS d, sec_to_time(3661) AS e, sec_to_time(-5) AS f"),
+        (A, "CREATE TABLE ag (g int, x double, i int)"),
+        (A, "INSERT INTO ag VALUES (1, 1, 5), (1, 2, 6), (1, 4, NULL), (2, 10, 7), (3, NULL, NULL)"),
+        (A, "SELECT g, std(x), stddev(x), stddev_pop(x), stddev_samp(x), variance(x), var_pop(x), var_samp(x), bit_and(i), bit_or(i), bit_xor(i) FROM ag GROUP BY g ORDER BY g"),
+        (A, "SELECT stddev_pop(i) AS a, var_samp(i) AS b, bit_and(i) AS c FROM ag WHERE g = 9"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

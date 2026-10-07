@@ -3259,6 +3259,34 @@ fn compute_agg(func: AggFunc, vals: &[Value]) -> Value {
         AggFunc::GroupConcat => Value::Null,
         AggFunc::CountStar => Value::Int(vals.len() as i64),
         AggFunc::Count => Value::Int(non_null.len() as i64),
+        AggFunc::StdPop | AggFunc::StdSamp | AggFunc::VarPop | AggFunc::VarSamp => {
+            let xs: Vec<f64> = non_null.iter().map(|v| value_to_f64(v)).collect();
+            let n = xs.len() as f64;
+            let samp = matches!(func, AggFunc::StdSamp | AggFunc::VarSamp);
+            if xs.is_empty() || (samp && xs.len() < 2) {
+                return Value::Null;
+            }
+            let mean = xs.iter().sum::<f64>() / n;
+            let ss: f64 = xs.iter().map(|x| (x - mean) * (x - mean)).sum();
+            let var = ss / if samp { n - 1.0 } else { n };
+            Value::Float(if matches!(func, AggFunc::StdPop | AggFunc::StdSamp) {
+                var.sqrt()
+            } else {
+                var
+            })
+        }
+        AggFunc::BitAnd | AggFunc::BitOr | AggFunc::BitXor => {
+            let mut acc: u64 = if matches!(func, AggFunc::BitAnd) { u64::MAX } else { 0 };
+            for v in &non_null {
+                let x = crate::mysql::funcs::to_u64(v);
+                acc = match func {
+                    AggFunc::BitAnd => acc & x,
+                    AggFunc::BitOr => acc | x,
+                    _ => acc ^ x,
+                };
+            }
+            crate::mysql::funcs::from_u64(acc)
+        }
         AggFunc::Sum | AggFunc::Avg => {
             if non_null.is_empty() {
                 return Value::Null;
