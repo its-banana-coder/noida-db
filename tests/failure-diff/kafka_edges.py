@@ -623,6 +623,45 @@ def offsets_only_group():
         except KafkaException as e:
             print("delete", err(e))
 
+
+@scenario
+def static_membership():
+    """group.instance.id: a second instance with the same id replaces the
+    first (one member, reported with its instance id) instead of joining
+    as an extra member."""
+    t = name("sm")
+    create(t, 2)
+    g = name("grp")
+    conf = {
+        "bootstrap.servers": BS,
+        "group.id": g,
+        "group.instance.id": "inst-1",
+        "auto.offset.reset": "earliest",
+        "session.timeout.ms": 6000,
+    }
+    a = Consumer(conf)
+    a.subscribe([t])
+    deadline = time.time() + 10
+    while time.time() < deadline and not a.assignment():
+        a.poll(0.2)
+    print("first assigned", len(a.assignment()))
+    d = admin.describe_consumer_groups([g])[g].result()
+    print("members", [m.group_instance_id for m in d.members])
+    b = Consumer(conf)
+    b.subscribe([t])
+    deadline = time.time() + 10
+    while time.time() < deadline and not b.assignment():
+        b.poll(0.2)
+        a.poll(0.2)
+    print("replacement assigned", len(b.assignment()))
+    d = admin.describe_consumer_groups([g])[g].result()
+    print("members", [m.group_instance_id for m in d.members])
+    b.close()
+    try:
+        a.close()
+    except KafkaException as e:
+        print("fenced close", err(e))
+
 for n, fn in SCENARIOS.items():
     if ONLY and n not in ONLY:
         continue
