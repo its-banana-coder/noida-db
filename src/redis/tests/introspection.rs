@@ -213,8 +213,12 @@ fn getkeys_for_commands_with_key_functions() {
         arr(vec![kf("k", &["RO", "access"]), kf("k3", &["OW", "update"])])
     );
     assert_eq!(t.run("COMMAND GETKEYS xread count 1 streams s1 s2 0 0"), bulks(&["s1", "s2"]));
-    // Redis 7.2's key spec (not the key function) answers this one.
-    assert_eq!(t.run("COMMAND GETKEYS xread streams s1 0 0"), bulks(&["s1"]));
+    // Current 7.2 releases mark XREAD's spec incomplete, so xreadGetKeys
+    // answers (7.2.12 and older used the spec and said s1).
+    assert_eq!(
+        t.run("COMMAND GETKEYS xread streams s1 0 0"),
+        err("ERR Invalid arguments specified for command")
+    );
     assert_eq!(
         t.run("COMMAND GETKEYSANDFLAGS bitfield k get u8 0"),
         arr(vec![kf("k", &["RO", "access"])])
