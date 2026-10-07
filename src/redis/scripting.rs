@@ -543,7 +543,7 @@ fn reply_to_lua(lua: &Lua, v: &Value, resp: u8) -> Lv {
         Value::Simple(s) => table(vec![("ok", Lv::String(lua.create_string(s).expect("string")))]),
         Value::Error(e) => table(vec![("err", Lv::String(lua.create_string(e).expect("string")))]),
         Value::Bulk(b) | Value::Verbatim(_, b) => Lv::String(lua.create_string(b).expect("string")),
-        Value::Null | Value::NullArray | Value::NoReply => Lv::Boolean(false),
+        Value::Null | Value::NullArray | Value::NoReply | Value::Attribute(_) => Lv::Boolean(false),
         Value::Bool(b) if resp >= 3 => Lv::Boolean(*b),
         Value::Bool(b) => {
             if *b {

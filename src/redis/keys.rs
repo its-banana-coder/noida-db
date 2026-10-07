@@ -389,7 +389,7 @@ fn restore(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if exists && !replace {
         return Err(Value::err("BUSYKEY Target key name already exists."));
     }
-    let Some(body) = super::rdb::unseal(&a[3]) else {
+    let Some(body) = super::rdb::unseal_with(&a[3], !ctx.engine.skip_checksum) else {
         return Err(Value::err("ERR DUMP payload version or checksum are wrong"));
     };
     let Some(data) =

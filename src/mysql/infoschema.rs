@@ -35,6 +35,7 @@ fn table_of(name: &str, cols: &[&str], rows: Vec<Vec<Value>>) -> Table {
             default_now: false,
             on_update_now: false,
             unsigned: false,
+            comment: String::new(),
         })
         .collect();
     let mut t = Table::new(name.to_string(), columns);
@@ -150,7 +151,7 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         text("utf8mb4_0900_ai_ci"),
                         Value::Null,
                         text(""),
-                        text(""),
+                        text(&t.comment),
                     ]
                 })
                 .chain(user_views(state).map(|(db, v)| {
@@ -247,7 +248,7 @@ fn virtual_table(state: &DbState, name: &str) -> Option<Table> {
                         text(key),
                         text(extra),
                         text("select,insert,update,references"),
-                        text(""),
+                        text(&c.comment),
                         text(""),
                         Value::Null,
                     ]);

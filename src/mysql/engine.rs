@@ -346,7 +346,8 @@ impl Engine {
     /// error (CLIENT_MULTI_STATEMENTS).
     pub fn execute_multi(&mut self, sql: &str) -> Vec<StatementResult> {
         let dialect = MySqlDialect {};
-        let rewritten = rewrite_rename_key(sql)
+        let rewritten = rewrite_table_comment(sql)
+            .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
             .or_else(|| rewrite_comma_update(sql));
         let text = rewritten.as_deref().unwrap_or(sql);
@@ -376,7 +377,8 @@ impl Engine {
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
-        let rewritten = rewrite_rename_key(sql)
+        let rewritten = rewrite_table_comment(sql)
+            .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
             .or_else(|| rewrite_comma_update(sql));
         let sql = rewritten.as_deref().unwrap_or(sql);
@@ -1174,4 +1176,21 @@ fn bool_assignment(set: &sqlparser::ast::Set, var: &str) -> Option<bool> {
         .or(out);
     }
     out
+}
+
+/// `ALTER TABLE t COMMENT [=] '...'`, which the SQL parser doesn't know, as
+/// a SET DEFAULT on a marked column name that the binder turns back into a
+/// table-comment change.
+pub fn rewrite_table_comment(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r#"(?is)^\s*alter\s+table\s+((?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+)(?:\s*\.\s*(?:`(?:[^`]|``)+`|[A-Za-z0-9_$]+))?)\s+comment\s*=?\s*('(?:[^'\\]|\\.|'')*'|"(?:[^"\\]|\\.|"")*")\s*;?\s*$"#,
+    )
+    .expect("regex");
+    let c = re.captures(sql)?;
+    Some(format!(
+        "ALTER TABLE {} ALTER COLUMN `{}` SET DEFAULT {}",
+        &c[1],
+        crate::mysql::binder::TABLE_COMMENT_MARKER,
+        &c[2]
+    ))
 }

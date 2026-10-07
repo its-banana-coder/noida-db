@@ -280,8 +280,21 @@ impl Binder {
                     create_table.columns,
                     create_table.constraints,
                 )?;
-                if let Plan::CreateTable { if_not_exists: f, .. } = &mut plan {
+                if let Plan::CreateTable { if_not_exists: f, comment, .. } = &mut plan {
                     *f = if_not_exists;
+                    if let sqlparser::ast::CreateTableOptions::Plain(opts) =
+                        &create_table.table_options
+                    {
+                        for o in opts {
+                            if let sqlparser::ast::SqlOption::Comment(
+                                sqlparser::ast::CommentDef::WithEq(c)
+                                | sqlparser::ast::CommentDef::WithoutEq(c),
+                            ) = o
+                            {
+                                *comment = c.clone();
+                            }
+                        }
+                    }
                 }
                 Ok(plan)
             }
@@ -545,6 +558,17 @@ impl Binder {
                 ColumnType::Decimal(p, s)
             }
             DataType::Date => ColumnType::Date,
+            DataType::Time(p, _) => {
+                let p = p.unwrap_or(0);
+                if p > 6 {
+                    return Err(MySqlError::new(
+                        1426,
+                        "42000",
+                        format!("Too-big precision {p} specified for '{col_name}'. Maximum is 6."),
+                    ));
+                }
+                ColumnType::Time(p as u8)
+            }
             // `TIMESTAMP` is stored and returned like `DATETIME` -- this
             // engine has no session time zone for its UTC-conversion
             // semantics to differ by.
@@ -561,6 +585,7 @@ impl Binder {
         let mut default = None;
         let mut default_now = false;
         let mut on_update_now = false;
+        let mut comment = String::new();
 
         for opt in &col_def.options {
             match &opt.option {
@@ -618,6 +643,7 @@ impl Binder {
                 {
                     on_update_now = true;
                 }
+                sqlparser::ast::ColumnOption::Comment(c) => comment = c.clone(),
                 _ => {}
             }
         }
@@ -631,6 +657,7 @@ impl Binder {
             primary_key,
             default_now,
             on_update_now,
+            comment,
             unsigned: matches!(
                 col_def.data_type,
                 DataType::IntUnsigned(_)
@@ -756,6 +783,21 @@ impl Binder {
                 }
                 A::DropForeignKey { name, .. } => AlterOp::DropForeignKey(name.value),
                 A::DropPrimaryKey { .. } => AlterOp::DropPrimaryKey,
+                // `COMMENT = '...'`, rewritten by the engine into a
+                // SET DEFAULT on a marked column name.
+                A::AlterColumn { column_name, op: Acol::SetDefault { value } }
+                    if column_name.value == TABLE_COMMENT_MARKER =>
+                {
+                    match value {
+                        AstExpr::Value(v) => match v.value {
+                            AstValue::SingleQuotedString(s) | AstValue::DoubleQuotedString(s) => {
+                                AlterOp::SetComment(s)
+                            }
+                            _ => return Err(MySqlError::syntax_error("COMMENT")),
+                        },
+                        _ => return Err(MySqlError::syntax_error("COMMENT")),
+                    }
+                }
                 A::AlterColumn { column_name, op } => match op {
                     Acol::SetDefault { value } => {
                         let mut v = &value;
@@ -902,6 +944,7 @@ impl Binder {
             indexes,
             foreign_keys,
             if_not_exists: false,
+            comment: String::new(),
         })
     }
 
@@ -3044,3 +3087,7 @@ fn row_query(query: &Query) -> Option<Query> {
 /// Marks a column rename that is really `RENAME INDEX|KEY old TO new`
 /// (see [`crate::mysql::engine::rewrite_rename_key`]).
 pub const RENAME_KEY_MARKER: &str = "\u{1}noida-rename-key:";
+
+/// The column name `ALTER TABLE t COMMENT = '...'` is rewritten to target
+/// (see [`crate::mysql::engine::rewrite_table_comment`]).
+pub const TABLE_COMMENT_MARKER: &str = "\u{1}noida_table_comment";
