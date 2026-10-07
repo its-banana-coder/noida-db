@@ -2335,6 +2335,28 @@ pub fn call(
                 Jsonb(Box::new(to_json_value(&a[0], tys[0], env).normalize()))
             }
         }
+        // SQL/JSON constructors with ABSENT ON NULL: null values dropped.
+        "json_build_object_absent" | "jsonb_build_object_absent" => {
+            let (mut va, mut vt) = (vec![], vec![]);
+            for (i, pair) in a.chunks(2).enumerate() {
+                if pair.len() == 2 && !pair[1].is_null() {
+                    va.extend_from_slice(pair);
+                    vt.extend_from_slice(&tys[i * 2..i * 2 + 2]);
+                }
+            }
+            let base = name.trim_end_matches("_absent");
+            return call(base, &va, &vt, ret, env);
+        }
+        "json_build_array_absent" | "jsonb_build_array_absent" => {
+            let (va, vt): (Vec<Value>, Vec<Type>) = a
+                .iter()
+                .zip(tys)
+                .filter(|(v, _)| !v.is_null())
+                .map(|(v, t)| (v.clone(), *t))
+                .unzip();
+            let base = name.trim_end_matches("_absent");
+            return call(base, &va, &vt, ret, env);
+        }
         "json_build_object" | "jsonb_build_object" => {
             if !a.len().is_multiple_of(2) {
                 return Err(err(
