@@ -1208,7 +1208,7 @@ impl Executor {
                     };
                     rows.push(vec![
                         Value::Text(col.name.clone()),
-                        Value::Text(mysql_type_name(&col.ty)),
+                        Value::Text(column_type_text(col)),
                         Value::Text(if col.not_null { "NO" } else { "YES" }.to_string()),
                         Value::Text(key.to_string()),
                         column_default_text(col).map(Value::Text).unwrap_or(Value::Null),
@@ -1221,7 +1221,7 @@ impl Executor {
                 let t = self.load_table(&db, &table)?;
                 let mut lines = Vec::new();
                 for col in &t.columns {
-                    let mut l = format!("  `{}` {}", col.name, mysql_type_name(&col.ty));
+                    let mut l = format!("  `{}` {}", col.name, column_type_text(col));
                     if col.not_null {
                         l.push_str(" NOT NULL");
                     }
@@ -1295,6 +1295,9 @@ impl Executor {
                     }
                     lines.push(l);
                 }
+                for c in &t.checks {
+                    lines.push(format!("  CONSTRAINT `{}` CHECK ({})", c.name, c.clause));
+                }
                 // The next AUTO_INCREMENT value shows once it has moved.
                 let auto =
                     if t.columns.iter().any(|c| c.auto_increment) && t.next_auto_increment > 1 {
@@ -1323,6 +1326,7 @@ impl Executor {
                 foreign_keys,
                 if_not_exists,
                 comment,
+                checks,
             } => {
                 if self
                     .db
@@ -1343,6 +1347,9 @@ impl Executor {
                 }
                 let mut t = Table::new(table.clone(), columns);
                 t.comment = comment;
+                for c in checks {
+                    self.add_check(&db, &mut t, c)?;
+                }
                 t.unique_keys = unique_keys;
                 t.indexes = indexes;
                 for fk in foreign_keys {
@@ -1522,6 +1529,38 @@ impl Executor {
                         AlterOp::AddForeignKey(fk) => {
                             self.add_foreign_key(&db, &mut t, fk, true)?
                         }
+                        AlterOp::AddCheck(c) => self.add_check(&db, &mut t, c)?,
+                        AlterOp::DropCheck(name) => {
+                            let before = t.checks.len();
+                            t.checks.retain(|c| !c.name.eq_ignore_ascii_case(&name));
+                            if t.checks.len() == before {
+                                return Err(MySqlError::new(
+                                    3821,
+                                    "HY000",
+                                    format!("Check constraint '{name}' is not found in the table."),
+                                ));
+                            }
+                        }
+                        AlterOp::DropConstraint(name)
+                            if t.checks.iter().any(|c| c.name.eq_ignore_ascii_case(&name)) =>
+                        {
+                            t.checks.retain(|c| !c.name.eq_ignore_ascii_case(&name));
+                        }
+                        AlterOp::DropConstraint(name)
+                            if t.foreign_keys.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) =>
+                        {
+                            t.foreign_keys.retain(|f| !f.name.eq_ignore_ascii_case(&name));
+                        }
+                        AlterOp::DropConstraint(name) => {
+                            if !t.has_index(&name) && !name.eq_ignore_ascii_case("PRIMARY") {
+                                return Err(MySqlError::new(
+                                    3940,
+                                    "HY000",
+                                    format!("Constraint '{name}' does not exist."),
+                                ));
+                            }
+                            alter_table(&mut t, AlterOp::DropKey(name), &mut rename_to, &self.sql_mode)?
+                        }
                         AlterOp::DropForeignKey(name) => {
                             let before = t.foreign_keys.len();
                             t.foreign_keys.retain(|f| !f.name.eq_ignore_ascii_case(&name));
@@ -1590,6 +1629,7 @@ impl Executor {
                 let mut replaced: Vec<Vec<Value>> = Vec::new();
                 let result = (|| -> Result<Vec<Vec<Value>>, MySqlError> {
                     let keys = work.keys();
+                    let checks = self.bind_checks(&work)?;
                     let mut affected = 0u64;
                     let mut first_generated_id: Option<i64> = None;
 
@@ -1692,6 +1732,13 @@ impl Executor {
                             }
                         }
 
+                        if let Err(e) = self.enforce_checks(&checks, &work, &new_row) {
+                            // INSERT IGNORE skips the row (MySQL: a warning).
+                            if matches!(mode, InsertMode::Ignore) {
+                                continue;
+                            }
+                            return Err(e);
+                        }
                         let conflict = find_key_conflict(&work, &keys, &new_row, None);
                         // A duplicate of another transaction's uncommitted
                         // row waits for it (and is then a duplicate or not).
@@ -2608,6 +2655,85 @@ impl Executor {
     /// sees an earlier one's new value (`SET a = a + 1, b = a` sets b to the
     /// new a). An `ON UPDATE CURRENT_TIMESTAMP` column the statement didn't
     /// assign itself is set to now.
+    /// A table's CHECK constraints, bound for evaluation against its rows.
+    fn bind_checks(&self, t: &Table) -> Result<Vec<(String, Expr)>, MySqlError> {
+        let dialect = sqlparser::dialect::MySqlDialect {};
+        let mut out = Vec::new();
+        for c in &t.checks {
+            let ast = sqlparser::parser::Parser::new(&dialect)
+                .try_with_sql(&c.expr)
+                .and_then(|mut p| p.parse_expr())
+                .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
+            let e = crate::mysql::binder::Binder::new(None).bind_standalone_expr(ast)?;
+            out.push((c.name.clone(), e));
+        }
+        Ok(out)
+    }
+
+    /// MySQL's ER_CHECK_CONSTRAINT_VIOLATED unless every check holds (a
+    /// NULL result passes, as in SQL).
+    fn enforce_checks(
+        &self,
+        checks: &[(String, Expr)],
+        t: &Table,
+        row: &[Value],
+    ) -> Result<(), MySqlError> {
+        for (name, e) in checks {
+            let v = self.eval_expr(e, row, Some(t))?;
+            if !v.is_null() && !crate::mysql::funcs::truthy(&v) {
+                return Err(MySqlError::new(
+                    3819,
+                    "HY000",
+                    format!("Check constraint '{name}' is violated."),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a CHECK to `t`: named `<table>_chk_<n>` if unnamed, unique in
+    /// the schema, and holding for every row already there.
+    fn add_check(
+        &self,
+        db: &str,
+        t: &mut Table,
+        mut c: crate::mysql::catalog::Check,
+    ) -> Result<(), MySqlError> {
+        let prefix = format!("{}_chk_", t.name);
+        if c.name.is_empty() {
+            let n = t
+                .checks
+                .iter()
+                .filter_map(|c| c.name.strip_prefix(&prefix)?.parse::<u32>().ok())
+                .max()
+                .unwrap_or(0);
+            c.name = format!("{prefix}{}", n + 1);
+        }
+        let taken = t.checks.iter().any(|x| x.name.eq_ignore_ascii_case(&c.name))
+            || self.db.lock().unwrap().schemas.get(db).is_some_and(|s| {
+                s.tables.values().any(|other| {
+                    other.name != t.name
+                        && other.checks.iter().any(|x| x.name.eq_ignore_ascii_case(&c.name))
+                })
+            });
+        if taken {
+            return Err(MySqlError::new(
+                3822,
+                "HY000",
+                format!("Duplicate check constraint name '{}'.", c.name),
+            ));
+        }
+        let name = c.name.clone();
+        t.checks.push(c);
+        // Kept in name order: the order MySQL checks (and lists) them in.
+        t.checks.sort_by(|a, b| a.name.cmp(&b.name));
+        let checks: Vec<_> = self.bind_checks(t)?.into_iter().filter(|(n, _)| *n == name).collect();
+        for row in &t.rows {
+            self.enforce_checks(&checks, t, row)?;
+        }
+        Ok(())
+    }
+
     fn apply_assignments(
         &self,
         t: &mut Table,
@@ -2651,6 +2777,10 @@ impl Executor {
                     t.rows[i][idx] = Value::Ts(now);
                 }
             }
+        }
+        if !t.checks.is_empty() {
+            let checks = self.bind_checks(t)?;
+            self.enforce_checks(&checks, t, &t.rows[i])?;
         }
         Ok(())
     }
@@ -4372,6 +4502,13 @@ pub(crate) fn mysql_type_name(ty: &ColumnType) -> String {
     }
 }
 
+/// A column's full type as SHOW CREATE TABLE / DESCRIBE /
+/// `COLUMN_TYPE` print it, `unsigned` included.
+pub(crate) fn column_type_text(col: &Column) -> String {
+    let t = mysql_type_name(&col.ty);
+    if col.unsigned { format!("{t} unsigned") } else { t }
+}
+
 fn column_default_text(col: &Column) -> Option<String> {
     if col.default_now {
         return Some("CURRENT_TIMESTAMP".into());
@@ -4771,6 +4908,20 @@ fn alter_table(
                     format!("Can't DROP '{name}'; check that column/key exists"),
                 ));
             };
+            // A CHECK on this column alone goes with it; one that also
+            // uses other columns blocks the drop.
+            let mut keep = Vec::new();
+            for c in std::mem::take(&mut t.checks) {
+                let cols = check_constraint_columns(&c, t);
+                if cols.iter().any(|x| x.eq_ignore_ascii_case(&name)) {
+                    if cols.iter().all(|x| x.eq_ignore_ascii_case(&name)) {
+                        continue;
+                    }
+                    return Err(check_uses_column(&c.name, &t.columns[i].name));
+                }
+                keep.push(c);
+            }
+            t.checks = keep;
             t.columns.remove(i);
             for row in t.rows.iter_mut() {
                 row.remove(i);
@@ -4788,6 +4939,9 @@ fn alter_table(
         }
         AlterOp::ReplaceColumn { old, mut col, unique, pos } => {
             let i = column_index_or_err(t, &old, "field list")?;
+            if !old.eq_ignore_ascii_case(&col.name) {
+                refuse_if_checked(t, i)?;
+            }
             col.primary_key |= t.columns[i].primary_key;
             let same_string_type = matches!(
                 (&t.columns[i].ty, &col.ty),
@@ -4831,6 +4985,9 @@ fn alter_table(
         }
         AlterOp::RenameColumn { old, new } => {
             let i = column_index_or_err(t, &old, "field list")?;
+            if !old.eq_ignore_ascii_case(&new) {
+                refuse_if_checked(t, i)?;
+            }
             for k in t.unique_keys.iter_mut().chain(t.indexes.iter_mut()) {
                 for c in k.columns.iter_mut() {
                     if c.eq_ignore_ascii_case(&old) {
@@ -4907,6 +5064,8 @@ fn alter_table(
         }
         AlterOp::AutoIncrement(n) => t.next_auto_increment = t.next_auto_increment.max(n),
         AlterOp::SetComment(c) => t.comment = c,
+        // Handled by the executor (they evaluate rows / see the schema).
+        AlterOp::AddCheck(_) | AlterOp::DropCheck(_) | AlterOp::DropConstraint(_) => {}
         AlterOp::Noop => {}
         // Handled by the executor, which can see the referenced tables.
         AlterOp::AddForeignKey(_) | AlterOp::DropForeignKey(_) => {}
@@ -5002,4 +5161,45 @@ pub(crate) fn parse_mysql_time(s: &str) -> Option<i64> {
     }
     let total = ((days * 24 + h) * 3600 + m * 60 + sec) * 1_000_000 + frac_us;
     Some(if neg { -total } else { total })
+}
+
+/// MySQL's ER_DEPENDENT_BY_CHECK_CONSTRAINT.
+fn check_uses_column(check: &str, col: &str) -> MySqlError {
+    MySqlError::new(
+        3959,
+        "HY000",
+        format!(
+            "Check constraint '{check}' uses column '{col}', hence column cannot be dropped or renamed."
+        ),
+    )
+}
+
+/// Renaming a column a CHECK uses is an error in MySQL.
+fn refuse_if_checked(t: &Table, i: usize) -> Result<(), MySqlError> {
+    let name = &t.columns[i].name;
+    for c in &t.checks {
+        if check_constraint_columns(c, t).iter().any(|x| x.eq_ignore_ascii_case(name)) {
+            return Err(check_uses_column(&c.name, name));
+        }
+    }
+    Ok(())
+}
+
+/// The table's columns a CHECK's expression names.
+pub(crate) fn check_constraint_columns(c: &crate::mysql::catalog::Check, t: &Table) -> Vec<String> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = sqlparser::dialect::MySqlDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, &c.expr).tokenize() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for tok in tokens {
+        if let Token::Word(w) = tok
+            && let Some(col) = t.columns.iter().find(|col| col.name.eq_ignore_ascii_case(&w.value))
+            && !out.contains(&col.name)
+        {
+            out.push(col.name.clone());
+        }
+    }
+    out
 }

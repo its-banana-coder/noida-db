@@ -347,6 +347,7 @@ impl Engine {
     pub fn execute_multi(&mut self, sql: &str) -> Vec<StatementResult> {
         let dialect = MySqlDialect {};
         let rewritten = rewrite_table_comment(sql)
+            .or_else(|| rewrite_drop_check(sql))
             .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
             .or_else(|| rewrite_comma_update(sql));
@@ -378,6 +379,7 @@ impl Engine {
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
         let rewritten = rewrite_table_comment(sql)
+            .or_else(|| rewrite_drop_check(sql))
             .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
             .or_else(|| rewrite_comma_update(sql));
@@ -1193,4 +1195,28 @@ pub fn rewrite_table_comment(sql: &str) -> Option<String> {
         crate::mysql::binder::TABLE_COMMENT_MARKER,
         &c[2]
     ))
+}
+
+/// `ALTER TABLE t ... DROP CHECK name ...`, which the SQL parser doesn't
+/// know, as a DROP CONSTRAINT of a marked name that the binder turns back
+/// into a CHECK drop.
+pub fn rewrite_drop_check(sql: &str) -> Option<String> {
+    let trimmed = sql.trim_start();
+    if trimmed.len() < 11 || !trimmed[..11].eq_ignore_ascii_case("ALTER TABLE") {
+        return None;
+    }
+    let re = regex_lite::Regex::new(r"(?i)\bdrop\s+check\s+(`(?:[^`]|``)+`|[A-Za-z0-9_$]+)")
+        .expect("regex");
+    if !re.is_match(sql) {
+        return None;
+    }
+    let out = re.replace_all(sql, |c: &regex_lite::Captures| {
+        let name = c[1].trim_matches('`').replace("``", "`");
+        format!(
+            "DROP CONSTRAINT `{}{}`",
+            crate::mysql::binder::DROP_CHECK_MARKER,
+            name.replace('`', "``")
+        )
+    });
+    Some(out.into_owned())
 }
