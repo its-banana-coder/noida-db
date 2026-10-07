@@ -253,7 +253,7 @@ pub struct Client {
     /// Passed the `requirepass` check (true from the start when none is set).
     pub authenticated: bool,
     pub reply_off: bool,
-    reply_skip: bool,
+    pub(crate) reply_skip: bool,
     pub reply_skip_next: bool,
     /// Waiting in a blocking command (BLPOP and friends).
     pub blocked: Option<BlockState>,
@@ -313,6 +313,8 @@ pub struct Engine {
     rng: u64,
     /// Keys evicted for maxmemory (INFO stats `evicted_keys`).
     pub evicted_keys: u64,
+    /// INFO commandstats / errorstats counters.
+    pub(crate) stats: super::stats::Stats,
     /// `DEBUG SET-SKIP-CHECKSUM-VALIDATION`: RESTORE ignores payload CRCs.
     pub(crate) skip_checksum: bool,
     /// Connections whose command CLIENT PAUSE is holding (counted as
@@ -557,6 +559,7 @@ impl Engine {
             last_save: now / 1000,
             scripts: Default::default(),
             evicted_keys: 0,
+            stats: Default::default(),
             skip_checksum: false,
             paused_clients: 0,
             oom: false,
@@ -770,6 +773,25 @@ impl Engine {
     }
 
     pub fn execute(&mut self, session: &mut Session, args: &[Vec<u8>]) -> Value {
+        let reply = self.execute_inner(session, args);
+        // errorstats count the error replies clients get, EXEC's included.
+        match &reply {
+            Value::Error(e) => self.stats.error(e),
+            Value::Array(items)
+                if args.first().is_some_and(|a| a.eq_ignore_ascii_case(b"exec")) =>
+            {
+                for item in items {
+                    if let Value::Error(e) = item {
+                        self.stats.error(e);
+                    }
+                }
+            }
+            _ => {}
+        }
+        reply
+    }
+
+    fn execute_inner(&mut self, session: &mut Session, args: &[Vec<u8>]) -> Value {
         if !self.clients.contains_key(&session.id) {
             // Killed by another client: the connection is going away.
             session.closing = true;
@@ -779,8 +801,16 @@ impl Engine {
         let in_multi = self.clients[&session.id].multi.is_some();
         let (handler, fullname) = match resolve(args) {
             Ok(found) => found,
-            Err(e) if in_multi => return self.multi_reject(session.id, &name, e),
-            Err(e) => return e,
+            Err(e) => {
+                // A known command with the wrong arity counts as rejected.
+                if let Value::Error(msg) = &e
+                    && let Some(rest) = msg.strip_prefix("ERR wrong number of arguments for '")
+                    && let Some((cmd, _)) = rest.split_once('\'')
+                {
+                    self.stats.reject(cmd);
+                }
+                return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
+            }
         };
         // Anything not read-only (scripts and EXEC included) may change data.
         if !command_meta::lookup(&name).is_some_and(|m| m.has_flag("readonly")) {
@@ -792,6 +822,7 @@ impl Engine {
         let no_auth = command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("no_auth"));
         if !no_auth && self.auth_required(session.id) {
             let e = Value::err("NOAUTH Authentication required.");
+            self.stats.reject(&fullname);
             return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
         }
         let now = self.now();
@@ -805,6 +836,7 @@ impl Engine {
                 "ERR Can't execute '{shown}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT \
                  / RESET are allowed in this context"
             ));
+            self.stats.reject(&fullname);
             return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
         }
         // maxmemory: evict first; a command that may grow memory is refused
@@ -813,6 +845,7 @@ impl Engine {
         self.oom = maxmemory > 0 && !self.perform_evictions(maxmemory as u64);
         if self.oom && command_meta::lookup(&fullname).is_some_and(|m| m.has_flag("denyoom")) {
             let e = Value::err("OOM command not allowed when used memory > 'maxmemory'.");
+            self.stats.reject(&fullname);
             return if in_multi { self.multi_reject(session.id, &name, e) } else { e };
         }
         if in_multi && !super::multi::runs_in_multi(&name) {
@@ -829,7 +862,7 @@ impl Engine {
         let suppressed = client.reply_off || client.reply_skip;
         client.reply_skip = std::mem::take(&mut client.reply_skip_next);
         session.resp = client.resp;
-        if suppressed { Value::NoReply } else { reply }
+        if suppressed { pushes_only(reply) } else { reply }
     }
 
     /// Runs one command handler. If it blocks, the client is registered as
@@ -842,6 +875,7 @@ impl Engine {
         deny_blocking: bool,
         reprocess_deadline: Option<u64>,
     ) -> Value {
+        let started = std::time::Instant::now();
         let now = self.now();
         let db = self.clients.get(&session.id).map_or(0, |c| c.db);
         let before = self.watch_snapshot(args, db);
@@ -874,10 +908,28 @@ impl Engine {
             self.block_client(session, req, args);
             return Value::NoReply;
         }
+        if let Ok((_, fullname)) = resolve(args) {
+            let usec = started.elapsed().as_micros() as u64;
+            self.stats.call(&fullname, usec, matches!(reply, Value::Error(_)));
+        }
         if !matches!(reply, Value::Error(_)) {
             self.touch_written(args, db, before);
         }
         reply
+    }
+}
+
+/// What CLIENT REPLY OFF/SKIP still sends: pub/sub notifications go out
+/// regardless (Redis's `CLIENT_PUSHING`).
+fn pushes_only(reply: Value) -> Value {
+    match reply {
+        Value::Push(_) => reply,
+        Value::Many(items) => {
+            let pushes: Vec<Value> =
+                items.into_iter().filter(|v| matches!(v, Value::Push(_))).collect();
+            if pushes.is_empty() { Value::NoReply } else { Value::Many(pushes) }
+        }
+        _ => Value::NoReply,
     }
 }
 

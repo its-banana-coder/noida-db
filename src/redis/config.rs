@@ -337,9 +337,8 @@ fn config_set(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     Ok(Value::ok())
 }
 
-fn config_resetstat(_: &mut Ctx, _: &[Vec<u8>]) -> Reply {
-    // The INFO counters noida-db reports are constants, so there is nothing
-    // to clear.
+fn config_resetstat(ctx: &mut Ctx, _: &[Vec<u8>]) -> Reply {
+    ctx.engine.stats = Default::default();
     Ok(Value::ok())
 }
 

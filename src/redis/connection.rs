@@ -471,6 +471,7 @@ fn client_reply(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     match a[2].to_ascii_lowercase().as_slice() {
         b"on" => {
             c.reply_off = false;
+            c.reply_skip = false;
             c.reply_skip_next = false;
             Ok(Value::ok())
         }

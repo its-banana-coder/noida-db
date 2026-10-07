@@ -294,6 +294,58 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             v => Value::Text(render_text(v).bytes().map(|x| format!("{x:02X}")).collect()),
         },
 
+        // ---- hashing and encoding ----
+        "MD5" | "SHA" | "SHA1" | "SHA2" | "CRC32" | "TO_BASE64" | "FROM_BASE64" | "UNHEX" => {
+            let want = if name == "SHA2" { 2 } else { 1 };
+            if a.len() != want {
+                return Err(MySqlError::new(
+                    1582,
+                    "42000",
+                    format!("Incorrect parameter count in the call to native function '{name}'"),
+                ));
+            }
+            if any_null(want) {
+                return Ok(Value::Null);
+            }
+            let data = match &a[0] {
+                Value::Bytes(b) => b.clone(),
+                v => render_text(v).into_bytes(),
+            };
+            use crate::sql::hash;
+            match name {
+                "MD5" => Value::Text(hash::hex(&hash::digest("md5", &data).unwrap())),
+                "SHA" | "SHA1" => Value::Text(hash::hex(&hash::digest("sha1", &data).unwrap())),
+                "SHA2" => {
+                    let alg = match value_to_f64(&a[1]) as i64 {
+                        0 | 256 => "sha256",
+                        224 => "sha224",
+                        384 => "sha384",
+                        512 => "sha512",
+                        _ => return Ok(Value::Null),
+                    };
+                    Value::Text(hash::hex(&hash::digest(alg, &data).unwrap()))
+                }
+                "CRC32" => Value::Int(crc32(&data) as i64),
+                "TO_BASE64" => Value::Text(hash::base64_encode(&data)),
+                "FROM_BASE64" => {
+                    match std::str::from_utf8(&data).ok().and_then(hash::base64_decode) {
+                        Some(b) => Value::Bytes(b),
+                        None => Value::Null,
+                    }
+                }
+                _ => {
+                    // UNHEX: an odd length gets a leading 0; a non-hex digit is NULL.
+                    let s = String::from_utf8_lossy(&data);
+                    let s = if s.len() % 2 == 1 { format!("0{s}") } else { s.into_owned() };
+                    let out: Option<Vec<u8>> = (0..s.len())
+                        .step_by(2)
+                        .map(|i| s.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+                        .collect();
+                    out.map_or(Value::Null, Value::Bytes)
+                }
+            }
+        }
+
         // ---- dates ----
         "DATE" => match to_ts(&arg(0)) {
             Some(t) => Value::Date(t.div_euclid(USECS_PER_DAY) as i32),
@@ -1401,4 +1453,16 @@ fn walk<'a>(doc: &'a Json, path: &[Step]) -> Option<&'a Json> {
     let mut found = Vec::new();
     walk_all(doc, path, &mut found);
     found.into_iter().next()
+}
+
+/// CRC-32 (IEEE), as MySQL's `CRC32()`.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { (c >> 1) ^ 0xEDB8_8320 } else { c >> 1 };
+        }
+    }
+    !c
 }
