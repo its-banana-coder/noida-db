@@ -183,6 +183,20 @@ impl GroupState {
         }
     }
 
+    /// KIP-345: a request naming a `group.instance.id` that now belongs to
+    /// a different member id comes from a replaced (fenced) instance.
+    pub fn is_fenced_instance(&self, instance_id: Option<&str>, member_id: &str) -> bool {
+        let Some(iid) = instance_id else { return false };
+        self.member_for_instance(iid).is_some_and(|m| m != member_id)
+    }
+
+    pub fn member_for_instance(&self, instance_id: &str) -> Option<String> {
+        self.members
+            .values()
+            .find(|m| m.group_instance_id.as_deref() == Some(instance_id))
+            .map(|m| m.member_id.clone())
+    }
+
     pub fn new(group_id: String) -> Self {
         Self {
             group_id,
@@ -1282,9 +1296,67 @@ impl EngineState {
             *group = GroupState::new(group_id.clone());
         }
 
+        // KIP-345 static membership: a member with a group.instance.id
+        // gets its member id straight away (no MEMBER_ID_REQUIRED round),
+        // and a new instance with an id already in the group replaces the
+        // old member -- taking over its assignment, without a rebalance if
+        // the group is stable and the subscription unchanged. The replaced
+        // member is fenced (FENCED_INSTANCE_ID) from then on.
+        let instance_id = req.group_instance_id.as_ref().map(|s| s.as_str().to_string());
+        let mut static_m_id = None;
+        if let Some(iid) = &instance_id {
+            let existing = group.member_for_instance(iid);
+            if !req.member_id.is_empty() {
+                if existing.as_deref().is_some_and(|e| e != req.member_id.as_str()) {
+                    res.error_code = 82; // FENCED_INSTANCE_ID
+                    res.member_id = req.member_id.clone();
+                    res.generation_id = -1;
+                    return res;
+                }
+            } else {
+                let new_id = new_member_id(client_id, &mut self.next_member_counter);
+                if let Some(old) = existing {
+                    let mut m = group.members.remove(&old).expect("member exists");
+                    m.member_id = new_id.clone();
+                    let unchanged = m.protocols
+                        == req
+                            .protocols
+                            .iter()
+                            .map(|p| (p.name.as_str().to_string(), p.metadata.to_vec()))
+                            .collect::<Vec<_>>();
+                    m.client_id = client_id.to_string();
+                    m.client_host = client_host.to_string();
+                    m.last_heartbeat_ms = now;
+                    group.members.insert(new_id.clone(), m);
+                    if let Some(a) = group.assignments.remove(&old) {
+                        group.assignments.insert(new_id.clone(), a);
+                    }
+                    if let Some(a) = group.awaiting_members.remove(&old) {
+                        group.awaiting_members.insert(new_id.clone(), a);
+                    }
+                    if group.leader_id.as_deref() == Some(old.as_str()) {
+                        group.leader_id = Some(new_id.clone());
+                    }
+                    if group.state == GroupLifecycleState::Stable && unchanged {
+                        res.error_code = 0;
+                        res.generation_id = group.generation_id;
+                        res.protocol_type =
+                            Some(StrBytes::from_string(group.protocol_type.clone()));
+                        res.protocol_name =
+                            group.protocol_name.as_ref().map(|s| StrBytes::from_string(s.clone()));
+                        res.leader =
+                            StrBytes::from_string(group.leader_id.clone().unwrap_or_default());
+                        res.member_id = StrBytes::from_string(new_id);
+                        return res;
+                    }
+                }
+                static_m_id = Some(new_id);
+            }
+        }
+
         // KIP-394: dynamic member join with empty member_id returns MEMBER_ID_REQUIRED (79)
         // for API version >= 4. For v0-v3, coordinator assigns member_id in the first JoinGroup.
-        if version >= 4 && req.member_id.is_empty() {
+        if version >= 4 && req.member_id.is_empty() && static_m_id.is_none() {
             let assigned_id = new_member_id(client_id, &mut self.next_member_counter);
             group.pending_member_ids.insert(assigned_id.clone());
 
@@ -1295,7 +1367,9 @@ impl EngineState {
             return res;
         }
 
-        let m_id = if req.member_id.is_empty() {
+        let m_id = if let Some(id) = static_m_id.clone() {
+            id
+        } else if req.member_id.is_empty() {
             new_member_id(client_id, &mut self.next_member_counter)
         } else {
             req.member_id.as_str().to_string()
@@ -1392,6 +1466,11 @@ impl EngineState {
             for (member_id_str, protos) in &group.awaiting_members {
                 let mut member_res = JoinGroupResponseMember::default();
                 member_res.member_id = StrBytes::from_string(member_id_str.clone());
+                member_res.group_instance_id = group
+                    .members
+                    .get(member_id_str)
+                    .and_then(|m| m.group_instance_id.as_ref())
+                    .map(|i| StrBytes::from_string(i.clone()));
                 let meta = protos
                     .iter()
                     .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
@@ -1422,6 +1501,11 @@ impl EngineState {
                 return res;
             }
         };
+
+        if group.is_fenced_instance(req.group_instance_id.as_deref(), &m_id) {
+            res.error_code = 82; // FENCED_INSTANCE_ID
+            return res;
+        }
 
         if !group.members.contains_key(&m_id) {
             res.error_code = 25; // UNKNOWN_MEMBER_ID
@@ -1483,6 +1567,11 @@ impl EngineState {
             }
         };
 
+        if group.is_fenced_instance(req.group_instance_id.as_deref(), &m_id) {
+            res.error_code = 82; // FENCED_INSTANCE_ID
+            return res;
+        }
+
         if !group.members.contains_key(&m_id) {
             res.error_code = 25; // UNKNOWN_MEMBER_ID
             return res;
@@ -1534,8 +1623,18 @@ impl EngineState {
             }
         };
 
+        // v3+ names members by member id or, for static members (e.g.
+        // AdminClient.removeMembersFromConsumerGroup), by group.instance.id.
         let members_to_leave: Vec<String> = if version >= 3 && !req.members.is_empty() {
-            req.members.iter().map(|m| m.member_id.as_str().to_string()).collect()
+            req.members
+                .iter()
+                .map(|m| match m.group_instance_id.as_deref() {
+                    Some(iid) if m.member_id.is_empty() => {
+                        group.member_for_instance(iid).unwrap_or_default()
+                    }
+                    _ => m.member_id.as_str().to_string(),
+                })
+                .collect()
         } else {
             vec![req.member_id.as_str().to_string()]
         };
@@ -1643,7 +1742,9 @@ impl EngineState {
                 Some(g)
                     if generation >= 0 || !m_id.is_empty() || req.group_instance_id.is_some() =>
                 {
-                    if !g.members.contains_key(m_id) {
+                    if g.is_fenced_instance(req.group_instance_id.as_deref(), m_id) {
+                        82 // FENCED_INSTANCE_ID
+                    } else if !g.members.contains_key(m_id) {
                         25 // UNKNOWN_MEMBER_ID
                     } else if generation != g.generation_id {
                         22 // ILLEGAL_GENERATION
@@ -1855,6 +1956,8 @@ impl EngineState {
                 for (m_id, m) in &group.members {
                     let mut dm = DescribedGroupMember::default();
                     dm.member_id = StrBytes::from_string(m_id.clone());
+                    dm.group_instance_id =
+                        m.group_instance_id.as_ref().map(|i| StrBytes::from_string(i.clone()));
                     dm.client_id = StrBytes::from_string(m.client_id.clone());
                     dm.client_host = StrBytes::from_string(m.client_host.clone());
 
@@ -2894,6 +2997,12 @@ impl Engine {
                     return resp;
                 }
             };
+            // Removed while waiting: replaced by a newer instance with the
+            // same group.instance.id, or expired.
+            if !group.members.contains_key(member_id.as_str()) {
+                resp.error_code = if req.group_instance_id.is_some() { 82 } else { 25 };
+                return resp;
+            }
 
             if group.state == GroupLifecycleState::CompletingRebalance
                 || group.state == GroupLifecycleState::Stable
@@ -2913,11 +3022,27 @@ impl Engine {
                 final_resp.member_id = member_id.clone();
                 if final_resp.leader == member_id {
                     let mut mems = Vec::new();
-                    for (m_id, protos) in &group.awaiting_members {
+                    // A static leader rejoining a stable group has no
+                    // round in progress: it gets every member's metadata.
+                    let all: HashMap<String, Vec<(String, Vec<u8>)>>;
+                    let joined = if group.awaiting_members.is_empty() {
+                        all = group
+                            .members
+                            .iter()
+                            .map(|(id, m)| (id.clone(), m.protocols.clone()))
+                            .collect();
+                        &all
+                    } else {
+                        &group.awaiting_members
+                    };
+                    for (m_id, protos) in joined {
                         let mut mem = kafka_protocol::messages::join_group_response::JoinGroupResponseMember::default();
                         mem.member_id =
                             kafka_protocol::protocol::StrBytes::from_string(m_id.clone());
-                        mem.group_instance_id = None;
+                        mem.group_instance_id =
+                            group.members.get(m_id).and_then(|m| m.group_instance_id.as_ref()).map(
+                                |i| kafka_protocol::protocol::StrBytes::from_string(i.clone()),
+                            );
                         mem.metadata = protos
                             .iter()
                             .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
