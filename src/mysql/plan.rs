@@ -374,6 +374,8 @@ pub enum Plan {
         indexes: Vec<UniqueKey>,
         foreign_keys: Vec<crate::mysql::catalog::ForeignKey>,
         if_not_exists: bool,
+        /// The table option `COMMENT = '...'`.
+        comment: String,
     },
     /// `DROP TABLE [IF EXISTS] a, b`.
     /// `ALTER TABLE t op, op, ...`.
@@ -926,6 +928,8 @@ pub enum AlterOp {
         now: bool,
     },
     AutoIncrement(i64),
+    /// `COMMENT = '...'` (the table's comment).
+    SetComment(String),
     /// Accepted and ignored: foreign keys, plain indexes, ALGORITHM/LOCK.
     Noop,
 }
