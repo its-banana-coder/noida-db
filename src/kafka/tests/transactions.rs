@@ -91,6 +91,13 @@ fn has_records(part: &kafka_protocol::messages::fetch_response::PartitionData) -
 #[test]
 fn test_transaction_lifecycle() {
     let t = T::new();
+    t.create_topic("orders", 2);
+    let mut init = InitProducerIdRequest::default();
+    init.transactional_id = Some(TransactionalId(StrBytes::from_static_str("my-tx")));
+    init.transaction_timeout_ms = 60_000;
+    let init_resp = t.engine.handle_init_producer_id(&init, 1);
+    assert_eq!(init_resp.error_code, 0);
+    assert_eq!(describe_txn(&t, "my-tx"), (0, "Empty".to_string(), vec![]));
 
     // 1. AddPartitionsToTxn
     let mut add_parts_req = AddPartitionsToTxnRequest::default();
@@ -137,15 +144,25 @@ fn test_transaction_lifecycle() {
     fetch_topic.name = TopicName::from(StrBytes::from_static_str("orders"));
     fetch_topic.partition_indexes.push(0);
     fetch_req.topics = Some(vec![fetch_topic]);
+    // Not visible until the transaction commits.
     let fetch_resp = t.engine.handle_offset_fetch(&fetch_req, 8);
-    assert_eq!(fetch_resp.topics[0].partitions[0].committed_offset, 99);
+    assert_eq!(fetch_resp.topics[0].partitions[0].committed_offset, -1);
+    assert_eq!(
+        describe_txn(&t, "my-tx"),
+        (0, "Ongoing".to_string(), vec![("orders".to_string(), vec![0, 1])])
+    );
 
     // 4. EndTxn (commit)
     let mut end_commit_req = EndTxnRequest::default();
     end_commit_req.transactional_id = TransactionalId(StrBytes::from_static_str("my-tx"));
+    end_commit_req.producer_id = init_resp.producer_id;
+    end_commit_req.producer_epoch = init_resp.producer_epoch;
     end_commit_req.committed = true;
     let end_commit_resp = t.engine.handle_end_txn(&end_commit_req, 1);
     assert_eq!(end_commit_resp.error_code, 0);
+    let fetch_resp = t.engine.handle_offset_fetch(&fetch_req, 8);
+    assert_eq!(fetch_resp.topics[0].partitions[0].committed_offset, 99);
+    assert_eq!(describe_txn(&t, "my-tx"), (0, "CompleteCommit".to_string(), vec![]));
 
     // 5. EndTxn (abort)
     let mut end_abort_req = EndTxnRequest::default();
@@ -160,10 +177,138 @@ fn test_transaction_lifecycle() {
     let desc_tx_resp = t.engine.handle_describe_transactions(&desc_tx_req, 0);
     assert_eq!(desc_tx_resp.transaction_states[0].error_code, 0);
     assert_eq!(desc_tx_resp.transaction_states[0].transactional_id.as_str(), "my-tx");
+    assert_eq!(describe_txn(&t, "never-used").0, 105); // TRANSACTIONAL_ID_NOT_FOUND
 
     let list_tx_req = ListTransactionsRequest::default();
     let list_tx_resp = t.engine.handle_list_transactions(&list_tx_req, 0);
     assert_eq!(list_tx_resp.error_code, 0);
+    let listed: Vec<_> = list_tx_resp
+        .transaction_states
+        .iter()
+        .map(|s| (s.transactional_id.as_str().to_string(), s.transaction_state.to_string()))
+        .collect();
+    assert_eq!(listed, vec![("my-tx".to_string(), "CompleteAbort".to_string())]);
+    let mut ongoing_only = ListTransactionsRequest::default();
+    ongoing_only.state_filters.push(StrBytes::from_static_str("Ongoing"));
+    assert!(t.engine.handle_list_transactions(&ongoing_only, 0).transaction_states.is_empty());
+}
+
+fn describe_txn(t: &T, tid: &str) -> (i16, String, Vec<(String, Vec<i32>)>) {
+    let mut req = DescribeTransactionsRequest::default();
+    req.transactional_ids.push(TransactionalId(StrBytes::from_string(tid.to_string())));
+    let res = t.engine.handle_describe_transactions(&req, 0);
+    let s = &res.transaction_states[0];
+    let topics =
+        s.topics.iter().map(|td| (td.topic.as_str().to_string(), td.partitions.clone())).collect();
+    (s.error_code, s.transaction_state.to_string(), topics)
+}
+
+fn txn_offset_commit(t: &T, tid: &str, pid: i64, epoch: i16, group: &str, offset: i64) -> i16 {
+    let mut req = TxnOffsetCommitRequest::default();
+    req.transactional_id = TransactionalId(StrBytes::from_string(tid.to_string()));
+    req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    req.producer_id = kafka_protocol::messages::ProducerId(pid);
+    req.producer_epoch = epoch;
+    let mut tp = TxnOffsetCommitRequestTopic::default();
+    tp.name = TopicName::from(StrBytes::from_static_str("src"));
+    let mut part = TxnOffsetCommitRequestPartition::default();
+    part.partition_index = 0;
+    part.committed_offset = offset;
+    tp.partitions.push(part);
+    req.topics.push(tp);
+    t.engine.handle_txn_offset_commit(&req, 3).topics[0].partitions[0].error_code
+}
+
+fn committed(t: &T, group: &str) -> i64 {
+    let mut req = OffsetFetchRequest::default();
+    req.group_id = GroupId(StrBytes::from_string(group.to_string()));
+    let mut ft = OffsetFetchRequestTopic::default();
+    ft.name = TopicName::from(StrBytes::from_static_str("src"));
+    ft.partition_indexes.push(0);
+    req.topics = Some(vec![ft]);
+    t.engine.handle_offset_fetch(&req, 7).topics[0].partitions[0].committed_offset
+}
+
+/// send_offsets_to_transaction + abort must leave the group's offsets
+/// alone (found: the aborted offsets were committed immediately).
+#[test]
+fn test_txn_offsets_discarded_on_abort() {
+    let t = T::new();
+    t.create_topic("src", 1);
+    let mut init = InitProducerIdRequest::default();
+    init.transactional_id = Some(TransactionalId(StrBytes::from_static_str("ab-tx")));
+    init.transaction_timeout_ms = 60_000;
+    let r = t.engine.handle_init_producer_id(&init, 1);
+    let (pid, epoch) = (r.producer_id.0, r.producer_epoch);
+    assert_eq!(txn_offset_commit(&t, "ab-tx", pid, epoch, "g", 5), 0);
+    let mut end = EndTxnRequest::default();
+    end.transactional_id = TransactionalId(StrBytes::from_static_str("ab-tx"));
+    end.producer_id = kafka_protocol::messages::ProducerId(pid);
+    end.producer_epoch = epoch;
+    end.committed = false;
+    assert_eq!(t.engine.handle_end_txn(&end, 3).error_code, 0);
+    assert_eq!(committed(&t, "g"), -1);
+    assert_eq!(describe_txn(&t, "ab-tx").1, "CompleteAbort");
+}
+
+/// A second InitProducerId for the same transactional.id aborts the first
+/// instance's open transaction: its records never become visible to
+/// read_committed and its offsets are dropped (found: they were committed).
+#[test]
+fn test_reinit_aborts_open_transaction() {
+    let t = T::new();
+    t.create_topic("src", 1);
+    t.create_topic("out", 1);
+    let mut init = InitProducerIdRequest::default();
+    init.transactional_id = Some(TransactionalId(StrBytes::from_static_str("z-tx")));
+    init.transaction_timeout_ms = 60_000;
+    let r1 = t.engine.handle_init_producer_id(&init, 1);
+    let (pid, e1) = (r1.producer_id.0, r1.producer_epoch);
+
+    let mut add = AddPartitionsToTxnRequest::default();
+    add.v3_and_below_transactional_id = TransactionalId(StrBytes::from_static_str("z-tx"));
+    add.v3_and_below_producer_id = kafka_protocol::messages::ProducerId(pid);
+    add.v3_and_below_producer_epoch = e1;
+    let mut at = AddPartitionsToTxnTopic::default();
+    at.name = TopicName::from(StrBytes::from_static_str("out"));
+    at.partitions = vec![0];
+    add.v3_and_below_topics = vec![at];
+    t.engine.handle_add_partitions_to_txn(&add, 3);
+    let mut prod = ProduceRequest::default();
+    prod.transactional_id = Some(TransactionalId(StrBytes::from_static_str("z-tx")));
+    let mut td = TopicProduceData::default();
+    td.name = TopicName::from(StrBytes::from_static_str("out"));
+    let mut pd = PartitionProduceData::default();
+    pd.index = 0;
+    pd.records = Some(bytes::Bytes::from(make_transactional_batch(pid, e1, 0)));
+    td.partition_data.push(pd);
+    prod.topic_data.push(td);
+    assert_eq!(t.engine.handle_produce(&prod, 9).responses[0].partition_responses[0].error_code, 0);
+    assert_eq!(txn_offset_commit(&t, "z-tx", pid, e1, "g", 7), 0);
+
+    let r2 = t.engine.handle_init_producer_id(&init, 1);
+    assert_eq!(r2.producer_id.0, pid);
+    assert!(r2.producer_epoch > e1);
+    assert_eq!(committed(&t, "g"), -1);
+    assert_eq!(describe_txn(&t, "z-tx"), (0, "Empty".to_string(), vec![]));
+    // The zombie can no longer commit offsets.
+    assert_eq!(txn_offset_commit(&t, "z-tx", pid, e1, "g", 8), 47);
+
+    // read_committed sees nothing: the record was aborted.
+    let mut fetch = FetchRequest::default();
+    fetch.isolation_level = 1;
+    let mut ft = FetchTopic::default();
+    ft.topic = TopicName::from(StrBytes::from_static_str("out"));
+    let mut fp = FetchPartition::default();
+    fp.partition = 0;
+    fp.partition_max_bytes = 1 << 20;
+    ft.partitions.push(fp);
+    fetch.topics.push(ft);
+    let res = t.engine.handle_fetch(&fetch, 11);
+    let p = &res.responses[0].partitions[0];
+    assert_eq!(p.last_stable_offset, p.high_watermark);
+    let aborted = p.aborted_transactions.as_ref().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(aborted, 1, "the open transaction was aborted");
 }
 
 /// The whole point of this feature: a read_committed consumer must never

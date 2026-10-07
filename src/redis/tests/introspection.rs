@@ -196,6 +196,40 @@ fn info_sections() {
 }
 
 #[test]
+fn getkeys_for_commands_with_key_functions() {
+    let mut t = T::new();
+    let kf = |k: &str, flags: &[&str]| arr(vec![bulk(k), simples(flags)]);
+    assert_eq!(
+        t.run("COMMAND GETKEYSANDFLAGS sort k1 store k2"),
+        arr(vec![kf("k1", &["RO", "access"]), kf("k2", &["OW", "update"])])
+    );
+    assert_eq!(
+        t.run("COMMAND GETKEYSANDFLAGS sort k limit 0 1 store a get # store b"),
+        arr(vec![kf("k", &["RO", "access"]), kf("b", &["OW", "update"])])
+    );
+    assert_eq!(t.run("COMMAND GETKEYS sort k1"), bulks(&["k1"]));
+    assert_eq!(
+        t.run("COMMAND GETKEYSANDFLAGS georadiusbymember k m 1 km storedist k3"),
+        arr(vec![kf("k", &["RO", "access"]), kf("k3", &["OW", "update"])])
+    );
+    assert_eq!(t.run("COMMAND GETKEYS xread count 1 streams s1 s2 0 0"), bulks(&["s1", "s2"]));
+    // Current 7.2 releases mark XREAD's spec incomplete, so xreadGetKeys
+    // answers (7.2.12 and older used the spec and said s1).
+    assert_eq!(
+        t.run("COMMAND GETKEYS xread streams s1 0 0"),
+        err("ERR Invalid arguments specified for command")
+    );
+    assert_eq!(
+        t.run("COMMAND GETKEYSANDFLAGS bitfield k get u8 0"),
+        arr(vec![kf("k", &["RO", "access"])])
+    );
+    assert_eq!(
+        t.run("COMMAND GETKEYSANDFLAGS bitfield k set u8 0 1"),
+        arr(vec![kf("k", &["RW", "access", "update"])])
+    );
+}
+
+#[test]
 fn command_and_error_stats() {
     let mut t = T::new();
     t.run("CONFIG RESETSTAT");

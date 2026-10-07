@@ -146,6 +146,18 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         } else {
             engine.dispatch(&method, path, query, &body)
         };
+        // Deprecation warnings travel in the payload; they go out as
+        // `Warning` headers.
+        let mut payload = payload;
+        let warnings: Vec<String> = payload
+            .as_object_mut()
+            .and_then(|m| m.remove(super::engine::WARNINGS))
+            .and_then(|w| w.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|w| format!("Warning: 299 Elasticsearch-8.15.3-noida \"{w}\"\r\n"))
+            .collect();
         let head = method == "HEAD";
         let (status, payload) =
             if head && status == 200 { (200, Value::Null) } else { (status, payload) };
@@ -156,7 +168,7 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         } else if let Some(text) = &raw_text {
             text.as_bytes().to_vec()
         } else {
-            serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())
+            to_es_json(&payload)
         };
         let content_type = if raw_text.is_some() {
             "text/plain; charset=UTF-8"
@@ -191,8 +203,9 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
         let w = reader.get_mut();
         write!(
             w,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Elastic-Product: Elasticsearch\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Elastic-Client-Meta\r\n{}{}\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Elastic-Product: Elasticsearch\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, HEAD, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Elastic-Client-Meta\r\n{}{}{}\r\n",
             bytes.len(),
+            warnings.concat(),
             if gzip_out { "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" } else { "" },
             if connection_close { "Connection: close\r\n" } else { "" }
         )?;
@@ -236,4 +249,61 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
 #[allow(dead_code)]
 fn _error_type_anchor(_: Value) {
     let _ = error("x", "x", 500);
+}
+
+/// Elasticsearch's key order for the keys whose position clients and
+/// tools see (an error's `type` before its `reason`, a document's
+/// metadata before `_source`); every other key keeps serde's order.
+const KEY_ORDER: &[&str] = &[
+    "error",
+    "root_cause",
+    "type",
+    "reason",
+    "_index",
+    "_id",
+    "_version",
+    "_seq_no",
+    "_primary_term",
+    "_routing",
+    "found",
+    "result",
+    "_shards",
+    "_score",
+    "_source",
+];
+
+fn to_es_json(v: &Value) -> Vec<u8> {
+    fn write(v: &Value, out: &mut Vec<u8>) {
+        match v {
+            Value::Object(m) => {
+                let rank = |k: &str| KEY_ORDER.iter().position(|x| *x == k).unwrap_or(usize::MAX);
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort_by_key(|k| rank(k));
+                out.push(b'{');
+                for (n, k) in keys.into_iter().enumerate() {
+                    if n > 0 {
+                        out.push(b',');
+                    }
+                    out.extend(serde_json::to_vec(k).unwrap_or_default());
+                    out.push(b':');
+                    write(&m[k], out);
+                }
+                out.push(b'}');
+            }
+            Value::Array(a) => {
+                out.push(b'[');
+                for (n, x) in a.iter().enumerate() {
+                    if n > 0 {
+                        out.push(b',');
+                    }
+                    write(x, out);
+                }
+                out.push(b']');
+            }
+            other => out.extend(serde_json::to_vec(other).unwrap_or_default()),
+        }
+    }
+    let mut out = Vec::new();
+    write(v, &mut out);
+    out
 }

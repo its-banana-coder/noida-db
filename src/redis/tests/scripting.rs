@@ -342,3 +342,35 @@ fn shebang_allow_oom() {
     assert_eq!(t.run("EVAL \"#!lua flags=allow-oom\\nreturn 1\" 0"), int(1));
     t.run("CONFIG SET maxmemory 0");
 }
+
+#[test]
+fn script_select_does_not_change_the_callers_db() {
+    let mut t = T::new();
+    t.run("SELECT 10");
+    t.run("SET mykey orig");
+    assert_eq!(t.run("EVAL \"return redis.pcall('select','9')\" 0"), ok());
+    assert_eq!(t.run("GET mykey"), bulk("orig"));
+}
+
+#[test]
+fn function_load_unknown_option() {
+    let mut t = T::new();
+    let code = "\"#!lua name=x\\nredis.register_function('x', function() return 1 end)\"";
+    assert_eq!(
+        t.run(&format!("FUNCTION LOAD foo bar {code}")),
+        err("ERR Unknown option given: foo")
+    );
+    assert_eq!(
+        t.run(&format!("FUNCTION LOAD replace foo {code}")),
+        err("ERR Unknown option given: foo")
+    );
+    assert_eq!(t.run(&format!("FUNCTION LOAD REPLACE {code}")), bulk("x"));
+}
+
+#[test]
+fn resp3_false_is_zero_on_resp2() {
+    let mut t = T::new();
+    let mut out = Vec::new();
+    super::super::resp::encode(&t.run("EVAL \"redis.setresp(3); return false\" 0"), 2, &mut out);
+    assert_eq!(out, b":0\r\n");
+}

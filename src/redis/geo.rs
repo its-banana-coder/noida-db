@@ -408,6 +408,10 @@ fn geo_search(ctx: &mut Ctx, a: &[Vec<u8>], v: Variant) -> Reply {
         }
     }
 
+    // COUNT without an order (and without ANY) sorts nearest first.
+    if count > 0 && !any && matches!(sort, Sort::None) {
+        sort = Sort::Asc;
+    }
     match sort {
         Sort::Asc => found.sort_by(|x, y| x.dist.total_cmp(&y.dist)),
         Sort::Desc => found.sort_by(|x, y| y.dist.total_cmp(&x.dist)),

@@ -86,6 +86,22 @@ pub struct Table {
     /// The table's `COMMENT` (empty when none).
     #[serde(default)]
     pub comment: String,
+    /// `CHECK` constraints, enforced on every write.
+    #[serde(default)]
+    pub checks: Vec<Check>,
+}
+
+/// A `CHECK (expr)` constraint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Check {
+    /// Its name (`<table>_chk_<n>` when the DDL gave none; empty until
+    /// the table it's added to assigns one).
+    pub name: String,
+    /// The expression as SQL this engine parses back to evaluate it.
+    pub expr: String,
+    /// The expression the way MySQL normalizes it for SHOW CREATE TABLE
+    /// and `information_schema.CHECK_CONSTRAINTS` (`(`a` >= 0)`).
+    pub clause: String,
 }
 
 /// A `FOREIGN KEY (columns) REFERENCES ref_db.ref_table (ref_columns)`.
@@ -133,6 +149,7 @@ impl Table {
             foreign_keys: Vec::new(),
             indexes: Vec::new(),
             comment: String::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -147,6 +164,7 @@ impl Table {
             foreign_keys: self.foreign_keys.clone(),
             indexes: self.indexes.clone(),
             comment: self.comment.clone(),
+            checks: self.checks.clone(),
         }
     }
 

@@ -183,6 +183,20 @@ impl GroupState {
         }
     }
 
+    /// KIP-345: a request naming a `group.instance.id` that now belongs to
+    /// a different member id comes from a replaced (fenced) instance.
+    pub fn is_fenced_instance(&self, instance_id: Option<&str>, member_id: &str) -> bool {
+        let Some(iid) = instance_id else { return false };
+        self.member_for_instance(iid).is_some_and(|m| m != member_id)
+    }
+
+    pub fn member_for_instance(&self, instance_id: &str) -> Option<String> {
+        self.members
+            .values()
+            .find(|m| m.group_instance_id.as_deref() == Some(instance_id))
+            .map(|m| m.member_id.clone())
+    }
+
     pub fn new(group_id: String) -> Self {
         Self {
             group_id,
@@ -227,6 +241,31 @@ pub struct EngineState {
     // transactional.id -> (topic, partition) set added via
     // AddPartitionsToTxn for the transaction currently in progress.
     pub txn_partitions: HashMap<String, HashSet<(String, i32)>>,
+    // transactional.id -> offsets sent with TxnOffsetCommit in the open
+    // transaction: they only become the group's committed offsets when the
+    // transaction commits (an abort discards them).
+    pub txn_pending_offsets: HashMap<String, Vec<PendingTxnOffset>>,
+    // transactional.id -> what DescribeTransactions/ListTransactions report.
+    pub txn_info: HashMap<String, TxnInfo>,
+}
+
+/// An offset committed inside a transaction, waiting for EndTxn.
+#[derive(Debug, Clone)]
+pub struct PendingTxnOffset {
+    pub key: (String, String, i32),
+    pub offset: i64,
+    pub metadata: Option<String>,
+}
+
+/// A transactional id's coordinator-side state, as Kafka's
+/// kafka-transactions.sh describe/list show it.
+#[derive(Debug, Clone)]
+pub struct TxnInfo {
+    /// Empty, Ongoing, CompleteCommit or CompleteAbort.
+    pub state: &'static str,
+    pub timeout_ms: i32,
+    /// When the current/last transaction started (-1: none since init).
+    pub start_ms: i64,
 }
 
 impl std::fmt::Debug for EngineState {
@@ -310,6 +349,8 @@ impl EngineState {
             producer_epochs: HashMap::new(),
             txn_producers: HashMap::new(),
             txn_partitions: HashMap::new(),
+            txn_pending_offsets: HashMap::new(),
+            txn_info: HashMap::new(),
         };
 
         // Pre-create internal topics as a real KRaft broker does
@@ -375,9 +416,12 @@ impl EngineState {
             (ApiKey::EndTxn, 0, 3),
             (ApiKey::TxnOffsetCommit, 0, 3),
             (ApiKey::DescribeTransactions, 0, 0),
-            (ApiKey::ListTransactions, 0, 0),
+            (ApiKey::ListTransactions, 0, 1),
             (ApiKey::DescribeProducers, 0, 0),
             (ApiKey::DescribeLogDirs, 0, 2),
+            (ApiKey::DescribeAcls, 0, 3),
+            (ApiKey::CreateAcls, 0, 3),
+            (ApiKey::DeleteAcls, 0, 3),
             (ApiKey::SaslHandshake, 0, 1),
             (ApiKey::SaslAuthenticate, 0, 2),
             (ApiKey::ApiVersions, 0, 3),
@@ -428,7 +472,11 @@ impl EngineState {
             if let Some(state) = self.topics.get(&topic_name) {
                 topic_res.error_code = 0;
                 topic_res.is_internal = state.is_internal;
-                for (p_id, part_state) in &state.partitions {
+                // In partition order, as Kafka lists them (clients such as
+                // Java's RoundRobinPartitioner index into this list).
+                let mut parts: Vec<_> = state.partitions.iter().collect();
+                parts.sort_by_key(|(p, _)| **p);
+                for (p_id, part_state) in parts {
                     let mut part_res = MetadataResponsePartition::default();
                     part_res.partition_index = *p_id;
                     part_res.leader_id = kafka_protocol::messages::BrokerId(part_state.leader);
@@ -438,21 +486,28 @@ impl EngineState {
                         vec![kafka_protocol::messages::BrokerId(part_state.leader)];
                     topic_res.partitions.push(part_res);
                 }
-            } else if req.allow_auto_topic_creation {
+            } else if super::log::validate_topic_name(&topic_name).is_err() {
+                topic_res.error_code = 17; // INVALID_TOPIC_EXCEPTION
+            } else if req.allow_auto_topic_creation
+                && self.broker_configs.get("auto.create.topics.enable").is_none_or(|v| v != "false")
+            {
+                // Auto-created with the broker's num.partitions.
                 let mut topic_state = TopicState {
                     name: topic_name.clone(),
                     is_internal: false,
                     partitions: HashMap::new(),
                     configs: HashMap::new(),
                 };
-                topic_state.partitions.insert(0, PartitionState::new(0, self.broker_id));
-
-                let mut part_res = MetadataResponsePartition::default();
-                part_res.partition_index = 0;
-                part_res.leader_id = kafka_protocol::messages::BrokerId(self.broker_id);
-                part_res.replica_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
-                part_res.isr_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
-                topic_res.partitions.push(part_res);
+                for p in 0..self.default_num_partitions() {
+                    topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
+                    let mut part_res = MetadataResponsePartition::default();
+                    part_res.partition_index = p;
+                    part_res.leader_id = kafka_protocol::messages::BrokerId(self.broker_id);
+                    part_res.replica_nodes =
+                        vec![kafka_protocol::messages::BrokerId(self.broker_id)];
+                    part_res.isr_nodes = vec![kafka_protocol::messages::BrokerId(self.broker_id)];
+                    topic_res.partitions.push(part_res);
+                }
                 topic_res.is_internal = false;
 
                 self.topics.insert(topic_name, topic_state);
@@ -465,6 +520,16 @@ impl EngineState {
         }
 
         res
+    }
+
+    /// The broker's `num.partitions`: what a topic created without a
+    /// partition count (CreateTopics with -1, or auto-creation) gets.
+    fn default_num_partitions(&self) -> i32 {
+        self.broker_configs
+            .get("num.partitions")
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &i32| n > 0)
+            .unwrap_or(1)
     }
 
     pub fn handle_create_topics(
@@ -484,20 +549,82 @@ impl EngineState {
                 super::log::validate_topic_config(c.name.as_str(), value).err()
             });
 
-            if let Err(msg) = super::log::validate_topic_name(topic_name_str) {
-                topic_res.error_code = 17; // INVALID_TOPIC_EXCEPTION
-                topic_res.error_message = Some(StrBytes::from_string(msg));
-            } else if let Some(msg) = config_error {
-                topic_res.error_code = 40; // INVALID_CONFIG
-                topic_res.error_message = Some(StrBytes::from_string(msg));
-            } else if topic.num_partitions <= 0 {
-                topic_res.error_code = 37; // INVALID_PARTITIONS
-            } else if topic.replication_factor > 1 {
-                topic_res.error_code = 38; // INVALID_REPLICATION_FACTOR
+            // -1 asks for the broker default (num.partitions /
+            // default.replication.factor); explicit replica assignments
+            // give the partition count instead, as on Kafka.
+            let num_partitions = if !topic.assignments.is_empty() {
+                topic.assignments.len() as i32
+            } else if topic.num_partitions == -1 {
+                self.default_num_partitions()
+            } else {
+                topic.num_partitions
+            };
+            let replication_factor = if !topic.assignments.is_empty() {
+                topic.assignments.iter().map(|a| a.broker_ids.len()).max().unwrap_or(0) as i32
+            } else if topic.replication_factor == -1 {
+                1
+            } else {
+                topic.replication_factor as i32
+            };
+            let fail = |code: i16, msg: String| (code, msg);
+            let error = if let Err(msg) = super::log::validate_topic_name(topic_name_str) {
+                Some(fail(17, msg)) // INVALID_TOPIC_EXCEPTION
             } else if self.topics.contains_key(topic_name_str) {
-                topic_res.error_code = 36; // TOPIC_ALREADY_EXISTS
+                Some(fail(36, format!("Topic '{topic_name_str}' already exists."))) // TOPIC_ALREADY_EXISTS
+            } else if !topic.assignments.is_empty()
+                && (topic.num_partitions != -1 || topic.replication_factor != -1)
+            {
+                Some(fail(
+                    42, // INVALID_REQUEST
+                    "Both numPartitions or replicationFactor and replicasAssignments were set. \
+                     Both cannot be used at the same time."
+                        .into(),
+                ))
+            } else if num_partitions <= 0 {
+                Some(fail(
+                    37, // INVALID_PARTITIONS
+                    "Number of partitions was set to an invalid non-positive value.".into(),
+                ))
+            } else if replication_factor <= 0 {
+                Some(fail(
+                    38, // INVALID_REPLICATION_FACTOR
+                    "Replication factor must be larger than 0, or -1 to use the default value."
+                        .into(),
+                ))
+            } else if let Some(bad) = topic
+                .assignments
+                .iter()
+                .flat_map(|a| a.broker_ids.iter())
+                .find(|b| b.0 != self.broker_id)
+            {
+                Some(fail(
+                    39, // INVALID_REPLICA_ASSIGNMENT
+                    format!(
+                        "The manual partition assignment includes broker {}, but no such broker is registered.",
+                        bad.0
+                    ),
+                ))
+            } else if replication_factor > 1 {
+                Some(fail(
+                    38, // INVALID_REPLICATION_FACTOR
+                    format!(
+                        "Unable to replicate the partition {replication_factor} time(s): The target \
+                         replication factor of {replication_factor} cannot be reached because only 1 \
+                         broker(s) are registered."
+                    ),
+                ))
+            } else {
+                config_error.map(|msg| fail(40, msg)) // INVALID_CONFIG
+            };
+
+            if let Some((code, msg)) = error {
+                topic_res.error_code = code;
+                topic_res.error_message = Some(StrBytes::from_string(msg));
             } else {
                 topic_res.error_code = 0;
+                topic_res.error_message = None;
+                topic_res.num_partitions = num_partitions;
+                topic_res.replication_factor = replication_factor as i16;
                 if !req.validate_only {
                     let mut topic_state = TopicState {
                         name: topic_name_str.to_string(),
@@ -505,7 +632,7 @@ impl EngineState {
                         partitions: HashMap::new(),
                         configs: HashMap::new(),
                     };
-                    for p in 0..topic.num_partitions {
+                    for p in 0..num_partitions {
                         topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
                     }
                     for conf in &topic.configs {
@@ -531,15 +658,30 @@ impl EngineState {
         use kafka_protocol::messages::delete_topics_response::DeletableTopicResult;
         let mut res = kafka_protocol::messages::DeleteTopicsResponse::default();
 
-        for topic_name_bytes in &req.topic_names {
-            let topic_name_str = topic_name_bytes.as_str();
+        // v0-5 name topics in `topic_names`; v6+ in `topics`, each by name
+        // or by topic id. noida-db has no topic ids, so a delete by id
+        // can only be for an id this broker never handed out.
+        let by_name = req.topic_names.iter().map(|n| (Some(n.clone()), Default::default()));
+        let by_state = req.topics.iter().map(|t| (t.name.clone(), t.topic_id));
+        for (name, topic_id) in by_name.chain(by_state) {
             let mut topic_res = DeletableTopicResult::default();
-            topic_res.name = Some(topic_name_bytes.clone());
-
-            if self.topics.remove(topic_name_str).is_some() {
-                topic_res.error_code = 0;
-            } else {
-                topic_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+            topic_res.name = name.clone();
+            topic_res.topic_id = topic_id;
+            match name {
+                Some(n) if self.topics.remove(n.as_str()).is_some() => {
+                    topic_res.error_code = 0;
+                }
+                Some(_) => {
+                    topic_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                    topic_res.error_message = Some(StrBytes::from_static_str(
+                        "This server does not host this topic-partition.",
+                    ));
+                }
+                None => {
+                    topic_res.error_code = 100; // UNKNOWN_TOPIC_ID
+                    topic_res.error_message =
+                        Some(StrBytes::from_static_str("This server does not host this topic ID."));
+                }
             }
             res.responses.push(topic_res);
         }
@@ -564,17 +706,35 @@ impl EngineState {
                 let current_count = topic_state.partitions.len() as i32;
                 let new_count = topic_partition_data.count;
 
-                if new_count <= current_count {
-                    // Partitions can only be increased
+                // Partitions can only be increased (messages as Kafka 3.8's).
+                if new_count < current_count {
                     topic_res.error_code = 37; // INVALID_PARTITIONS
+                    topic_res.error_message = Some(StrBytes::from_string(format!(
+                        "The topic {topic_name_str} currently has {current_count} partition(s); \
+                         {new_count} would not be an increase."
+                    )));
+                } else if new_count == current_count {
+                    topic_res.error_code = 37; // INVALID_PARTITIONS
+                    topic_res.error_message = Some(StrBytes::from_string(format!(
+                        "Topic already has {current_count} partition(s)."
+                    )));
                 } else {
-                    for p in current_count..new_count {
-                        topic_state.partitions.insert(p, PartitionState::new(p, self.broker_id));
+                    // validate_only: report what would happen, change nothing.
+                    if !req.validate_only {
+                        for p in current_count..new_count {
+                            topic_state
+                                .partitions
+                                .insert(p, PartitionState::new(p, self.broker_id));
+                        }
                     }
                     topic_res.error_code = 0;
+                    topic_res.error_message = None;
                 }
             } else {
                 topic_res.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                topic_res.error_message = Some(StrBytes::from_static_str(
+                    "This server does not host this topic-partition.",
+                ));
             }
 
             res.results.push(topic_res);
@@ -631,6 +791,18 @@ impl EngineState {
         };
 
         if let Some(tid) = tx_id {
+            // Like Kafka's coordinator, re-initialising a transactional.id
+            // whose transaction is still open aborts that transaction
+            // (abort markers on its partitions, its offsets discarded)
+            // before the new producer instance gets its epoch -- the old
+            // instance's records must never become visible.
+            if self.txn_is_open(&tid) {
+                self.complete_txn(&tid, pid, epoch, false);
+            }
+            self.txn_info.insert(
+                tid.clone(),
+                TxnInfo { state: "Empty", timeout_ms: req.transaction_timeout_ms, start_ms: -1 },
+            );
             self.txn_producers.insert(tid, (pid, epoch));
         }
         self.producer_epochs.insert(pid, epoch);
@@ -1124,9 +1296,67 @@ impl EngineState {
             *group = GroupState::new(group_id.clone());
         }
 
+        // KIP-345 static membership: a member with a group.instance.id
+        // gets its member id straight away (no MEMBER_ID_REQUIRED round),
+        // and a new instance with an id already in the group replaces the
+        // old member -- taking over its assignment, without a rebalance if
+        // the group is stable and the subscription unchanged. The replaced
+        // member is fenced (FENCED_INSTANCE_ID) from then on.
+        let instance_id = req.group_instance_id.as_ref().map(|s| s.as_str().to_string());
+        let mut static_m_id = None;
+        if let Some(iid) = &instance_id {
+            let existing = group.member_for_instance(iid);
+            if !req.member_id.is_empty() {
+                if existing.as_deref().is_some_and(|e| e != req.member_id.as_str()) {
+                    res.error_code = 82; // FENCED_INSTANCE_ID
+                    res.member_id = req.member_id.clone();
+                    res.generation_id = -1;
+                    return res;
+                }
+            } else {
+                let new_id = new_member_id(client_id, &mut self.next_member_counter);
+                if let Some(old) = existing {
+                    let mut m = group.members.remove(&old).expect("member exists");
+                    m.member_id = new_id.clone();
+                    let unchanged = m.protocols
+                        == req
+                            .protocols
+                            .iter()
+                            .map(|p| (p.name.as_str().to_string(), p.metadata.to_vec()))
+                            .collect::<Vec<_>>();
+                    m.client_id = client_id.to_string();
+                    m.client_host = client_host.to_string();
+                    m.last_heartbeat_ms = now;
+                    group.members.insert(new_id.clone(), m);
+                    if let Some(a) = group.assignments.remove(&old) {
+                        group.assignments.insert(new_id.clone(), a);
+                    }
+                    if let Some(a) = group.awaiting_members.remove(&old) {
+                        group.awaiting_members.insert(new_id.clone(), a);
+                    }
+                    if group.leader_id.as_deref() == Some(old.as_str()) {
+                        group.leader_id = Some(new_id.clone());
+                    }
+                    if group.state == GroupLifecycleState::Stable && unchanged {
+                        res.error_code = 0;
+                        res.generation_id = group.generation_id;
+                        res.protocol_type =
+                            Some(StrBytes::from_string(group.protocol_type.clone()));
+                        res.protocol_name =
+                            group.protocol_name.as_ref().map(|s| StrBytes::from_string(s.clone()));
+                        res.leader =
+                            StrBytes::from_string(group.leader_id.clone().unwrap_or_default());
+                        res.member_id = StrBytes::from_string(new_id);
+                        return res;
+                    }
+                }
+                static_m_id = Some(new_id);
+            }
+        }
+
         // KIP-394: dynamic member join with empty member_id returns MEMBER_ID_REQUIRED (79)
         // for API version >= 4. For v0-v3, coordinator assigns member_id in the first JoinGroup.
-        if version >= 4 && req.member_id.is_empty() {
+        if version >= 4 && req.member_id.is_empty() && static_m_id.is_none() {
             let assigned_id = new_member_id(client_id, &mut self.next_member_counter);
             group.pending_member_ids.insert(assigned_id.clone());
 
@@ -1137,7 +1367,9 @@ impl EngineState {
             return res;
         }
 
-        let m_id = if req.member_id.is_empty() {
+        let m_id = if let Some(id) = static_m_id.clone() {
+            id
+        } else if req.member_id.is_empty() {
             new_member_id(client_id, &mut self.next_member_counter)
         } else {
             req.member_id.as_str().to_string()
@@ -1234,6 +1466,11 @@ impl EngineState {
             for (member_id_str, protos) in &group.awaiting_members {
                 let mut member_res = JoinGroupResponseMember::default();
                 member_res.member_id = StrBytes::from_string(member_id_str.clone());
+                member_res.group_instance_id = group
+                    .members
+                    .get(member_id_str)
+                    .and_then(|m| m.group_instance_id.as_ref())
+                    .map(|i| StrBytes::from_string(i.clone()));
                 let meta = protos
                     .iter()
                     .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
@@ -1264,6 +1501,11 @@ impl EngineState {
                 return res;
             }
         };
+
+        if group.is_fenced_instance(req.group_instance_id.as_deref(), &m_id) {
+            res.error_code = 82; // FENCED_INSTANCE_ID
+            return res;
+        }
 
         if !group.members.contains_key(&m_id) {
             res.error_code = 25; // UNKNOWN_MEMBER_ID
@@ -1325,6 +1567,11 @@ impl EngineState {
             }
         };
 
+        if group.is_fenced_instance(req.group_instance_id.as_deref(), &m_id) {
+            res.error_code = 82; // FENCED_INSTANCE_ID
+            return res;
+        }
+
         if !group.members.contains_key(&m_id) {
             res.error_code = 25; // UNKNOWN_MEMBER_ID
             return res;
@@ -1376,8 +1623,18 @@ impl EngineState {
             }
         };
 
+        // v3+ names members by member id or, for static members (e.g.
+        // AdminClient.removeMembersFromConsumerGroup), by group.instance.id.
         let members_to_leave: Vec<String> = if version >= 3 && !req.members.is_empty() {
-            req.members.iter().map(|m| m.member_id.as_str().to_string()).collect()
+            req.members
+                .iter()
+                .map(|m| match m.group_instance_id.as_deref() {
+                    Some(iid) if m.member_id.is_empty() => {
+                        group.member_for_instance(iid).unwrap_or_default()
+                    }
+                    _ => m.member_id.as_str().to_string(),
+                })
+                .collect()
         } else {
             vec![req.member_id.as_str().to_string()]
         };
@@ -1485,7 +1742,9 @@ impl EngineState {
                 Some(g)
                     if generation >= 0 || !m_id.is_empty() || req.group_instance_id.is_some() =>
                 {
-                    if !g.members.contains_key(m_id) {
+                    if g.is_fenced_instance(req.group_instance_id.as_deref(), m_id) {
+                        82 // FENCED_INSTANCE_ID
+                    } else if !g.members.contains_key(m_id) {
                         25 // UNKNOWN_MEMBER_ID
                     } else if generation != g.generation_id {
                         22 // ILLEGAL_GENERATION
@@ -1697,6 +1956,8 @@ impl EngineState {
                 for (m_id, m) in &group.members {
                     let mut dm = DescribedGroupMember::default();
                     dm.member_id = StrBytes::from_string(m_id.clone());
+                    dm.group_instance_id =
+                        m.group_instance_id.as_ref().map(|i| StrBytes::from_string(i.clone()));
                     dm.client_id = StrBytes::from_string(m.client_id.clone());
                     dm.client_host = StrBytes::from_string(m.client_host.clone());
 
@@ -1972,6 +2233,7 @@ impl EngineState {
                         .entry(tx_id.clone())
                         .or_default()
                         .insert((topic.name.as_str().to_string(), p_id));
+                    self.mark_txn_ongoing(&tx_id);
                 }
                 topic_res.results_by_partition.push(part_res);
             }
@@ -1983,13 +2245,95 @@ impl EngineState {
     }
 
     pub fn handle_add_offsets_to_txn(
-        &self,
-        _req: &kafka_protocol::messages::AddOffsetsToTxnRequest,
+        &mut self,
+        req: &kafka_protocol::messages::AddOffsetsToTxnRequest,
         _version: i16,
     ) -> kafka_protocol::messages::AddOffsetsToTxnResponse {
         let mut res = kafka_protocol::messages::AddOffsetsToTxnResponse::default();
+        if self.is_fenced(req.producer_id.0, req.producer_epoch) {
+            res.error_code = 47; // INVALID_PRODUCER_EPOCH
+            return res;
+        }
+        self.mark_txn_ongoing(req.transactional_id.as_str());
         res.error_code = 0;
         res
+    }
+
+    fn is_fenced(&self, producer_id: i64, producer_epoch: i16) -> bool {
+        self.producer_epochs.get(&producer_id).is_some_and(|&expected| producer_epoch < expected)
+    }
+
+    fn txn_is_open(&self, tx_id: &str) -> bool {
+        self.txn_partitions.get(tx_id).is_some_and(|p| !p.is_empty())
+            || self.txn_pending_offsets.get(tx_id).is_some_and(|o| !o.is_empty())
+    }
+
+    fn mark_txn_ongoing(&mut self, tx_id: &str) {
+        let now = self.now_ms();
+        let info = self.txn_info.entry(tx_id.to_string()).or_insert(TxnInfo {
+            state: "Empty",
+            timeout_ms: 60_000,
+            start_ms: -1,
+        });
+        if info.state != "Ongoing" {
+            info.state = "Ongoing";
+            info.start_ms = now;
+        }
+    }
+
+    /// Ends `tx_id`'s open transaction: a commit or abort marker on every
+    /// partition it wrote to, and its pending offsets applied (commit) or
+    /// dropped (abort). Returns an error code (0 = ok).
+    fn complete_txn(
+        &mut self,
+        tx_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed: bool,
+    ) -> i16 {
+        if let Some(partitions) = self.txn_partitions.remove(tx_id) {
+            let now = self.now_ms();
+            for (topic_name, p_id) in partitions {
+                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
+                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
+
+                // Only append a control batch if the transaction was genuinely active on this
+                // partition. If it was already force-aborted at shutdown, active_txns is empty
+                // and a commit must be rejected with INVALID_TXN_STATE.
+                if let Some(first_offset) = part_state.active_txns.remove(&producer_id) {
+                    if !committed {
+                        part_state.aborted_txns.push((producer_id, first_offset));
+                    }
+                    let base_offset = part_state.high_watermark;
+                    let control_batch = encode_control_batch(
+                        producer_id,
+                        producer_epoch,
+                        base_offset,
+                        committed,
+                        now,
+                    );
+                    part_state.append_batch(control_batch, 1, now, None);
+                } else if committed
+                    && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
+                {
+                    // This transaction was already force-aborted (e.g. by shutdown resolution).
+                    // A subsequent commit cannot succeed.
+                    self.txn_pending_offsets.remove(tx_id);
+                    return 48; // INVALID_TXN_STATE
+                }
+            }
+        }
+        let pending = self.txn_pending_offsets.remove(tx_id).unwrap_or_default();
+        if committed {
+            for p in pending {
+                self.committed_offsets.insert(p.key.clone(), p.offset);
+                self.set_offset_metadata(p.key, p.metadata.as_deref());
+            }
+        }
+        if let Some(info) = self.txn_info.get_mut(tx_id) {
+            info.state = if committed { "CompleteCommit" } else { "CompleteAbort" };
+        }
+        0
     }
 
     pub fn handle_end_txn(
@@ -2008,40 +2352,7 @@ impl EngineState {
             return res;
         }
 
-        if let Some(partitions) = self.txn_partitions.remove(&tx_id) {
-            let now = self.now_ms();
-            for (topic_name, p_id) in partitions {
-                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
-                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
-
-                // Only append a control batch if the transaction was genuinely active on this
-                // partition. If it was already force-aborted at shutdown, active_txns is empty
-                // and a commit must be rejected with INVALID_TXN_STATE.
-                if let Some(first_offset) = part_state.active_txns.remove(&producer_id) {
-                    if !req.committed {
-                        part_state.aborted_txns.push((producer_id, first_offset));
-                    }
-                    let base_offset = part_state.high_watermark;
-                    let control_batch = encode_control_batch(
-                        producer_id,
-                        producer_epoch,
-                        base_offset,
-                        req.committed,
-                        now,
-                    );
-                    part_state.append_batch(control_batch, 1, now, None);
-                } else if req.committed
-                    && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
-                {
-                    // This transaction was already force-aborted (e.g. by shutdown resolution).
-                    // A subsequent commit cannot succeed.
-                    res.error_code = 48; // INVALID_TXN_STATE
-                    return res;
-                }
-            }
-        }
-
-        res.error_code = 0;
+        res.error_code = self.complete_txn(&tx_id, producer_id, producer_epoch, req.committed);
         res
     }
 
@@ -2055,6 +2366,8 @@ impl EngineState {
         };
         let mut res = kafka_protocol::messages::TxnOffsetCommitResponse::default();
         let group_id = req.group_id.as_str().to_string();
+        let tx_id = req.transactional_id.as_str().to_string();
+        let fenced = self.is_fenced(req.producer_id.0, req.producer_epoch);
 
         for topic in &req.topics {
             let mut topic_res = TxnOffsetCommitResponseTopic::default();
@@ -2065,11 +2378,19 @@ impl EngineState {
                 let mut part_res = TxnOffsetCommitResponsePartition::default();
                 part_res.partition_index = part.partition_index;
 
-                let key = (group_id.clone(), topic_name.clone(), part.partition_index);
-                self.committed_offsets.insert(key.clone(), part.committed_offset);
-                self.set_offset_metadata(key, part.committed_metadata.as_deref());
-
-                part_res.error_code = 0;
+                if fenced {
+                    part_res.error_code = 47; // INVALID_PRODUCER_EPOCH
+                } else {
+                    // Held until the transaction ends (see complete_txn).
+                    self.txn_pending_offsets.entry(tx_id.clone()).or_default().push(
+                        PendingTxnOffset {
+                            key: (group_id.clone(), topic_name.clone(), part.partition_index),
+                            offset: part.committed_offset,
+                            metadata: part.committed_metadata.as_deref().map(str::to_string),
+                        },
+                    );
+                    part_res.error_code = 0;
+                }
                 topic_res.partitions.push(part_res);
             }
 
@@ -2338,14 +2659,44 @@ impl EngineState {
         req: &kafka_protocol::messages::DescribeTransactionsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::DescribeTransactionsResponse {
-        use kafka_protocol::messages::describe_transactions_response::TransactionState;
+        use kafka_protocol::messages::describe_transactions_response::{
+            TopicData, TransactionState,
+        };
         let mut res = kafka_protocol::messages::DescribeTransactionsResponse::default();
 
         for tx_id in &req.transactional_ids {
             let mut tx_state = TransactionState::default();
             tx_state.transactional_id = tx_id.clone();
-            tx_state.transaction_state = StrBytes::from_static_str("CompleteCommit");
-            tx_state.error_code = 0;
+            let tid = tx_id.as_str();
+            match (self.txn_info.get(tid), self.txn_producers.get(tid)) {
+                (Some(info), Some(&(pid, epoch))) => {
+                    tx_state.error_code = 0;
+                    tx_state.transaction_state = StrBytes::from_static_str(info.state);
+                    tx_state.transaction_timeout_ms = info.timeout_ms;
+                    tx_state.transaction_start_time_ms = info.start_ms;
+                    tx_state.producer_id = ProducerId(pid);
+                    tx_state.producer_epoch = epoch;
+                    let mut by_topic: std::collections::BTreeMap<&str, Vec<i32>> =
+                        std::collections::BTreeMap::new();
+                    for (t, p) in self.txn_partitions.get(tid).into_iter().flatten() {
+                        by_topic.entry(t.as_str()).or_default().push(*p);
+                    }
+                    for (t, mut parts) in by_topic {
+                        parts.sort_unstable();
+                        let mut td = TopicData::default();
+                        td.topic = TopicName::from(StrBytes::from_string(t.to_string()));
+                        td.partitions = parts;
+                        tx_state.topics.push(td);
+                    }
+                }
+                _ => {
+                    tx_state.error_code = 105; // TRANSACTIONAL_ID_NOT_FOUND
+                    tx_state.transaction_state = StrBytes::from_static_str("");
+                    tx_state.producer_id = ProducerId(-1);
+                    tx_state.producer_epoch = -1;
+                    tx_state.transaction_start_time_ms = -1;
+                }
+            }
             res.transaction_states.push(tx_state);
         }
 
@@ -2354,11 +2705,52 @@ impl EngineState {
 
     pub fn handle_list_transactions(
         &self,
-        _req: &kafka_protocol::messages::ListTransactionsRequest,
+        req: &kafka_protocol::messages::ListTransactionsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::ListTransactionsResponse {
+        use kafka_protocol::messages::list_transactions_response::TransactionState;
+        const STATES: [&str; 7] = [
+            "Empty",
+            "Ongoing",
+            "PrepareCommit",
+            "PrepareAbort",
+            "CompleteCommit",
+            "CompleteAbort",
+            "PrepareEpochFence",
+        ];
         let mut res = kafka_protocol::messages::ListTransactionsResponse::default();
         res.error_code = 0;
+        res.unknown_state_filters =
+            req.state_filters.iter().filter(|f| !STATES.contains(&f.as_str())).cloned().collect();
+        let now = self.now_ms();
+        let mut tids: Vec<&String> = self.txn_info.keys().collect();
+        tids.sort();
+        for tid in tids {
+            let info = &self.txn_info[tid];
+            let Some(&(pid, _)) = self.txn_producers.get(tid) else { continue };
+            if !req.state_filters.is_empty()
+                && !req.state_filters.iter().any(|f| f.as_str() == info.state)
+            {
+                continue;
+            }
+            if !req.producer_id_filters.is_empty()
+                && !req.producer_id_filters.iter().any(|p| p.0 == pid)
+            {
+                continue;
+            }
+            // v1: only transactions running longer than duration_filter ms.
+            if req.duration_filter >= 0
+                && (info.state != "Ongoing" || now - info.start_ms < req.duration_filter)
+            {
+                continue;
+            }
+            let mut ts = TransactionState::default();
+            ts.transactional_id =
+                kafka_protocol::messages::TransactionalId(StrBytes::from_string(tid.clone()));
+            ts.producer_id = ProducerId(pid);
+            ts.transaction_state = StrBytes::from_static_str(info.state);
+            res.transaction_states.push(ts);
+        }
         res
     }
 
@@ -2605,6 +2997,12 @@ impl Engine {
                     return resp;
                 }
             };
+            // Removed while waiting: replaced by a newer instance with the
+            // same group.instance.id, or expired.
+            if !group.members.contains_key(member_id.as_str()) {
+                resp.error_code = if req.group_instance_id.is_some() { 82 } else { 25 };
+                return resp;
+            }
 
             if group.state == GroupLifecycleState::CompletingRebalance
                 || group.state == GroupLifecycleState::Stable
@@ -2624,11 +3022,27 @@ impl Engine {
                 final_resp.member_id = member_id.clone();
                 if final_resp.leader == member_id {
                     let mut mems = Vec::new();
-                    for (m_id, protos) in &group.awaiting_members {
+                    // A static leader rejoining a stable group has no
+                    // round in progress: it gets every member's metadata.
+                    let all: HashMap<String, Vec<(String, Vec<u8>)>>;
+                    let joined = if group.awaiting_members.is_empty() {
+                        all = group
+                            .members
+                            .iter()
+                            .map(|(id, m)| (id.clone(), m.protocols.clone()))
+                            .collect();
+                        &all
+                    } else {
+                        &group.awaiting_members
+                    };
+                    for (m_id, protos) in joined {
                         let mut mem = kafka_protocol::messages::join_group_response::JoinGroupResponseMember::default();
                         mem.member_id =
                             kafka_protocol::protocol::StrBytes::from_string(m_id.clone());
-                        mem.group_instance_id = None;
+                        mem.group_instance_id =
+                            group.members.get(m_id).and_then(|m| m.group_instance_id.as_ref()).map(
+                                |i| kafka_protocol::protocol::StrBytes::from_string(i.clone()),
+                            );
                         mem.metadata = protos
                             .iter()
                             .find(|(n, _)| Some(n) == group.protocol_name.as_ref())
@@ -3167,6 +3581,8 @@ impl EngineState {
             producer_epochs: HashMap::new(), // fencing state not persisted (§5)
             txn_producers: HashMap::new(),
             txn_partitions: HashMap::new(),
+            txn_pending_offsets: HashMap::new(),
+            txn_info: HashMap::new(),
         }
     }
 }

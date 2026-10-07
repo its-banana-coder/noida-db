@@ -349,7 +349,24 @@ fn lua_error_message(e: &mlua::Error) -> String {
 }
 
 /// Runs `body` with Redis's Lua environment and converts what it returns.
+/// A script's SELECT doesn't change the caller's database.
 fn run_script(
+    ctx: &mut Ctx,
+    body: &[u8],
+    sha: &str,
+    keys: &[Vec<u8>],
+    args: &[Vec<u8>],
+    read_only: bool,
+) -> Result<Value, Value> {
+    let db = ctx.client().db;
+    let out = run_script_in(ctx, body, sha, keys, args, read_only);
+    if let Some(c) = ctx.engine.clients.get_mut(&ctx.session.id) {
+        c.db = db;
+    }
+    out
+}
+
+fn run_script_in(
     ctx: &mut Ctx,
     body: &[u8],
     sha: &str,
@@ -900,7 +917,24 @@ pub fn library_functions(code: &[u8]) -> Result<Vec<super::functions::FunctionMe
 
 /// FCALL: runs function `fname` of the library `code` with `keys` and
 /// `args` (its two arguments), in the sandbox EVAL uses.
+/// A script's SELECT doesn't change the caller's database.
 pub fn run_function(
+    ctx: &mut Ctx,
+    code: &[u8],
+    fname: &str,
+    keys: &[Vec<u8>],
+    args: &[Vec<u8>],
+    read_only: bool,
+) -> Result<Value, Value> {
+    let db = ctx.client().db;
+    let out = run_function_in(ctx, code, fname, keys, args, read_only);
+    if let Some(c) = ctx.engine.clients.get_mut(&ctx.session.id) {
+        c.db = db;
+    }
+    out
+}
+
+fn run_function_in(
     ctx: &mut Ctx,
     code: &[u8],
     fname: &str,

@@ -877,16 +877,49 @@ impl Engine {
                 }
                 Ok(StmtResult::tag("DEALLOCATE"))
             }
-            S::Explain { statement, analyze, .. } => {
-                if *analyze {
-                    return Err(unsupported("EXPLAIN ANALYZE"));
-                }
-                let prepared = self.prepare(s, &statement.to_string(), &[])?;
-                let _ = prepared;
-                let line = format!("{} (cost=0.00..0.00 rows=0 width=0)", explain_node(statement));
+            S::Explain { statement, analyze, verbose, format, options, .. } => {
+                let o = super::explain::options(
+                    *analyze,
+                    *verbose,
+                    format.as_ref(),
+                    options.as_deref(),
+                )
+                .map_err(|m| PgError::new(code::SYNTAX_ERROR, m))?;
+                let started = std::time::Instant::now();
+                // Binding reports unknown tables/columns the way EXPLAIN does.
+                self.prepare(s, &statement.to_string(), &[])?;
+                let planning_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let root = self.with_db(s, |db| {
+                    let rows = |name: &str| {
+                        db.tables
+                            .values()
+                            .find(|t| t.name == name)
+                            .map_or(0, |t| t.rows.len() as u64)
+                    };
+                    super::explain::plan(statement, &rows)
+                });
+                // ANALYZE runs the statement (a DML one really writes, as in
+                // Postgres) and reports what it returned and how long it took.
+                let actual = if o.analyze {
+                    let t0 = std::time::Instant::now();
+                    let r = self.run_data_statement(s, statement, params, param_types)?;
+                    let rows = if r.returns_rows {
+                        r.rows.len() as u64
+                    } else {
+                        r.tag.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0)
+                    };
+                    Some(super::explain::Actual {
+                        rows,
+                        planning_ms,
+                        execution_ms: t0.elapsed().as_secs_f64() * 1000.0,
+                    })
+                } else {
+                    None
+                };
+                let lines = super::explain::render(&root, &o, actual.as_ref());
                 Ok(StmtResult {
-                    cols: vec![OutCol::new("QUERY PLAN", Type::TEXT)],
-                    rows: vec![vec![Value::text(line)]],
+                    cols: vec![OutCol::new("QUERY PLAN", explain_type(&o))],
+                    rows: lines.into_iter().map(|l| vec![Value::text(l)]).collect(),
                     tag: "EXPLAIN".into(),
                     notices: vec![],
                     params_changed: vec![],
@@ -1459,19 +1492,19 @@ fn describe_other(
                 vec![OutCol::new(name.clone(), Type::TEXT)]
             }
         }
-        a::Statement::Explain { .. } => vec![OutCol::new("QUERY PLAN", Type::TEXT)],
+        a::Statement::Explain { analyze, verbose, format, options, .. } => {
+            let ty =
+                super::explain::options(*analyze, *verbose, format.as_ref(), options.as_deref())
+                    .map_or(Type::TEXT, |o| explain_type(&o));
+            vec![OutCol::new("QUERY PLAN", ty)]
+        }
         _ => vec![],
     })
 }
 
-fn explain_node(stmt: &a::Statement) -> String {
-    match stmt {
-        a::Statement::Query(_) => "Seq Scan".into(),
-        a::Statement::Insert(_) => "Insert".into(),
-        a::Statement::Update(_) => "Update".into(),
-        a::Statement::Delete(_) => "Delete".into(),
-        _ => "Result".into(),
-    }
+/// `EXPLAIN (FORMAT JSON)` is a json column; the others are text.
+fn explain_type(o: &super::explain::Options) -> Type {
+    if o.format == super::explain::Format::Json { Type::JSON } else { Type::TEXT }
 }
 
 fn set_value_text(values: &[a::Expr]) -> PgResult<String> {

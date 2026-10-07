@@ -277,6 +277,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 let sql = String::from_utf8_lossy(&payload[1..]).to_string();
                 let dialect = MySqlDialect {};
                 let rewritten = crate::mysql::engine::rewrite_table_comment(&sql)
+                    .or_else(|| crate::mysql::engine::rewrite_drop_check(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_rename_key(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_trailing_into(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql))
@@ -601,13 +602,22 @@ fn column_type_for(val: Option<&Value>) -> (u8, u16, u8) {
         Some(Value::Int(_)) => (0x08, BINARY, 0), // LONGLONG (i64 storage)
         Some(Value::Bool(_)) => (0x01, BINARY, 0), // TINY
         Some(Value::Float(_)) => (0x05, BINARY, 31), // DOUBLE, 31 = not fixed
+        // A whole number past i64 but within u64 is a BIGINT UNSIGNED
+        // result (bit operators, BIT_AND): LONGLONG, not DECIMAL.
+        Some(Value::Num(n))
+            if n.display_scale() == 0
+                && n.to_i64().is_none()
+                && n.to_string().parse::<u64>().is_ok() =>
+        {
+            (0x08, BINARY, 0)
+        }
         Some(Value::Num(n)) => (0xf6, BINARY, n.display_scale().min(30) as u8), // NEWDECIMAL
-        Some(Value::Date(_)) => (0x0a, BINARY, 0), // DATE
-        Some(Value::Ts(_)) => (0x0c, BINARY, 0),  // DATETIME
-        Some(Value::Time(_)) => (0x0b, BINARY, 0), // TIME
-        Some(Value::Json(_)) => (0xf5, UTF8MB4, 0), // JSON
-        Some(Value::Bytes(_)) => (0xfc, BINARY, 0), // BLOB
-        _ => (0xfd, UTF8MB4, 0),                  // VAR_STRING
+        Some(Value::Date(_)) => (0x0a, BINARY, 0),                              // DATE
+        Some(Value::Ts(_)) => (0x0c, BINARY, 0),                                // DATETIME
+        Some(Value::Time(_)) => (0x0b, BINARY, 0),                              // TIME
+        Some(Value::Json(_)) => (0xf5, UTF8MB4, 0),                             // JSON
+        Some(Value::Bytes(_)) => (0xfc, BINARY, 0),                             // BLOB
+        _ => (0xfd, UTF8MB4, 0),                                                // VAR_STRING
     }
 }
 
@@ -626,7 +636,9 @@ fn column_def_packet(name: &str, val: Option<&Value>) -> Vec<u8> {
     p.extend_from_slice(&charset.to_le_bytes()); // character_set (2)
     p.extend_from_slice(&255u32.to_le_bytes()); // column_length (4)
     p.push(col_type); // type (1)
-    p.extend_from_slice(&0u16.to_le_bytes()); // flags (2)
+    // UNSIGNED for a BIGINT UNSIGNED result past i64 (see column_type_for).
+    let flags: u16 = if col_type == 0x08 && matches!(val, Some(Value::Num(_))) { 0x20 } else { 0 };
+    p.extend_from_slice(&flags.to_le_bytes()); // flags (2)
     p.push(decimals); // decimals (1)
     p.extend_from_slice(&[0, 0]); // filler (2, reserved)
     p
@@ -643,7 +655,22 @@ fn column_sample(rows: &[Vec<Value>], i: usize) -> Option<&Value> {
     // later rows with the wrong type (pymysql raised mid-result and the
     // connection's packet stream was left out of sync).
     let kind = std::mem::discriminant(first);
-    if vals.all(|v| std::mem::discriminant(v) == kind) { Some(first) } else { None }
+    let rest: Vec<&Value> = vals.collect();
+    if rest.iter().all(|v| std::mem::discriminant(*v) == kind) {
+        return Some(first);
+    }
+    // Integers with a whole-number DECIMAL past i64 (a BIGINT UNSIGNED
+    // result such as BIT_AND's 18446744073709551615) stay an integer column.
+    let whole = |v: &Value| match v {
+        Value::Int(_) => true,
+        Value::Num(n) => n.display_scale() == 0,
+        _ => false,
+    };
+    if whole(first) && rest.iter().all(|v| whole(v)) {
+        // The DECIMAL sample: it declares the column LONGLONG UNSIGNED.
+        return std::iter::once(first).chain(rest).find(|v| matches!(v, Value::Num(_)));
+    }
+    None
 }
 
 /// How many result columns to declare: the rows' own width, or -- for a
@@ -1034,6 +1061,10 @@ fn encode_binary_value(out: &mut Vec<u8>, ty: u8, val: &Value) {
     use crate::sql::datetime::{USECS_PER_DAY, ymd_from_date};
     match (ty, val) {
         (0x08, Value::Int(i)) => out.extend_from_slice(&i.to_le_bytes()),
+        (0x08, Value::Num(n)) => {
+            let u = n.to_string().parse::<u64>().unwrap_or(0);
+            out.extend_from_slice(&u.to_le_bytes())
+        }
         (0x01, Value::Bool(b)) => out.push(u8::from(*b)),
         (0x05, Value::Float(f)) => out.extend_from_slice(&f.to_le_bytes()),
         (0x0a, Value::Date(d)) => {

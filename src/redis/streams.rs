@@ -998,10 +998,11 @@ fn xgroup(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             Ok(Value::ok())
         }
         b"setid" => {
+            // Unlike CREATE, SETID takes `-` and `+` too.
             let id = if a[4] == b"$" {
                 ctx.get_stream(&key)?.map_or((0, 0), |s| s.last_id)
             } else {
-                parse_id(&a[4], 0, true)?
+                parse_id(&a[4], 0, false)?
             };
             let g = group_of(ctx, &key, &name)?;
             g.last_id = id;
