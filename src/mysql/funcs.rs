@@ -360,7 +360,25 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             Some(t) => Value::Int(field(name, t)),
             None => Value::Null,
         },
-        "EXTRACT" => {
+        "WEEK" | "WEEKOFYEAR" | "YEARWEEK" => {
+            need(1)?;
+            let mode = match name {
+                "WEEKOFYEAR" => Some(3),
+                _ => match a.get(1) {
+                    Some(v) if v.is_null() => None,
+                    Some(v) => Some(value_to_f64(v) as i64),
+                    None => Some(0),
+                },
+            };
+            match (to_ts(&arg(0)), mode) {
+                (Some(t), Some(mode)) => {
+                    let (y, w) = week(t, mode, name == "YEARWEEK");
+                    Value::Int(if name == "YEARWEEK" { y * 100 + w } else { w })
+                }
+                _ => Value::Null,
+            }
+        }
+        "EXTRACT" | "NOIDA_EXTRACT" => {
             need(2)?;
             let unit = text(0).unwrap_or_default();
             match to_ts(&arg(1)) {
@@ -874,8 +892,80 @@ fn field(unit: &str, t: i64) -> i64 {
         "DAYOFWEEK" => dow + 1,
         "WEEKDAY" => (dow + 6) % 7,
         "DAYOFYEAR" => days - date_from_ymd(y, 1, 1) as i64 + 1,
-        _ => 0,
+        "WEEK" => week(t, 0, false).1,
+        // Compound units: the fields' digits run together.
+        "YEAR_MONTH" => y * 100 + m as i64,
+        _ => compound(unit, d as i64, us).unwrap_or(0),
     }
+}
+
+/// `DAY_SECOND`, `HOUR_MICROSECOND`, ...: DDHHMMSS-style integers.
+fn compound(unit: &str, day: i64, us: i64) -> Option<i64> {
+    let (from, to) = unit.split_once('_')?;
+    let parts = ["DAY", "HOUR", "MINUTE", "SECOND", "MICROSECOND"];
+    let lo = parts.iter().position(|p| *p == from)?;
+    let hi = parts.iter().position(|p| *p == to)?;
+    if lo >= hi {
+        return None;
+    }
+    let vals = [
+        (day, 100),
+        (us / (3600 * USECS_PER_SEC), 100),
+        (us / (60 * USECS_PER_SEC) % 60, 100),
+        (us / USECS_PER_SEC % 60, 100),
+        (us % USECS_PER_SEC, 1_000_000),
+    ];
+    Some(vals[lo..=hi].iter().fold(0, |acc, (v, width)| acc * width + v))
+}
+
+/// MySQL's `calc_week`: (year, week) of timestamp `t` in `WEEK()` mode
+/// `mode` (0-7); `year_week` is YEARWEEK's behaviour (weeks belong to
+/// the year they mostly fall in, never week 0).
+fn week(t: i64, mode: i64, year_week: bool) -> (i64, i64) {
+    const MONDAY_FIRST: i64 = 1;
+    const WEEK_YEAR: i64 = 2;
+    const FIRST_WEEKDAY: i64 = 4;
+    let mut b = mode & 7;
+    if b & MONDAY_FIRST == 0 {
+        b ^= FIRST_WEEKDAY;
+    }
+    if year_week {
+        b |= WEEK_YEAR;
+    }
+    let daynr = t.div_euclid(USECS_PER_DAY);
+    let (y, m, d) = ymd_from_date(daynr as i32);
+    let mut year = y;
+    let mut first_daynr = date_from_ymd(y, 1, 1) as i64;
+    let monday_first = b & MONDAY_FIRST != 0;
+    let mut week_year = b & WEEK_YEAR != 0;
+    let first_weekday = b & FIRST_WEEKDAY != 0;
+    // 0 = the week's first day (2000-01-01 was a Saturday).
+    let weekday_of = |n: i64| (n + if monday_first { 5 } else { 6 }).rem_euclid(7);
+    let days_in = |yr: i64| if (yr % 4 == 0 && yr % 100 != 0) || yr % 400 == 0 { 366 } else { 365 };
+    let mut weekday = weekday_of(first_daynr);
+    let short_first = |wd: i64| (first_weekday && wd != 0) || (!first_weekday && wd >= 4);
+    if m == 1 && (d as i64) <= 7 - weekday {
+        if !week_year && short_first(weekday) {
+            return (year, 0);
+        }
+        week_year = true;
+        year -= 1;
+        let n = days_in(year);
+        first_daynr -= n;
+        weekday = (weekday + 53 * 7 - n) % 7;
+    }
+    let days = if short_first(weekday) {
+        daynr - (first_daynr + (7 - weekday))
+    } else {
+        daynr - (first_daynr - weekday)
+    };
+    if week_year && days >= 52 * 7 {
+        let wd = (weekday + days_in(year)) % 7;
+        if (!first_weekday && wd < 4) || (first_weekday && wd == 0) {
+            return (year + 1, 1);
+        }
+    }
+    (year, days / 7 + 1)
 }
 
 const MONTHS: [&str; 12] = [

@@ -346,6 +346,8 @@ impl Engine {
     /// error (CLIENT_MULTI_STATEMENTS).
     pub fn execute_multi(&mut self, sql: &str) -> Vec<StatementResult> {
         let dialect = MySqlDialect {};
+        let units = rewrite_extract_units(sql);
+        let sql = units.as_deref().unwrap_or(sql);
         let rewritten = rewrite_table_comment(sql)
             .or_else(|| rewrite_drop_check(sql))
             .or_else(|| rewrite_rename_key(sql))
@@ -378,6 +380,8 @@ impl Engine {
 
     pub fn execute(&mut self, sql: &str) -> Result<Vec<Vec<Value>>, MySqlError> {
         let dialect = MySqlDialect {};
+        let units = rewrite_extract_units(sql);
+        let sql = units.as_deref().unwrap_or(sql);
         let rewritten = rewrite_table_comment(sql)
             .or_else(|| rewrite_drop_check(sql))
             .or_else(|| rewrite_rename_key(sql))
@@ -1042,6 +1046,21 @@ pub fn rewrite_trailing_into(sql: &str) -> Option<String> {
 /// `ALTER TABLE t ... RENAME {INDEX|KEY} a TO b ...`, which the SQL parser
 /// doesn't know, as a column rename of a marked name that the binder turns
 /// back into an index rename.
+/// `EXTRACT(DAY_SECOND FROM x)` and the other compound units, which
+/// sqlparser doesn't parse: an internal `NOIDA_EXTRACT('DAY_SECOND', x)`.
+pub fn rewrite_extract_units(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?i)\bextract\s*\(\s*(year_month|day_hour|day_minute|day_second|day_microsecond|hour_minute|hour_second|hour_microsecond|minute_second|minute_microsecond|second_microsecond)\s+from\s+",
+    )
+    .expect("regex");
+    re.is_match(sql).then(|| {
+        re.replace_all(sql, |c: &regex_lite::Captures| {
+            format!("NOIDA_EXTRACT('{}', ", c[1].to_ascii_uppercase())
+        })
+        .into_owned()
+    })
+}
+
 pub fn rewrite_rename_key(sql: &str) -> Option<String> {
     let trimmed = sql.trim_start();
     if trimmed.len() < 11 || !trimmed[..11].eq_ignore_ascii_case("ALTER TABLE") {
