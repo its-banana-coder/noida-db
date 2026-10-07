@@ -1672,6 +1672,37 @@ impl Ddl<'_, '_> {
                     a::AlterColumnOperation::DropNotNull => {
                         self.ctx.db.table_mut(oid).unwrap().columns[idx].not_null = false;
                     }
+                    // `DROP IDENTITY [IF EXISTS]` (rewritten; see `rewrite_django_ddl`).
+                    a::AlterColumnOperation::SetDefault { value }
+                        if value.to_string().starts_with("noida_drop_identity(") =>
+                    {
+                        let if_exists = value.to_string().contains("true");
+                        let (tname, identity) = {
+                            let t = self.ctx.db.table(oid).unwrap();
+                            (t.name.clone(), t.columns[idx].identity)
+                        };
+                        match identity {
+                            Some((_, seq)) => {
+                                self.ctx.db.table_mut(oid).unwrap().columns[idx].identity = None;
+                                self.ctx.db.sequences.remove(&seq);
+                                self.ctx.seqs.remove(&seq);
+                            }
+                            None if if_exists => {
+                                let msg = format!(
+                                    "column \"{cname}\" of relation \"{tname}\" is not an identity column, skipping"
+                                );
+                                self.ctx.rt.notices.push(PgError::notice(msg));
+                            }
+                            None => {
+                                return Err(PgError::new(
+                                    code::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                                    format!(
+                                        "column \"{cname}\" of relation \"{tname}\" is not an identity column"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     a::AlterColumnOperation::SetDefault { value } => {
                         self.ctx.db.table_mut(oid).unwrap().columns[idx].default =
                             Some(value.to_string());

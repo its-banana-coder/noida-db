@@ -51,6 +51,8 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let sql = after_frame.as_deref().unwrap_or(sql);
     let after_cons = rewrite_set_constraints(sql);
     let sql = after_cons.as_deref().unwrap_or(sql);
+    let after_django = rewrite_django_ddl(sql);
+    let sql = after_django.as_deref().unwrap_or(sql);
     let after_seq = seqddl::rewrite(sql)?;
     let sql1 = after_seq.as_deref().unwrap_or(sql);
     let after_refresh = refresh::rewrite(sql1)?;
@@ -243,6 +245,41 @@ fn rewrite_set_constraints(sql: &str) -> Option<String> {
         })
         .into_owned(),
     )
+}
+
+/// Clauses Django's Postgres backend emits that sqlparser doesn't take:
+/// - `ALTER COLUMN c DROP IDENTITY [IF EXISTS]` -> a marked SET DEFAULT
+///   (handled by `Ddl::alter_op`);
+/// - `ALTER COLUMN c TYPE t COLLATE "x"` -> the COLLATE dropped (noida-db
+///   compares text bytewise, as the C collation);
+/// - `CREATE INDEX ... TABLESPACE ts` -> TABLESPACE dropped;
+/// - `FOR NO KEY UPDATE` / `FOR KEY SHARE` -> `FOR UPDATE` / `FOR SHARE`,
+///   and `FOR ... OF a, b` -> `OF a` (row locks are table-wide here).
+fn rewrite_django_ddl(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    if !["identity", "collate", "tablespace", " key ", " of "].iter().any(|k| lower.contains(k)) {
+        return None;
+    }
+    let mut out = sql.to_string();
+    let rules: [(&str, &str); 6] = [
+        (r"(?i)\bdrop\s+identity\s+if\s+exists\b", "SET DEFAULT noida_drop_identity(true)"),
+        (r"(?i)\bdrop\s+identity\b", "SET DEFAULT noida_drop_identity(false)"),
+        (r#"(?i)(\btype\s+[a-z0-9_ ()\[\],."]+?)\s+collate\s+("[^"]+"|[a-z0-9_.]+)"#, "$1"),
+        (
+            r#"(?i)^(\s*create\s+(?:unique\s+)?index\b[^;]*?)\s+tablespace\s+("[^"]+"|[a-z0-9_]+)"#,
+            "$1",
+        ),
+        (r"(?i)\bfor\s+no\s+key\s+update\b", "FOR UPDATE"),
+        (r"(?i)\bfor\s+key\s+share\b", "FOR SHARE"),
+    ];
+    for (pat, rep) in rules {
+        let re = regex_lite::Regex::new(pat).expect("regex");
+        out = re.replace_all(&out, rep).into_owned();
+    }
+    let of_list = regex_lite::Regex::new(r#"(?i)(\bfor\s+(?:update|share)\s+of\s+("[^"]+"|[a-z0-9_.]+))(\s*,\s*("[^"]+"|[a-z0-9_.]+))+"#)
+        .expect("regex");
+    out = of_list.replace_all(&out, "$1").into_owned();
+    (out != sql).then_some(out)
 }
 
 /// Parses a single SQL expression (defaults, check constraints).
