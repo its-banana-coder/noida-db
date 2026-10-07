@@ -224,3 +224,43 @@ fn getkeys_for_commands_with_key_functions() {
         arr(vec![kf("k", &["RW", "access", "update"])])
     );
 }
+
+#[test]
+fn command_and_error_stats() {
+    let mut t = T::new();
+    t.run("CONFIG RESETSTAT");
+    t.run("SET a");
+    t.run("GET a");
+    t.run("LPUSH a");
+    t.run("SET a 1");
+    t.run("LPUSH a x");
+    t.run("CLIENT LIST x");
+    t.run("FOO");
+    let info = text(&t.run("INFO commandstats"));
+    let line = |name: &str| {
+        info.lines().find(|l| l.starts_with(&format!("cmdstat_{name}:"))).map(|l| {
+            // usec figures vary; keep the counts.
+            let v = l.split_once(':').unwrap().1;
+            v.split(',').filter(|kv| !kv.starts_with("usec")).collect::<Vec<_>>().join(",")
+        })
+    };
+    assert!(info.starts_with("# Commandstats\r\n"), "{info}");
+    assert_eq!(line("set").as_deref(), Some("calls=1,rejected_calls=1,failed_calls=0"));
+    assert_eq!(line("lpush").as_deref(), Some("calls=1,rejected_calls=1,failed_calls=1"));
+    assert_eq!(line("client|list").as_deref(), Some("calls=1,rejected_calls=0,failed_calls=1"));
+    assert_eq!(line("get").as_deref(), Some("calls=1,rejected_calls=0,failed_calls=0"));
+    assert_eq!(line("foo"), None);
+    assert_eq!(
+        text(&t.run("INFO errorstats")),
+        "# Errorstats\r\nerrorstat_ERR:count=4\r\nerrorstat_WRONGTYPE:count=1\r\n"
+    );
+    // The two INFO calls above count too.
+    let stats = text(&t.run("INFO stats"));
+    assert!(stats.contains("total_commands_processed:9\r\n"), "{stats}");
+    assert!(stats.contains("total_error_replies:5\r\n"), "{stats}");
+    // Not in the default INFO; in INFO all.
+    assert!(!text(&t.run("INFO")).contains("rejected_calls"));
+    assert!(text(&t.run("INFO all")).contains("rejected_calls"));
+    t.run("CONFIG RESETSTAT");
+    assert_eq!(text(&t.run("INFO errorstats")), "# Errorstats\r\n");
+}

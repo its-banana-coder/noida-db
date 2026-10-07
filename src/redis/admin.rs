@@ -351,7 +351,7 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
             "Stats",
             vec![
                 f("total_connections_received", "0".into()),
-                f("total_commands_processed", "0".into()),
+                f("total_commands_processed", ctx.engine.stats.commands_processed.to_string()),
                 f("instantaneous_ops_per_sec", "0".into()),
                 f("rejected_connections", "0".into()),
                 f("expired_keys", "0".into()),
@@ -361,7 +361,7 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
                 f("pubsub_channels", ctx.engine.pubsub.counts().0.to_string()),
                 f("pubsub_patterns", ctx.engine.pubsub.counts().1.to_string()),
                 f("pubsubshard_channels", ctx.engine.pubsub.counts().2.to_string()),
-                f("total_error_replies", "0".into()),
+                f("total_error_replies", ctx.engine.stats.error_replies.to_string()),
             ],
         );
     }
@@ -397,8 +397,11 @@ fn info(ctx: &mut Ctx, a: &[Vec<u8>]) -> Reply {
     if want("module_list") {
         add("Modules", vec![]);
     }
+    if want("commandstats") {
+        add("Commandstats", ctx.engine.stats.command_lines());
+    }
     if want("errorstats") {
-        add("Errorstats", vec![]);
+        add("Errorstats", ctx.engine.stats.error_lines());
     }
     if want("cluster") {
         add("Cluster", vec![f("cluster_enabled", "0".into())]);

@@ -15,7 +15,20 @@ use super::session::Settings;
 use super::types::{self, Array, Base, Type, Value};
 
 /// Per-connection runtime state the executor and system functions need.
+/// An open cursor, as `pg_cursors` lists it.
+#[derive(Clone, Debug)]
+pub struct CursorInfo {
+    pub name: String,
+    pub statement: String,
+    pub holdable: bool,
+    pub binary: bool,
+    pub scrollable: bool,
+    pub created: i64,
+}
+
 pub struct Runtime {
+    /// The session's open cursors when the statement started (`pg_cursors`).
+    pub cursors: Vec<CursorInfo>,
     pub pid: i32,
     pub user: String,
     pub database: String,

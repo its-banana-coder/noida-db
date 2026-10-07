@@ -59,7 +59,9 @@ btrim(text)text btrim(text,text)text ltrim(text)text ltrim(text,text)text rtrim(
 lpad(text,int4)text lpad(text,int4,text)text rpad(text,int4)text rpad(text,int4,text)text
 left(text,int4)text right(text,int4)text repeat(text,int4)text reverse(text)text
 !concat(...any)text !concat_ws(text,...any)text split_part(text,text,int4)text
-md5(text)text md5(bytea)text sha256(bytea)bytea ascii(text)int4 chr(int4)text
+md5(text)text md5(bytea)text sha224(bytea)bytea sha256(bytea)bytea sha384(bytea)bytea sha512(bytea)bytea
+digest(text,text)bytea digest(bytea,text)bytea hmac(text,text,text)bytea hmac(bytea,bytea,text)bytea
+ascii(text)int4 chr(int4)text
 !format(text)text !format(text,...any)text quote_ident(text)text quote_literal(anyelement)text !quote_nullable(anyelement)text
 to_tsvector(text)tsvector to_tsvector(text,text)tsvector
 to_tsquery(text)tsquery to_tsquery(text,text)tsquery
