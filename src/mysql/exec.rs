@@ -4789,12 +4789,30 @@ fn alter_table(
         AlterOp::ReplaceColumn { old, mut col, unique, pos } => {
             let i = column_index_or_err(t, &old, "field list")?;
             col.primary_key |= t.columns[i].primary_key;
-            for row in t.rows.iter_mut() {
+            let same_string_type = matches!(
+                (&t.columns[i].ty, &col.ty),
+                (ColumnType::Varchar(_), ColumnType::Varchar(_))
+            );
+            for (n, row) in t.rows.iter_mut().enumerate() {
                 let v = std::mem::replace(&mut row[i], Value::Null);
                 if v.is_null() && col.not_null {
                     return Err(MySqlError::new(1138, "22004", "Invalid use of NULL value"));
                 }
-                row[i] = coerce_to_column(v, &col, mode)?;
+                // Errors name the row ALTER was copying; narrowing a string
+                // column to the same kind is "Data truncated" (1265), not
+                // INSERT's "Data too long".
+                row[i] = coerce_to_column(v, &col, mode).map_err(|e| {
+                    let at = format!("at row {}", n + 1);
+                    if e.code == 1406 && same_string_type {
+                        MySqlError::new(
+                            1265,
+                            "01000",
+                            format!("Data truncated for column '{}' {at}", col.name),
+                        )
+                    } else {
+                        MySqlError::new(e.code, e.sql_state, e.message.replace("at row 1", &at))
+                    }
+                })?;
             }
             if !old.eq_ignore_ascii_case(&col.name) {
                 for k in t.unique_keys.iter_mut().chain(t.indexes.iter_mut()) {

@@ -778,6 +778,16 @@ MYSQL_QUERIES = {
         (A, "SELECT ja.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
         (A, "SELECT ja.id, jb.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
     ],
+    "ALTER narrowing errors": [
+        (A, "CREATE TABLE n1 (a varchar(10), b varchar(10), d text, i int)"),
+        (A, "INSERT INTO n1 VALUES ('ab','ab','ab',1),('abcdef','ab','abcdef',1),('abcdefg','abcdef','x',300)"),
+        (A, "ALTER TABLE n1 MODIFY a varchar(3)"),
+        (A, "ALTER TABLE n1 MODIFY d varchar(3)"),
+        (A, "ALTER TABLE n1 MODIFY i tinyint"),
+        (A, "ALTER TABLE n1 CHANGE b b2 varchar(4)"),
+        (A, "ALTER TABLE n1 MODIFY a varchar(20)"),
+        (A, "SELECT * FROM n1 ORDER BY a"),
+    ],
     "hash and encoding functions": [
         (A, "SELECT MD5('a'), MD5(NULL), MD5(1), SHA1('a'), SHA(''), SHA2('a', 256), SHA2('a', 0), SHA2('a', 224), SHA2('a', 384), SHA2('a', 512), SHA2('a', 7), SHA2('a', NULL)"),
         (A, "SELECT CRC32('a'), CRC32(''), CRC32(12), CRC32(NULL), TO_BASE64('abc'), TO_BASE64(REPEAT('x', 60)), FROM_BASE64('YWJj'), UNHEX('4142'), UNHEX('zz'), UNHEX('141'), HEX(UNHEX('4142'))"),

@@ -1447,27 +1447,33 @@ impl Ddl<'_, '_> {
                 let mut c = Column { typmod, ..Column::new(&cname, ty) };
                 let mut pending = vec![];
                 for opt in &column_def.options {
+                    // `CONSTRAINT name REFERENCES ...`: the name Django
+                    // later drops it by.
+                    let name = opt.name.as_ref().map(ident).unwrap_or_default();
                     match &opt.option {
                         a::ColumnOption::NotNull => c.not_null = true,
                         a::ColumnOption::Default(e) => {
                             c.default = Some(default_sql(self.ctx.db, e, ty))
                         }
                         a::ColumnOption::PrimaryKey(_) => {
-                            pending.push(PendingConstraint::PrimaryKey)
+                            pending.push((name, PendingConstraint::PrimaryKey))
                         }
-                        a::ColumnOption::Unique(_) => pending.push(PendingConstraint::Unique),
+                        a::ColumnOption::Unique(_) => {
+                            pending.push((name, PendingConstraint::Unique))
+                        }
                         a::ColumnOption::Check(chk) => {
-                            pending.push(PendingConstraint::Check(chk.expr.to_string()))
+                            pending.push((name, PendingConstraint::Check(chk.expr.to_string())))
                         }
-                        a::ColumnOption::ForeignKey(fk) => {
-                            pending.push(PendingConstraint::ForeignKey {
+                        a::ColumnOption::ForeignKey(fk) => pending.push((
+                            name,
+                            PendingConstraint::ForeignKey {
                                 table: name_parts(&fk.foreign_table),
                                 cols: fk.referred_columns.iter().map(ident).collect(),
                                 on_delete: fk_action(&fk.on_delete),
                                 on_update: fk_action(&fk.on_update),
                                 deferral: deferral(&fk.characteristics),
-                            });
-                        }
+                            },
+                        )),
                         a::ColumnOption::Generated { generation_expr, .. } => {
                             if let Some(e) = generation_expr {
                                 c.generated = Some(e.to_string());
@@ -1571,8 +1577,8 @@ impl Ddl<'_, '_> {
                         r.push(Value::Null);
                     }
                 }
-                for p in pending {
-                    self.add_constraint(oid, "", std::slice::from_ref(&cname), p)?;
+                for (name, p) in pending {
+                    self.add_constraint(oid, &name, std::slice::from_ref(&cname), p)?;
                 }
             }
             Op::DropColumn { column_names, if_exists, drop_behavior, .. } => {
@@ -1751,7 +1757,17 @@ impl Ddl<'_, '_> {
                                     &self.info.fmt,
                                     self.info.now,
                                 )
-                                .map_err(|_| {
+                                .map_err(|e| {
+                                    // A value that doesn't fit (too long, out
+                                    // of range) fails as itself; only a type
+                                    // with no cast asks for USING.
+                                    if matches!(
+                                        e.code,
+                                        code::STRING_DATA_RIGHT_TRUNCATION
+                                            | code::NUMERIC_VALUE_OUT_OF_RANGE
+                                    ) {
+                                        return e;
+                                    }
                                     PgError::new(
                                         code::DATATYPE_MISMATCH,
                                         format!(
@@ -1759,7 +1775,11 @@ impl Ddl<'_, '_> {
                                             ty.display(typmod)
                                         ),
                                     )
-                                    .hint("You might need to specify \"USING <expr>\".")
+                                    .hint(format!(
+                                        "You might need to specify \"USING {}::{}\".",
+                                        super::funcs::quote_ident(&cname),
+                                        ty.display(typmod)
+                                    ))
                                 })?,
                             };
                             new_vals.push(types::apply_typmod(v, ty, typmod, true)?);
