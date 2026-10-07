@@ -106,7 +106,7 @@ timezone(text,timestamptz)timestamp timezone(text,timestamp)timestamptz timezone
 date_bin(interval,timestamp,timestamp)timestamp date_bin(interval,timestamptz,timestamptz)timestamptz
 !to_json(anyelement)json !to_jsonb(anyelement)jsonb !array_to_json(anyarray)json !row_to_json(record)json
 !row_to_json(record,_text)json !to_jsonb(record,_text)jsonb
-!json_build_object(...any)json !jsonb_build_object(...any)jsonb !json_build_array(...any)json !jsonb_build_array(...any)jsonb
+!json_build_object(...any)json !jsonb_build_object(...any)jsonb !json_build_object_absent(...any)json !jsonb_build_object_absent(...any)jsonb !json_build_object_absent()json !jsonb_build_object_absent()jsonb !json_build_array_absent(...any)json !jsonb_build_array_absent(...any)jsonb !json_build_array_absent()json !jsonb_build_array_absent()jsonb !json_build_array(...any)json !jsonb_build_array(...any)jsonb
 !json_build_object()json !jsonb_build_object()jsonb !json_build_array()json !jsonb_build_array()jsonb
 json_object(_text)json jsonb_object(_text)jsonb json_object(_text,_text)json jsonb_object(_text,_text)jsonb
 jsonb_typeof(jsonb)text json_typeof(json)text jsonb_array_length(jsonb)int4 json_array_length(json)int4
