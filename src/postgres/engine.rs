@@ -93,6 +93,10 @@ pub struct Cursor {
     pub cols: Vec<OutCol>,
     pub rows: Vec<Row>,
     pub pos: usize,
+    /// `WITH HOLD`: outlives the transaction's COMMIT.
+    pub hold: bool,
+    /// Declared in the current transaction (a ROLLBACK drops it).
+    pub new: bool,
 }
 
 pub struct Session {
@@ -715,6 +719,13 @@ impl Engine {
                         return Err(unsupported("DECLARE of multiple cursor names"));
                     }
                     let name = d.names[0].value.to_lowercase();
+                    let hold = d.hold == Some(true);
+                    if !hold && s.status != TxStatus::InTransaction {
+                        return Err(PgError::new(
+                            "25P01",
+                            "DECLARE CURSOR can only be used in transaction blocks",
+                        ));
+                    }
                     // The engine has no lazy/streaming execution, so the
                     // cursor's query just runs eagerly right now, in
                     // whatever transaction is already open (an ordinary
@@ -722,7 +733,10 @@ impl Engine {
                     // already-materialized rows.
                     let q_stmt = a::Statement::Query(for_query.clone());
                     let result = self.run_data_statement(s, &q_stmt, &[], &[])?;
-                    s.cursors.insert(name, Cursor { cols: result.cols, rows: result.rows, pos: 0 });
+                    s.cursors.insert(
+                        name,
+                        Cursor { cols: result.cols, rows: result.rows, pos: 0, hold, new: true },
+                    );
                 }
                 Ok(StmtResult::tag("DECLARE CURSOR"))
             }
@@ -762,7 +776,13 @@ impl Engine {
                 match cursor {
                     a::CloseCursor::All => s.cursors.clear(),
                     a::CloseCursor::Specific { name } => {
-                        s.cursors.remove(&name.value.to_lowercase());
+                        let key = name.value.to_lowercase();
+                        if s.cursors.remove(&key).is_none() {
+                            return Err(PgError::new(
+                                code::INVALID_CURSOR_NAME,
+                                format!("cursor \"{key}\" does not exist"),
+                            ));
+                        }
                     }
                 }
                 Ok(StmtResult::tag("CLOSE CURSOR"))
@@ -1097,7 +1117,11 @@ impl Engine {
         if g.writer == Some(s.id) {
             g.writer = None;
         }
-        s.cursors.clear();
+        // WITH HOLD cursors outlive the commit.
+        s.cursors.retain(|_, c| c.hold);
+        for c in s.cursors.values_mut() {
+            c.new = false;
+        }
         Ok(())
     }
 
@@ -1107,7 +1131,8 @@ impl Engine {
         if g.writer == Some(s.id) {
             g.writer = None;
         }
-        s.cursors.clear();
+        // Held cursors from earlier transactions survive; the rest go.
+        s.cursors.retain(|_, c| c.hold && !c.new);
     }
 
     fn rollback_to(&self, s: &mut Session, name: &str) -> PgResult<StmtResult> {

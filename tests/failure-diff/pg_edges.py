@@ -769,4 +769,16 @@ PG_EDGES.update({
         "SELECT id, j::text, arr::text FROM js ORDER BY id",
         "SELECT id FROM js WHERE j['a'][1] = '7'",
     ),
+    "pg edge: cursors WITH HOLD": steps(
+        "DECLARE c1 CURSOR FOR SELECT 1",
+        "DECLARE c2 CURSOR WITH HOLD FOR SELECT g FROM generate_series(1, 5) g",
+        "FETCH 2 FROM c2",
+        "BEGIN", "DECLARE c3 CURSOR FOR SELECT 1", "DECLARE c4 CURSOR WITH HOLD FOR SELECT 2", "COMMIT",
+        "FETCH 1 FROM c3",
+        "FETCH 1 FROM c4",
+        "BEGIN", "DECLARE c5 CURSOR WITH HOLD FOR SELECT 5", "ROLLBACK",
+        "FETCH 1 FROM c5",
+        "BEGIN", "FETCH 1 FROM c2", "ROLLBACK", "FETCH 1 FROM c2",
+        "CLOSE c2", "CLOSE c4", "CLOSE nope",
+    ),
 })
