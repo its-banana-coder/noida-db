@@ -822,4 +822,18 @@ PG_EDGES.update({
         "SELECT a.name FROM dj1 a, dj1 b WHERE a.id = b.id ORDER BY a.id FOR UPDATE OF a, b",
         "SELECT name FROM dj1 ORDER BY 1 FOR KEY SHARE",
     ),
+    "pg edge: ADD COLUMN named constraints and ALTER TYPE overflow": steps(
+        "CREATE TABLE b1 (id int PRIMARY KEY)",
+        "CREATE TABLE n1 (id int PRIMARY KEY, name varchar(255), arr varchar(20)[], num numeric(10,2), t text)",
+        "INSERT INTO n1 VALUES (1, repeat('x', 255), ARRAY['abcdefghijklmnopq'], 12345678.5, 'abc')",
+        "ALTER TABLE n1 ADD COLUMN b_id integer NULL CONSTRAINT n1_b_fk REFERENCES b1(id) DEFERRABLE INITIALLY DEFERRED, ADD COLUMN u int CONSTRAINT n1_u_uq UNIQUE, ADD COLUMN c int CONSTRAINT n1_c_ck CHECK (c > 0)",
+        "SELECT conname, contype FROM pg_constraint WHERE conrelid = 'n1'::regclass ORDER BY 1",
+        "ALTER TABLE n1 DROP CONSTRAINT n1_b_fk",
+        "ALTER TABLE n1 ALTER COLUMN name TYPE varchar(254)",
+        "ALTER TABLE n1 ALTER COLUMN arr TYPE varchar(15)[]",
+        "ALTER TABLE n1 ALTER COLUMN num TYPE numeric(5,2)",
+        "ALTER TABLE n1 ALTER COLUMN t TYPE int",
+        "ALTER TABLE n1 ALTER COLUMN name TYPE varchar(300)",
+        "SELECT length(name) FROM n1",
+    ),
 })

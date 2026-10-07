@@ -778,6 +778,16 @@ MYSQL_QUERIES = {
         (A, "SELECT ja.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
         (A, "SELECT ja.id, jb.id FROM ja JOIN jb ON ja.id = jb.id ORDER BY id"),
     ],
+    "ALTER narrowing errors": [
+        (A, "CREATE TABLE n1 (a varchar(10), b varchar(10), d text, i int)"),
+        (A, "INSERT INTO n1 VALUES ('ab','ab','ab',1),('abcdef','ab','abcdef',1),('abcdefg','abcdef','x',300)"),
+        (A, "ALTER TABLE n1 MODIFY a varchar(3)"),
+        (A, "ALTER TABLE n1 MODIFY d varchar(3)"),
+        (A, "ALTER TABLE n1 MODIFY i tinyint"),
+        (A, "ALTER TABLE n1 CHANGE b b2 varchar(4)"),
+        (A, "ALTER TABLE n1 MODIFY a varchar(20)"),
+        (A, "SELECT * FROM n1 ORDER BY a"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 
