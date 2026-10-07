@@ -227,6 +227,31 @@ pub struct EngineState {
     // transactional.id -> (topic, partition) set added via
     // AddPartitionsToTxn for the transaction currently in progress.
     pub txn_partitions: HashMap<String, HashSet<(String, i32)>>,
+    // transactional.id -> offsets sent with TxnOffsetCommit in the open
+    // transaction: they only become the group's committed offsets when the
+    // transaction commits (an abort discards them).
+    pub txn_pending_offsets: HashMap<String, Vec<PendingTxnOffset>>,
+    // transactional.id -> what DescribeTransactions/ListTransactions report.
+    pub txn_info: HashMap<String, TxnInfo>,
+}
+
+/// An offset committed inside a transaction, waiting for EndTxn.
+#[derive(Debug, Clone)]
+pub struct PendingTxnOffset {
+    pub key: (String, String, i32),
+    pub offset: i64,
+    pub metadata: Option<String>,
+}
+
+/// A transactional id's coordinator-side state, as Kafka's
+/// kafka-transactions.sh describe/list show it.
+#[derive(Debug, Clone)]
+pub struct TxnInfo {
+    /// Empty, Ongoing, CompleteCommit or CompleteAbort.
+    pub state: &'static str,
+    pub timeout_ms: i32,
+    /// When the current/last transaction started (-1: none since init).
+    pub start_ms: i64,
 }
 
 impl std::fmt::Debug for EngineState {
@@ -310,6 +335,8 @@ impl EngineState {
             producer_epochs: HashMap::new(),
             txn_producers: HashMap::new(),
             txn_partitions: HashMap::new(),
+            txn_pending_offsets: HashMap::new(),
+            txn_info: HashMap::new(),
         };
 
         // Pre-create internal topics as a real KRaft broker does
@@ -375,7 +402,7 @@ impl EngineState {
             (ApiKey::EndTxn, 0, 3),
             (ApiKey::TxnOffsetCommit, 0, 3),
             (ApiKey::DescribeTransactions, 0, 0),
-            (ApiKey::ListTransactions, 0, 0),
+            (ApiKey::ListTransactions, 0, 1),
             (ApiKey::DescribeProducers, 0, 0),
             (ApiKey::DescribeLogDirs, 0, 2),
             (ApiKey::DescribeAcls, 0, 3),
@@ -750,6 +777,18 @@ impl EngineState {
         };
 
         if let Some(tid) = tx_id {
+            // Like Kafka's coordinator, re-initialising a transactional.id
+            // whose transaction is still open aborts that transaction
+            // (abort markers on its partitions, its offsets discarded)
+            // before the new producer instance gets its epoch -- the old
+            // instance's records must never become visible.
+            if self.txn_is_open(&tid) {
+                self.complete_txn(&tid, pid, epoch, false);
+            }
+            self.txn_info.insert(
+                tid.clone(),
+                TxnInfo { state: "Empty", timeout_ms: req.transaction_timeout_ms, start_ms: -1 },
+            );
             self.txn_producers.insert(tid, (pid, epoch));
         }
         self.producer_epochs.insert(pid, epoch);
@@ -2091,6 +2130,7 @@ impl EngineState {
                         .entry(tx_id.clone())
                         .or_default()
                         .insert((topic.name.as_str().to_string(), p_id));
+                    self.mark_txn_ongoing(&tx_id);
                 }
                 topic_res.results_by_partition.push(part_res);
             }
@@ -2102,13 +2142,95 @@ impl EngineState {
     }
 
     pub fn handle_add_offsets_to_txn(
-        &self,
-        _req: &kafka_protocol::messages::AddOffsetsToTxnRequest,
+        &mut self,
+        req: &kafka_protocol::messages::AddOffsetsToTxnRequest,
         _version: i16,
     ) -> kafka_protocol::messages::AddOffsetsToTxnResponse {
         let mut res = kafka_protocol::messages::AddOffsetsToTxnResponse::default();
+        if self.is_fenced(req.producer_id.0, req.producer_epoch) {
+            res.error_code = 47; // INVALID_PRODUCER_EPOCH
+            return res;
+        }
+        self.mark_txn_ongoing(req.transactional_id.as_str());
         res.error_code = 0;
         res
+    }
+
+    fn is_fenced(&self, producer_id: i64, producer_epoch: i16) -> bool {
+        self.producer_epochs.get(&producer_id).is_some_and(|&expected| producer_epoch < expected)
+    }
+
+    fn txn_is_open(&self, tx_id: &str) -> bool {
+        self.txn_partitions.get(tx_id).is_some_and(|p| !p.is_empty())
+            || self.txn_pending_offsets.get(tx_id).is_some_and(|o| !o.is_empty())
+    }
+
+    fn mark_txn_ongoing(&mut self, tx_id: &str) {
+        let now = self.now_ms();
+        let info = self.txn_info.entry(tx_id.to_string()).or_insert(TxnInfo {
+            state: "Empty",
+            timeout_ms: 60_000,
+            start_ms: -1,
+        });
+        if info.state != "Ongoing" {
+            info.state = "Ongoing";
+            info.start_ms = now;
+        }
+    }
+
+    /// Ends `tx_id`'s open transaction: a commit or abort marker on every
+    /// partition it wrote to, and its pending offsets applied (commit) or
+    /// dropped (abort). Returns an error code (0 = ok).
+    fn complete_txn(
+        &mut self,
+        tx_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed: bool,
+    ) -> i16 {
+        if let Some(partitions) = self.txn_partitions.remove(tx_id) {
+            let now = self.now_ms();
+            for (topic_name, p_id) in partitions {
+                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
+                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
+
+                // Only append a control batch if the transaction was genuinely active on this
+                // partition. If it was already force-aborted at shutdown, active_txns is empty
+                // and a commit must be rejected with INVALID_TXN_STATE.
+                if let Some(first_offset) = part_state.active_txns.remove(&producer_id) {
+                    if !committed {
+                        part_state.aborted_txns.push((producer_id, first_offset));
+                    }
+                    let base_offset = part_state.high_watermark;
+                    let control_batch = encode_control_batch(
+                        producer_id,
+                        producer_epoch,
+                        base_offset,
+                        committed,
+                        now,
+                    );
+                    part_state.append_batch(control_batch, 1, now, None);
+                } else if committed
+                    && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
+                {
+                    // This transaction was already force-aborted (e.g. by shutdown resolution).
+                    // A subsequent commit cannot succeed.
+                    self.txn_pending_offsets.remove(tx_id);
+                    return 48; // INVALID_TXN_STATE
+                }
+            }
+        }
+        let pending = self.txn_pending_offsets.remove(tx_id).unwrap_or_default();
+        if committed {
+            for p in pending {
+                self.committed_offsets.insert(p.key.clone(), p.offset);
+                self.set_offset_metadata(p.key, p.metadata.as_deref());
+            }
+        }
+        if let Some(info) = self.txn_info.get_mut(tx_id) {
+            info.state = if committed { "CompleteCommit" } else { "CompleteAbort" };
+        }
+        0
     }
 
     pub fn handle_end_txn(
@@ -2127,40 +2249,7 @@ impl EngineState {
             return res;
         }
 
-        if let Some(partitions) = self.txn_partitions.remove(&tx_id) {
-            let now = self.now_ms();
-            for (topic_name, p_id) in partitions {
-                let Some(topic_state) = self.topics.get_mut(&topic_name) else { continue };
-                let Some(part_state) = topic_state.partitions.get_mut(&p_id) else { continue };
-
-                // Only append a control batch if the transaction was genuinely active on this
-                // partition. If it was already force-aborted at shutdown, active_txns is empty
-                // and a commit must be rejected with INVALID_TXN_STATE.
-                if let Some(first_offset) = part_state.active_txns.remove(&producer_id) {
-                    if !req.committed {
-                        part_state.aborted_txns.push((producer_id, first_offset));
-                    }
-                    let base_offset = part_state.high_watermark;
-                    let control_batch = encode_control_batch(
-                        producer_id,
-                        producer_epoch,
-                        base_offset,
-                        req.committed,
-                        now,
-                    );
-                    part_state.append_batch(control_batch, 1, now, None);
-                } else if req.committed
-                    && part_state.aborted_txns.iter().any(|&(pid, _)| pid == producer_id)
-                {
-                    // This transaction was already force-aborted (e.g. by shutdown resolution).
-                    // A subsequent commit cannot succeed.
-                    res.error_code = 48; // INVALID_TXN_STATE
-                    return res;
-                }
-            }
-        }
-
-        res.error_code = 0;
+        res.error_code = self.complete_txn(&tx_id, producer_id, producer_epoch, req.committed);
         res
     }
 
@@ -2174,6 +2263,8 @@ impl EngineState {
         };
         let mut res = kafka_protocol::messages::TxnOffsetCommitResponse::default();
         let group_id = req.group_id.as_str().to_string();
+        let tx_id = req.transactional_id.as_str().to_string();
+        let fenced = self.is_fenced(req.producer_id.0, req.producer_epoch);
 
         for topic in &req.topics {
             let mut topic_res = TxnOffsetCommitResponseTopic::default();
@@ -2184,11 +2275,19 @@ impl EngineState {
                 let mut part_res = TxnOffsetCommitResponsePartition::default();
                 part_res.partition_index = part.partition_index;
 
-                let key = (group_id.clone(), topic_name.clone(), part.partition_index);
-                self.committed_offsets.insert(key.clone(), part.committed_offset);
-                self.set_offset_metadata(key, part.committed_metadata.as_deref());
-
-                part_res.error_code = 0;
+                if fenced {
+                    part_res.error_code = 47; // INVALID_PRODUCER_EPOCH
+                } else {
+                    // Held until the transaction ends (see complete_txn).
+                    self.txn_pending_offsets.entry(tx_id.clone()).or_default().push(
+                        PendingTxnOffset {
+                            key: (group_id.clone(), topic_name.clone(), part.partition_index),
+                            offset: part.committed_offset,
+                            metadata: part.committed_metadata.as_deref().map(str::to_string),
+                        },
+                    );
+                    part_res.error_code = 0;
+                }
                 topic_res.partitions.push(part_res);
             }
 
@@ -2457,14 +2556,44 @@ impl EngineState {
         req: &kafka_protocol::messages::DescribeTransactionsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::DescribeTransactionsResponse {
-        use kafka_protocol::messages::describe_transactions_response::TransactionState;
+        use kafka_protocol::messages::describe_transactions_response::{
+            TopicData, TransactionState,
+        };
         let mut res = kafka_protocol::messages::DescribeTransactionsResponse::default();
 
         for tx_id in &req.transactional_ids {
             let mut tx_state = TransactionState::default();
             tx_state.transactional_id = tx_id.clone();
-            tx_state.transaction_state = StrBytes::from_static_str("CompleteCommit");
-            tx_state.error_code = 0;
+            let tid = tx_id.as_str();
+            match (self.txn_info.get(tid), self.txn_producers.get(tid)) {
+                (Some(info), Some(&(pid, epoch))) => {
+                    tx_state.error_code = 0;
+                    tx_state.transaction_state = StrBytes::from_static_str(info.state);
+                    tx_state.transaction_timeout_ms = info.timeout_ms;
+                    tx_state.transaction_start_time_ms = info.start_ms;
+                    tx_state.producer_id = ProducerId(pid);
+                    tx_state.producer_epoch = epoch;
+                    let mut by_topic: std::collections::BTreeMap<&str, Vec<i32>> =
+                        std::collections::BTreeMap::new();
+                    for (t, p) in self.txn_partitions.get(tid).into_iter().flatten() {
+                        by_topic.entry(t.as_str()).or_default().push(*p);
+                    }
+                    for (t, mut parts) in by_topic {
+                        parts.sort_unstable();
+                        let mut td = TopicData::default();
+                        td.topic = TopicName::from(StrBytes::from_string(t.to_string()));
+                        td.partitions = parts;
+                        tx_state.topics.push(td);
+                    }
+                }
+                _ => {
+                    tx_state.error_code = 105; // TRANSACTIONAL_ID_NOT_FOUND
+                    tx_state.transaction_state = StrBytes::from_static_str("");
+                    tx_state.producer_id = ProducerId(-1);
+                    tx_state.producer_epoch = -1;
+                    tx_state.transaction_start_time_ms = -1;
+                }
+            }
             res.transaction_states.push(tx_state);
         }
 
@@ -2473,11 +2602,52 @@ impl EngineState {
 
     pub fn handle_list_transactions(
         &self,
-        _req: &kafka_protocol::messages::ListTransactionsRequest,
+        req: &kafka_protocol::messages::ListTransactionsRequest,
         _version: i16,
     ) -> kafka_protocol::messages::ListTransactionsResponse {
+        use kafka_protocol::messages::list_transactions_response::TransactionState;
+        const STATES: [&str; 7] = [
+            "Empty",
+            "Ongoing",
+            "PrepareCommit",
+            "PrepareAbort",
+            "CompleteCommit",
+            "CompleteAbort",
+            "PrepareEpochFence",
+        ];
         let mut res = kafka_protocol::messages::ListTransactionsResponse::default();
         res.error_code = 0;
+        res.unknown_state_filters =
+            req.state_filters.iter().filter(|f| !STATES.contains(&f.as_str())).cloned().collect();
+        let now = self.now_ms();
+        let mut tids: Vec<&String> = self.txn_info.keys().collect();
+        tids.sort();
+        for tid in tids {
+            let info = &self.txn_info[tid];
+            let Some(&(pid, _)) = self.txn_producers.get(tid) else { continue };
+            if !req.state_filters.is_empty()
+                && !req.state_filters.iter().any(|f| f.as_str() == info.state)
+            {
+                continue;
+            }
+            if !req.producer_id_filters.is_empty()
+                && !req.producer_id_filters.iter().any(|p| p.0 == pid)
+            {
+                continue;
+            }
+            // v1: only transactions running longer than duration_filter ms.
+            if req.duration_filter >= 0
+                && (info.state != "Ongoing" || now - info.start_ms < req.duration_filter)
+            {
+                continue;
+            }
+            let mut ts = TransactionState::default();
+            ts.transactional_id =
+                kafka_protocol::messages::TransactionalId(StrBytes::from_string(tid.clone()));
+            ts.producer_id = ProducerId(pid);
+            ts.transaction_state = StrBytes::from_static_str(info.state);
+            res.transaction_states.push(ts);
+        }
         res
     }
 
@@ -3286,6 +3456,8 @@ impl EngineState {
             producer_epochs: HashMap::new(), // fencing state not persisted (§5)
             txn_producers: HashMap::new(),
             txn_partitions: HashMap::new(),
+            txn_pending_offsets: HashMap::new(),
+            txn_info: HashMap::new(),
         }
     }
 }

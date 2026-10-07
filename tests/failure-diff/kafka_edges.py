@@ -623,6 +623,69 @@ def offsets_only_group():
         except KafkaException as e:
             print("delete", err(e))
 
+
+@scenario
+def txn_abort_and_fencing():
+    """Offsets sent in an aborted transaction are not committed; a second
+    producer with the same transactional.id aborts the first one's open
+    transaction (its records never become visible)."""
+    src, out = name("tsrc"), name("tout")
+    create(src, 1)
+    create(out, 1)
+    produce(src, [(None, b"a"), (None, b"b")])
+    g = name("grp")
+    c = Consumer(
+        {"bootstrap.servers": BS, "group.id": g, "auto.offset.reset": "earliest",
+         "enable.auto.commit": False}
+    )
+    c.subscribe([src])
+    seen, deadline = 0, time.time() + 15
+    while seen < 2 and time.time() < deadline:
+        m = c.poll(0.5)
+        if m is not None and not m.error():
+            seen += 1
+    p = Producer({"bootstrap.servers": BS, "transactional.id": name("tid")})
+    p.init_transactions(10)
+    for commit in [False, True]:
+        p.begin_transaction()
+        p.produce(out, value=b"x", partition=0)
+        p.send_offsets_to_transaction(
+            [TopicPartition(src, 0, 2 if commit else 1)], c.consumer_group_metadata()
+        )
+        p.commit_transaction(10) if commit else p.abort_transaction(10)
+        print("commit" if commit else "abort", c.committed([TopicPartition(src, 0)], 10)[0].offset)
+    c.close()
+
+    t, tid = name("tfence"), name("tid")
+    create(t, 1)
+    p1 = Producer({"bootstrap.servers": BS, "transactional.id": tid, "linger.ms": 0})
+    p1.init_transactions(10)
+    p1.begin_transaction()
+    p1.produce(t, value=b"zombie", partition=0)
+    p1.flush(10)
+    p2 = Producer({"bootstrap.servers": BS, "transactional.id": tid, "linger.ms": 0})
+    p2.init_transactions(10)
+    try:
+        p1.commit_transaction(10)
+        print("zombie commit ok?!")
+    except KafkaException as e:
+        print("zombie commit", err(e))
+    p2.begin_transaction()
+    p2.produce(t, value=b"live", partition=0)
+    p2.commit_transaction(10)
+    rc = Consumer(
+        {"bootstrap.servers": BS, "group.id": name("g"), "isolation.level": "read_committed",
+         "auto.offset.reset": "earliest"}
+    )
+    rc.assign([TopicPartition(t, 0, 0)])
+    got, deadline = [], time.time() + 5
+    while time.time() < deadline and not got:
+        m = rc.poll(0.5)
+        if m is not None and not m.error():
+            got.append(m.value())
+    rc.close()
+    print("read_committed", got)
+
 for n, fn in SCENARIOS.items():
     if ONLY and n not in ONLY:
         continue
