@@ -7,7 +7,7 @@
 const COMMANDS: &str = include_str!("data/redis-7.2-commands.txt");
 
 /// Raise this as commands are implemented. Never lower it.
-const IMPLEMENTED_FLOOR: usize = 222;
+const IMPLEMENTED_FLOOR: usize = 223;
 
 fn commands() -> Vec<(&'static str, &'static str)> {
     COMMANDS
@@ -43,7 +43,6 @@ const OUT_OF_SCOPE: &[&str] = &[
     "readonly",
     "readwrite",
     // server internals
-    "debug",
     "shutdown",
     "pfdebug",
     "pfselftest",

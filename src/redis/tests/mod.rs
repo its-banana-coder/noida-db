@@ -5,6 +5,7 @@ mod auth;
 mod bitops;
 mod config;
 mod connection;
+mod debug;
 mod devtools;
 mod geo;
 mod hashes;
