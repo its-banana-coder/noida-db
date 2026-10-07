@@ -495,7 +495,7 @@ fn getkeys_proc(name: &str, argv: &[Vec<u8>]) -> Vec<(usize, &'static [&'static 
             }
             let Some(sp) = streams else { return vec![] };
             let num = argv.len() - sp - 1;
-            if num == 0 || num % 2 != 0 {
+            if num == 0 || !num.is_multiple_of(2) {
                 return vec![];
             }
             // XREADGROUP's keys are reported RO too, as Redis does.
