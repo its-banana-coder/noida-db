@@ -222,10 +222,8 @@ impl Templates {
     fn index_template_out(t: &Value) -> Value {
         let mut out = Map::new();
         out.insert("index_patterns".into(), json!(patterns(t)));
-        for k in ["template"] {
-            if let Some(v) = t.get(k) {
-                out.insert(k.into(), v.clone());
-            }
+        if let Some(v) = t.get("template") {
+            out.insert("template".into(), v.clone());
         }
         out.insert("composed_of".into(), t.get("composed_of").cloned().unwrap_or(json!([])));
         for k in [
