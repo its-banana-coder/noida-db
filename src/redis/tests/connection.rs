@@ -225,6 +225,15 @@ fn client_reply_modes() {
     assert_eq!(t.run("GET k"), Value::NoReply);
     assert_eq!(t.run("GET k"), bulk("v"));
     assert_eq!(t.run("CLIENT REPLY MAYBE"), err(SYNTAX));
+    // ON right after SKIP is answered (it clears the skip).
+    assert_eq!(t.run("CLIENT REPLY SKIP"), Value::NoReply);
+    assert_eq!(t.run("CLIENT REPLY ON"), ok());
+    assert_eq!(t.run("PING"), simple("PONG"));
+    // Pub/sub notifications go out even with replies off.
+    t.run("CLIENT REPLY OFF");
+    let sub = |ch: &str, n: i64| Value::Push(vec![bulk("subscribe"), bulk(ch), int(n)]);
+    assert_eq!(t.run("SUBSCRIBE a b"), Value::Many(vec![sub("a", 1), sub("b", 2)]));
+    assert_eq!(t.run("PING"), Value::NoReply);
 }
 
 #[test]
