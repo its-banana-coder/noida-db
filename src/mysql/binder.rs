@@ -2846,7 +2846,15 @@ impl Binder {
             | "JSON_DEPTH"
             | "JSON_SEARCH"
             | "JSON_OVERLAPS"
-            | "JSON_PRETTY" => {
+            | "JSON_PRETTY"
+            | "MD5"
+            | "SHA"
+            | "SHA1"
+            | "SHA2"
+            | "CRC32"
+            | "TO_BASE64"
+            | "FROM_BASE64"
+            | "UNHEX" => {
                 let bound_args =
                     args.iter().map(|a| self.bind_function_arg(a)).collect::<Result<_, _>>()?;
                 Ok(Expr::Call { name: upper, args: bound_args })

@@ -822,6 +822,14 @@ PG_EDGES.update({
         "SELECT a.name FROM dj1 a, dj1 b WHERE a.id = b.id ORDER BY a.id FOR UPDATE OF a, b",
         "SELECT name FROM dj1 ORDER BY 1 FOR KEY SHARE",
     ),
+    "pg edge: pgcrypto digest and hmac": steps(
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+        "SELECT encode(digest('abc', 'sha1'), 'hex'), encode(digest('abc'::bytea, 'sha224'), 'hex'), digest(NULL::text, 'md5') IS NULL, pg_typeof(digest('a', 'md5'))",
+        "SELECT encode(hmac('abc', 'key', 'sha256'), 'hex'), encode(hmac('abc'::bytea, 'key'::bytea, 'MD5'), 'hex')",
+        "SELECT encode(sha224('abc'), 'hex'), encode(sha384('abc'), 'hex'), encode(sha512('abc'), 'hex')",
+        "SELECT encode(digest('a', 'SHA256'), 'hex')",
+        "SELECT digest('a', 'nope')",
+    ),
     "pg edge: deferrable unique and primary keys": steps(
         "CREATE TABLE du (id int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, k int UNIQUE DEFERRABLE, CONSTRAINT du_kk UNIQUE (k, id) DEFERRABLE INITIALLY IMMEDIATE)",
         "INSERT INTO du VALUES (1, 1), (2, 2)",
