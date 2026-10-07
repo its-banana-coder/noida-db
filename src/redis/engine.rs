@@ -735,7 +735,7 @@ impl Engine {
 
     /// Evicts keys by `maxmemory-policy` until memory is under `maxmemory`
     /// (Redis's `performEvictions`). False if it can't get there.
-    fn perform_evictions(&mut self, maxmemory: u64) -> bool {
+    pub(crate) fn perform_evictions(&mut self, maxmemory: u64) -> bool {
         let policy = self.config.get("maxmemory-policy").unwrap_or_else(|| "noeviction".into());
         let mut used = self.used_memory();
         while used > maxmemory {
