@@ -36,6 +36,10 @@ pub struct Runtime {
     pub deadline: Option<std::time::Instant>,
     /// Work done since the last interrupt check.
     pub ticks: u32,
+    /// `SET CONSTRAINTS ALL DEFERRED|IMMEDIATE` in this transaction.
+    pub deferred_all: Option<bool>,
+    /// `SET CONSTRAINTS name DEFERRED|IMMEDIATE`, by constraint name.
+    pub deferred: BTreeMap<String, bool>,
 }
 
 impl Runtime {

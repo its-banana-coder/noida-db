@@ -285,6 +285,8 @@ impl Engine {
                 cancel: cancel.clone(),
                 deadline: None,
                 ticks: 0,
+                deferred_all: None,
+                deferred: BTreeMap::new(),
             },
             status: TxStatus::Idle,
             txn: None,
@@ -893,6 +895,56 @@ impl Engine {
         }
     }
 
+    /// `SET CONSTRAINTS names|ALL DEFERRED|IMMEDIATE` (see
+    /// `rewrite_set_constraints`): for the rest of the transaction;
+    /// IMMEDIATE also checks those constraints now.
+    fn set_constraints(&self, s: &mut Session, value: &str) -> PgResult<StmtResult> {
+        let mut r = StmtResult::tag("SET CONSTRAINTS");
+        let (names, mode) = value.rsplit_once('|').unwrap_or((value, "immediate"));
+        let deferred = mode == "deferred";
+        if s.status != TxStatus::InTransaction || s.txn.is_none() {
+            r.notices.push(PgError {
+                severity: "WARNING",
+                ..PgError::new("25P01", "SET CONSTRAINTS can only be used in transaction blocks")
+            });
+            return Ok(r);
+        }
+        let state = &s.txn.as_ref().unwrap().state;
+        let names: Vec<String> = names.split(',').map(str::to_string).collect();
+        let all = names.len() == 1 && names[0] == "all";
+        if all {
+            s.rt.deferred_all = Some(deferred);
+            s.rt.deferred.clear();
+        } else {
+            for n in &names {
+                let cons =
+                    state.tables.values().flat_map(|t| &t.constraints).find(|c| &c.name == n);
+                match cons {
+                    None => {
+                        return Err(PgError::new(
+                            code::UNDEFINED_OBJECT,
+                            format!("constraint \"{n}\" does not exist"),
+                        ));
+                    }
+                    Some(c) if !c.deferrable && !c.initially_deferred => {
+                        return Err(PgError::new(
+                            code::WRONG_OBJECT_TYPE,
+                            format!("constraint \"{n}\" is not deferrable"),
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+            for n in &names {
+                s.rt.deferred.insert(n.clone(), deferred);
+            }
+        }
+        if !deferred {
+            super::dml::check_deferred_named(state, (!all).then_some(&names[..]))?;
+        }
+        Ok(r)
+    }
+
     fn run_set(&self, s: &mut Session, set: &a::Set) -> PgResult<StmtResult> {
         let mut changed = vec![];
         match set {
@@ -902,6 +954,9 @@ impl Engine {
                 }
                 let name = name_parts(variable).join(".");
                 let value = set_value_text(values)?;
+                if name == "noida_set_constraints" {
+                    return self.set_constraints(s, &value);
+                }
                 if let Some(c) = s.rt.settings.set(&name, &value)? {
                     changed.push((c.to_string(), s.rt.settings.get(c)?));
                 }
@@ -1084,6 +1139,8 @@ impl Engine {
             return Err(e);
         }
         let Some(mut tx) = s.txn.take() else { return Ok(()) };
+        s.rt.deferred_all = None;
+        s.rt.deferred.clear();
         if tx.wrote {
             on_commit_actions(&mut tx.state, &s.rt.settings.temp_schema);
         }
@@ -1103,6 +1160,8 @@ impl Engine {
 
     fn rollback(&self, s: &mut Session) {
         s.txn = None;
+        s.rt.deferred_all = None;
+        s.rt.deferred.clear();
         let mut g = self.global.lock().unwrap();
         if g.writer == Some(s.id) {
             g.writer = None;

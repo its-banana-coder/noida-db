@@ -49,6 +49,8 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let sql = after_ext.as_deref().unwrap_or(sql);
     let after_frame = rewrite_frame_casts(sql);
     let sql = after_frame.as_deref().unwrap_or(sql);
+    let after_cons = rewrite_set_constraints(sql);
+    let sql = after_cons.as_deref().unwrap_or(sql);
     let after_seq = seqddl::rewrite(sql)?;
     let sql1 = after_seq.as_deref().unwrap_or(sql);
     let after_refresh = refresh::rewrite(sql1)?;
@@ -208,6 +210,39 @@ fn rewrite_frame_casts(sql: &str) -> Option<String> {
     .expect("regex");
     let out = re.replace_all(sql, "CAST($1 AS $2)$3").into_owned();
     (out != sql).then_some(out)
+}
+
+/// `SET CONSTRAINTS {ALL | name, ...} {DEFERRED | IMMEDIATE}`, which
+/// sqlparser doesn't parse: carried as `SET noida_set_constraints =
+/// 'names|mode'` to the SET handler (`Engine::set_constraints`).
+fn rewrite_set_constraints(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?is)\bset\s+constraints\s+(all|[a-z_\x22][a-z0-9_$.\x22\s,]*?)\s+(deferred|immediate)\b",
+    )
+    .expect("regex");
+    if !re.is_match(sql) {
+        return None;
+    }
+    Some(
+        re.replace_all(sql, |c: &regex_lite::Captures| {
+            let names: Vec<String> = c[1]
+                .split(',')
+                .map(|n| {
+                    let n = n.trim();
+                    match n.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+                        Some(q) => q.replace("''", "'"),
+                        None => n.to_ascii_lowercase(),
+                    }
+                })
+                .collect();
+            format!(
+                "SET noida_set_constraints = '{}|{}'",
+                names.join(",").replace('\'', "''"),
+                c[2].to_ascii_lowercase()
+            )
+        })
+        .into_owned(),
+    )
 }
 
 /// Parses a single SQL expression (defaults, check constraints).
