@@ -14,6 +14,7 @@ use super::analysis;
 use super::dates;
 use super::fields;
 use super::highlight;
+use super::queries;
 use super::query_string;
 use super::scoring;
 use super::sorting;
@@ -441,13 +442,13 @@ fn meta_tokens(mappings: &Value, d: &CommittedDoc, field: &str) -> Vec<String> {
     }
 }
 
-fn doc_tokens(mappings: &Value, docs: &[CommittedDoc], field: &str) -> Vec<Vec<String>> {
+pub(super) fn doc_tokens(mappings: &Value, docs: &[CommittedDoc], field: &str) -> Vec<Vec<String>> {
     docs.iter().map(|d| tokens_for(mappings, &d.source, field)).collect()
 }
 
 /// BM25 (Lucene/Elasticsearch defaults k1=1.2, b=0.75) over the given field
 /// for a set of already-analyzed query terms.
-fn bm25_scores(
+pub(super) fn bm25_scores(
     mappings: &Value,
     docs: &[CommittedDoc],
     field: &str,
@@ -484,7 +485,7 @@ fn bm25_scores(
     scores
 }
 
-fn field_and_spec(v: &Value) -> Option<(&str, &Value)> {
+pub(super) fn field_and_spec(v: &Value) -> Option<(&str, &Value)> {
     v.as_object().and_then(|o| o.iter().next()).map(|(k, v)| (k.as_str(), v))
 }
 
@@ -533,7 +534,7 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
 
 /// A query string analyzed the way `field` is: `keyword` (and numeric,
 /// boolean, date) fields take it whole, text fields through `standard`.
-fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
+pub(super) fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
     match resolve_field(mappings, field).1.as_deref() {
         None | Some("text") | Some("match_only_text") => analysis::standard(text),
         Some(_) => vec![text.to_string()],
@@ -541,7 +542,7 @@ fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
 }
 
 /// A query value as text: `"quick"`, `10`, `true`.
-fn query_text(v: Option<&Value>) -> String {
+pub(super) fn query_text(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
@@ -550,7 +551,11 @@ fn query_text(v: Option<&Value>) -> String {
     }
 }
 
-fn eval_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+pub(super) fn eval_match(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
     let (text, op, boost) = if let Some(o) = spec.as_object() {
         (
@@ -688,7 +693,11 @@ fn phrase_matches(doc_tokens: &[String], query_terms: &[String]) -> bool {
 /// A sloppy phrase match: some choice of positions for the query terms
 /// whose total displacement from consecutive order is at most `slop`
 /// (Lucene's edit-distance notion of phrase slop, reordering included).
-fn sloppy_phrase_matches(doc_tokens: &[String], query_terms: &[String], slop: usize) -> bool {
+pub(super) fn sloppy_phrase_matches(
+    doc_tokens: &[String],
+    query_terms: &[String],
+    slop: usize,
+) -> bool {
     if slop == 0 {
         return phrase_matches(doc_tokens, query_terms);
     }
@@ -1018,7 +1027,11 @@ fn eval_exists(v: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     out
 }
 
-fn eval_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
+pub(super) fn eval_prefix(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
     let (value, boost) = value_and_boost(spec);
     let prefix = value_to_term(&value);
@@ -1044,7 +1057,7 @@ fn eval_ids(v: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
         .collect()
 }
 
-fn clauses(v: &Value, key: &str) -> Vec<Value> {
+pub(super) fn clauses(v: &Value, key: &str) -> Vec<Value> {
     match v.get(key) {
         Some(Value::Array(a)) => a.clone(),
         Some(other) => vec![other.clone()],
@@ -1190,6 +1203,30 @@ pub fn eval(
         let inner = v.get("filter").cloned().unwrap_or_else(|| json!({"match_all":{}}));
         let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
         return Ok(eval(&inner, mappings, docs)?.into_keys().map(|k| (k, boost)).collect());
+    }
+    if let Some(v) = obj.get("match_phrase_prefix") {
+        return Ok(queries::match_phrase_prefix(v, mappings, docs));
+    }
+    if let Some(v) = obj.get("match_bool_prefix") {
+        return Ok(queries::match_bool_prefix(v, mappings, docs));
+    }
+    if let Some(v) = obj.get("boosting") {
+        return queries::boosting(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("function_score") {
+        return queries::function_score(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("script_score") {
+        return queries::script_score(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("combined_fields") {
+        return queries::combined_fields(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("geo_distance") {
+        return queries::geo_distance(v, docs);
+    }
+    if let Some(v) = obj.get("geo_bounding_box") {
+        return queries::geo_bounding_box(v, docs);
     }
     // Found via testing before a public release: this used to fall
     // through to `HashMap::new()` -- a real client sending a query type
@@ -2156,7 +2193,23 @@ pub fn search_with(
             &format!("[from] parameter cannot be negative, found [{from}]"),
         ));
     }
+    if body.get("terminate_after").and_then(Value::as_i64).is_some_and(|n| n < 0) {
+        return Err(EsError::new(400, "illegal_argument_exception", "terminateAfter must be > 0"));
+    }
+    if let Some(n) = body.get("track_total_hits").and_then(Value::as_i64)
+        && n < -1
+    {
+        return Err(EsError::new(
+            400,
+            "illegal_argument_exception",
+            &format!("[track_total_hits] parameter must be positive or equals to -1, got {n}"),
+        ));
+    }
     let search_after = body.get("search_after");
+    let collapse = match body.get("collapse") {
+        Some(c) => Some(collapse_spec(c, mappings, body)?),
+        None => None,
+    };
     if search_after.is_some() && from > 0 {
         return Err(EsError::new(
             400,
@@ -2204,6 +2257,8 @@ pub fn search_with(
     let originals = docs;
     let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     let mut scores = eval(&query, mappings, docs)?;
+    apply_indices_boost(body, docs, &mut scores);
+    let named = named_queries(&query, mappings, docs)?;
     let mut inner = Vec::new();
     inner_hits(&query, mappings, docs, &mut inner)?;
     if let Some(min_score) = body.get("min_score").and_then(Value::as_f64) {
@@ -2236,6 +2291,12 @@ pub fn search_with(
         let after = after.as_array().cloned().unwrap_or_else(|| vec![after.clone()]);
         let after = sorting::after_keys(&specs, &after)?;
         ranked.retain(|h| sorting::compare_keys(&specs, &h.2, &after) == Ordering::Greater);
+    }
+    // Field collapsing: the top hit of each value; inner hits per group.
+    let all_ranked = ranked.clone();
+    if let Some(c) = &collapse {
+        let mut seen = HashSet::new();
+        ranked.retain(|h| seen.insert(collapse_key(&docs[h.0], c).to_string()));
     }
 
     let source_filter = body.get("_source");
@@ -2319,6 +2380,24 @@ pub fn search_with(
                     hit["inner_hits"][name.as_str()] = h.clone();
                 }
             }
+            if let Some(c) = &collapse {
+                let key = collapse_key(&docs[*idx], c);
+                hit["fields"][c.field.as_str()] = json!([key.clone()]);
+                for ih in &c.inner {
+                    let group: Vec<(usize, f32)> = all_ranked
+                        .iter()
+                        .filter(|h| collapse_key(&docs[h.0], c) == key)
+                        .map(|h| (h.0, h.1))
+                        .collect();
+                    hit["inner_hits"][ih.name.as_str()] =
+                        collapse_inner_hits(ih, &group, mappings, docs, originals)?;
+                }
+            }
+            let names: Vec<&String> =
+                named.iter().filter(|(_, m)| m.contains(idx)).map(|(n, _)| n).collect();
+            if !names.is_empty() {
+                hit["matched_queries"] = json!(names);
+            }
             Ok(hit)
         })
         .collect();
@@ -2338,6 +2417,217 @@ pub fn search_with(
         resp["aggregations"] = eval_aggs(agg_spec, mappings, docs, &matched);
     }
     Ok(resp)
+}
+
+/// `indices_boost`: `[{"index": boost}, ...]` (or an object): matching
+/// indices' scores multiplied.
+fn apply_indices_boost(body: &Value, docs: &[CommittedDoc], scores: &mut HashMap<usize, f32>) {
+    let Some(spec) = body.get("indices_boost") else { return };
+    let mut pairs: Vec<(String, f32)> = vec![];
+    let mut add = |o: &Map<String, Value>| {
+        for (k, v) in o {
+            if let Some(b) = v.as_f64() {
+                pairs.push((k.clone(), b as f32));
+            }
+        }
+    };
+    match spec {
+        Value::Array(a) => a.iter().filter_map(Value::as_object).for_each(&mut add),
+        Value::Object(o) => add(o),
+        _ => {}
+    }
+    for (i, s) in scores.iter_mut() {
+        let index = &docs[*i].index;
+        let glob = |p: &str| {
+            let pc: Vec<char> = p.chars().collect();
+            let tc: Vec<char> = index.chars().collect();
+            glob_match(&pc, &tc)
+        };
+        if let Some((_, b)) = pairs.iter().find(|(p, _)| p == index || glob(p)) {
+            *s *= b;
+        }
+    }
+}
+
+/// Every clause of `query` carrying a `_name`, with the documents it
+/// matches (for each hit's `matched_queries`).
+fn named_queries(
+    query: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<Vec<(String, HashSet<usize>)>, EsError> {
+    let mut found: Vec<(String, Value)> = vec![];
+    collect_named(query, &mut found);
+    found
+        .into_iter()
+        .map(|(n, q)| Ok((n, eval(&q, mappings, docs)?.into_keys().collect())))
+        .collect()
+}
+
+fn collect_named(v: &Value, out: &mut Vec<(String, Value)>) {
+    match v {
+        Value::Object(o) => {
+            // A query object is `{type: body}`; its name is in the body,
+            // or (for field queries) in the field's spec.
+            if o.len() == 1 {
+                let (_, body) = o.iter().next().unwrap();
+                let name = body.get("_name").and_then(Value::as_str).or_else(|| {
+                    body.as_object()
+                        .filter(|b| b.len() == 1)
+                        .and_then(|b| b.values().next())
+                        .and_then(|spec| spec.get("_name"))
+                        .and_then(Value::as_str)
+                });
+                if let Some(n) = name {
+                    out.push((n.to_string(), v.clone()));
+                    // Its body isn't a query itself; look below it.
+                    if let Some(b) = body.as_object() {
+                        b.values().for_each(|x| collect_named(x, out));
+                    }
+                    return;
+                }
+            }
+            for x in o.values() {
+                collect_named(x, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_named(x, out)),
+        _ => {}
+    }
+}
+
+struct CollapseInner {
+    name: String,
+    from: usize,
+    size: usize,
+    sort: Option<Value>,
+}
+
+struct CollapseSpec {
+    field: String,
+    ty: Option<String>,
+    inner: Vec<CollapseInner>,
+}
+
+fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSpec, EsError> {
+    let field = c
+        .get("field")
+        .and_then(Value::as_str)
+        .ok_or_else(|| EsError::parsing("Required [field]"))?;
+    let (_, ty) = resolve_field(mappings, field);
+    match ty.as_deref() {
+        None => {
+            return Err(EsError::shard_failure(
+                "illegal_argument_exception",
+                &format!("no mapping found for `{field}` in order to collapse on"),
+            ));
+        }
+        Some(t @ ("text" | "match_only_text")) => {
+            return Err(EsError::shard_failure(
+                "illegal_argument_exception",
+                &format!("collapse is not supported for the field [{field}] of the type [{t}]"),
+            ));
+        }
+        _ => {}
+    }
+    if body.get("search_after").is_some() {
+        let same = match body.get("sort") {
+            Some(Value::Array(a)) if a.len() == 1 => sort_field_name(&a[0]) == Some(field),
+            Some(one) => sort_field_name(one) == Some(field),
+            None => false,
+        };
+        if !same {
+            return Err(EsError::new(
+                400,
+                "illegal_argument_exception",
+                "Cannot use [collapse] in conjunction with [search_after] unless the search is \
+                 sorted on the same field. Multiple sort fields are not allowed.",
+            ));
+        }
+    }
+    let inner = match c.get("inner_hits") {
+        None => vec![],
+        Some(Value::Array(a)) => a.iter().map(inner_spec).collect(),
+        Some(o) => vec![inner_spec(o)],
+    };
+    Ok(CollapseSpec { field: field.to_string(), ty, inner })
+}
+
+fn sort_field_name(v: &Value) -> Option<&str> {
+    match v {
+        Value::String(s) => Some(s),
+        Value::Object(o) => o.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
+fn inner_spec(v: &Value) -> CollapseInner {
+    CollapseInner {
+        name: v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+        from: v.get("from").and_then(Value::as_u64).unwrap_or(0) as usize,
+        size: v.get("size").and_then(Value::as_u64).unwrap_or(3) as usize,
+        sort: v.get("sort").cloned(),
+    }
+}
+
+/// A document's collapse value (`null` for none).
+fn collapse_key(d: &CommittedDoc, c: &CollapseSpec) -> Value {
+    raw_values(&d.source, &c.field)
+        .into_iter()
+        .next()
+        .map(|v| match (c.ty.as_deref(), v) {
+            (Some("long" | "integer" | "short" | "byte"), Value::Number(n)) => {
+                json!(n.as_i64().unwrap_or_default())
+            }
+            _ => v.clone(),
+        })
+        .unwrap_or(Value::Null)
+}
+
+fn collapse_inner_hits(
+    ih: &CollapseInner,
+    group: &[(usize, f32)],
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    originals: &[CommittedDoc],
+) -> Result<Value, EsError> {
+    let specs = match &ih.sort {
+        Some(s) => sorting::parse(s, mappings, true)?,
+        None => vec![],
+    };
+    let mut ranked: Vec<(usize, f32, Vec<Value>)> =
+        group.iter().map(|(i, s)| (*i, *s, sorting::keys(&specs, &docs[*i], *i, *s))).collect();
+    if specs.is_empty() {
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
+    } else {
+        ranked.sort_by(|a, b| sorting::compare_keys(&specs, &a.2, &b.2).then(a.0.cmp(&b.0)));
+    }
+    let shows_scores = specs.is_empty() || specs.iter().any(|s| s.is_score());
+    let max_score = if shows_scores {
+        ranked.iter().map(|h| h.1).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
+    } else {
+        None
+    };
+    let hits: Vec<Value> = ranked
+        .iter()
+        .skip(ih.from)
+        .take(ih.size)
+        .map(|(i, sc, keys)| {
+            let d = &originals[*i];
+            let mut h = json!({"_index": d.index, "_id": d.id,
+                "_score": if shows_scores { json!(sc) } else { Value::Null },
+                "_source": d.source});
+            if !specs.is_empty() {
+                h["sort"] = Value::Array(keys.clone());
+            }
+            h
+        })
+        .collect();
+    Ok(json!({"hits": {
+        "total": {"value": group.len(), "relation": "eq"},
+        "max_score": max_score,
+        "hits": hits,
+    }}))
 }
 
 /// Evaluates `query` over the root-level view of `docs` (nested objects

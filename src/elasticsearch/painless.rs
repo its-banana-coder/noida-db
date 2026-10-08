@@ -1283,6 +1283,26 @@ impl Script {
     }
 }
 
+impl Script {
+    /// Runs a scoring/value script (`script_score`, script fields) with
+    /// `vars` bound (`doc`, `_score`, `params`, ...): its `return` value,
+    /// or the value of its last expression (`doc['n'].value * 2`).
+    pub fn value(&self, vars: Map<String, Value>) -> Result<Value, String> {
+        let mut env = Env { scopes: vec![vars], steps: 0 };
+        let (last, init) = match self.stmts.split_last() {
+            Some((Stmt::Expr(e), init)) => (Some(e), init),
+            _ => (None, &self.stmts[..]),
+        };
+        if let Flow::Return(v) = env.run(init)? {
+            return Ok(v);
+        }
+        match last {
+            Some(e) => env.eval(e),
+            None => Ok(Value::Null),
+        }
+    }
+}
+
 /// A request's `script` (a string, or `{source, params, lang}`) as
 /// (source, params).
 pub fn script_parts(script: &Value) -> Result<(String, Value), String> {

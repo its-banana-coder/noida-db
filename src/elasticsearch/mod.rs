@@ -8,6 +8,7 @@ mod field_caps;
 mod fields;
 mod highlight;
 mod painless;
+mod queries;
 mod query_string;
 mod scoring;
 mod search;

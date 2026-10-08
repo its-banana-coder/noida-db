@@ -73,6 +73,9 @@ struct Index {
     docs: HashMap<String, Document>,
     order: Vec<String>,
     seq: i64,
+    /// Per-shard `_seq_no` counters when the index has several shards.
+    #[serde(default)]
+    shard_seq: HashMap<i64, i64>,
     opened: bool,
     /// The last-refreshed, searchable snapshot (near-real-time semantics:
     /// `_search` sees this, real-time GET reads `docs` directly).
@@ -360,6 +363,14 @@ impl Engine {
             // real index name.
             return self.bulk(method, "", &q, body);
         }
+        // Index-less mapping/settings APIs: every index.
+        match segments.as_slice() {
+            ["_mapping"] => return self.mapping_api(method, "_all", &q, body),
+            ["_mapping", "field", f] => return self.field_mapping_api(method, "_all", f, &q),
+            ["_settings"] => return self.settings_api(method, "_all", None, &q, body),
+            ["_settings", name] => return self.settings_api(method, "_all", Some(name), &q, body),
+            _ => {}
+        }
         if segments.len() == 1 && segments[0].starts_with('_') {
             return (404, error("not_found", "no handler found for uri", 404));
         }
@@ -398,11 +409,20 @@ impl Engine {
             return require_alias_error(segments[0]);
         }
         if segments.len() == 1 {
+            // GET / DELETE take an index expression; PUT / HEAD one name.
+            if matches!(method, "GET" | "DELETE") {
+                return self.index_expr_api(method, segments[0], &q);
+            }
             return self.index_api(method, index_name, body);
         }
         match segments[1] {
-            "_mapping" => self.mapping_api(method, index_name, body),
-            "_settings" => self.settings_api(method, index_name, body),
+            "_mapping" if segments.get(2) == Some(&"field") && segments.len() == 4 => {
+                self.field_mapping_api(method, segments[0], segments[3], &q)
+            }
+            "_mapping" => self.mapping_api(method, segments[0], &q, body),
+            "_settings" => {
+                self.settings_api(method, segments[0], segments.get(2).copied(), &q, body)
+            }
             "_refresh" | "_flush" | "_open" | "_close" | "_forcemerge"
                 if method == "POST"
                     || (method == "GET" && matches!(segments[1], "_refresh" | "_flush")) =>
@@ -677,10 +697,18 @@ impl Engine {
         q: &HashMap<String, String>,
     ) -> Result<Vec<String>, (u16, Value)> {
         let ignore_unavailable = q.get("ignore_unavailable").is_some_and(|v| v == "true");
+        // `expand_wildcards=none`: a wildcard is a literal (missing) name.
+        let no_expand = q.get("expand_wildcards").is_some_and(|v| v == "none");
         if !ignore_unavailable {
             for (n, part) in expr.split(',').map(str::trim).enumerate() {
                 let excluded = n > 0 && part.starts_with('-');
-                if part.is_empty() || excluded || part == "_all" || part.contains('*') {
+                if part.is_empty() || excluded || part == "_all" {
+                    continue;
+                }
+                if part.contains('*') {
+                    if no_expand {
+                        return Err(missing_index(part));
+                    }
                     continue;
                 }
                 if Self::resolve_indices(s, part).is_empty() {
@@ -688,7 +716,16 @@ impl Engine {
                 }
             }
         }
-        let names = Self::resolve_indices(s, expr);
+        let names = if no_expand {
+            let literal: Vec<&str> = expr
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.contains('*') && *p != "_all")
+                .collect();
+            if literal.is_empty() { vec![] } else { Self::resolve_indices(s, &literal.join(",")) }
+        } else {
+            Self::resolve_indices(s, expr)
+        };
         if names.is_empty() && q.get("allow_no_indices").is_some_and(|v| v == "false") {
             return Err(missing_index(expr));
         }
@@ -1578,7 +1615,11 @@ impl Engine {
                 let req: Value = parse_json(body).unwrap_or_else(|| json!({}));
                 let mut index = new_index_from_templates(&s.templates, name);
                 if let Some(m) = req.get("mappings") {
-                    merge(&mut index.mappings, expand_dotted(m));
+                    let m = expand_dotted(m);
+                    if let Err(e) = validate_mapping(&json!({}), &m) {
+                        return e;
+                    }
+                    merge(&mut index.mappings, m);
                 }
                 if let Some(st) = req.get("settings") {
                     apply_settings(&mut index.settings, st);
@@ -1616,41 +1657,275 @@ impl Engine {
         }
     }
 
-    fn mapping_api(&self, method: &str, name: &str, body: &[u8]) -> (u16, Value) {
+    /// `GET|PUT [/{index-expr}]/_mapping`.
+    fn mapping_api(
+        &self,
+        method: &str,
+        expr: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
-        let Some(i) = s.indices.get_mut(name) else {
-            return missing_index(name);
+        let names = match Self::resolve_targets(&s, expr, q) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         match method {
             // `{"<index>": {"mappings": {...}}}`, as Elasticsearch shapes it.
-            "GET" => (200, json!({(name): {"mappings": i.mappings}})),
+            "GET" => {
+                let mut out = Map::new();
+                for n in &names {
+                    if let Some(i) = s.indices.get(n) {
+                        out.insert(n.clone(), json!({"mappings": shown_mappings(&i.mappings)}));
+                    }
+                }
+                (200, Value::Object(out))
+            }
             "PUT" | "POST" => {
                 let next = parse_json(body).unwrap_or_else(|| json!({}));
-                merge(&mut i.mappings, expand_dotted(&next));
+                if next.get("_doc").is_some() {
+                    return (
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            "Types cannot be provided in put mapping requests",
+                            400,
+                        ),
+                    );
+                }
+                let next = expand_dotted(&next);
+                for n in &names {
+                    if let Some(i) = s.indices.get(n)
+                        && let Err(e) = validate_mapping(&i.mappings, &next)
+                    {
+                        return e;
+                    }
+                }
+                for n in &names {
+                    if let Some(i) = s.indices.get_mut(n) {
+                        merge(&mut i.mappings, next.clone());
+                    }
+                }
                 (200, json!({"acknowledged":true}))
             }
             _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
         }
     }
 
-    fn settings_api(&self, method: &str, name: &str, body: &[u8]) -> (u16, Value) {
+    /// `GET [/{index-expr}]/_mapping/field/{fields}`: each field's
+    /// definition by full name (wildcards allowed).
+    fn field_mapping_api(
+        &self,
+        method: &str,
+        expr: &str,
+        fields: &str,
+        q: &HashMap<String, String>,
+    ) -> (u16, Value) {
+        if method != "GET" {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        // `local` was removed from this API in 8.0.
+        if q.contains_key("local") {
+            return (
+                400,
+                error(
+                    "illegal_argument_exception",
+                    "request [/_mapping/field] contains unrecognized parameter: [local]",
+                    400,
+                ),
+            );
+        }
+        let s = self.0.lock().unwrap();
+        let names = match Self::resolve_targets(&s, expr, q) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        let patterns: Vec<&str> =
+            fields.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+        let mut out = Map::new();
+        for n in &names {
+            let Some(i) = s.indices.get(n) else { continue };
+            let mut leaves = vec![];
+            mapped_leaves(&i.mappings, "", &mut leaves);
+            let mut m = Map::new();
+            for (full, def) in leaves {
+                if patterns.iter().any(|p| glob_match(p, &full)) {
+                    let leaf = full.rsplit('.').next().unwrap_or(&full).to_string();
+                    m.insert(full.clone(), json!({"full_name": full, "mapping": {(leaf): def}}));
+                }
+            }
+            for meta in META_FIELDS {
+                if patterns.iter().any(|p| p.contains('*') && glob_match(p, meta)) {
+                    m.insert(meta.to_string(), json!({"full_name": meta, "mapping": {}}));
+                }
+            }
+            out.insert(n.clone(), json!({"mappings": m}));
+        }
+        (200, Value::Object(out))
+    }
+
+    /// `GET|PUT [/{index-expr}]/_settings[/{names}]`.
+    fn settings_api(
+        &self,
+        method: &str,
+        expr: &str,
+        filter: Option<&str>,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
-        let Some(i) = s.indices.get_mut(name) else {
-            return missing_index(name);
+        let names = match Self::resolve_targets(&s, expr, q) {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         match method {
-            "GET" => (200, json!({(name):{"settings":i.settings}})),
+            "GET" => {
+                let patterns: Option<Vec<String>> = filter.filter(|f| *f != "_all").map(|f| {
+                    f.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+                });
+                let defaults =
+                    q.get("include_defaults").is_some_and(|v| v.is_empty() || v == "true");
+                let mut out = Map::new();
+                for n in &names {
+                    let Some(i) = s.indices.get(n) else { continue };
+                    let flat = flat_settings(&i.settings);
+                    let keep = |k: &str| {
+                        patterns.as_ref().is_none_or(|ps| ps.iter().any(|p| glob_match(p, k)))
+                    };
+                    let shown: Vec<(String, Value)> =
+                        flat.iter().filter(|(k, _)| keep(k)).cloned().collect();
+                    let mut entry = Map::new();
+                    if !shown.is_empty() {
+                        entry.insert("settings".into(), nest_settings(&shown));
+                    }
+                    if defaults {
+                        let rest: Vec<(String, Value)> = DEFAULT_SETTINGS
+                            .iter()
+                            .filter(|(k, _)| keep(k) && !flat.iter().any(|(f, _)| f == k))
+                            .map(|(k, v)| (k.to_string(), json!(v)))
+                            .collect();
+                        entry.insert("defaults".into(), nest_settings(&rest));
+                        entry.entry("settings").or_insert_with(|| json!({}));
+                    }
+                    if !entry.is_empty() {
+                        out.insert(n.clone(), Value::Object(entry));
+                    }
+                }
+                (200, Value::Object(out))
+            }
             "PUT" => {
                 let Some(req) = parse_json(body) else { return (400, malformed_body()) };
                 let req = match req.get("settings") {
                     Some(inner) if req.as_object().is_some_and(|m| m.len() == 1) => inner.clone(),
                     _ => req,
                 };
-                apply_settings(&mut i.settings, &req);
+                if let Err(e) = validate_settings(&req, true) {
+                    return e;
+                }
+                let preserve = q.get("preserve_existing").is_some_and(|v| v == "true");
+                for n in &names {
+                    if let Some(i) = s.indices.get_mut(n) {
+                        let req = if preserve {
+                            let have = flat_settings(&i.settings);
+                            let fresh: Vec<(String, Value)> = flat_settings(&nested_incoming(&req))
+                                .into_iter()
+                                .filter(|(k, _)| !have.iter().any(|(h, _)| h == k))
+                                .collect();
+                            nest_settings(&fresh)
+                        } else {
+                            req.clone()
+                        };
+                        apply_settings(&mut i.settings, &req);
+                    }
+                }
                 (200, json!({"acknowledged":true}))
             }
             _ => (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405)),
         }
+    }
+
+    /// `GET /{index-expr}` and `DELETE /{index-expr}`.
+    fn index_expr_api(
+        &self,
+        method: &str,
+        expr: &str,
+        q: &HashMap<String, String>,
+    ) -> (u16, Value) {
+        let mut s = self.0.lock().unwrap();
+        if method == "DELETE" {
+            // `action.destructive_requires_name` (default true) refuses
+            // wildcard and `_all` deletes.
+            let setting = ["transient", "persistent"].iter().find_map(|k| {
+                s.cluster_settings
+                    .get(*k)
+                    .and_then(|m| m.get("action.destructive_requires_name"))
+                    .cloned()
+            });
+            let requires_name =
+                setting.as_ref().and_then(Value::as_str).is_none_or(|v| v != "false");
+            if requires_name && expr.split(',').any(|p| p.trim() == "_all" || p.contains('*')) {
+                return (
+                    400,
+                    error(
+                        "illegal_argument_exception",
+                        "Wildcard expressions or all indices are not allowed",
+                        400,
+                    ),
+                );
+            }
+            // Deleting through an alias is refused, wildcards excepted.
+            for part in expr.split(',').map(str::trim) {
+                if !part.contains('*')
+                    && !s.indices.contains_key(part)
+                    && s.indices.values().any(|i| i.aliases.contains_key(part))
+                {
+                    return (
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            &format!(
+                                "The provided expression [{part}] matches an alias, specify the corresponding concrete indices instead."
+                            ),
+                            400,
+                        ),
+                    );
+                }
+            }
+        }
+        let names = match Self::resolve_targets(&s, expr, q) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        // A wildcard delete only removes indices the pattern names, never
+        // those reached through an alias.
+        let names: Vec<String> = if method == "DELETE" {
+            names
+                .into_iter()
+                .filter(|n| {
+                    expr.split(',')
+                        .map(str::trim)
+                        .any(|p| p == n || p == "_all" || glob_match(p, n))
+                })
+                .collect()
+        } else {
+            names
+        };
+        if method == "DELETE" {
+            for n in &names {
+                s.indices.remove(n);
+            }
+            return (200, json!({"acknowledged":true}));
+        }
+        let mut out = Map::new();
+        for n in &names {
+            if let Some(i) = s.indices.get(n) {
+                out.insert(
+                    n.clone(),
+                    json!({"aliases": i.aliases, "mappings": shown_mappings(&i.mappings), "settings": i.settings}),
+                );
+            }
+        }
+        (200, Value::Object(out))
     }
 
     /// Index-level admin actions over an index expression (one name, a
@@ -1786,8 +2061,7 @@ impl Engine {
                 };
                 dynamic_mapping(&mut i.mappings, &src);
                 let exists = i.docs.contains_key(&id);
-                i.seq += 1;
-                let seq = i.seq;
+                let seq = i.next_seq(q.get("routing").map_or(id.as_str(), String::as_str));
                 // A new version goes to the end of the index order, as
                 // Lucene appends it (ties in search order follow this).
                 if exists {
@@ -1822,11 +2096,11 @@ impl Engine {
                 }
                 let visible = routed_visible(i, &id, q.get("routing").map(String::as_str));
                 if !visible {
-                    i.seq += 1;
+                    let seq = i.next_seq(q.get("routing").map_or(id.as_str(), String::as_str));
                     return (
                         404,
                         json!({"_index": index, "_id": id, "_version": 1, "result": "not_found",
-                               "_shards": shards, "_seq_no": i.seq, "_primary_term": 1}),
+                               "_shards": shards, "_seq_no": seq, "_primary_term": 1}),
                     );
                 }
                 if let Err(e) = check_seq_no(i.docs.get(&id), &id, q) {
@@ -1838,8 +2112,7 @@ impl Engine {
                 {
                     return (409, external_conflict(&id, d.version, v));
                 }
-                i.seq += 1;
-                let seq = i.seq;
+                let seq = i.next_seq(q.get("routing").map_or(id.as_str(), String::as_str));
                 let (status, version, result) = match i.docs.remove(&id) {
                     Some(d) => {
                         i.order.retain(|x| x != &id);
@@ -1983,20 +2256,21 @@ impl Engine {
             match op.as_str() {
                 "delete" => {
                     let version = d.version + 1;
+                    let key = d.routing.clone().unwrap_or_else(|| id.to_string());
                     i.docs.remove(id);
                     i.order.retain(|x| x != id);
-                    i.seq += 1;
+                    let seq = i.next_seq(&key);
                     (
                         200,
                         json!({"_index": index, "_id": id, "_version": version, "result": "deleted",
                                "_shards": {"total": 2, "successful": 1, "failed": 0},
-                               "_seq_no": i.seq, "_primary_term": 1}),
+                               "_seq_no": seq, "_primary_term": 1}),
                     )
                 }
                 "index" | "create" => {
                     dynamic_mapping(&mut i.mappings, &new_source);
-                    i.seq += 1;
-                    let seq = i.seq;
+                    let key = d.routing.clone().unwrap_or_else(|| id.to_string());
+                    let seq = i.next_seq(&key);
                     i.order.retain(|x| x != id);
                     i.order.push(id.to_string());
                     let d = i.docs.get_mut(id).unwrap();
@@ -2046,8 +2320,7 @@ impl Engine {
                 }
             }
             dynamic_mapping(&mut i.mappings, &src);
-            i.seq += 1;
-            let seq = i.seq;
+            let seq = i.next_seq(q.get("routing").map_or(id, String::as_str));
             i.order.push(id.to_string());
             i.docs.insert(
                 id.to_string(),
@@ -2430,13 +2703,13 @@ impl Engine {
                 }
                 wrote = true;
                 done += 1;
-                i.seq += 1;
+                let key = i.docs.get(&snap.id).and_then(|d| d.routing.clone());
+                let seq = i.next_seq(key.as_deref().unwrap_or(&snap.id));
                 if op == "delete" {
                     i.docs.remove(&snap.id);
                     i.order.retain(|x| x != &snap.id);
                 } else {
                     dynamic_mapping(&mut i.mappings, &src);
-                    let seq = i.seq;
                     let d = i.docs.get_mut(&snap.id).unwrap();
                     d.source = src;
                     d.seq = seq;
@@ -3234,6 +3507,21 @@ fn shard_of(i: &Index, key: &str) -> i64 {
     (murmur3_routing(key) as i64).rem_euclid(routing_shards) / factor
 }
 
+impl Index {
+    /// The next `_seq_no` for a write routed by `key` (routing or id):
+    /// Elasticsearch numbers each shard's operations separately.
+    fn next_seq(&mut self, key: &str) -> i64 {
+        if shard_counts(self).0 <= 1 {
+            self.seq += 1;
+            return self.seq;
+        }
+        let shard = shard_of(self, key);
+        let n = self.shard_seq.entry(shard).or_insert(-1);
+        *n += 1;
+        *n
+    }
+}
+
 /// Whether a read or write with `routing` reaches the shard holding `id`.
 fn routed_visible(i: &Index, id: &str, routing: Option<&str>) -> bool {
     let Some(d) = i.docs.get(id) else { return true };
@@ -3678,4 +3966,351 @@ fn looks_like_date(s: &str) -> bool {
     }
     b.len() == 10
         || (b[10] == b'T' && b.len() >= 16 && digits(11..13) && b[13] == b':' && digits(14..16))
+}
+
+/// Metadata fields `_mapping/field/*` lists.
+const META_FIELDS: &[&str] = &[
+    "_data_stream_timestamp",
+    "_doc_count",
+    "_feature",
+    "_field_names",
+    "_id",
+    "_ignored",
+    "_ignored_source",
+    "_index",
+    "_nested_path",
+    "_routing",
+    "_seq_no",
+    "_source",
+    "_tier",
+    "_version",
+];
+
+/// Field types Elasticsearch 8.15 knows.
+const FIELD_TYPES: &[&str] = &[
+    "text",
+    "keyword",
+    "long",
+    "integer",
+    "short",
+    "byte",
+    "double",
+    "float",
+    "half_float",
+    "scaled_float",
+    "unsigned_long",
+    "date",
+    "date_nanos",
+    "boolean",
+    "binary",
+    "object",
+    "nested",
+    "flattened",
+    "geo_point",
+    "geo_shape",
+    "point",
+    "shape",
+    "ip",
+    "completion",
+    "search_as_you_type",
+    "token_count",
+    "dense_vector",
+    "sparse_vector",
+    "rank_feature",
+    "rank_features",
+    "alias",
+    "join",
+    "percolator",
+    "integer_range",
+    "float_range",
+    "long_range",
+    "double_range",
+    "date_range",
+    "ip_range",
+    "match_only_text",
+    "wildcard",
+    "constant_keyword",
+    "version",
+    "histogram",
+    "aggregate_metric_double",
+    "semantic_text",
+    "counted_keyword",
+    "passthrough",
+];
+
+/// The mapping as GET shows it: no `properties` key when there are none.
+fn shown_mappings(m: &Value) -> Value {
+    match m.as_object() {
+        Some(o)
+            if o.len() == 1
+                && o.get("properties")
+                    .is_some_and(|p| p.as_object().is_some_and(Map::is_empty)) =>
+        {
+            json!({})
+        }
+        _ => m.clone(),
+    }
+}
+
+/// Every mapped leaf field as (dotted full name, definition).
+fn mapped_leaves(m: &Value, prefix: &str, out: &mut Vec<(String, Value)>) {
+    let Some(props) = m.get("properties").and_then(Value::as_object) else { return };
+    for (k, def) in props {
+        let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        if def.get("properties").is_some()
+            && def.get("type").is_none_or(|t| t == "object" || t == "nested")
+        {
+            mapped_leaves(def, &full, out);
+        } else {
+            let mut d = def.clone();
+            if let Some(o) = d.as_object_mut() {
+                o.remove("fields");
+            }
+            out.push((full.clone(), def.clone()));
+            if let Some(multi) = def.get("fields").and_then(Value::as_object) {
+                for (sub, sd) in multi {
+                    out.push((format!("{full}.{sub}"), sd.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// An incoming mapping checked against the index's current one: known
+/// field types, and no type change for an existing field.
+fn validate_mapping(current: &Value, incoming: &Value) -> Result<(), (u16, Value)> {
+    fn walk(cur: Option<&Value>, inc: &Value, prefix: &str) -> Result<(), (u16, Value)> {
+        let Some(props) = inc.get("properties").and_then(Value::as_object) else { return Ok(()) };
+        for (k, def) in props {
+            let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            let existing = cur.and_then(|c| c.get("properties")).and_then(|p| p.get(k));
+            if let Some(t) = def.get("type").and_then(Value::as_str) {
+                if !FIELD_TYPES.contains(&t) {
+                    return Err((
+                        400,
+                        error(
+                            "mapper_parsing_exception",
+                            &format!(
+                                "Failed to parse mapping: No handler for type [{t}] declared on field [{k}]"
+                            ),
+                            400,
+                        ),
+                    ));
+                }
+                let old =
+                    existing.and_then(|e| e.get("type")).and_then(Value::as_str).or_else(|| {
+                        existing.filter(|e| e.get("properties").is_some()).map(|_| "object")
+                    });
+                if let Some(o) = old
+                    && o != t
+                {
+                    return Err((
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            &format!("mapper [{full}] cannot be changed from type [{o}] to [{t}]"),
+                            400,
+                        ),
+                    ));
+                }
+            }
+            walk(existing, def, &full)?;
+        }
+        Ok(())
+    }
+    walk(Some(current), incoming, "")
+}
+
+/// Settings as dotted `index.*` keys with string values.
+fn flat_settings(v: &Value) -> Vec<(String, Value)> {
+    fn go(prefix: &str, v: &Value, out: &mut Vec<(String, Value)>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                    go(&key, x, out);
+                }
+            }
+            other => out.push((prefix.to_string(), other.clone())),
+        }
+    }
+    let mut out = vec![];
+    go("", v, &mut out);
+    out.into_iter()
+        .map(|(k, v)| (if k.starts_with("index.") { k } else { format!("index.{k}") }, v))
+        .collect()
+}
+
+/// Dotted settings back into the nested form Elasticsearch returns.
+fn nest_settings(flat: &[(String, Value)]) -> Value {
+    let mut root = json!({});
+    for (k, v) in flat {
+        let parts: Vec<&str> = k.split('.').collect();
+        let mut node = &mut root;
+        for p in &parts[..parts.len() - 1] {
+            if !node.get(*p).is_some_and(Value::is_object) {
+                node[*p] = json!({});
+            }
+            node = &mut node[*p];
+        }
+        node[parts[parts.len() - 1]] = v.clone();
+    }
+    root
+}
+
+/// A settings request with every key under `index`.
+fn nested_incoming(req: &Value) -> Value {
+    nest_settings(&flat_settings(req))
+}
+
+/// Index settings shown under `defaults` with `include_defaults=true`.
+const DEFAULT_SETTINGS: &[(&str, &str)] = &[
+    ("index.auto_expand_replicas", "false"),
+    ("index.blocks.read_only", "false"),
+    ("index.blocks.read_only_allow_delete", "false"),
+    ("index.blocks.write", "false"),
+    ("index.codec", "default"),
+    ("index.hidden", "false"),
+    ("index.mapping.depth.limit", "20"),
+    ("index.mapping.nested_fields.limit", "50"),
+    ("index.mapping.nested_objects.limit", "10000"),
+    ("index.mapping.total_fields.limit", "1000"),
+    ("index.max_docvalue_fields_search", "100"),
+    ("index.max_inner_result_window", "100"),
+    ("index.max_ngram_diff", "1"),
+    ("index.max_regex_length", "1000"),
+    ("index.max_rescore_window", "10000"),
+    ("index.max_result_window", "10000"),
+    ("index.max_script_fields", "32"),
+    ("index.max_shingle_diff", "3"),
+    ("index.max_terms_count", "65536"),
+    ("index.number_of_replicas", "1"),
+    ("index.number_of_shards", "1"),
+    ("index.refresh_interval", "1s"),
+];
+
+/// Top-level `index.*` setting groups Elasticsearch accepts.
+const KNOWN_SETTINGS: &[&str] = &[
+    "number_of_shards",
+    "number_of_replicas",
+    "number_of_routing_shards",
+    "refresh_interval",
+    "max_result_window",
+    "max_inner_result_window",
+    "max_rescore_window",
+    "max_docvalue_fields_search",
+    "max_script_fields",
+    "max_ngram_diff",
+    "max_shingle_diff",
+    "max_terms_count",
+    "max_regex_length",
+    "max_slices_per_scroll",
+    "max_refresh_listeners",
+    "max_adjacency_matrix_filters",
+    "blocks",
+    "routing",
+    "mapping",
+    "analysis",
+    "lifecycle",
+    "sort",
+    "codec",
+    "similarity",
+    "search",
+    "indexing",
+    "translog",
+    "merge",
+    "query",
+    "highlight",
+    "default_pipeline",
+    "final_pipeline",
+    "hidden",
+    "auto_expand_replicas",
+    "unassigned",
+    "priority",
+    "store",
+    "shard",
+    "write",
+    "gc_deletes",
+    "requests",
+    "soft_deletes",
+    "load_fixed_bitset_filters_eagerly",
+    "version",
+    "creation_date",
+    "uuid",
+    "provided_name",
+    "routing_partition_size",
+    "format",
+    "frozen",
+    "fast_refresh",
+    "mode",
+    "time_series",
+    "look_ahead_time",
+    "look_back_time",
+    "dense_vector",
+    "default_allocation",
+    "verified_before_close",
+    "resize",
+    "plugin",
+    "queries",
+    "fielddata",
+    "warmer",
+    "ccr",
+    "xpack",
+    "data_path",
+    "check_on_startup",
+    "compound_format",
+    "allocation",
+];
+
+/// Settings that can't change on an open index.
+const STATIC_SETTINGS: &[&str] = &[
+    "index.number_of_shards",
+    "index.number_of_routing_shards",
+    "index.routing_partition_size",
+    "index.codec",
+    "index.soft_deletes.enabled",
+    "index.store.type",
+    "index.mode",
+];
+
+/// A settings update: unknown settings and (on an open index) static
+/// ones are refused, as Elasticsearch does.
+fn validate_settings(req: &Value, update: bool) -> Result<(), (u16, Value)> {
+    let flat = flat_settings(req);
+    for (k, _) in &flat {
+        let group = k.trim_start_matches("index.").split('.').next().unwrap_or("");
+        if !KNOWN_SETTINGS.contains(&group) {
+            return Err((
+                400,
+                error(
+                    "illegal_argument_exception",
+                    &format!(
+                        "unknown setting [{k}] please check that any required plugins are installed, or check the breaking changes documentation for removed settings"
+                    ),
+                    400,
+                ),
+            ));
+        }
+    }
+    if update {
+        let statics: Vec<&String> = flat
+            .iter()
+            .map(|(k, _)| k)
+            .filter(|k| STATIC_SETTINGS.contains(&k.as_str()) || k.starts_with("index.analysis."))
+            .collect();
+        if !statics.is_empty() {
+            let list = statics.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            return Err((
+                400,
+                error(
+                    "illegal_argument_exception",
+                    &format!(
+                        "Can't update non dynamic settings [[{list}]] for open indices unless the `reopen` query parameter is set to true. Alternatively, close the indices, apply the settings changes, and reopen the indices"
+                    ),
+                    400,
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
