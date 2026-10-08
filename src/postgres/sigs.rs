@@ -145,7 +145,7 @@ s:generate_series(numeric,numeric)numeric s:generate_series(numeric,numeric,nume
 s:generate_series(timestamp,timestamp,interval)timestamp s:generate_series(timestamptz,timestamptz,interval)timestamptz
 !num_nulls(...any)int4 !num_nonnulls(...any)int4
 !format_type(oid,int4)text version()text current_database()name current_schema()name current_schemas(bool)_name
-pg_backend_pid()int4 pg_typeof(any)regtype
+pg_backend_pid()int4 !pg_typeof(any)regtype
 !pg_get_expr(pg_node_tree,oid)text !pg_get_expr(pg_node_tree,oid,bool)text pg_get_expr(text,oid)text pg_get_expr(text,oid,bool)text
 pg_table_is_visible(oid)bool pg_type_is_visible(oid)bool pg_function_is_visible(oid)bool
 pg_collation_is_visible(oid)bool pg_operator_is_visible(oid)bool pg_opclass_is_visible(oid)bool pg_conversion_is_visible(oid)bool pg_ts_config_is_visible(oid)bool pg_ts_dict_is_visible(oid)bool

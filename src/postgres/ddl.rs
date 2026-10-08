@@ -371,6 +371,19 @@ impl Ddl<'_, '_> {
                 )
             })?);
         }
+        // A table-level CHECK names no columns: conkey is the columns its
+        // expression reads, in order of appearance.
+        if let PendingConstraint::Check(sql) = &kind
+            && idxs.is_empty()
+        {
+            for w in sql_identifiers(sql) {
+                if let Some(i) = t.col_index(&w)
+                    && !idxs.contains(&i)
+                {
+                    idxs.push(i);
+                }
+            }
+        }
         let mut fk_deferral = (false, false);
         let kind = match kind {
             PendingConstraint::Deferrable(inner, d) => {
@@ -506,6 +519,9 @@ impl Ddl<'_, '_> {
                 predicate: None,
                 method: "btree".into(),
                 nulls_not_distinct: !nulls_distinct,
+                include: vec![],
+                opclass: vec![],
+                nulls_first: vec![],
             });
         }
         if matches!(kind, ConstraintKind::PrimaryKey) {
@@ -617,11 +633,46 @@ impl Ddl<'_, '_> {
         );
         let found = match b.lookup_sequence_oid(qualifier.as_deref(), &name) {
             Ok(oid) => oid,
-            Err(_) if d.if_flag => return Ok("ALTER SEQUENCE".into()),
+            Err(_) if d.if_flag => {
+                self.ctx
+                    .rt
+                    .notices
+                    .push(PgError::notice(format!("relation \"{name}\" does not exist, skipping")));
+                return Ok("ALTER SEQUENCE".into());
+            }
             Err(e) => return Err(e),
         };
         let mut seq = self.ctx.db.sequences.get(&found).cloned().unwrap();
         let old_text = self.ctx.db.regclass_text(seq.schema, &seq.name, &self.info.search_path);
+        // AS type: bounds that were the old type's defaults become the new
+        // type's (an explicit MINVALUE/MAXVALUE below still wins).
+        if let Some(t) = d.as_type.as_deref() {
+            let ty = match t {
+                "bigint" | "int8" => Type::INT8,
+                "integer" | "int" | "int4" => Type::INT4,
+                "smallint" | "int2" => Type::INT2,
+                _ => {
+                    return Err(PgError::new(
+                        code::INVALID_PARAMETER_VALUE,
+                        "sequence type must be smallint, integer, or bigint",
+                    ));
+                }
+            };
+            let range = |b: Base| match b {
+                Base::Int2 => (i16::MIN as i64, i16::MAX as i64),
+                Base::Int4 => (i32::MIN as i64, i32::MAX as i64),
+                _ => (i64::MIN, i64::MAX),
+            };
+            let (old_lo, old_hi) = range(seq.ty.base);
+            let (new_lo, new_hi) = range(ty.base);
+            if seq.max == old_hi {
+                seq.max = new_hi;
+            }
+            if seq.min == old_lo || seq.min == old_lo + 1 {
+                seq.min = if seq.min == old_lo { new_lo } else { new_lo + 1 };
+            }
+            seq.ty = ty;
+        }
         apply_seq_options(&mut seq, d, false)?;
         if let Some(new_name) = &d.rename_to {
             if self.ctx.db.relation_exists(seq.schema, new_name) {
@@ -943,8 +994,17 @@ impl Ddl<'_, '_> {
         let mut exprs = vec![];
         let mut expr_names = vec![];
         let mut desc = vec![];
+        let mut nulls_first = vec![];
+        let mut opclass = vec![];
         for c in &ci.columns {
-            desc.push(c.column.options.sort == Some(a::OrderBySort::Desc));
+            let is_desc = c.column.options.sort == Some(a::OrderBySort::Desc);
+            desc.push(is_desc);
+            nulls_first.push(c.column.options.nulls_first.unwrap_or(is_desc));
+            opclass.push(
+                c.operator_class
+                    .as_ref()
+                    .map(|o| name_parts(o).pop().unwrap_or_default().to_ascii_lowercase()),
+            );
             match &c.column.expr {
                 a::Expr::Identifier(id) => {
                     let n = ident(id);
@@ -988,6 +1048,14 @@ impl Ddl<'_, '_> {
                 format!("relation \"{name}\" already exists"),
             ));
         }
+        let mut include = vec![];
+        for id in &ci.include {
+            let n = ident(id);
+            let t = self.ctx.db.table(oid).unwrap();
+            include.push(t.col_index(&n).ok_or_else(|| {
+                PgError::new(code::UNDEFINED_COLUMN, format!("column \"{n}\" does not exist"))
+            })?);
+        }
         let predicate = ci.predicate.as_ref().map(|p| p.to_string());
         let idx_oid = self.ctx.db.alloc_oid();
         let method = ci
@@ -1006,6 +1074,9 @@ impl Ddl<'_, '_> {
             predicate,
             method,
             nulls_not_distinct: ci.nulls_distinct == Some(false),
+            include,
+            opclass,
+            nulls_first,
         };
         let t = self.ctx.db.table_mut(oid).unwrap();
         t.indexes.push(index);
@@ -2059,39 +2130,68 @@ fn default_sql(db: &DbState, e: &a::Expr, ty: Type) -> String {
     format!("{e}::{name}")
 }
 
-/// Renames a bare identifier in stored SQL, leaving strings and quoted
-/// identifiers alone.
+/// Renames an identifier in stored SQL (defaults, CHECKs, generated
+/// columns, index expressions): unquoted words by their folded spelling,
+/// quoted ones exactly; string literals are left alone.
 fn rename_ident(sql: &str, old: &str, new: &str) -> String {
+    // The new name as it must be written: quoted unless a plain
+    // lower-case identifier.
+    let written = super::funcs::quote_ident(new);
     let mut out = String::with_capacity(sql.len());
-    let b = sql.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let quote = b[i];
-                out.push(quote as char);
-                i += 1;
-                while i < b.len() {
-                    out.push(b[i] as char);
-                    if b[i] == quote {
-                        i += 1;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => {
+                out.push(c);
+                while let Some((_, d)) = chars.next() {
+                    out.push(d);
+                    if d == '\'' {
+                        if chars.peek().map(|p| p.1) == Some('\'') {
+                            out.push(chars.next().unwrap().1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            // A quoted identifier matches the old name exactly.
+            '"' => {
+                let mut name = String::new();
+                while let Some((_, d)) = chars.next() {
+                    if d == '"' {
+                        if chars.peek().map(|p| p.1) == Some('"') {
+                            chars.next();
+                            name.push('"');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        name.push(d);
+                    }
+                }
+                if name == old {
+                    out.push_str(&written);
+                } else {
+                    out.push('"');
+                    out.push_str(&name.replace('"', "\"\""));
+                    out.push('"');
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                let mut end = i + c.len_utf8();
+                while let Some(&(k, d)) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' || d == '$' {
+                        end = k + d.len_utf8();
+                        chars.next();
+                    } else {
                         break;
                     }
-                    i += 1;
                 }
+                let word = &sql[i..end];
+                // An unquoted word folds to lower case.
+                if word.to_lowercase() == old { out.push_str(&written) } else { out.push_str(word) }
             }
-            c if c.is_ascii_alphanumeric() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                let word = &sql[start..i];
-                if word.eq_ignore_ascii_case(old) { out.push_str(new) } else { out.push_str(word) }
-            }
-            c => {
-                out.push(c as char);
-                i += 1;
-            }
+            c => out.push(c),
         }
     }
     out
@@ -2165,4 +2265,61 @@ fn object_kind_name(k: a::ObjectType) -> &'static str {
         a::ObjectType::Database => "DATABASE",
         _ => "OBJECT",
     }
+}
+
+/// The identifiers in an SQL expression (unquoted ones folded to lower
+/// case), skipping string literals.
+fn sql_identifiers(sql: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                while let Some(d) = chars.next() {
+                    if d == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '"' => {
+                let mut w = String::new();
+                while let Some(d) = chars.next() {
+                    if d == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            w.push('"');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        w.push(d);
+                    }
+                }
+                out.push(w);
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let mut w = c.to_lowercase().to_string();
+                while let Some(&d) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' || d == '$' {
+                        w.extend(d.to_lowercase());
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(w);
+            }
+            c if c.is_ascii_digit() => {
+                while chars.peek().is_some_and(|d| d.is_alphanumeric() || *d == '.') {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }

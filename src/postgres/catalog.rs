@@ -139,6 +139,15 @@ pub struct Index {
     pub predicate: Option<String>,
     pub method: String,
     pub nulls_not_distinct: bool,
+    /// `INCLUDE (...)` columns: stored in the index, not part of the key.
+    #[serde(default)]
+    pub include: Vec<usize>,
+    /// Per key: an explicit operator class (`varchar_pattern_ops`).
+    #[serde(default)]
+    pub opclass: Vec<Option<String>>,
+    /// Per key: NULLS FIRST (explicit, or DESC's default).
+    #[serde(default)]
+    pub nulls_first: Vec<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -259,13 +259,15 @@ fn rewrite_set_constraints(sql: &str) -> Option<String> {
     }
     Some(
         re.replace_all(sql, |c: &regex_lite::Captures| {
+            // Each name may be schema-qualified (`"s"."c"`): passed on as
+            // `schema<TAB>name` for the engine to resolve.
             let names: Vec<String> = c[1]
                 .split(',')
                 .map(|n| {
-                    let n = n.trim();
-                    match n.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
-                        Some(q) => q.replace("''", "'"),
-                        None => n.to_ascii_lowercase(),
+                    let parts = split_qualified(n.trim());
+                    match parts.len() {
+                        0 | 1 => parts.into_iter().next().unwrap_or_default(),
+                        k => format!("{}\t{}", parts[k - 2], parts[k - 1]),
                     }
                 })
                 .collect();
@@ -277,6 +279,35 @@ fn rewrite_set_constraints(sql: &str) -> Option<String> {
         })
         .into_owned(),
     )
+}
+
+/// `a."B".c` as its parts: quoted ones kept as written, others lowered.
+fn split_qualified(n: &str) -> Vec<String> {
+    let mut parts = vec![];
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut was_quoted = false;
+    let mut chars = n.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                cur.push('"');
+            }
+            '"' => {
+                quoted = !quoted;
+                was_quoted = true;
+            }
+            '.' if !quoted => {
+                parts.push(if was_quoted { cur.clone() } else { cur.trim().to_ascii_lowercase() });
+                cur.clear();
+                was_quoted = false;
+            }
+            c => cur.push(c),
+        }
+    }
+    parts.push(if was_quoted { cur } else { cur.trim().to_ascii_lowercase() });
+    parts
 }
 
 /// Clauses Django's Postgres backend emits that sqlparser doesn't take:

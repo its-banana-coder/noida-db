@@ -64,7 +64,9 @@ struct Txn {
     /// Settings as the transaction began (ROLLBACK restores them; COMMIT
     /// restores those set LOCAL), and as each savepoint was taken.
     settings: Settings,
-    savepoint_settings: Vec<Settings>,
+    /// Per savepoint: its settings and SET CONSTRAINTS state, which
+    /// ROLLBACK TO restores.
+    savepoint_settings: Vec<(Settings, Option<bool>, BTreeMap<String, bool>)>,
 }
 
 #[derive(Clone)]
@@ -473,8 +475,10 @@ impl Engine {
             Err(e) if e.severity != "NOTICE" => {
                 if s.status == TxStatus::InTransaction {
                     s.status = TxStatus::Failed;
-                } else if s.txn.is_some() {
-                    // Implicit transaction: roll it back.
+                } else if s.status == TxStatus::Idle && s.txn.is_some() {
+                    // Implicit transaction: roll it back. (An error in an
+                    // already-failed block leaves it failed; ROLLBACK TO a
+                    // savepoint can still recover it.)
                     self.rollback(s);
                 }
             }
@@ -604,7 +608,11 @@ impl Engine {
                 };
                 let snapshot = tx.state.clone();
                 tx.savepoints.push((n, snapshot));
-                tx.savepoint_settings.push(s.rt.settings.clone());
+                tx.savepoint_settings.push((
+                    s.rt.settings.clone(),
+                    s.rt.deferred_all,
+                    s.rt.deferred.clone(),
+                ));
                 Ok(StmtResult::tag("SAVEPOINT"))
             }
             S::ReleaseSavepoint { name } => {
@@ -619,6 +627,7 @@ impl Engine {
                 match tx.savepoints.iter().rposition(|(sn, _)| *sn == n) {
                     Some(i) => {
                         tx.savepoints.truncate(i);
+                        tx.savepoint_settings.truncate(i);
                         Ok(StmtResult::tag("RELEASE"))
                     }
                     None => Err(PgError::new(
@@ -1043,15 +1052,35 @@ impl Engine {
             return Ok(r);
         }
         let state = &s.txn.as_ref().unwrap().state;
-        let names: Vec<String> = names.split(',').map(str::to_string).collect();
-        let all = names.len() == 1 && names[0] == "all";
+        // `schema<TAB>name` for a qualified name (see rewrite_set_constraints).
+        let qualified: Vec<(Option<String>, String)> = names
+            .split(',')
+            .map(|n| match n.split_once('\t') {
+                Some((sch, c)) => (Some(sch.to_string()), c.to_string()),
+                None => (None, n.to_string()),
+            })
+            .collect();
+        let names: Vec<String> = qualified.iter().map(|(_, n)| n.clone()).collect();
+        // An unqualified name is looked up along the search path.
+        let path = s.rt.settings.lookup_path(&s.rt.user);
+        let all = qualified.len() == 1 && qualified[0] == (None, "all".to_string());
         if all {
             s.rt.deferred_all = Some(deferred);
             s.rt.deferred.clear();
         } else {
-            for n in &names {
-                let cons =
-                    state.tables.values().flat_map(|t| &t.constraints).find(|c| &c.name == n);
+            for (sch, n) in &qualified {
+                let cons = state
+                    .tables
+                    .values()
+                    .filter(|t| {
+                        let ts = state.schema_name(t.schema);
+                        match sch {
+                            Some(sc) => ts == sc,
+                            None => path.iter().any(|p| p == ts),
+                        }
+                    })
+                    .flat_map(|t| &t.constraints)
+                    .find(|c| &c.name == n);
                 match cons {
                     None => {
                         return Err(PgError::new(
@@ -1115,15 +1144,25 @@ impl Engine {
                     },
                     // `SET TIME ZONE INTERVAL '+05:30' HOUR TO MINUTE`
                     // (what some drivers send for a fixed-offset zone that
-                    // isn't a named one): the offset is the interval's own
-                    // literal text, which already parses as one.
-                    a::Expr::Interval(iv) => match &*iv.value {
-                        a::Expr::Value(v) => match &v.value {
-                            a::Value::SingleQuotedString(s) => s.clone(),
+                    // isn't a named one): hours east of UTC, as Postgres
+                    // turns it into the numeric zone `<+05:30>-05:30`.
+                    a::Expr::Interval(iv) => {
+                        let text = match &*iv.value {
+                            a::Expr::Value(v) => match &v.value {
+                                a::Value::SingleQuotedString(s) => s.clone(),
+                                other => other.to_string(),
+                            },
                             other => other.to_string(),
-                        },
-                        other => other.to_string(),
-                    },
+                        };
+                        let iv = crate::sql::datetime::parse_interval(&text).map_err(|_| {
+                            PgError::new(
+                                code::INVALID_PARAMETER_VALUE,
+                                format!("invalid value for parameter \"TimeZone\": \"{text}\""),
+                            )
+                        })?;
+                        let secs = iv.micros / 1_000_000 + iv.days as i64 * 86_400;
+                        format!("{}", secs as f64 / 3600.0)
+                    }
                     other => other.to_string(),
                 };
                 let v = if v.eq_ignore_ascii_case("default") || v.eq_ignore_ascii_case("local") {
@@ -1341,8 +1380,10 @@ impl Engine {
             Some(i) => {
                 tx.state = tx.savepoints[i].1.clone();
                 tx.savepoints.truncate(i + 1);
-                if let Some(settings) = tx.savepoint_settings.get(i) {
+                if let Some((settings, all, named)) = tx.savepoint_settings.get(i) {
                     s.rt.settings = settings.clone();
+                    s.rt.deferred_all = *all;
+                    s.rt.deferred = named.clone();
                 }
                 tx.savepoint_settings.truncate(i + 1);
                 s.status = TxStatus::InTransaction;

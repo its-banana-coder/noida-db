@@ -2130,7 +2130,7 @@ pub fn call(
                 ),
                 (Ts(t), Base::Timestamptz) => {
                     let zone = match a.get(2) {
-                        Some(Text(z)) => super::tz::lookup(z).ok_or_else(|| {
+                        Some(Text(z)) => super::tz::lookup_posix(z).ok_or_else(|| {
                             err(
                                 code::INVALID_PARAMETER_VALUE,
                                 format!("time zone \"{z}\" not recognized"),
@@ -2162,7 +2162,7 @@ pub fn call(
                         Ts(*t)
                     } else {
                         Ts(datetime::trunc_local(&field, *t)
-                            .ok_or_else(|| unit_err(&field, "timestamp without time zone"))?)
+                            .ok_or_else(|| unit_err(&field, "timestamp"))?)
                     }
                 }
                 _ => Null,
@@ -2259,7 +2259,7 @@ pub fn call(
                 Ts(local)
             } else {
                 let zone = match a.get(6) {
-                    Some(Text(z)) => super::tz::lookup(z).ok_or_else(|| {
+                    Some(Text(z)) => super::tz::lookup_posix(z).ok_or_else(|| {
                         err(
                             code::INVALID_PARAMETER_VALUE,
                             format!("time zone \"{z}\" not recognized"),
@@ -2294,7 +2294,7 @@ pub fn call(
         }),
         "timezone" => {
             let zone = match &a[0] {
-                Text(z) => super::tz::lookup(z).ok_or_else(|| {
+                Text(z) => super::tz::lookup_posix(z).ok_or_else(|| {
                     err(code::INVALID_PARAMETER_VALUE, format!("time zone \"{z}\" not recognized"))
                 })?,
                 Interval(iv) => super::tz::Zone::Fixed((iv.micros / USECS_PER_SEC) as i32),
@@ -2767,8 +2767,16 @@ pub fn similar_to_regex(p: &str, esc: Option<char>) -> PgResult<String> {
     Ok(out)
 }
 
+/// date_trunc's error for a unit it can't truncate to (Postgres's
+/// wording: `timestamp units "dow" not recognized`).
 fn unit_err(field: &str, ty: &str) -> PgError {
-    err(code::FEATURE_NOT_SUPPORTED, format!("unit \"{field}\" not supported for type {ty}"))
+    if ty == "interval" && field == "week" {
+        return err(
+            code::FEATURE_NOT_SUPPORTED,
+            "interval units \"week\" not supported because months usually have fractional weeks",
+        );
+    }
+    err(code::INVALID_PARAMETER_VALUE, format!("{ty} units \"{field}\" not recognized"))
 }
 
 pub fn normalize_field(f: &str) -> String {

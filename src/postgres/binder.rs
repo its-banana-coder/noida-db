@@ -2876,6 +2876,25 @@ impl<'a> Binder<'a> {
                     )
                     .hint("Could not choose a best candidate operator. You might need to add explicit type casts."));
                 }
+                // date + unknown (int or interval?) and timetz + unknown
+                // have no best candidate in Postgres.
+                let known = if lt.is_unknown() { rt } else { lt };
+                if op == "+"
+                    && (lt.is_unknown() || rt.is_unknown())
+                    && !known.array
+                    && matches!(known.base, Base::Date | Base::Timetz)
+                {
+                    let (l, r) = if lt.is_unknown() {
+                        ("unknown".to_string(), rt.display(-1))
+                    } else {
+                        (lt.display(-1), "unknown".to_string())
+                    };
+                    return Err(PgError::new(
+                        code::AMBIGUOUS_FUNCTION,
+                        format!("operator is not unique: {l} + {r}"),
+                    )
+                    .hint("Could not choose a best candidate operator. You might need to add explicit type casts."));
+                }
                 let lt = if lt.is_unknown() { guess_unknown(rt, op) } else { lt };
                 let rt = if rt.is_unknown() { guess_unknown(lt, op) } else { rt };
                 match self.arith_types(op, lt, rt) {
@@ -5449,8 +5468,19 @@ fn promote(a: Type, b: Type) -> Option<Type> {
 }
 
 /// The type an unknown literal takes from the other operand.
-fn guess_unknown(other: Type, _op: &str) -> Type {
-    if other.is_unknown() { Type::NUMERIC } else { other }
+fn guess_unknown(other: Type, op: &str) -> Type {
+    if other.is_unknown() {
+        return Type::NUMERIC;
+    }
+    // There is no timestamp + timestamp: `ts + NULL` / `ts + '1 hour'`
+    // adds an interval.
+    if op == "+"
+        && !other.array
+        && matches!(other.base, Base::Timestamp | Base::Timestamptz | Base::Time)
+    {
+        return Type::INTERVAL;
+    }
+    other
 }
 
 /// Operator names noida-db implements, for `OPERATOR(schema.op)` syntax.
