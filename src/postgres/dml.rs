@@ -494,6 +494,7 @@ fn default_value(ctx: &mut Ctx, table: u32, col: usize) -> PgResult<Value> {
 pub fn session_info(ctx: &Ctx) -> SessionInfo {
     SessionInfo {
         user: ctx.rt.user.clone(),
+        role: ctx.rt.role.clone().unwrap_or_else(|| ctx.rt.user.clone()),
         database: ctx.rt.database.clone(),
         search_path: ctx.rt.settings.lookup_path(&ctx.rt.user),
         fmt: ctx.rt.settings.fmt(),

@@ -13,7 +13,10 @@ use super::types::{self, Base, FmtCtx, Type, Value};
 
 /// What the binder needs to know about the session.
 pub struct SessionInfo {
+    /// The session user (login).
     pub user: String,
+    /// The current role (SET ROLE), what current_user reports.
+    pub role: String,
     pub database: String,
     pub search_path: Vec<String>,
     pub fmt: FmtCtx,
@@ -1127,6 +1130,7 @@ impl<'a> Binder<'a> {
                             table_oid: 0,
                             attnum: 0,
                             rec: None,
+                            collation: None,
                         });
                         asts.push(a::Expr::Identifier(a::Ident::new(m.name.clone())));
                     }
@@ -1146,6 +1150,7 @@ impl<'a> Binder<'a> {
                             table_oid: c.table_oid,
                             attnum: c.attnum,
                             rec: None,
+                            collation: None,
                         });
                         asts.push(a::Expr::Identifier(a::Ident::new(c.name.clone())));
                     }
@@ -1183,6 +1188,7 @@ impl<'a> Binder<'a> {
                             table_oid: c.table_oid,
                             attnum: c.attnum,
                             rec: None,
+                            collation: None,
                         });
                         asts.push(a::Expr::Identifier(a::Ident::new(c.name.clone())));
                     }
@@ -1844,7 +1850,15 @@ impl<'a> Binder<'a> {
                 let e = if depth == 0 { m.expr.clone() } else { outerize(m.expr.clone(), depth) };
                 return Some((
                     depth,
-                    TE { e, ty: m.ty, typmod: m.typmod, table_oid: 0, attnum: 0, rec: None },
+                    TE {
+                        e,
+                        ty: m.ty,
+                        typmod: m.typmod,
+                        table_oid: 0,
+                        attnum: 0,
+                        rec: None,
+                        collation: None,
+                    },
                 ));
             }
             let hits: Vec<&SCol> = scope
@@ -1867,6 +1881,7 @@ impl<'a> Binder<'a> {
                         table_oid: c.table_oid,
                         attnum: c.attnum,
                         rec: c.rec.clone(),
+                        collation: None,
                     },
                 ));
             }
@@ -2076,10 +2091,14 @@ impl<'a> Binder<'a> {
                     items.push(te);
                 }
                 let ty = self.common_type(&tys, "IN", 0)?;
-                let xe = self.coerce(x, ty, -1, CastCtx::Implicit, "IN")?;
+                let ci = ty.is_string()
+                    && (self.case_insensitive(&x)
+                        || items.iter().any(|i| self.case_insensitive(i)));
+                let fold = |e: Expr| if ci { fold_case(e) } else { e };
+                let xe = fold(self.coerce(x, ty, -1, CastCtx::Implicit, "IN")?);
                 let mut list_e = vec![];
                 for it in items {
-                    list_e.push(self.coerce(it, ty, -1, CastCtx::Implicit, "IN")?);
+                    list_e.push(fold(self.coerce(it, ty, -1, CastCtx::Implicit, "IN")?));
                 }
                 Ok(TE::new(
                     Expr::InList { expr: Box::new(xe), list: list_e, negated: *negated },
@@ -2134,6 +2153,7 @@ impl<'a> Binder<'a> {
                     table_oid: 0,
                     attnum: 0,
                     rec: cols[0].rec.clone(),
+                    collation: None,
                 })
             }
             E::AnyOp { left, compare_op, right, .. } | E::AllOp { left, compare_op, right } => {
@@ -2258,6 +2278,15 @@ impl<'a> Binder<'a> {
                 let ci = matches!(e, E::ILike { .. });
                 let s = self.bind_expr(expr)?;
                 let p = self.bind_expr(pattern)?;
+                if [&s, &p].iter().any(|t| self.collation_of(t).is_some_and(|i| !i.deterministic)) {
+                    return Err(PgError::new(
+                        code::FEATURE_NOT_SUPPORTED,
+                        format!(
+                            "nondeterministic collations are not supported for {}",
+                            if ci { "ILIKE" } else { "LIKE" }
+                        ),
+                    ));
+                }
                 let op = match (ci, negated) {
                     (false, false) => "~~",
                     (false, true) => "!~~",
@@ -2336,7 +2365,19 @@ impl<'a> Binder<'a> {
                 let tz = self.bind_expr(time_zone)?;
                 self.call("timezone", vec![tz, ts])
             }
-            E::Collate { expr, .. } => self.bind_expr(expr),
+            E::Collate { expr, collation } => {
+                let mut te = self.bind_expr(expr)?;
+                let name = name_parts(collation).pop().unwrap_or_default();
+                if !super::collation::collatable(te.ty) && !te.ty.is_unknown() {
+                    return Err(PgError::new(
+                        code::DATATYPE_MISMATCH,
+                        format!("collations are not supported by type {}", te.ty.display(-1)),
+                    ));
+                }
+                super::collation::resolve(self.db, &name)?;
+                te.collation = Some(name);
+                Ok(te)
+            }
             E::Prefixed { prefix, value } => {
                 // e.g. B'1010' / X'ff' style prefixed literals.
                 let _ = prefix;
@@ -2696,8 +2737,12 @@ impl<'a> Binder<'a> {
         let ty = self
             .common_type(&[l.ty, r.ty], "comparison", 0)
             .map_err(|_| no_operator(op.symbol(), l.ty, r.ty))?;
+        // A case-insensitive (nondeterministic) collation on either side
+        // compares the case-folded values.
+        let ci = ty.is_string() && (self.case_insensitive(&l) || self.case_insensitive(&r));
         let le = self.coerce(l, ty, -1, CastCtx::Implicit, "comparison")?;
         let re = self.coerce(r, ty, -1, CastCtx::Implicit, "comparison")?;
+        let (le, re) = if ci { (fold_case(le), fold_case(re)) } else { (le, re) };
         // Enums compare by declaration order, not by label.
         let (le, re) = (enum_order(le, ty), enum_order(re, ty));
         Ok(Expr::Compare {
@@ -2706,6 +2751,23 @@ impl<'a> Binder<'a> {
             right: Box::new(re),
             bpchar: ty.base == Base::Bpchar,
         })
+    }
+
+    /// The collation an operand compares under: an explicit COLLATE, else
+    /// its column's.
+    fn collation_of(&self, te: &TE) -> Option<super::collation::Info> {
+        let name = te.collation.clone().or_else(|| {
+            (te.attnum > 0)
+                .then(|| self.db.table(te.table_oid))
+                .flatten()
+                .and_then(|t| t.columns.get(te.attnum as usize - 1))
+                .and_then(|c| c.collation.clone())
+        })?;
+        super::collation::lookup(self.db, &name)
+    }
+
+    fn case_insensitive(&self, te: &TE) -> bool {
+        self.collation_of(te).is_some_and(|i| super::collation::case_insensitive(&i))
     }
 
     /// `(s1, e1) OVERLAPS (s2, e2)`: each end may be an interval (a
@@ -2867,7 +2929,21 @@ impl<'a> Binder<'a> {
     fn binop_te(&mut self, op: &'static str, l: TE, r: TE) -> PgResult<TE> {
         let (lt, rt) = (l.ty, r.ty);
         let both_unknown = lt.is_unknown() && rt.is_unknown();
+        let is_inet = |t: Type| !t.array && matches!(t.base, Base::Inet | Base::Cidr);
+        let inet_op = is_inet(lt) || is_inet(rt);
         let (ltarget, rtarget, ret): (Type, Type, Type) = match op {
+            // inet: containment, address arithmetic.
+            "<<" | ">>" | "<<=" | ">>=" | "&&" if inet_op => {
+                (Type::of(Base::Inet), Type::of(Base::Inet), Type::BOOL)
+            }
+            "-" if inet_op && (is_inet(rt) || (rt.is_unknown() && is_inet(lt))) => {
+                (Type::of(Base::Inet), Type::of(Base::Inet), Type::INT8)
+            }
+            "+" | "-" if is_inet(lt) => (Type::of(Base::Inet), Type::INT8, Type::of(Base::Inet)),
+            "+" if is_inet(rt) => (Type::INT8, Type::of(Base::Inet), Type::of(Base::Inet)),
+            "&" | "|" if inet_op => {
+                (Type::of(Base::Inet), Type::of(Base::Inet), Type::of(Base::Inet))
+            }
             "+" | "-" | "*" | "/" | "%" | "^" => {
                 if both_unknown {
                     return Err(PgError::new(
@@ -3419,8 +3495,9 @@ impl<'a> Binder<'a> {
                 },
                 Type::of(Base::Time),
             )),
-            "current_user" | "user" | "session_user" | "current_role" => {
-                konst(Value::text(self.sess.user.clone()), Type::NAME)
+            "session_user" => konst(Value::text(self.sess.user.clone()), Type::NAME),
+            "current_user" | "user" | "current_role" => {
+                konst(Value::text(self.sess.role.clone()), Type::NAME)
             }
             "current_catalog" | "current_database" => {
                 konst(Value::text(self.sess.database.clone()), Type::NAME)
@@ -3560,28 +3637,7 @@ impl<'a> Binder<'a> {
 
     fn fold_call(&self, e: Expr) -> PgResult<Expr> {
         let Expr::Call { name, args, ty, arg_tys } = &e else { return Ok(e) };
-        let volatile = matches!(
-            *name,
-            "now"
-                | "clock_timestamp"
-                | "statement_timestamp"
-                | "transaction_timestamp"
-                | "random"
-                | "gen_random_uuid"
-                | "uuid_generate_v4"
-                | "nextval"
-                | "currval"
-                | "lastval"
-                | "setval"
-                | "current_date"
-                | "current_time"
-                | "localtime"
-                | "localtimestamp"
-                | "current_setting"
-                | "set_config"
-                | "timeofday"
-                | "pg_sleep"
-        );
+        let volatile = NOT_IMMUTABLE.contains(name);
         if volatile || !args.iter().all(|x| matches!(x, Expr::Const(_))) {
             return Ok(e);
         }
@@ -5171,11 +5227,14 @@ pub struct TE {
     pub table_oid: u32,
     pub attnum: i16,
     pub rec: Option<Vec<(String, Type)>>,
+    /// An explicit `COLLATE` (a column's own collation is looked up from
+    /// `table_oid`/`attnum`).
+    pub collation: Option<String>,
 }
 
 impl TE {
     pub fn new(e: Expr, ty: Type) -> TE {
-        TE { e, ty, typmod: -1, table_oid: 0, attnum: 0, rec: None }
+        TE { e, ty, typmod: -1, table_oid: 0, attnum: 0, rec: None, collation: None }
     }
     fn with_typmod(mut self, m: i32) -> TE {
         self.typmod = m;
@@ -5488,7 +5547,7 @@ fn known_operator(op: &str) -> Option<&'static str> {
     const OPS: &[&str] = &[
         "+", "-", "*", "/", "%", "^", "||", "&", "|", "#", "<<", ">>", "->", "->>", "#>", "#>>",
         "@>", "<@", "?", "?|", "?&", "#-", "&&", "~~", "!~~", "~~*", "!~~*", "~", "!~", "~*",
-        "!~*", "^@",
+        "!~*", "^@", "<<=", ">>=",
     ];
     OPS.iter().find(|o| **o == op).copied()
 }
@@ -5712,4 +5771,61 @@ fn enum_order(e: Expr, ty: Type) -> Expr {
         },
         _ => e,
     }
+}
+
+/// `lower(e)`, for comparing under a case-insensitive collation.
+fn fold_case(e: Expr) -> Expr {
+    Expr::Call { name: "lower", args: vec![e], ty: Type::TEXT, arg_tys: vec![Type::TEXT] }
+}
+
+/// Built-in functions that are VOLATILE or STABLE: never folded at plan
+/// time, and not allowed in index expressions.
+pub const NOT_IMMUTABLE: &[&str] = &[
+    "now",
+    "clock_timestamp",
+    "statement_timestamp",
+    "transaction_timestamp",
+    "random",
+    "gen_random_uuid",
+    "uuid_generate_v4",
+    "nextval",
+    "currval",
+    "lastval",
+    "setval",
+    "current_date",
+    "current_time",
+    "localtime",
+    "localtimestamp",
+    "current_setting",
+    "set_config",
+    "timeofday",
+    "pg_sleep",
+];
+
+/// Whether an index expression uses something not IMMUTABLE: a volatile
+/// or stable function, or a timestamptz cast that depends on TimeZone.
+pub fn uses_mutable(e: &Expr) -> bool {
+    let mut found = false;
+    let mut stack = vec![e.clone()];
+    while let Some(mut x) = stack.pop() {
+        match &x {
+            Expr::Call { name, .. } if NOT_IMMUTABLE.contains(name) => found = true,
+            Expr::Cast { from, to, .. }
+                if from.base == Base::Timestamptz
+                    && !from.array
+                    && matches!(
+                        to.base,
+                        Base::Date | Base::Timestamp | Base::Time | Base::Text | Base::Varchar
+                    ) =>
+            {
+                found = true
+            }
+            _ => {}
+        }
+        if found {
+            return true;
+        }
+        x.children_mut(&mut |c| stack.push(c.clone()));
+    }
+    false
 }

@@ -458,6 +458,8 @@ pub enum Value {
     Ts(i64),
     Interval(Interval),
     Uuid([u8; 16]),
+    /// inet and cidr.
+    Inet(super::inet::Inet),
     Jsonb(Box<Json>),
     Array(Box<Array>),
     Record(Vec<Value>),
@@ -507,6 +509,7 @@ impl Value {
             Value::Ts(_) => 10,
             Value::Interval(_) => 11,
             Value::Uuid(_) => 12,
+            Value::Inet(_) => 16,
             Value::Jsonb(_) => 13,
             Value::Array(_) => 14,
             Value::Record(_) => 15,
@@ -553,6 +556,7 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
         (Ts(x), Ts(y)) => x.cmp(y),
         (Interval(x), Interval(y)) => x.span().cmp(&y.span()),
         (Uuid(x), Uuid(y)) => x.cmp(y),
+        (Inet(x), Inet(y)) => super::inet::cmp(x, y),
         (Jsonb(x), Jsonb(y)) => json::cmp_jsonb(x, y),
         (Array(x), Array(y)) => {
             for (p, q) in x.items.iter().zip(&y.items) {
@@ -764,6 +768,7 @@ pub fn to_text(v: &Value, ty: Type, f: &FmtCtx) -> String {
         },
         Value::Interval(iv) => datetime::format_interval_styled(iv, f.interval_style),
         Value::Uuid(u) => format_uuid(u),
+        Value::Inet(v) => super::inet::format(v, ty.base == Base::Cidr),
         Value::Jsonb(j) => j.to_jsonb_string(),
         Value::Array(a) => array_to_text(a, ty, f),
         Value::Record(fields) => {
@@ -797,6 +802,7 @@ pub fn value_type_guess(v: &Value) -> Type {
         Value::Ts(_) => Type::TIMESTAMP,
         Value::Interval(_) => Type::INTERVAL,
         Value::Uuid(_) => Type::UUID,
+        Value::Inet(_) => Type::of(Base::Inet),
         Value::Jsonb(_) => Type::JSONB,
         Value::Array(a) => a
             .items
@@ -1124,6 +1130,13 @@ pub fn from_text(s: &str, ty: Type, ctx: &Ctx) -> PgResult<Value> {
             _ => dt_error(e, "interval", s),
         })?),
         Base::Uuid => Value::Uuid(parse_uuid(s)?),
+        Base::Inet | Base::Cidr => {
+            Value::Inet(super::inet::parse(s, ty.base == Base::Cidr).map_err(|m| {
+                let cidr_bits = m.starts_with("invalid cidr value");
+                let e = PgError::new(code::INVALID_TEXT_REPRESENTATION, m);
+                if cidr_bits { e.detail("Value has bits set to right of mask.") } else { e }
+            })?)
+        }
         Base::Json => {
             json::parse(s).map_err(|e| invalid_input("json", s).detail(e.0))?;
             Value::Text(s.to_string())
@@ -1646,6 +1659,7 @@ pub fn to_binary(v: &Value, ty: Type, f: &FmtCtx) -> Vec<u8> {
             out.extend_from_slice(&iv.months.to_be_bytes());
         }
         (_, Value::Uuid(u)) => out.extend_from_slice(u),
+        (b, Value::Inet(v)) => out.extend(super::inet::to_binary(v, b == Base::Cidr)),
         (_, Value::Jsonb(j)) => {
             out.push(1);
             out.extend_from_slice(j.to_jsonb_string().as_bytes());
@@ -1747,6 +1761,12 @@ pub fn from_binary(b: &[u8], ty: Type) -> PgResult<Value> {
             })
         }
         Base::Uuid => Value::Uuid(arr(16)?.try_into().unwrap()),
+        Base::Inet | Base::Cidr => Value::Inet(super::inet::from_binary(b).ok_or_else(|| {
+            PgError::new(
+                code::INVALID_BINARY_REPRESENTATION,
+                "invalid inet value in external \"inet\" value",
+            )
+        })?),
         Base::Jsonb => {
             if b.first() != Some(&1) {
                 return Err(PgError::new(

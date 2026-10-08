@@ -127,7 +127,33 @@ pub fn binop(
 ) -> PgResult<Value> {
     use Value::*;
     let zone = &env.fmt.zone;
+    let inet_err = |m: String| err(code::NUMERIC_VALUE_OUT_OF_RANGE, m);
     Ok(match (op, a, b) {
+        // inet / cidr
+        ("<<", Inet(x), Inet(y)) => Bool(super::inet::contains(y, x, false)),
+        (">>", Inet(x), Inet(y)) => Bool(super::inet::contains(x, y, false)),
+        ("<<=", Inet(x), Inet(y)) => Bool(super::inet::contains(y, x, true)),
+        (">>=", Inet(x), Inet(y)) => Bool(super::inet::contains(x, y, true)),
+        ("&&", Inet(x), Inet(y)) => Bool(super::inet::overlaps(x, y)),
+        ("-", Inet(x), Inet(y)) => Int(super::inet::sub(x, y).map_err(inet_err)?),
+        ("+" | "-", Inet(x), Int(n)) => {
+            let n = if op == "-" { -(*n as i128) } else { *n as i128 };
+            Inet(super::inet::add(x, n).map_err(inet_err)?)
+        }
+        ("+", Int(n), Inet(x)) => Inet(super::inet::add(x, *n as i128).map_err(inet_err)?),
+        ("&" | "|", Inet(x), Inet(y)) => {
+            if x.v6 != y.v6 {
+                return Err(err(
+                    code::INVALID_PARAMETER_VALUE,
+                    "cannot AND inet values of different sizes",
+                ));
+            }
+            let mut r = *x;
+            for i in 0..16 {
+                r.addr[i] = if op == "&" { x.addr[i] & y.addr[i] } else { x.addr[i] | y.addr[i] };
+            }
+            Inet(r)
+        }
         ("+", Int(x), Int(y)) => return int_result(x.checked_add(*y), ret),
         ("-", Int(x), Int(y)) => return int_result(x.checked_sub(*y), ret),
         ("*", Int(x), Int(y)) => return int_result(x.checked_mul(*y), ret),
@@ -1714,6 +1740,40 @@ pub fn call(
             } else {
                 String::new()
             })
+        }
+        "text" if matches!(a.first(), Some(Inet(_))) => {
+            let Inet(x) = &a[0] else { unreachable!() };
+            Text(super::inet::format_full(x))
+        }
+        // inet / cidr
+        "host" | "masklen" | "family" | "network" | "broadcast" | "netmask" | "hostmask"
+        | "abbrev" | "set_masklen" | "inet_same_family" | "inet_merge"
+            if matches!(a.first(), Some(Inet(_))) =>
+        {
+            use super::inet as n;
+            let Inet(x) = &a[0] else { unreachable!() };
+            let cidr_in = tys.first().is_some_and(|t| t.base == Base::Cidr);
+            let other = |i: usize| match a.get(i) {
+                Some(Inet(y)) => Ok(*y),
+                _ => Err(err(code::INVALID_PARAMETER_VALUE, "expected an inet argument")),
+            };
+            let bad = |m: String| err(code::INVALID_PARAMETER_VALUE, m);
+            match name {
+                "host" => Text(n::host(x)),
+                "masklen" => Int(x.bits as i64),
+                "family" => Int(x.family()),
+                "network" => Inet(n::network(x)),
+                "broadcast" => Inet(n::broadcast(x)),
+                "netmask" => Inet(n::netmask(x)),
+                "hostmask" => Inet(n::hostmask(x)),
+                "abbrev" => Text(n::abbrev(x, cidr_in)),
+                "set_masklen" => Inet(
+                    n::set_masklen(x, a.get(1).and_then(Value::as_int).unwrap_or(-1), cidr_in)
+                        .map_err(bad)?,
+                ),
+                "inet_same_family" => Bool(x.v6 == other(1)?.v6),
+                _ => Inet(n::merge(x, &other(1)?).map_err(bad)?),
+            }
         }
         "md5" => Text(match &a[0] {
             Bytes(b) => md5_hex(b),
