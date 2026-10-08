@@ -438,6 +438,67 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             v => Value::Text(render_text(v).bytes().map(|x| format!("{x:02X}")).collect()),
         },
 
+        // ---- IP addresses ----
+        "INET_ATON" | "INET_NTOA" | "INET6_ATON" | "INET6_NTOA" | "IS_IPV4" | "IS_IPV6"
+        | "IS_IPV4_MAPPED" | "IS_IPV4_COMPAT" => {
+            need(1)?;
+            if any_null(1) {
+                return Ok(Value::Null);
+            }
+            let txt = || render_text(&a[0]);
+            let bytes = || match &a[0] {
+                Value::Bytes(b) => b.clone(),
+                v => render_text(v).into_bytes(),
+            };
+            match name {
+                "INET_ATON" => inet_aton(&txt()).map_or(Value::Null, |n| Value::Int(n as i64)),
+                "INET_NTOA" => {
+                    let n = value_to_f64(&a[0]);
+                    if !(0.0..=u32::MAX as f64).contains(&n) {
+                        Value::Null
+                    } else {
+                        Value::Text(std::net::Ipv4Addr::from(n as u32).to_string())
+                    }
+                }
+                "INET6_ATON" => {
+                    let t = txt();
+                    if let Ok(v4) = t.parse::<std::net::Ipv4Addr>() {
+                        Value::Bytes(v4.octets().to_vec())
+                    } else if let Ok(v6) = t.parse::<std::net::Ipv6Addr>() {
+                        Value::Bytes(v6.octets().to_vec())
+                    } else {
+                        Value::Null
+                    }
+                }
+                "INET6_NTOA" => {
+                    let b = bytes();
+                    match b.len() {
+                        4 => {
+                            Value::Text(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]).to_string())
+                        }
+                        16 => {
+                            let arr: [u8; 16] = b.as_slice().try_into().unwrap();
+                            Value::Text(ipv6_text(&arr))
+                        }
+                        _ => Value::Null,
+                    }
+                }
+                "IS_IPV4" => Value::Int(txt().parse::<std::net::Ipv4Addr>().is_ok() as i64),
+                "IS_IPV6" => Value::Int(txt().parse::<std::net::Ipv6Addr>().is_ok() as i64),
+                _ => {
+                    let b = bytes();
+                    let ok = b.len() == 16
+                        && b[..10].iter().all(|x| *x == 0)
+                        && if name == "IS_IPV4_MAPPED" {
+                            b[10] == 0xff && b[11] == 0xff
+                        } else {
+                            b[10] == 0 && b[11] == 0
+                        };
+                    Value::Int(ok as i64)
+                }
+            }
+        }
+
         // ---- hashing and encoding ----
         "MD5" | "SHA" | "SHA1" | "SHA2" | "CRC32" | "TO_BASE64" | "FROM_BASE64" | "UNHEX" => {
             let want = if name == "SHA2" { 2 } else { 1 };
@@ -1806,4 +1867,41 @@ fn calc_week(day: i32, behaviour: u32) -> (i64, i64) {
         }
     }
     (year, days / 7 + 1)
+}
+
+/// MySQL's INET_ATON: dotted quad, also with fewer parts (`127.1` is
+/// 127.0.0.1: the last part fills the remaining bytes).
+fn inet_aton(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty()
+        || parts.len() > 4
+        || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let nums: Vec<u64> = parts.iter().map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    let (last, head) = nums.split_last()?;
+    if head.iter().any(|n| *n > 255) {
+        return None;
+    }
+    let rest_bits = 8 * (4 - head.len() as u32);
+    if rest_bits < 32 && *last >= 1u64 << rest_bits {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for n in head {
+        v = (v << 8) | n;
+    }
+    Some(((v << rest_bits) | last) as u32)
+}
+
+/// IPv6 text as MySQL's INET6_NTOA writes it: IPv4-mapped and
+/// IPv4-compatible addresses end in a dotted quad.
+fn ipv6_text(b: &[u8; 16]) -> String {
+    let compat =
+        b[..12].iter().all(|x| *x == 0) && (b[12] != 0 || b[13] != 0 || b[14] != 0 || b[15] > 1);
+    if compat {
+        return format!("::{}.{}.{}.{}", b[12], b[13], b[14], b[15]);
+    }
+    std::net::Ipv6Addr::from(*b).to_string()
 }

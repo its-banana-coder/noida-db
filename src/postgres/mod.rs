@@ -19,6 +19,7 @@ pub mod exec;
 pub mod explain;
 pub mod fts;
 pub mod funcs;
+pub mod inet;
 pub mod jsonpath;
 pub mod keywords;
 pub mod pgcatalog;
@@ -44,6 +45,8 @@ use sqlparser::parser::Parser;
 
 /// Parses a SQL string into statements.
 pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
+    let after_netops = rewrite_net_ops(sql);
+    let sql = after_netops.as_deref().unwrap_or(sql);
     let after_explain = rewrite_explain_paren(sql);
     let sql = after_explain.as_deref().unwrap_or(sql);
     let after_db = rewrite_create_database(sql)?;
@@ -78,6 +81,45 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
             None => Err(syntax_error(e)),
         },
     }
+}
+
+/// `a <<= b` / `a >>= b` (inet "contained by or equal" / "contains or
+/// equal"), which sqlparser can't tokenize: spelled as OPERATOR(...).
+fn rewrite_net_ops(sql: &str) -> Option<String> {
+    if !sql.contains("<<=") && !sql.contains(">>=") {
+        return None;
+    }
+    let mut out = String::with_capacity(sql.len() + 32);
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
+    let mut changed = false;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+            out.push(c);
+            continue;
+        }
+        if (c == '<' || c == '>') && chars.peek() == Some(&c) {
+            let mut look = chars.clone();
+            look.next();
+            if look.peek() == Some(&'=') {
+                chars.next();
+                chars.next();
+                out.push_str(&format!(" OPERATOR(pg_catalog.{c}{c}=) "));
+                changed = true;
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    changed.then_some(out)
 }
 
 /// `EXPLAIN [ANALYZE] [VERBOSE] (SELECT ...) UNION (...)`: sqlparser reads

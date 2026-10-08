@@ -2867,7 +2867,21 @@ impl<'a> Binder<'a> {
     fn binop_te(&mut self, op: &'static str, l: TE, r: TE) -> PgResult<TE> {
         let (lt, rt) = (l.ty, r.ty);
         let both_unknown = lt.is_unknown() && rt.is_unknown();
+        let is_inet = |t: Type| !t.array && matches!(t.base, Base::Inet | Base::Cidr);
+        let inet_op = is_inet(lt) || is_inet(rt);
         let (ltarget, rtarget, ret): (Type, Type, Type) = match op {
+            // inet: containment, address arithmetic.
+            "<<" | ">>" | "<<=" | ">>=" | "&&" if inet_op => {
+                (Type::of(Base::Inet), Type::of(Base::Inet), Type::BOOL)
+            }
+            "-" if inet_op && (is_inet(rt) || (rt.is_unknown() && is_inet(lt))) => {
+                (Type::of(Base::Inet), Type::of(Base::Inet), Type::INT8)
+            }
+            "+" | "-" if is_inet(lt) => (Type::of(Base::Inet), Type::INT8, Type::of(Base::Inet)),
+            "+" if is_inet(rt) => (Type::INT8, Type::of(Base::Inet), Type::of(Base::Inet)),
+            "&" | "|" if inet_op => {
+                (Type::of(Base::Inet), Type::of(Base::Inet), Type::of(Base::Inet))
+            }
             "+" | "-" | "*" | "/" | "%" | "^" => {
                 if both_unknown {
                     return Err(PgError::new(
@@ -5485,7 +5499,7 @@ fn known_operator(op: &str) -> Option<&'static str> {
     const OPS: &[&str] = &[
         "+", "-", "*", "/", "%", "^", "||", "&", "|", "#", "<<", ">>", "->", "->>", "#>", "#>>",
         "@>", "<@", "?", "?|", "?&", "#-", "&&", "~~", "!~~", "~~*", "!~~*", "~", "!~", "~*",
-        "!~*", "^@",
+        "!~*", "^@", "<<=", ">>=",
     ];
     OPS.iter().find(|o| **o == op).copied()
 }

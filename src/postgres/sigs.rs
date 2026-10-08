@@ -59,6 +59,9 @@ btrim(text)text btrim(text,text)text ltrim(text)text ltrim(text,text)text rtrim(
 lpad(text,int4)text lpad(text,int4,text)text rpad(text,int4)text rpad(text,int4,text)text
 left(text,int4)text right(text,int4)text repeat(text,int4)text reverse(text)text
 !concat(...any)text !concat_ws(text,...any)text split_part(text,text,int4)text
+host(inet)text masklen(inet)int4 family(inet)int4 network(inet)cidr broadcast(inet)inet netmask(inet)inet hostmask(inet)inet
+abbrev(inet)text abbrev(cidr)text set_masklen(inet,int4)inet set_masklen(cidr,int4)cidr text(inet)text
+inet_same_family(inet,inet)bool inet_merge(inet,inet)cidr
 md5(text)text md5(bytea)text sha224(bytea)bytea sha256(bytea)bytea sha384(bytea)bytea sha512(bytea)bytea
 digest(text,text)bytea digest(bytea,text)bytea hmac(text,text,text)bytea hmac(bytea,bytea,text)bytea
 ascii(text)int4 chr(int4)text

@@ -97,6 +97,12 @@ pub fn cast_context(from: Type, to: Type) -> Option<CastCtx> {
     if matches!(from.base, Base::Enum(_)) && to.is_string() {
         return Some(CastCtx::Assignment);
     }
+    // cidr is an inet (implicitly); inet narrows to cidr on assignment.
+    match (from.base, to.base) {
+        (Base::Cidr, Base::Inet) if !from.array && !to.array => return Some(CastCtx::Implicit),
+        (Base::Inet, Base::Cidr) if !from.array && !to.array => return Some(CastCtx::Assignment),
+        _ => {}
+    }
     // Automatic I/O conversion casts.
     if to.is_string() {
         return Some(CastCtx::Assignment);
@@ -193,6 +199,8 @@ fn convert(v: Value, from: Type, to: Type, fmt: &FmtCtx, now: i64) -> PgResult<V
                 s.trim_end_matches(' ').to_string()
             }
             (Value::Text(s), _) => s.clone(),
+            // inet::text keeps the netmask even for a single host.
+            (Value::Inet(x), _) => super::inet::format_full(x),
             _ => types::to_text(&v, from, fmt),
         };
         return Ok(Value::Text(match to.base {
@@ -299,6 +307,9 @@ fn convert(v: Value, from: Type, to: Type, fmt: &FmtCtx, now: i64) -> PgResult<V
             json::parse_jsonb(&s).map_err(|e| types::invalid_input("json", &s).detail(e.0))?,
         )),
         (Value::Jsonb(j), _) if tb == Base::Json => Value::Text(j.to_jsonb_string()),
+        // inet -> cidr drops the host bits; cidr -> inet is the same value.
+        (Value::Inet(x), _) if tb == Base::Cidr => Value::Inet(super::inet::network(&x)),
+        (Value::Inet(x), _) if tb == Base::Inet => Value::Inet(x),
         (Value::Jsonb(j), _) => jsonb_to_scalar(&j, to)?,
         (v, _) => {
             // Anything else goes through text.

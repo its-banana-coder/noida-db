@@ -1810,6 +1810,7 @@ enum JoinKey {
     Bytes(Vec<u8>),
     Int(i64),
     Uuid([u8; 16]),
+    Inet(super::inet::Inet),
 }
 
 fn join_key_value(v: &Value) -> Option<JoinKey> {
@@ -1828,6 +1829,7 @@ fn join_key_value(v: &Value) -> Option<JoinKey> {
         Value::Date(d) => JoinKey::Int(*d as i64),
         Value::Time(t) | Value::Ts(t) => JoinKey::Int(*t),
         Value::Uuid(u) => JoinKey::Uuid(*u),
+        Value::Inet(v) => JoinKey::Inet(*v),
         _ => return None,
     })
 }
