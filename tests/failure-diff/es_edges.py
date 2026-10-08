@@ -865,6 +865,44 @@ scenario("index_management", mk("im-1", {"t": {"type": "text"}, "k": {"type": "k
     ("GET", "/im-*"),
 ])
 
+scenario("filter_path_closed", setup("fpc") + [
+    ("GET", "/fpc/_search?filter_path=hits.total"),
+    ("GET", "/fpc/_search?filter_path=hits.hits._id,hits.hits._source.title&sort=price"),
+    ("GET", "/fpc/_search?filter_path=-hits.hits._source,-took,-_shards&size=2&sort=price"),
+    ("GET", "/fpc/_search?filter_path=**._id&size=2&sort=price"),
+    ("GET", "/fpc/_search?filter_path=hits.*.total"),
+    ("GET", "/fpc/_search?filter_path=nope"),
+    ("GET", "/fpc/_doc/1?filter_path=_source.*"),
+    ("GET", "/fpc/_mapping?filter_path=*.mappings.properties.title"),
+    ("GET", "/fpc/_search?filter_path=hits.hits&size=0"),
+    ("GET", "/nope-idx/_search?filter_path=error.type"),
+    ("GET", "/_cluster/health?filter_path=status,number_of_nodes"),
+    ("GET", "/fpc?features=aliases,settings", None, {"pick": lambda r: r["fpc"]["mappings"]}),
+    ("GET", "/fpc?human=true", None, {"pick": lambda r: sorted(r["fpc"]["settings"]["index"])}),
+    ("GET", "/fpc/_settings", None, {"pick": lambda r: sorted(r["fpc"]["settings"]["index"])}),
+    ("GET", "/_fpc"),
+    ("PUT", "/fpc-closed", {"settings": {"number_of_replicas": 0}}),
+    ("POST", "/fpc-closed/_close"),
+    ("GET", "/fpc-closed/_search"),
+    ("GET", "/fpc-closed/_count"),
+    ("PUT", "/fpc-closed/_doc/1", {"a": 1}),
+    ("GET", "/fpc-closed/_doc/1"),
+    ("GET", "/fpc*/_search?filter_path=hits.total"),
+    ("GET", "/fpc*/_search?expand_wildcards=all&filter_path=hits.total"),
+    ("GET", "/fpc*?expand_wildcards=closed", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/fpc*", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/fpc*/_settings/index.number_of_replicas"),
+    ("GET", "/fpc*/_mapping"),
+    ("POST", "/fpc*/_open"),
+    ("GET", "/fpc-closed/_count"),
+    ("DELETE", "/fpc-closed"),
+    ("PUT", "/fpc-a", {"aliases": {"fpc-al": {}}}),
+    ("DELETE", "/fpc-al?ignore_unavailable=true"),
+    ("DELETE", "/fpc-al,fpc-nope?ignore_unavailable=true"),
+    ("GET", "/fpc-a", None, {"pick": lambda r: list(r)}),
+    ("DELETE", "/fpc-a"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

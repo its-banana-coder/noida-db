@@ -258,6 +258,25 @@ impl Engine {
             }
             walk(&mut resp);
         }
+        // `filter_path`: keep (or with `-`, drop) the named parts.
+        if status < 400
+            && let Some(fp) = query.split('&').find_map(|p| p.strip_prefix("filter_path="))
+        {
+            let fp = percent_decode_segment(&fp.replace('+', " "));
+            let (mut inc, mut exc) = (vec![], vec![]);
+            for p in fp.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                match p.strip_prefix('-') {
+                    Some(e) => exc.push(e.split('.').map(String::from).collect::<Vec<_>>()),
+                    None => inc.push(p.split('.').map(String::from).collect::<Vec<_>>()),
+                }
+            }
+            if !inc.is_empty() {
+                resp = filter_path_include(&resp, &inc).unwrap_or_else(|| json!({}));
+            }
+            if !exc.is_empty() {
+                resp = filter_path_exclude(&resp, &exc).unwrap_or_else(|| json!({}));
+            }
+        }
         (status, resp)
     }
 
@@ -372,6 +391,19 @@ impl Engine {
             _ => {}
         }
         if segments.len() == 1 && segments[0].starts_with('_') {
+            // `/{index}` with a name Elasticsearch can't have.
+            if matches!(method, "GET" | "HEAD" | "PUT" | "DELETE") && !segments[0].contains('*') {
+                let n = segments[0];
+                return (
+                    400,
+                    json!({"error": {"root_cause": [{"type": "invalid_index_name_exception",
+                        "reason": format!("Invalid index name [{n}], must not start with '_'."),
+                        "index_uuid": "_na_", "index": n}],
+                        "type": "invalid_index_name_exception",
+                        "reason": format!("Invalid index name [{n}], must not start with '_'."),
+                        "index_uuid": "_na_", "index": n}, "status": 400}),
+                );
+            }
             return (404, error("not_found", "no handler found for uri", 404));
         }
         if segments.is_empty() {
@@ -407,6 +439,56 @@ impl Engine {
             && !self.is_alias(segments[0])
         {
             return require_alias_error(segments[0]);
+        }
+        // Reads and writes against a closed index fail; a wildcard just
+        // skips it.
+        if matches!(
+            segments.get(1).copied(),
+            Some(
+                "_search"
+                    | "_count"
+                    | "_doc"
+                    | "_create"
+                    | "_source"
+                    | "_update"
+                    | "_bulk"
+                    | "_mget"
+                    | "_msearch"
+                    | "_delete_by_query"
+                    | "_update_by_query"
+                    | "_pit"
+            )
+        ) {
+            let s = self.0.lock().unwrap();
+            let ignore_unavailable = q.get("ignore_unavailable").is_some_and(|v| v == "true");
+            let ew = q.get("expand_wildcards").map_or("open", String::as_str);
+            let reach_closed = ew.split(',').any(|w| matches!(w.trim(), "closed" | "all"));
+            for part in segments[0].split(',').map(str::trim) {
+                if part.contains('*') && reach_closed {
+                    if let Some((n, _)) =
+                        s.indices.iter().find(|(n, i)| !i.opened && glob_match(part, n))
+                    {
+                        return index_closed(n);
+                    }
+                    continue;
+                }
+                if part.contains('*') || ignore_unavailable {
+                    continue;
+                }
+                let target = if s.indices.contains_key(part) {
+                    Some(part.to_string())
+                } else {
+                    s.indices
+                        .iter()
+                        .find(|(_, i)| i.aliases.contains_key(part))
+                        .map(|(n, _)| n.clone())
+                };
+                if let Some(t) = target
+                    && s.indices.get(&t).is_some_and(|i| !i.opened)
+                {
+                    return index_closed(&t);
+                }
+            }
         }
         if segments.len() == 1 {
             // GET / DELETE take an index expression; PUT / HEAD one name.
@@ -726,6 +808,27 @@ impl Engine {
         } else {
             Self::resolve_indices(s, expr)
         };
+        // `expand_wildcards` (default `open`) picks which indices a
+        // wildcard reaches; named indices are always kept.
+        let ew = q.get("expand_wildcards").map_or("open", String::as_str);
+        let want_open = ew.split(',').any(|w| matches!(w.trim(), "open" | "all"));
+        let want_closed = ew.split(',').any(|w| matches!(w.trim(), "closed" | "all"));
+        let literal: Vec<&str> = expr
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.contains('*') && *p != "_all" && !p.starts_with('-'))
+            .collect();
+        let named =
+            if literal.is_empty() { vec![] } else { Self::resolve_indices(s, &literal.join(",")) };
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|n| {
+                named.contains(n)
+                    || s.indices
+                        .get(n)
+                        .is_none_or(|i| if i.opened { want_open } else { want_closed })
+            })
+            .collect();
         if names.is_empty() && q.get("allow_no_indices").is_some_and(|v| v == "false") {
             return Err(missing_index(expr));
         }
@@ -1774,6 +1877,7 @@ impl Engine {
         body: &[u8],
     ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
+        let q = &with_default_expand(q, "open");
         let names = match Self::resolve_targets(&s, expr, q) {
             Ok(n) => n,
             Err(e) => return e,
@@ -1853,29 +1957,15 @@ impl Engine {
     ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
         if method == "DELETE" {
-            // `action.destructive_requires_name` (default true) refuses
-            // wildcard and `_all` deletes.
-            let setting = ["transient", "persistent"].iter().find_map(|k| {
-                s.cluster_settings
-                    .get(*k)
-                    .and_then(|m| m.get("action.destructive_requires_name"))
-                    .cloned()
-            });
-            let requires_name =
-                setting.as_ref().and_then(Value::as_str).is_none_or(|v| v != "false");
-            if requires_name && expr.split(',').any(|p| p.trim() == "_all" || p.contains('*')) {
-                return (
-                    400,
-                    error(
-                        "illegal_argument_exception",
-                        "Wildcard expressions or all indices are not allowed",
-                        400,
-                    ),
-                );
+            if let Err(e) = destructive_check(&s, expr) {
+                return e;
             }
-            // Deleting through an alias is refused, wildcards excepted.
+            // Deleting through an alias is refused, wildcards excepted
+            // (with `ignore_unavailable` the alias is just skipped).
+            let ignore_unavailable = q.get("ignore_unavailable").is_some_and(|v| v == "true");
             for part in expr.split(',').map(str::trim) {
-                if !part.contains('*')
+                if !ignore_unavailable
+                    && !part.contains('*')
                     && !s.indices.contains_key(part)
                     && s.indices.values().any(|i| i.aliases.contains_key(part))
                 {
@@ -1892,6 +1982,7 @@ impl Engine {
                 }
             }
         }
+        let q = &with_default_expand(q, if method == "DELETE" { "open,closed" } else { "open" });
         let names = match Self::resolve_targets(&s, expr, q) {
             Ok(n) => n,
             Err(e) => return e,
@@ -1911,17 +2002,41 @@ impl Engine {
             names
         };
         if method == "DELETE" {
+            // With `allow_no_indices=false` every wildcard must match an
+            // index by name.
+            if q.get("allow_no_indices").is_some_and(|v| v == "false") {
+                for part in expr.split(',').map(str::trim).filter(|p| p.contains('*')) {
+                    if !s.indices.keys().any(|n| glob_match(part, n)) {
+                        return missing_index(part);
+                    }
+                }
+                if names.is_empty() {
+                    return missing_index(expr);
+                }
+            }
             for n in &names {
                 s.indices.remove(n);
             }
             return (200, json!({"acknowledged":true}));
         }
+        // `features` picks which sections are filled in.
+        let features = q.get("features").map_or("aliases,mappings,settings", String::as_str);
+        let has = |f: &str| features.split(',').any(|x| x.trim() == f);
+        let human = q.get("human").is_some_and(|v| v.is_empty() || v == "true");
         let mut out = Map::new();
         for n in &names {
             if let Some(i) = s.indices.get(n) {
+                let mut settings = i.settings.clone();
+                if human {
+                    add_human_settings(&mut settings);
+                }
                 out.insert(
                     n.clone(),
-                    json!({"aliases": i.aliases, "mappings": shown_mappings(&i.mappings), "settings": i.settings}),
+                    json!({
+                        "aliases": if has("aliases") { json!(i.aliases) } else { json!({}) },
+                        "mappings": if has("mappings") { shown_mappings(&i.mappings) } else { json!({}) },
+                        "settings": if has("settings") { settings } else { json!({}) },
+                    }),
                 );
             }
         }
@@ -1932,6 +2047,13 @@ impl Engine {
     /// list, wildcards, `_all`, or none for every index).
     fn index_action(&self, expr: &str, action: &str, q: &HashMap<String, String>) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
+        if matches!(action, "_open" | "_close")
+            && let Err(e) = destructive_check(&s, expr)
+        {
+            return e;
+        }
+        // Opening reaches closed indices by default; the rest open ones.
+        let q = &with_default_expand(q, if action == "_open" { "closed" } else { "open" });
         let names = match Self::resolve_targets(&s, expr, q) {
             Ok(n) => n,
             Err(e) => return e,
@@ -3343,6 +3465,58 @@ fn shard_counts(i: &Index) -> (u64, u64) {
     (num("number_of_shards", 1), num("number_of_replicas", 1))
 }
 
+/// `?human`: readable forms of the creation date and version.
+fn add_human_settings(settings: &mut Value) {
+    let Some(idx) = settings.get_mut("index").and_then(Value::as_object_mut) else { return };
+    if let Some(ms) =
+        idx.get("creation_date").and_then(Value::as_str).and_then(|v| v.parse::<i64>().ok())
+    {
+        idx.insert("creation_date_string".into(), json!(super::dates::format(ms, None, 0)));
+    }
+    if let Some(v) = idx.get_mut("version").and_then(Value::as_object_mut)
+        && v.contains_key("created")
+    {
+        v.insert("created_string".into(), json!("8.15.0-8.15.3"));
+    }
+}
+
+/// `action.destructive_requires_name` (default true): deleting, opening
+/// or closing by wildcard or `_all` is refused.
+fn destructive_check(s: &State, expr: &str) -> Result<(), (u16, Value)> {
+    let setting = ["transient", "persistent"].iter().find_map(|k| {
+        s.cluster_settings.get(*k).and_then(|m| m.get("action.destructive_requires_name")).cloned()
+    });
+    let requires_name = setting.as_ref().and_then(Value::as_str).is_none_or(|v| v != "false");
+    if requires_name && expr.split(',').any(|p| p.trim() == "_all" || p.contains('*')) {
+        return Err((
+            400,
+            error(
+                "illegal_argument_exception",
+                "Wildcard expressions or all indices are not allowed",
+                400,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The query with an API's own `expand_wildcards` default filled in.
+fn with_default_expand(q: &HashMap<String, String>, default: &str) -> HashMap<String, String> {
+    let mut q = q.clone();
+    q.entry("expand_wildcards".into()).or_insert_with(|| default.into());
+    q
+}
+
+/// `index_closed_exception` for a read or write against a closed index.
+fn index_closed(name: &str) -> (u16, Value) {
+    let e = json!({"type": "index_closed_exception", "reason": "closed", "index_uuid": "noida", "index": name});
+    (
+        400,
+        json!({"error": {"root_cause": [e.clone()], "type": "index_closed_exception", "reason": "closed",
+                           "index_uuid": "noida", "index": name}, "status": 400}),
+    )
+}
+
 fn missing_index(name: &str) -> (u16, Value) {
     (
         404,
@@ -3751,6 +3925,79 @@ fn glob_match(pat: &str, name: &str) -> bool {
     true
 }
 
+/// The paths left to match below key `k`, `**` matching any depth.
+fn filter_path_step(paths: &[Vec<String>], k: &str) -> Vec<Vec<String>> {
+    let mut next = vec![];
+    for p in paths {
+        let Some(head) = p.first() else { continue };
+        if head == "**" {
+            next.push(p.clone());
+            if let Some(after) = p.get(1)
+                && glob_match(after, k)
+            {
+                next.push(p[2..].to_vec());
+            }
+        } else if glob_match(head, k) {
+            next.push(p[1..].to_vec());
+        }
+    }
+    next
+}
+
+/// `filter_path` includes: only what some path reaches (arrays don't use
+/// a path segment); `None` when nothing is left.
+fn filter_path_include(v: &Value, paths: &[Vec<String>]) -> Option<Value> {
+    if paths.iter().any(|p| p.is_empty() || (p.len() == 1 && p[0] == "**")) {
+        return Some(v.clone());
+    }
+    match v {
+        Value::Object(m) => {
+            let out: Map<String, Value> = m
+                .iter()
+                .filter_map(|(k, x)| {
+                    let next = filter_path_step(paths, k);
+                    if next.is_empty() {
+                        None
+                    } else {
+                        filter_path_include(x, &next).map(|r| (k.clone(), r))
+                    }
+                })
+                .collect();
+            (!out.is_empty()).then_some(Value::Object(out))
+        }
+        Value::Array(a) => {
+            let out: Vec<Value> = a.iter().filter_map(|x| filter_path_include(x, paths)).collect();
+            (!out.is_empty()).then_some(Value::Array(out))
+        }
+        _ => None,
+    }
+}
+
+/// `filter_path` excludes (`-path`): everything but what a path reaches.
+fn filter_path_exclude(v: &Value, paths: &[Vec<String>]) -> Option<Value> {
+    if paths.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    match v {
+        Value::Object(m) => Some(Value::Object(
+            m.iter()
+                .filter_map(|(k, x)| {
+                    let next = filter_path_step(paths, k);
+                    if next.is_empty() {
+                        Some((k.clone(), x.clone()))
+                    } else {
+                        filter_path_exclude(x, &next).map(|r| (k.clone(), r))
+                    }
+                })
+                .collect(),
+        )),
+        Value::Array(a) => {
+            Some(Value::Array(a.iter().filter_map(|x| filter_path_exclude(x, paths)).collect()))
+        }
+        other => Some(other.clone()),
+    }
+}
+
 /// Percent-decodes one URL path segment (`+` stays a plus sign there).
 fn percent_decode_segment(seg: &str) -> String {
     if !seg.contains('%') {
@@ -3927,7 +4174,42 @@ fn new_index_from_templates(templates: &Templates, name: &str) -> Index {
         apply_settings(&mut index.settings, &r.settings);
         index.aliases.extend(r.aliases);
     }
+    // The settings Elasticsearch fills in for every new index.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let generated = json!({"index": {
+        "routing": {"allocation": {"include": {"_tier_preference": "data_content"}}},
+        "provided_name": name,
+        "creation_date": now.to_string(),
+        "uuid": index_uuid(),
+        "version": {"created": "8512000"},
+    }});
+    let mut settings = generated;
+    merge(&mut settings, index.settings.clone());
+    index.settings = settings;
     index
+}
+
+/// A random-looking 22-character index uuid, as Elasticsearch prints one.
+fn index_uuid() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(22);
+    while out.len() < 22 {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_usize(out.len());
+        let mut v = h.finish();
+        for _ in 0..10 {
+            if out.len() == 22 {
+                break;
+            }
+            out.push(ALPHABET[(v & 63) as usize] as char);
+            v >>= 6;
+        }
+    }
+    out
 }
 
 /// `_source`, `_source_includes` and `_source_excludes` URL parameters as

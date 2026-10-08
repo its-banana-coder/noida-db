@@ -536,6 +536,11 @@ def main():
     report = {}
     for f in files:
         d = os.path.basename(os.path.dirname(f))
+        # Elasticsearch's own test clusters allow wildcard deletes through
+        # node config, which cluster settings APIs don't show; here it is a
+        # persistent setting, so it's left out where those APIs are tested.
+        allow = None if d.startswith(("cluster.put_settings", "cluster.get_settings")) else False
+        r.http("PUT", "/_cluster/settings", {}, {"persistent": {"action.destructive_requires_name": allow}}, {}, False)
         for name, status, why in r.run_file(f):
             report.setdefault(d, []).append({"file": os.path.basename(f), "test": name, "status": status, "why": why})
     tot = {"pass": 0, "fail": 0, "skip": 0}
