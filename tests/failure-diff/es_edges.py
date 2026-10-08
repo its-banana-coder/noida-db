@@ -138,7 +138,7 @@ MAPPING = {
 
 
 def setup(index="edge", mapping=MAPPING, docs=DOCS):
-    steps = [("DELETE", f"/{index}"), ("PUT", f"/{index}", mapping)]
+    steps = [("DELETE", f"/{index}?ignore_unavailable=true"), ("PUT", f"/{index}", mapping)]
     bulk = []
     for i, d in enumerate(docs, 1):
         bulk.append({"index": {"_index": index, "_id": str(i)}})
@@ -432,7 +432,7 @@ scenario("painless_more", setup() + [
 ])
 
 scenario("auto_refresh", [
-    ("DELETE", "/auto"),
+    ("DELETE", "/auto?ignore_unavailable=true"),
     ("PUT", "/auto", {"settings": {"index": {"refresh_interval": "1s"}}}),
     ("POST", "/auto/_search", {}, {"pick": ids}),
     ("POST", "/auto/_doc/1", {"a": 1}),
@@ -798,6 +798,71 @@ scenario("query_dsl_more", setup("geo", GEO_MAPPING, GEO_DOCS) + [
     ("POST", G, {"track_total_hits": -2}),
     ("DELETE", "/geo"),
     ("DELETE", "/edge"),
+])
+
+
+# Index management over index expressions (lists, wildcards, _all) and
+# the mapping/settings APIs apps call at startup and in migrations.
+def mk(name, props=None, settings=None):
+    body = {"settings": dict(STATIC, **(settings or {}))}
+    if props is not None:
+        body["mappings"] = {"properties": props}
+    return [("DELETE", f"/{name}"), ("PUT", f"/{name}", body)]
+
+
+scenario("index_management", mk("im-1", {"t": {"type": "text"}, "k": {"type": "keyword"}, "o": {"properties": {"n": {"type": "long"}}}})
+         + mk("im-2", {"t": {"type": "keyword"}}) + mk("im-x") + [
+    ("GET", "/im-1/_mapping"),
+    ("GET", "/im-x/_mapping"),
+    ("GET", "/im-1,im-2/_mapping"),
+    ("GET", "/im-*/_mapping"),
+    ("GET", "/im-nope/_mapping"),
+    ("GET", "/im-nope/_mapping?ignore_unavailable=true"),
+    ("GET", "/im-nope*/_mapping"),
+    ("GET", "/im-nope*/_mapping?allow_no_indices=false"),
+    ("GET", "/_mapping", None, {"pick": lambda r: sorted(k for k in r if k.startswith("im-"))}),
+    ("GET", "/_all/_mapping", None, {"pick": lambda r: sorted(k for k in r if k.startswith("im-"))}),
+    ("GET", "/im-1/_mapping/field/t"),
+    ("GET", "/im-1/_mapping/field/o.n,k"),
+    ("GET", "/im-1/_mapping/field/nope"),
+    ("GET", "/im-*/_mapping/field/t"),
+    ("GET", "/_mapping/field/k", None, {"pick": lambda r: {k: v for k, v in r.items() if k.startswith("im-")} if isinstance(r, dict) else r}),
+    ("GET", "/im-1/_mapping/field/*", None, {"pick": lambda r: sorted(r.get("im-1", {}).get("mappings", {}))}),
+    ("GET", "/im-1/_mapping/field/o.*"),
+    ("PUT", "/im-*/_mapping", {"properties": {"added": {"type": "integer"}}}),
+    ("GET", "/im-2,im-x/_mapping"),
+    ("PUT", "/im-1/_mapping", {"_doc": {"properties": {"z": {"type": "keyword"}}}}),
+    ("PUT", "/im-1/_mapping", {"properties": {"t": {"type": "keyword"}}}),
+    ("PUT", "/im-1/_mapping", {"properties": {"bad": {"type": "no_such_type"}}}),
+    ("PUT", "/im-q", {"mappings": {"properties": {"bad": {"type": "no_such_type"}}}}),
+    ("GET", "/im-1/_settings/index.number_of_shards"),
+    ("GET", "/im-1/_settings/index.number_of_*"),
+    ("GET", "/im-1,im-2/_settings/index.refresh_interval"),
+    ("GET", "/_settings/index.number_of_shards", None, {"pick": lambda r: {k: v for k, v in r.items() if k.startswith("im-")}}),
+    ("GET", "/im-1/_settings?include_defaults=true", None,
+     {"pick": lambda r: (r["im-1"]["settings"]["index"].get("refresh_interval"), r["im-1"].get("defaults", {}).get("index", {}).get("max_result_window"))}),
+    ("PUT", "/im-*/_settings", {"index": {"number_of_replicas": 0}}),
+    ("GET", "/im-2/_settings/index.number_of_replicas"),
+    ("PUT", "/im-1/_settings", {"index": {"number_of_shards": 3}}),
+    ("PUT", "/im-1/_settings", {"index": {"no_such_setting": 1}}),
+    ("PUT", "/im-1/_settings?preserve_existing=true", {"index": {"number_of_replicas": 2, "max_result_window": 500}}),
+    ("GET", "/im-1/_settings/index.number_of_replicas,index.max_result_window"),
+    ("PUT", "/im-1/_settings", {"index": {"max_result_window": None}}),
+    ("GET", "/im-1/_settings/index.max_result_window"),
+    ("PUT", "/_settings", {"index": {"number_of_replicas": 0}}, {"pick": lambda r: r}),
+    ("GET", "/im-1,im-2", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/im-*", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/im-nope"),
+    ("GET", "/im-nope?ignore_unavailable=true"),
+    ("GET", "/im-nope*"),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "im-2", "alias": "im-alias"}}]}),
+    ("DELETE", "/im-alias"),
+    ("DELETE", "/im-nope"),
+    ("DELETE", "/im-nope?ignore_unavailable=true"),
+    ("DELETE", "/im-1,im-2"),
+    ("GET", "/im-*", None, {"pick": lambda r: sorted(r)}),
+    ("DELETE", "/im-*"), ("DELETE", "/im-x"),
+    ("GET", "/im-*"),
 ])
 
 failures = 0

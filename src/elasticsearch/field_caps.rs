@@ -244,7 +244,7 @@ pub fn field_caps(
             if filters.iter().any(|f| f == "-multifield") && cap.multifield {
                 continue;
             }
-            if !types.is_empty() && !types.contains(&cap.ty) {
+            if !types.is_empty() && !types.contains(&cap.ty) && !parents.contains(&name) {
                 continue;
             }
             fields
