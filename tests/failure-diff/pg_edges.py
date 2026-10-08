@@ -890,4 +890,11 @@ PG_EDGES.update({
         "SELECT DISTINCT ON (id) id, name FROM dd ORDER BY id DESC",
         "SELECT DISTINCT ON (name) id FROM dd ORDER BY name, id",
     ),
+    "pg edge: ^ operand types": steps(
+        "CREATE TABLE en (the_integer bigint, the_float double precision, n numeric(10,2))",
+        "INSERT INTO en VALUES (42, 15.5, 2.5)",
+        "UPDATE en SET the_integer = (the_integer ^ 2), the_float = (the_float ^ 1.5) RETURNING *",
+        "SELECT pg_typeof(the_float ^ 1.5), pg_typeof(n ^ 2), pg_typeof(the_integer ^ n), pg_typeof(n ^ the_float), pg_typeof(2 ^ 3), pg_typeof(2.5::float4 ^ 2.0) FROM en",
+        "SELECT n ^ 3, 2 ^ 3, 10 ^ -2, 0 ^ 0 FROM en",
+    ),
 })
