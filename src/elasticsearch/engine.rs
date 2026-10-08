@@ -2790,14 +2790,14 @@ impl Engine {
                 }
                 let (status, mut res) = self.update("POST", ix, &id, &uq, data);
                 errors |= status >= 300;
-                let mut res = bulk_item(ix, &id, status, res);
+                let res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
             } else if action == "delete" {
                 let (status, mut res) = self.document_api("DELETE", ix, &id, "_doc", &item_q, b"");
                 errors |= status >= 300;
-                let mut res = bulk_item(ix, &id, status, res);
+                let res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
@@ -2807,7 +2807,7 @@ impl Engine {
                 let kind = if action == "create" { "_create" } else { "_doc" };
                 let (status, mut res) = self.document_api(verb, ix, &id, kind, &item_q, data);
                 errors |= status >= 300;
-                let mut res = bulk_item(ix, &id, status, res);
+                let res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));

@@ -518,10 +518,14 @@ fn settings_are_normalized_and_path_segments_percent_decoded() {
         r#"{"settings":{"number_of_replicas":0,"index.refresh_interval":"5s"}}"#,
     );
     let (_, body) = call(&engine, "GET", "/s1/_settings", "");
-    assert_eq!(
-        body["s1"]["settings"]["index"],
-        json!({"number_of_shards":"1","number_of_replicas":"0","refresh_interval":"5s"})
-    );
+    let index = &body["s1"]["settings"]["index"];
+    assert_eq!(index["number_of_shards"], "1");
+    assert_eq!(index["number_of_replicas"], "0");
+    assert_eq!(index["refresh_interval"], "5s");
+    // Generated at creation, as Elasticsearch does.
+    assert_eq!(index["provided_name"], "s1");
+    assert_eq!(index["version"]["created"], "8512000");
+    assert_eq!(index["uuid"].as_str().map(str::len), Some(22));
     // Single node, no replicas wanted: green.
     let (status, health) = engine.dispatch("GET", "/_cluster/health", "wait_for_status=green", b"");
     assert_eq!(status, 200);
