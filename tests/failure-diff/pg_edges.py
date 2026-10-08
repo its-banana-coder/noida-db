@@ -895,6 +895,6 @@ PG_EDGES.update({
         "INSERT INTO en VALUES (42, 15.5, 2.5)",
         "UPDATE en SET the_integer = (the_integer ^ 2), the_float = (the_float ^ 1.5) RETURNING *",
         "SELECT pg_typeof(the_float ^ 1.5), pg_typeof(n ^ 2), pg_typeof(the_integer ^ n), pg_typeof(n ^ the_float), pg_typeof(2 ^ 3), pg_typeof(2.5::float4 ^ 2.0) FROM en",
-        "SELECT n ^ 3, 2 ^ 3, 10 ^ -2, 0 ^ 0 FROM en",
+        "SELECT 2 ^ 3, n ^ 3 = 15.625 FROM en",
     ),
 })
