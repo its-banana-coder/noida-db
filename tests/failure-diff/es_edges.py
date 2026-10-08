@@ -292,6 +292,118 @@ scenario("highlight_long", setup("long", LONG_MAPPING, LONG_DOCS) + [
 ])
 
 
+# Highlighting beyond the basics: highlighter types, tag schemas,
+# encoders, per-field queries, multi-fields, boundary scanners, nested
+# inner hits and the errors apps hit.
+HLM_DOCS = [
+    {"title": "The quick brown fox", "tags": ["fox", "animal"], "num": 42, "k": "abc", "kk": "abcdef",
+     "html": "<b>Fish & chips</b> are quick to cook",
+     "body": "The quick brown fox jumps over the lazy dog. Foxes are quick and clever animals! "
+             "Did you know a fox can run fast? The brown fox lives in the forest near the river, "
+             "where quick streams flow and the lazy dog never goes because it is far too lazy.",
+     "multi": ["first quick value", "second slow value", "third quick one here"],
+     "comments": [{"author": "ann", "text": "quick reply here"}, {"author": "bob", "text": "a slow answer"},
+                  {"author": "cy", "text": "another quick note"}]},
+    {"title": "Lazy dogs and quick cats", "tags": ["dog"], "num": 7, "k": "xyz", "kk": "x",
+     "html": "quick <i>tags</i>", "body": "Nothing about foxes here, only quick cats and lazy dogs.",
+     "multi": ["slow"], "comments": [{"author": "dan", "text": "nothing"}]},
+]
+HLM_MAPPING = {"settings": STATIC,
+               "mappings": {"properties": {
+    "title": {"type": "text", "fields": {"raw": {"type": "keyword"}, "std": {"type": "text"}}},
+    "body": {"type": "text"}, "tags": {"type": "keyword"}, "num": {"type": "integer"},
+    "k": {"type": "keyword"}, "kk": {"type": "keyword", "ignore_above": 3}, "html": {"type": "text"},
+    "multi": {"type": "text"}, "tv": {"type": "text", "term_vector": "with_positions_offsets"},
+    "comments": {"type": "nested", "properties": {"author": {"type": "keyword"}, "text": {"type": "text"}}},
+}}}
+for d in HLM_DOCS:
+    d["tv"] = d["title"]
+HM = "/hl-m/_search"
+def hl(q, h, **kw):
+    b = {"query": q, "highlight": h}
+    b.update(kw)
+    return ("POST", HM, b, {"pick": HL})
+scenario("highlight_more", setup("hl-m", HLM_MAPPING, HLM_DOCS) + [
+    hl({"multi_match": {"query": "quick fox", "fields": ["t*"]}}, {"fields": {"*": {}}}),
+    hl({"multi_match": {"query": "quick fox", "fields": ["title*"]}}, {"fields": {"title*": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"*": {}}}),
+    hl({"match_phrase": {"body": "quick brown fox"}}, {"fields": {"body": {}}}),
+    hl({"match_phrase": {"body": "quick brown fox"}}, {"fields": {"body": {"type": "plain"}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"body": "quick fox"}}, {"tags_schema": "styled", "fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"body": "quick fox"}}, {"pre_tags": ["<a>", "<b>"], "post_tags": ["</a>", "</b>"], "fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"html": "quick fish"}}, {"encoder": "html", "fields": {"html": {}}}),
+    hl({"match": {"html": "quick fish"}}, {"fields": {"html": {}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"number_of_fragments": 0}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"number_of_fragments": 1}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"type": "plain"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"no_match_size": 20}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"no_match_size": 20, "number_of_fragments": 0}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"highlight_query": {"match": {"title": "fox"}}}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"matched_fields": ["title", "title.std"]}}}),
+    hl({"match": {"title.std": "quick"}}, {"fields": {"title": {"matched_fields": ["title", "title.std"]}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"fragment_size": 30, "boundary_scanner": "word"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"fragment_size": 30, "boundary_scanner": "sentence"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"type": "plain", "fragment_size": 30}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"type": "plain", "fragment_size": 30, "number_of_fragments": 2}}}),
+    hl({"match": {"body": "lazy"}}, {"fields": {"body": {"type": "plain", "number_of_fragments": 0}}}),
+    hl({"match": {"body": "river"}}, {"fields": {"body": {}}}),
+    hl({"match": {"body": "river"}}, {"max_analyzed_offset": 20, "fields": {"body": {}}}),
+    hl({"match": {"body": "river"}}, {"max_analyzed_offset": -1, "fields": {"body": {}}}),
+    hl({"match": {"tv": "quick"}}, {"fields": {"tv": {"type": "fvh"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"type": "fvh"}}}),
+    hl({"term": {"k": "abc"}}, {"fields": {"k": {}}}),
+    hl({"term": {"num": 42}}, {"fields": {"num": {}}}),
+    hl({"prefix": {"kk": "ab"}}, {"fields": {"kk": {}}}),
+    hl({"match": {"title": "quick"}}, {"pre_tags": [], "post_tags": [], "fields": {"title": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": [{"title": {}}, {"body": {}}]}),
+    hl({"fuzzy": {"title": {"value": "quikc"}}}, {"fields": {"title": {}}}),
+    hl({"match": {"title": {"query": "quick lazy", "operator": "and"}}}, {"fields": {"title": {}}}),
+    hl({"bool": {"must": {"match": {"title": "quick"}}, "must_not": {"match": {"title": "cats"}}}}, {"fields": {"title": {}}}),
+    hl({"query_string": {"query": "qui*"}}, {"fields": {"title": {}, "body": {"number_of_fragments": 1}}}),
+    hl({"match": {"body": "quick"}}, {"order": "score", "fields": {"body": {"fragment_size": 40, "number_of_fragments": 2}}}),
+    hl({"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}},
+                   "inner_hits": {"highlight": {"fields": {"comments.text": {}}}}}}, {"fields": {"title": {}}}),
+    ("POST", HM, {"query": {"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}},
+                                       "inner_hits": {"_source": False, "highlight": {"fields": {"comments.text": {}}}}}}},
+     {"pick": lambda r: [(h["_id"], h.get("inner_hits")) for h in r["hits"]["hits"]]}),
+    hl({"match": {"title": "quick"}}, {"type": "nope", "fields": {"title": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"fragmenter": "simple", "type": "plain", "fragment_size": 10}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"fragmenter": "nope", "type": "plain"}}}),
+    hl({"match": {"html": "quick fish"}}, {"encoder": "html", "fields": {"html": {"type": "plain"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"type": "plain", "no_match_size": 20}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"type": "plain", "number_of_fragments": 0}}}),
+    hl({"match": {"multi": "quick value"}}, {"order": "score", "fields": {"multi": {"type": "plain"}}}),
+    hl({"terms": {"tags": ["fox", "dog"]}}, {"fields": {"tags": {"type": "plain"}}}),
+    hl({"match": {"body": "quick lazy"}}, {"fields": {"body": {"type": "plain", "fragment_size": 50, "number_of_fragments": 3, "order": "score"}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"type": "plain", "fragment_size": 20}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"type": "plain", "fragment_size": 20, "number_of_fragments": 2}}}),
+    hl({"match": {"multi": "quick value"}}, {"fields": {"multi": {"type": "plain", "number_of_fragments": 1}}}),
+    hl({"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}}}}, {"fields": {"*": {}}}),
+    hl({"bool": {"should": [{"match_phrase": {"body": "lazy dog"}},
+                            {"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}}}}]}},
+       {"fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match_phrase": {"title": "quick brown"}}, {"fields": {"title": {}, "title.std": {}, "tv": {"type": "fvh"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"boundary_scanner": "chars"}}}),
+    hl({"match": {"body": "fox"}}, {"tags_schema": "nope", "fields": {"body": {}}}),
+    hl({"match": {"body": "fox"}}, {"pre_tags": ["<x>"], "fields": {"body": {}}}),
+    hl({"match": {"title": "quick"}}, {"require_field_match": False, "fields": {"title": {"matched_fields": ["title.std"]}}}),
+    ("DELETE", "/hl-m"),
+] + setup("hl-o", {"settings": {"index": {"refresh_interval": "-1", "highlight.max_analyzed_offset": 30}},
+                   "mappings": {"properties": {"f": {"type": "text"}, "g": {"type": "text", "index_options": "offsets"}}}},
+          [{"f": "The quick brown fox went to the forest and saw another fox.",
+            "g": "The quick brown fox went to the forest and saw another fox."}]) + [
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"fields": {"f": {"type": "plain"}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"g": "fox"}}, "highlight": {"fields": {"g": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 20, "fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 18, "fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"g": "fox"}}, "highlight": {"max_analyzed_offset": 20, "fields": {"g": {"type": "plain"}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 50, "fields": {"f": {}}}}, {"pick": HL}),
+    ("DELETE", "/hl-o"),
+])
+
 # Suggesters: term ("did you mean"), phrase, and completion (autocomplete)
 # with weights, fuzzy, regex and category/geo contexts.
 SUG_DOCS = [
@@ -994,9 +1106,9 @@ for name, steps in SCENARIOS.items():
         if a == b:
             print(f"  ok   {i:2} {label}")
             if os.environ.get("ES_EDGES_VERBOSE"):
-                print(f"         both: {json.dumps(a)[:600]}")
+                print(f"         both: {json.dumps(a)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}")
         else:
             failures += 1
-            print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:600]}\n        noida: {json.dumps(b)[:600]}")
+            print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}\n        noida: {json.dumps(b)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}")
 print(f"\n{failures} differing steps")
 sys.exit(min(failures, 100))

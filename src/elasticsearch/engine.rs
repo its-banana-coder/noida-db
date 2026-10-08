@@ -976,7 +976,10 @@ impl Engine {
             );
             return (200, resp);
         }
-        match search::search_typed(&mappings, &docs, &req, typed) {
+        let settings =
+            if names.len() == 1 { s.indices[&names[0]].settings.clone() } else { Value::Null };
+        let opts = search::SearchOptions { typed, settings, ..Default::default() };
+        match search::search_with(&mappings, &docs, &req, &opts) {
             Ok(mut resp) => {
                 if q.get("typed_keys").is_some_and(|v| v == "true") {
                     suggest::type_keys(&req, &mut resp);
