@@ -13,7 +13,16 @@ use super::search::{CommittedDoc, EsError, raw_values, resolve_field};
 enum Key {
     Score,
     Doc,
-    Field { path: String, ty: Option<String> },
+    Field {
+        path: String,
+        ty: Option<String>,
+    },
+    /// `_geo_distance`: from `origin` (lat, lon), in meters per `unit`.
+    Geo {
+        path: String,
+        origin: (f64, f64),
+        unit_m: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +85,27 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
             ));
         }
         let key = match field.as_str() {
+            "_geo_distance" => {
+                let o = opts.as_object().cloned().unwrap_or_default();
+                let skip = ["order", "unit", "mode", "distance_type", "ignore_unmapped", "nested"];
+                let (path, point) = o
+                    .iter()
+                    .find(|(k, _)| !skip.contains(&k.as_str()))
+                    .ok_or_else(|| EsError::parsing("[_geo_distance] requires a field"))?;
+                // One point, or the first of several origins.
+                let point = match point {
+                    Value::Array(a) if !a.iter().all(Value::is_number) => {
+                        a.first().cloned().unwrap_or_default()
+                    }
+                    p => p.clone(),
+                };
+                let origin = super::queries::parse_point(&point)
+                    .ok_or_else(|| EsError::parsing("[_geo_distance] failed to parse point"))?;
+                let unit = o.get("unit").and_then(Value::as_str).unwrap_or("m");
+                let unit_m = super::queries::unit_meters(unit)
+                    .ok_or_else(|| EsError::parsing(&format!("No distance unit match [{unit}]")))?;
+                Key::Geo { path: path.clone(), origin, unit_m }
+            }
             "_score" => Key::Score,
             "_doc" | "_shard_doc" => Key::Doc,
             f => {
@@ -197,6 +227,13 @@ pub fn keys(specs: &[SortSpec], doc: &CommittedDoc, doc_idx: usize, score: f32) 
         .map(|s| match &s.key {
             Key::Score => json!(score),
             Key::Doc => json!(doc_idx),
+            Key::Geo { path, origin, unit_m } => {
+                let mode_max = s.mode.as_deref() == Some("max") || (s.mode.is_none() && s.desc);
+                match super::queries::sort_distance(doc, path, *origin, *unit_m, mode_max) {
+                    Some(d) => json!(d),
+                    None => Value::Null,
+                }
+            }
             Key::Field { path, ty } => {
                 let ty = ty.as_deref();
                 let mut vals: Vec<Value> = raw_values(&doc.source, path)

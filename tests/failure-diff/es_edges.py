@@ -714,6 +714,92 @@ scenario("field_caps_msearch", [
     ("DELETE", "/fc-1"), ("DELETE", "/fc-2"),
 ])
 
+
+# Query DSL beyond the basics: what relevance tuning, autocomplete and
+# location features send.
+GEO_MAPPING = {
+    "settings": STATIC,
+    "mappings": {"properties": {
+        "title": {"type": "text", "fields": {"raw": {"type": "keyword"}}},
+        "body": {"type": "text"},
+        "price": {"type": "integer"},
+        "tags": {"type": "keyword"},
+        "date": {"type": "date"},
+        "status": {"type": "keyword"},
+        "loc": {"type": "geo_point"},
+    }},
+}
+GEO_DOCS = [dict(d, loc=l) for d, l in zip(DOCS, [
+    {"lat": 52.52, "lon": 13.405}, "48.8566,2.3522", [-0.1276, 51.5072],
+    {"lat": 40.4168, "lon": -3.7038}, "41.9028, 12.4964"])]
+G = "/geo/_search"
+
+
+def ids_scores(r):
+    return [(h["_id"], round(h["_score"], 3) if h.get("_score") is not None else None)
+            for h in r["hits"]["hits"]]
+
+
+scenario("query_dsl_more", setup("geo", GEO_MAPPING, GEO_DOCS) + [
+    ("POST", G, {"query": {"match_phrase_prefix": {"title": "quick br"}}}, {"pick": ids}),
+    ("POST", G, {"query": {"match_phrase_prefix": {"title": {"query": "brown b", "max_expansions": 10}}}}, {"pick": ids}),
+    ("POST", G, {"query": {"match_phrase_prefix": {"body": "the"}}}, {"pick": ids}),
+    ("POST", G, {"query": {"match_bool_prefix": {"title": "quick br"}}}, {"pick": ids}),
+    ("POST", G, {"query": {"match_bool_prefix": {"title": {"query": "fox quick", "operator": "and"}}}}, {"pick": ids}),
+    ("POST", G, {"query": {"boosting": {"positive": {"match": {"title": "brown"}},
+                                        "negative": {"term": {"tags": "wild"}},
+                                        "negative_boost": 0.5}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"function_score": {"query": {"match": {"title": "brown"}},
+                                              "field_value_factor": {"field": "price", "factor": 1.2, "modifier": "sqrt", "missing": 1}}}},
+     {"pick": ids_scores}),
+    ("POST", G, {"query": {"function_score": {"query": {"match_all": {}},
+                                              "functions": [{"filter": {"term": {"status": "active"}}, "weight": 3},
+                                                            {"filter": {"term": {"tags": "animal"}}, "weight": 2}],
+                                              "score_mode": "sum", "boost_mode": "replace"}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"function_score": {"query": {"match": {"body": "quick"}},
+                                              "functions": [{"field_value_factor": {"field": "price"}}],
+                                              "boost_mode": "sum", "max_boost": 20}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"function_score": {"functions": [{"gauss": {"price": {"origin": 20, "scale": 10, "decay": 0.5}}}]}}},
+     {"pick": ids_scores}),
+    ("POST", G, {"query": {"function_score": {"functions": [{"exp": {"date": {"origin": "2024-03-01", "scale": "30d"}}}],
+                                              "boost_mode": "replace"}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"function_score": {"functions": [{"linear": {"price": {"origin": 0, "scale": 20, "offset": 5}}}],
+                                              "score_mode": "max", "boost_mode": "replace", "min_score": 0.5}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"script_score": {"query": {"match": {"title": "brown"}},
+                                            "script": {"source": "_score * doc['price'].value"}}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"script_score": {"query": {"match_all": {}},
+                                            "script": {"source": "doc['price'].value / params.d", "params": {"d": 5}},
+                                            "min_score": 3}}}, {"pick": ids_scores}),
+    ("POST", G, {"query": {"script_score": {"query": {"match_all": {}}, "script": "-1"}}}),
+    ("POST", G, {"query": {"combined_fields": {"query": "quick fox", "fields": ["title", "body"]}}}, {"pick": ids}),
+    ("POST", G, {"query": {"combined_fields": {"query": "quick fox", "fields": ["title", "body"], "operator": "and"}}}, {"pick": ids}),
+    ("POST", G, {"query": {"geo_distance": {"distance": "1200km", "loc": {"lat": 50.0, "lon": 8.0}}}}, {"pick": ids}),
+    ("POST", G, {"query": {"geo_distance": {"distance": "900km", "loc": "48.0,3.0"}}}, {"pick": ids}),
+    ("POST", G, {"query": {"geo_bounding_box": {"loc": {"top_left": {"lat": 53, "lon": -1}, "bottom_right": {"lat": 45, "lon": 14}}}}}, {"pick": ids}),
+    ("POST", G, {"sort": [{"_geo_distance": {"loc": {"lat": 48.8, "lon": 2.3}, "order": "asc", "unit": "km"}}]},
+     {"pick": lambda r: [(h["_id"], [round(x, 1) for x in h["sort"]]) for h in r["hits"]["hits"]]}),
+    ("POST", G, {"query": {"bool": {"should": [{"match": {"title": {"query": "quick", "_name": "q_title"}}},
+                                               {"term": {"tags": {"value": "pet", "_name": "q_pet"}}},
+                                               {"range": {"price": {"gte": 30, "_name": "pricey"}}}]}}},
+     {"pick": lambda r: sorted((h["_id"], sorted(h.get("matched_queries", []))) for h in r["hits"]["hits"])}),
+    ("POST", G, {"query": {"bool": {"filter": [{"term": {"status": "active"}}], "_name": "outer"}}},
+     {"pick": lambda r: sorted((h["_id"], h.get("matched_queries")) for h in r["hits"]["hits"])}),
+    ("POST", G, {"collapse": {"field": "status"}, "sort": [{"price": "asc"}]},
+     {"pick": lambda r: [(h["_id"], h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("POST", G, {"collapse": {"field": "status", "inner_hits": {"name": "same", "size": 2, "sort": [{"price": "desc"}]}},
+                 "sort": [{"price": "desc"}]},
+     {"pick": lambda r: [(h["_id"], [x["_id"] for x in h.get("inner_hits", {}).get("same", {}).get("hits", {}).get("hits", [])]) for h in r["hits"]["hits"]]}),
+    ("POST", G, {"collapse": {"field": "body"}}),
+] + setup() + [
+    ("POST", "/geo,edge/_search", {"indices_boost": [{"geo": 2.0}], "query": {"match": {"title": "brown"}}},
+     {"pick": lambda r: [(h["_index"], h["_id"]) for h in r["hits"]["hits"]]}),
+    ("POST", G, {"from": -1}),
+    ("POST", G, {"terminate_after": -1}),
+    ("POST", G, {"track_total_hits": -2}),
+    ("DELETE", "/geo"),
+    ("DELETE", "/edge"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:
