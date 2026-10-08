@@ -1220,17 +1220,18 @@ impl<'a> Binder<'a> {
                     ),
                 ))
             }
-            Expr::Sub { kind, query } => {
-                if query_has_outer_ref(&query, 1) {
-                    return Err(unsupported("outer references from a subquery in a grouped query"));
-                }
+            // A correlated subquery reads the grouped row: its references to
+            // this query's columns become references to their group keys.
+            Expr::Sub { kind, mut query } => {
+                self.regroup_outer(&mut query, keys)?;
                 Ok(Expr::Sub { kind, query })
             }
-            Expr::InSub { left, op, query, all, negated } => {
+            Expr::InSub { left, op, mut query, all, negated } => {
                 let left = left
                     .into_iter()
                     .map(|l| self.regroup(l, keys, nagg))
                     .collect::<PgResult<Vec<_>>>()?;
+                self.regroup_outer(&mut query, keys)?;
                 Ok(Expr::InSub { left, op, query, all, negated })
             }
             mut other => {
@@ -1249,6 +1250,44 @@ impl<'a> Binder<'a> {
                     None => Ok(other),
                 }
             }
+        }
+    }
+
+    /// Points a subquery's references to this (grouped) query's input
+    /// columns at the group keys; an ungrouped one is Postgres's 42803.
+    fn regroup_outer(&self, q: &mut Query, keys: &[Expr]) -> PgResult<()> {
+        let mut err = None;
+        map_query_exprs(q, 0, &mut |e, level| {
+            if err.is_some() {
+                return;
+            }
+            if let Expr::Outer(d, i) = e
+                && *d == level + 1
+            {
+                match keys.iter().position(|k| *k == Expr::Col(*i)) {
+                    Some(p) => *i = p,
+                    None => {
+                        let i = *i;
+                        let name = self
+                            .scopes
+                            .last()
+                            .and_then(|s| s.cols.iter().find(|c| c.idx == i))
+                            .map(|c| match &c.rel {
+                                Some(r) => format!("{r}.{}", c.name),
+                                None => c.name.clone(),
+                            })
+                            .unwrap_or_else(|| "?".into());
+                        err = Some(PgError::new(
+                            code::GROUPING_ERROR,
+                            format!("subquery uses ungrouped column \"{name}\" from outer query"),
+                        ));
+                    }
+                }
+            }
+        });
+        match err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -5507,78 +5546,91 @@ fn expr_has_srf(e: &Expr) -> bool {
     e.contains(&|x| matches!(x, Expr::Call { name, .. } if sigs::kind_of(name) == Some(Kind::Srf)))
 }
 
-/// Whether a plan reads a column from `depth` levels out.
-fn query_has_outer_ref(q: &Query, depth: usize) -> bool {
-    let mut found = false;
-    visit_query_exprs(q, &mut |e, level| {
-        if let Expr::Outer(d, _) = e
-            && *d == depth + level
-        {
-            found = true;
-        }
-    });
-    found
-}
-
-fn visit_query_exprs(q: &Query, f: &mut dyn FnMut(&Expr, usize)) {
-    fn walk_expr(e: &Expr, level: usize, f: &mut dyn FnMut(&Expr, usize)) {
+/// Calls `f` on every expression of `q` (and its subqueries), mutably,
+/// with how many subquery levels below `q` it sits (`level`).
+fn map_query_exprs(q: &mut Query, level: usize, f: &mut dyn FnMut(&mut Expr, usize)) {
+    fn walk(e: &mut Expr, level: usize, f: &mut dyn FnMut(&mut Expr, usize)) {
         f(e, level);
         match e {
-            Expr::Sub { query, .. } => visit_at(query, level + 1, f),
+            Expr::Sub { query, .. } => map_query_exprs(query, level + 1, f),
             Expr::InSub { query, left, .. } => {
                 for l in left {
-                    walk_expr(l, level, f);
+                    walk(l, level, f);
                 }
-                visit_at(query, level + 1, f);
+                map_query_exprs(query, level + 1, f);
             }
-            _ => {
-                let mut cl = e.clone();
-                cl.children_mut(&mut |c| walk_expr(c, level, f));
-            }
+            _ => e.children_mut(&mut |c| walk(c, level, f)),
         }
     }
-    fn visit_at(q: &Query, level: usize, f: &mut dyn FnMut(&Expr, usize)) {
-        match q {
-            Query::Select(s) => {
-                for e in s.proj.iter().chain(s.filter.iter()).chain(s.having.iter()) {
-                    walk_expr(e, level, f);
-                }
-                if let Some(g) = &s.group {
-                    for e in g {
-                        walk_expr(e, level, f);
-                    }
-                }
-                for agg in &s.aggs {
-                    for e in &agg.args {
-                        walk_expr(e, level, f);
-                    }
+    fn walk_from(fr: &mut From, level: usize, f: &mut dyn FnMut(&mut Expr, usize)) {
+        match fr {
+            From::Sub(q) => map_query_exprs(q, level + 1, f),
+            From::Func { args, .. } => args.iter_mut().for_each(|a| walk(a, level, f)),
+            From::Join { left, right, on, .. } => {
+                walk_from(left, level, f);
+                walk_from(right, level, f);
+                if let Some(o) = on {
+                    walk(o, level, f);
                 }
             }
-            Query::Values { rows, .. } => {
-                for r in rows {
-                    for e in r {
-                        walk_expr(e, level, f);
-                    }
-                }
-            }
-            Query::SetOp { left, right, .. } => {
-                visit_at(left, level, f);
-                visit_at(right, level, f);
-            }
-            Query::With { ctes, body } => {
-                for c in ctes {
-                    visit_at(&c.query, level, f);
-                }
-                visit_at(body, level, f);
-            }
-            Query::Recursive { seed, step, .. } => {
-                visit_at(seed, level, f);
-                visit_at(step, level, f);
-            }
-            Query::Dml(_) => {}
+            _ => {}
         }
     }
-    visit_at(q, 0, f);
+    match q {
+        Query::Select(s) => {
+            walk_from(&mut s.from, level, f);
+            let s = &mut **s;
+            for e in s
+                .proj
+                .iter_mut()
+                .chain(s.filter.iter_mut())
+                .chain(s.having.iter_mut())
+                .chain(s.limit.iter_mut())
+                .chain(s.offset.iter_mut())
+            {
+                walk(e, level, f);
+            }
+            for e in s.group.iter_mut().flatten() {
+                walk(e, level, f);
+            }
+            for agg in &mut s.aggs {
+                for e in agg.args.iter_mut().chain(agg.filter.iter_mut()) {
+                    walk(e, level, f);
+                }
+                for (e, ..) in &mut agg.order {
+                    walk(e, level, f);
+                }
+            }
+            for w in &mut s.windows {
+                for e in w.args.iter_mut().chain(w.partition.iter_mut()) {
+                    walk(e, level, f);
+                }
+                for (e, ..) in &mut w.order {
+                    walk(e, level, f);
+                }
+            }
+        }
+        Query::Values { rows, .. } => {
+            for e in rows.iter_mut().flatten() {
+                walk(e, level, f);
+            }
+        }
+        Query::SetOp { left, right, .. } => {
+            map_query_exprs(left, level, f);
+            map_query_exprs(right, level, f);
+        }
+        Query::With { ctes, body } => {
+            for c in ctes {
+                map_query_exprs(&mut c.query, level, f);
+            }
+            map_query_exprs(body, level, f);
+        }
+        Query::Recursive { seed, step, .. } => {
+            map_query_exprs(seed, level, f);
+            map_query_exprs(step, level, f);
+        }
+        _ => {}
+    }
 }
 
 fn attach_tail(q: Query, order: Vec<SortKey>, limit: Option<Expr>, offset: Option<Expr>) -> Query {
