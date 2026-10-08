@@ -118,8 +118,32 @@ pub fn lookup(name: &str) -> Option<Zone> {
     }
     let zone = load_tzif(trimmed).map(|i| Zone::Tzif(Arc::new(i)));
     let zone = zone.or_else(|| abbrev_offset(&lower).map(Zone::Fixed));
+    // A POSIX TZ string: `UTC-05:00`, `EST5`, `EST5EDT,M3.2.0,M11.1.0`,
+    // `<+0530>-05:30` (offsets west of Greenwich, so UTC-05:00 is +5).
+    let zone = zone.or_else(|| posix_zone(trimmed));
     cache.lock().unwrap().insert(lower, zone.clone());
     zone
+}
+
+/// `lookup` for `AT TIME ZONE` / `timezone()` / `date_trunc(.., zone)`,
+/// where Postgres reads a bare `+05` as a POSIX offset (west positive):
+/// `ts AT TIME ZONE '+05'` is UTC-5. (`SET TIME ZONE '+05'` and literals
+/// read it as ISO, east.)
+pub fn lookup_posix(name: &str) -> Option<Zone> {
+    match parse_iso_offset(name.trim()) {
+        Some(o) => Some(Zone::Fixed(-o)),
+        None => lookup(name),
+    }
+}
+
+fn posix_zone(s: &str) -> Option<Zone> {
+    let p = PosixTz::parse(s)?;
+    Some(match p.dst {
+        None => Zone::Fixed(p.std_off),
+        Some(_) => {
+            Zone::Tzif(Arc::new(TzInfo { transitions: vec![], types: vec![], footer: Some(p) }))
+        }
+    })
 }
 
 /// Common abbreviations Postgres knows by default.

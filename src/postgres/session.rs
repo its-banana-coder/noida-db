@@ -255,7 +255,7 @@ impl Settings {
         let l = name.to_ascii_lowercase();
         if l == "all" {
             self.values = self.session_defaults.clone();
-            self.zone = tz::lookup(&self.values["TimeZone"]).unwrap_or(Zone::utc());
+            self.zone = tz::lookup_posix(&self.values["TimeZone"]).unwrap_or(Zone::utc());
             return Ok(None);
         }
         let c = canonical(&l).ok_or_else(|| unrecognized(name))?;
@@ -299,7 +299,28 @@ impl Settings {
         }
         Ok(match name {
             "TimeZone" => {
-                let z = tz::lookup(value).ok_or_else(|| bad(value))?;
+                // A plain number is hours east of UTC, kept as a POSIX name
+                // (`5` -> `<+05>-05`), as Postgres's check_timezone does.
+                if let Ok(h) = value.trim().parse::<f64>()
+                    && h.is_finite()
+                {
+                    let secs = (h * 3600.0).round() as i32;
+                    let hm = |v: i32| {
+                        let v = v.abs();
+                        let (hh, mm, ss) = (v / 3600, v / 60 % 60, v % 60);
+                        match (mm, ss) {
+                            (0, 0) => format!("{hh:02}"),
+                            (_, 0) => format!("{hh:02}:{mm:02}"),
+                            _ => format!("{hh:02}:{mm:02}:{ss:02}"),
+                        }
+                    };
+                    let (east, west) = if secs >= 0 { ('+', '-') } else { ('-', '+') };
+                    self.zone = tz::Zone::Fixed(secs);
+                    return Ok(format!("<{east}{}>{west}{}", hm(secs), hm(secs)));
+                }
+                // Otherwise a zone name, abbreviation or POSIX string
+                // (`+05:30` there is west of Greenwich).
+                let z = tz::lookup_posix(value).ok_or_else(|| bad(value))?;
                 self.zone = z;
                 let l = value.to_ascii_lowercase();
                 if l == "utc" || l == "z" {
