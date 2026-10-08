@@ -432,6 +432,24 @@ impl Engine {
                     .unwrap_or_else(|| segments[0].to_string())
             }
         };
+        // Single-document ops through an alias need one target index.
+        let single_doc = match segments.get(1).copied() {
+            Some("_doc" | "_create" | "_update") if segments.len() == 3 => true,
+            Some("_doc") => method == "POST" && segments.len() == 2,
+            Some("_source" | "_explain" | "_termvectors") => segments.len() == 3,
+            _ => false,
+        };
+        let index_name = if single_doc {
+            let write = matches!(method, "PUT" | "POST" | "DELETE")
+                && matches!(segments[1], "_doc" | "_create" | "_update");
+            let s = self.0.lock().unwrap();
+            match Self::single_target(&s, segments[0], write) {
+                Ok(t) => t,
+                Err(e) => return e,
+            }
+        } else {
+            index_name
+        };
         let index_name = index_name.as_str();
         if q.get("require_alias").is_some_and(|v| v.is_empty() || v == "true")
             && matches!(segments.get(1).copied(), Some("_doc" | "_create" | "_update"))
@@ -547,20 +565,57 @@ impl Engine {
 
     /// The index a single-document write to `name` goes to: the index
     /// itself, or an alias's write index (or only index).
-    fn write_target(&self, name: &str) -> String {
+    fn write_target(&self, name: &str) -> Result<String, (u16, Value)> {
         let s = self.0.lock().unwrap();
+        Self::single_target(&s, name, true)
+    }
+
+    /// The one index a single-document op on `name` reaches: the index
+    /// itself, or for an alias its write index (writes) or its only index
+    /// (reads), with Elasticsearch's errors otherwise.
+    fn single_target(s: &State, name: &str, write: bool) -> Result<String, (u16, Value)> {
         if s.indices.contains_key(name) {
-            return name.to_string();
+            return Ok(name.to_string());
         }
         let mut with: Vec<(&String, &Index)> =
             s.indices.iter().filter(|(_, i)| i.aliases.contains_key(name)).collect();
-        with.sort_by(|a, b| a.0.cmp(b.0));
-        if let Some((n, _)) = with.iter().find(|(_, i)| {
-            i.aliases[name].get("is_write_index").and_then(Value::as_bool) == Some(true)
-        }) {
-            return n.to_string();
+        if with.is_empty() {
+            return Ok(name.to_string());
         }
-        with.first().map(|(n, _)| n.to_string()).unwrap_or_else(|| name.to_string())
+        with.sort_by(|a, b| a.0.cmp(b.0));
+        let flag = |i: &Index| i.aliases[name].get("is_write_index").and_then(Value::as_bool);
+        if write {
+            if let Some((n, _)) = with.iter().find(|(_, i)| flag(i) == Some(true)) {
+                return Ok(n.to_string());
+            }
+            if with.len() == 1 && flag(with[0].1) != Some(false) {
+                return Ok(with[0].0.to_string());
+            }
+            return Err((
+                400,
+                error(
+                    "illegal_argument_exception",
+                    &format!(
+                        "no write index is defined for alias [{name}]. The write index may be explicitly disabled using is_write_index=false or the alias points to multiple indices without one being designated as a write index"
+                    ),
+                    400,
+                ),
+            ));
+        }
+        if with.len() == 1 {
+            return Ok(with[0].0.to_string());
+        }
+        let list = with.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ");
+        Err((
+            400,
+            error(
+                "illegal_argument_exception",
+                &format!(
+                    "alias [{name}] has more than one index associated with it [{list}], can't execute a single index op"
+                ),
+                400,
+            ),
+        ))
     }
 
     /// `GET|POST [/<index>]/_field_caps?fields=...`.
@@ -932,7 +987,16 @@ impl Engine {
                     .collect(),
             );
         }
+        let scroll_param = q
+            .get("scroll")
+            .cloned()
+            .or_else(|| req.get("scroll").and_then(Value::as_str).map(str::to_string));
         let mut s = self.0.lock().unwrap();
+        if let Err(e) =
+            validate_scroll_and_slice(&s, index_pattern, &req, q, scroll_param.as_deref())
+        {
+            return e;
+        }
         let now = std::time::Instant::now();
         s.contexts.retain(|_, c| c.expires > now);
         if let Some(pit) = req.get("pit") {
@@ -956,8 +1020,10 @@ impl Engine {
             let ContextKind::Pit { mappings, docs } = &ctx.kind else {
                 return context_missing(&id);
             };
+            let (mappings, docs) = (mappings.clone(), docs.clone());
             let opts = search::SearchOptions { typed: true, pit: true, ..Default::default() };
-            return match search::search_with(mappings, docs, &req, &opts) {
+            let docs = sliced(&s, docs, &req);
+            return match search::search_with(&mappings, &docs, &req, &opts) {
                 Ok(mut resp) => {
                     resp["pit_id"] = json!(id);
                     (200, resp)
@@ -1010,7 +1076,12 @@ impl Engine {
                 Ok(cs) => cs.into_iter().sum(),
                 Err(e) => return (e.status, e.to_json()),
             };
-            let shards = names.len().max(1);
+            let shards: u64 = names
+                .iter()
+                .filter_map(|n| s.indices.get(n))
+                .map(|i| shard_counts(i).0.max(1))
+                .sum::<u64>()
+                .max(1);
             return (
                 200,
                 json!({"count": total, "_shards": {"total": shards, "successful": shards, "skipped": 0, "failed": 0}}),
@@ -1047,11 +1118,12 @@ impl Engine {
             }
             (json!({"properties": props}), docs, !names.is_empty())
         };
-        let scroll = q
-            .get("scroll")
-            .cloned()
-            .or_else(|| req.get("scroll").and_then(Value::as_str).map(str::to_string));
+        // Every primary shard of the targets is searched.
+        let shard_total: u64 =
+            names.iter().filter_map(|n| s.indices.get(n)).map(|i| shard_counts(i).0.max(1)).sum();
+        let scroll = scroll_param;
         if let Some(scroll) = scroll {
+            let docs = sliced(&s, docs, &req);
             let keep = parse_keep_alive(&scroll).unwrap_or(std::time::Duration::from_secs(60));
             let size = req.get("size").and_then(Value::as_u64).unwrap_or(10) as usize;
             let opts = search::SearchOptions { typed, all_hits: true, ..Default::default() };
@@ -1076,10 +1148,14 @@ impl Engine {
                     },
                 },
             );
+            set_search_shards(&mut resp, shard_total);
             return (200, resp);
         }
         match search::search_typed(&mappings, &docs, &req, typed) {
-            Ok(resp) => (200, resp),
+            Ok(mut resp) => {
+                set_search_shards(&mut resp, shard_total);
+                (200, resp)
+            }
             Err(e) => (e.status, e.to_json()),
         }
     }
@@ -1087,20 +1163,10 @@ impl Engine {
     /// Health of `indices` (all when `None`): green when no index wants
     /// replicas, yellow otherwise (a single node can't place them).
     fn health_of(s: &State, names: &[String]) -> Value {
-        let pri: usize = names.len();
-        let replicas: usize = names
-            .iter()
-            .filter_map(|n| s.indices.get(n))
-            .map(|i| {
-                i.settings["index"]["number_of_replicas"]
-                    .as_str()
-                    .and_then(|r| r.parse().ok())
-                    .or_else(|| {
-                        i.settings["index"]["number_of_replicas"].as_u64().map(|r| r as usize)
-                    })
-                    .unwrap_or(1)
-            })
-            .sum();
+        let counts: Vec<(u64, u64)> =
+            names.iter().filter_map(|n| s.indices.get(n)).map(shard_counts).collect();
+        let pri = counts.iter().map(|(p, _)| *p as usize).sum::<usize>();
+        let replicas = counts.iter().map(|(p, r)| (p * r) as usize).sum::<usize>();
         let status = if replicas > 0 { "yellow" } else { "green" };
         let pct =
             if pri + replicas == 0 { 100.0 } else { pri as f64 * 100.0 / (pri + replicas) as f64 };
@@ -1550,13 +1616,14 @@ impl Engine {
         let mut s = self.0.lock().unwrap();
         let now = std::time::Instant::now();
         s.contexts.retain(|_, c| c.expires > now);
-        let ids: Vec<String> = match (path_id, req.get("scroll_id"), q.get("scroll_id")) {
-            (Some(p), _, _) => p.split(',').map(str::to_string).collect(),
-            (_, Some(Value::String(i)), _) => vec![i.clone()],
-            (_, Some(Value::Array(a)), _) => {
+        // A body `scroll_id` wins over the URL's.
+        let ids: Vec<String> = match (req.get("scroll_id"), path_id, q.get("scroll_id")) {
+            (Some(Value::String(i)), _, _) => i.split(',').map(str::to_string).collect(),
+            (Some(Value::Array(a)), _, _) => {
                 a.iter().filter_map(Value::as_str).map(str::to_string).collect()
             }
-            (_, _, Some(i)) => vec![i.clone()],
+            (_, Some(p), _) => p.split(',').map(str::to_string).collect(),
+            (_, _, Some(i)) => i.split(',').map(str::to_string).collect(),
             _ => Vec::new(),
         };
         if method == "DELETE" {
@@ -1586,6 +1653,29 @@ impl Engine {
             .and_then(Value::as_str)
             .or(q.get("scroll").map(String::as_str))
             .and_then(parse_keep_alive);
+        if let Some(k) = keep {
+            let max_keep = ["transient", "persistent"]
+                .iter()
+                .find_map(|c| {
+                    s.cluster_settings
+                        .get(*c)
+                        .and_then(|m| m.get("search.max_keep_alive"))
+                        .and_then(Value::as_str)
+                        .and_then(parse_keep_alive)
+                })
+                .unwrap_or(std::time::Duration::from_secs(86_400));
+            if k > max_keep {
+                let e = search::EsError::shard_failure(
+                    "illegal_argument_exception",
+                    &format!(
+                        "Keep alive for request ({}) is too large. It must be less than ({}). This limit can be set by changing the [search.max_keep_alive] cluster level setting.",
+                        time_value(k),
+                        time_value(max_keep)
+                    ),
+                );
+                return (400, e.to_json());
+            }
+        }
         let Some(ctx) = s.contexts.get_mut(&id) else { return context_missing(&id) };
         if let Some(k) = keep {
             ctx.expires = now + k;
@@ -2164,7 +2254,7 @@ impl Engine {
                 }
                 let create = kind == "_create" || q.get("op_type").is_some_and(|o| o == "create");
                 if create && i.docs.contains_key(&id) {
-                    return (409, version_conflict(index, &id));
+                    return (409, version_conflict(index, &id, i.docs[&id].version));
                 }
                 if let Err(e) = check_seq_no(i.docs.get(&id), &id, q) {
                     return e;
@@ -2500,6 +2590,35 @@ impl Engine {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
         let text = String::from_utf8_lossy(body);
+        // Every action line is checked before anything runs: a bad one
+        // fails the whole request.
+        {
+            let mut numbered = text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty());
+            while let Some((n, line)) = numbered.next() {
+                let Ok(Value::Object(m)) = serde_json::from_str::<Value>(line) else { break };
+                let malformed = |what: String| {
+                    (
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            &format!("Malformed action/metadata line [{}], {what}", n + 1),
+                            400,
+                        ),
+                    )
+                };
+                let Some(action) = m.keys().next() else {
+                    return malformed("expected FIELD_NAME but found [END_OBJECT]".into());
+                };
+                if !matches!(action.as_str(), "index" | "create" | "update" | "delete") {
+                    return malformed(format!(
+                        "expected field [create], [delete], [index] or [update] but found [{action}]"
+                    ));
+                }
+                if action != "delete" {
+                    numbered.next();
+                }
+            }
+        }
         let mut lines = text.lines().filter(|l| !l.trim().is_empty());
         let mut items = Vec::new();
         let mut errors = false;
@@ -2513,8 +2632,22 @@ impl Engine {
             let Some((action, opts)) = m.as_object().and_then(|o| o.iter().next()) else {
                 continue;
             };
+            // `index` with `op_type: create` is a create.
+            let action = if action == "index"
+                && opts.get("op_type").and_then(Value::as_str) == Some("create")
+            {
+                "create"
+            } else {
+                action.as_str()
+            };
             let ix = opts.get("_index").and_then(Value::as_str).unwrap_or(index);
-            let given_id = opts.get("_id").and_then(Value::as_str);
+            // A numeric `_id` is taken as its string form.
+            let given_id_owned = opts.get("_id").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            });
+            let given_id = given_id_owned.as_deref();
             let id = given_id.map(str::to_string).unwrap_or_else(auto_id);
             // Per-item options, as the single-document APIs take them.
             let mut item_q: HashMap<String, String> = HashMap::new();
@@ -2567,7 +2700,17 @@ impl Engine {
                 items.push(item_error(404, require_alias_error(ix).1));
                 continue;
             }
-            let ix = &self.write_target(ix);
+            let ix = &match self.write_target(ix) {
+                Ok(t) => t,
+                Err(e) => {
+                    if action != "delete" {
+                        lines.next();
+                    }
+                    errors = true;
+                    items.push(item_error(e.0, e.1));
+                    continue;
+                }
+            };
             touched.push(ix.to_string());
             if action == "update" {
                 // A partial update (`{"doc": ...}` / upsert), not a
@@ -2584,14 +2727,14 @@ impl Engine {
                 }
                 let (status, mut res) = self.update("POST", ix, &id, &uq, data);
                 errors |= status >= 300;
-                res["status"] = json!(status);
+                let mut res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
             } else if action == "delete" {
                 let (status, mut res) = self.document_api("DELETE", ix, &id, "_doc", &item_q, b"");
                 errors |= status >= 300;
-                res["status"] = json!(status);
+                let mut res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
@@ -2601,7 +2744,7 @@ impl Engine {
                 let kind = if action == "create" { "_create" } else { "_doc" };
                 let (status, mut res) = self.document_api(verb, ix, &id, kind, &item_q, data);
                 errors |= status >= 300;
-                res["status"] = json!(status);
+                let mut res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
@@ -3465,6 +3608,14 @@ fn shard_counts(i: &Index) -> (u64, u64) {
     (num("number_of_shards", 1), num("number_of_replicas", 1))
 }
 
+/// A search response's `_shards` header for `total` primary shards.
+fn set_search_shards(resp: &mut Value, total: u64) {
+    if total > 1 && resp.get("_shards").is_some() {
+        resp["_shards"]["total"] = json!(total);
+        resp["_shards"]["successful"] = json!(total);
+    }
+}
+
 /// `?human`: readable forms of the creation date and version.
 fn add_human_settings(settings: &mut Value) {
     let Some(idx) = settings.get_mut("index").and_then(Value::as_object_mut) else { return };
@@ -3498,6 +3649,182 @@ fn destructive_check(s: &State, expr: &str) -> Result<(), (u16, Value)> {
         ));
     }
     Ok(())
+}
+
+/// Scroll and slice request checks, with Elasticsearch's messages.
+fn validate_scroll_and_slice(
+    s: &State,
+    index_pattern: &str,
+    req: &Value,
+    q: &HashMap<String, String>,
+    scroll: Option<&str>,
+) -> Result<(), (u16, Value)> {
+    let cluster_setting = |key: &str| {
+        ["transient", "persistent"].iter().find_map(|k| {
+            s.cluster_settings
+                .get(*k)
+                .and_then(|m| m.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    };
+    let max_keep = cluster_setting("search.max_keep_alive")
+        .and_then(|v| parse_keep_alive(&v))
+        .unwrap_or(std::time::Duration::from_secs(86_400));
+    let invalid = |msg: &str| {
+        Err((
+            400,
+            error(
+                "action_request_validation_exception",
+                &format!("Validation Failed: 1: {msg};"),
+                400,
+            ),
+        ))
+    };
+    if let Some(sc) = scroll {
+        let size = q
+            .get("size")
+            .and_then(|v| v.parse::<i64>().ok())
+            .or_else(|| req.get("size").and_then(Value::as_i64));
+        if size == Some(0) {
+            return invalid("[size] cannot be [0] in a scroll context");
+        }
+        if q.get("request_cache").is_some_and(|v| v == "true") {
+            return invalid("[request_cache] cannot be used in a scroll context");
+        }
+        if let Some(keep) = parse_keep_alive(sc)
+            && keep > max_keep
+        {
+            let e = search::EsError::shard_failure(
+                "illegal_argument_exception",
+                &format!(
+                    "Keep alive for request ({}) is too large. It must be less than ({}). This limit can be set by changing the [search.max_keep_alive] cluster level setting.",
+                    time_value(keep),
+                    time_value(max_keep)
+                ),
+            );
+            return Err((400, e.to_json()));
+        }
+    }
+    let Some(slice) = req.get("slice") else { return Ok(()) };
+    let id = slice_num(slice, "id").unwrap_or(-1);
+    let max = slice_num(slice, "max").unwrap_or(-1);
+    let parse_err = |field: &str, reason: &str| {
+        Err((
+            400,
+            json!({"error": {"root_cause": [{"type": "x_content_parse_exception", "reason": format!("[slice] failed to parse field [{field}]")}],
+                "type": "x_content_parse_exception", "reason": format!("[slice] failed to parse field [{field}]"),
+                "caused_by": {"type": "illegal_argument_exception", "reason": reason}}, "status": 400}),
+        ))
+    };
+    if id < 0 {
+        return parse_err("id", "id must be greater than or equal to 0");
+    }
+    if max <= 1 {
+        return parse_err("max", "max must be greater than 1");
+    }
+    if id >= max {
+        return parse_err("max", "max must be greater than id");
+    }
+    if scroll.is_none() && req.get("pit").is_none() {
+        return invalid("[slice] can only be used with [scroll] or [point-in-time] requests");
+    }
+    let limit = Engine::resolve_indices(s, index_pattern)
+        .iter()
+        .filter_map(|n| s.indices.get(n))
+        .map(|i| {
+            let v = &i.settings["index"]["max_slices_per_scroll"];
+            v.as_i64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).unwrap_or(1024)
+        })
+        .min()
+        .unwrap_or(1024);
+    if max > limit {
+        let e = search::EsError::shard_failure(
+            "illegal_argument_exception",
+            &format!(
+                "The number of slices [{max}] is too large. It must be less than [{limit}]. This limit can be set by changing the [index.max_slices_per_scroll] index level setting."
+            ),
+        );
+        return Err((400, e.to_json()));
+    }
+    Ok(())
+}
+
+/// A `slice` number, given as a number or a numeric string.
+fn slice_num(slice: &Value, key: &str) -> Option<i64> {
+    let v = slice.get(key)?;
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// The documents in a request's `slice` (all of them without one): each
+/// document belongs to one slice by a hash of its `_id` (or `field`).
+fn sliced(s: &State, docs: Vec<CommittedDoc>, req: &Value) -> Vec<CommittedDoc> {
+    let Some(slice) = req.get("slice") else { return docs };
+    let (Some(id), Some(max)) = (slice_num(slice, "id"), slice_num(slice, "max")) else {
+        return docs;
+    };
+    let field = slice.get("field").and_then(Value::as_str).unwrap_or("_id");
+    let hash_of = |d: &CommittedDoc| {
+        let key = if field == "_id" {
+            d.id.clone()
+        } else {
+            match search::raw_values(&d.source, field).first() {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            }
+        };
+        i64::from(murmur3_routing(&key))
+    };
+    docs.into_iter()
+        .filter(|d| {
+            let Some(i) = s.indices.get(&d.index) else {
+                return hash_of(d).rem_euclid(max) == id;
+            };
+            let shards = shard_counts(i).0.max(1) as i64;
+            let routing = i.docs.get(&d.id).and_then(|x| x.routing.clone());
+            let shard = shard_of(i, routing.as_deref().unwrap_or(&d.id));
+            if max <= shards {
+                // Whole shards go to slices.
+                return shard % max == id;
+            }
+            // More slices than shards: each shard is split further.
+            if shard != id % shards {
+                return false;
+            }
+            let per_shard = max / shards + i64::from(max % shards > shard);
+            per_shard <= 1 || hash_of(d).rem_euclid(per_shard) == id / shards
+        })
+        .collect()
+}
+
+/// A duration as Elasticsearch's `TimeValue` prints it: `2m`, `41.6d`.
+fn time_value(d: std::time::Duration) -> String {
+    let ms = d.as_millis() as f64;
+    for (unit, size) in [("d", 86_400_000.0), ("h", 3_600_000.0), ("m", 60_000.0), ("s", 1000.0)] {
+        if ms >= size {
+            let v = ms / size;
+            return if v.fract() == 0.0 { format!("{v}{unit}") } else { format!("{v:.1}{unit}") };
+        }
+    }
+    format!("{ms}ms")
+}
+
+/// A bulk item's response: a failure keeps only the target and the
+/// error's cause, as Elasticsearch reports it per item.
+fn bulk_item(index: &str, id: &str, status: u16, mut res: Value) -> Value {
+    if status >= 300
+        && let Some(err) = res.get("error").cloned()
+        && err.is_object()
+    {
+        let mut cause = err.clone();
+        if let Some(o) = cause.as_object_mut() {
+            o.remove("root_cause");
+        }
+        return json!({"_index": index, "_id": id, "status": status, "error": cause});
+    }
+    res["status"] = json!(status);
+    res
 }
 
 /// The query with an API's own `expand_wildcards` default filled in.
@@ -3614,7 +3941,12 @@ fn get_doc(i: &Index, index: &str, id: &str, o: &GetOpts) -> (u16, Value) {
     let source_enabled =
         i.mappings.get("_source").and_then(|s| s.get("enabled")).and_then(Value::as_bool)
             != Some(false);
-    let want_source = o.stored_fields.is_none() || o.source_explicit;
+    let lists_source = o.stored_fields.as_ref().is_some_and(|sf| match sf {
+        Value::Array(a) => a.iter().any(|f| f == "_source"),
+        Value::String(f) => f.split(',').any(|f| f.trim() == "_source"),
+        _ => false,
+    });
+    let want_source = o.stored_fields.is_none() || o.source_explicit || lists_source;
     if source_enabled && want_source && !matches!(o.source, Some(Value::Bool(false))) {
         r["_source"] = search::filter_source(&source, o.source.as_ref());
     }
@@ -3838,12 +4170,13 @@ fn did_you_mean(field: &str, known: &[&str]) -> String {
     }
 }
 
-fn version_conflict(_index: &str, id: &str) -> Value {
-    error(
-        "version_conflict_engine_exception",
-        &format!("[{}]: version conflict, document already exists", id),
-        409,
-    )
+fn version_conflict(index: &str, id: &str, current: i64) -> Value {
+    let cause = json!({"type": "version_conflict_engine_exception",
+        "reason": format!("[{id}]: version conflict, document already exists (current version [{current}])"),
+        "index_uuid": "noida", "shard": "0", "index": index});
+    let mut top = cause.clone();
+    top["root_cause"] = json!([cause]);
+    json!({"error": top, "status": 409})
 }
 fn doc_response(index: &str, id: &str, d: &Document, result: &str) -> Value {
     let mut v =

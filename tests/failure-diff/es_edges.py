@@ -903,6 +903,77 @@ scenario("filter_path_closed", setup("fpc") + [
     ("DELETE", "/fpc-a"),
 ])
 
+def _bulk_docs(index, n):
+    out = []
+    for i in range(n):
+        out.append({"index": {"_index": index, "_id": str(i)}})
+        out.append({"n": i, "k": f"k{i % 7}"})
+    return out
+
+
+scenario("scroll_slice_shards", [
+    ("DELETE", "/ss-1?ignore_unavailable=true"),
+    ("PUT", "/ss-1", {"settings": {"number_of_shards": 3, "number_of_replicas": 0}}),
+    ("POST", "/_bulk?refresh=true", _bulk_docs("ss-1", 40), {"pick": lambda r: r["errors"]}),
+    ("GET", "/ss-1/_search?size=0", None, {"pick": lambda r: (r["_shards"], r["hits"]["total"])}),
+    ("GET", "/ss-1/_count"),
+    ("GET", "/_cluster/health/ss-1", None, {"pick": lambda r: (r["active_primary_shards"], r["active_shards"], r["unassigned_shards"], r["status"])}),
+    ("GET", "/ss-1/_search?scroll=1m&size=0"),
+    ("GET", "/ss-1/_search?scroll=1m&request_cache=true"),
+    ("GET", "/ss-1/_search?scroll=1000h"),
+    ("POST", "/ss-1/_search", {"slice": {"id": 0, "max": 2}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 2, "max": 2}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 0, "max": 1}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": -1, "max": 2}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 0, "max": 1025}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 0, "max": 4}, "size": 100}, {"pick": lambda r: r["_shards"]["total"]}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 1, "max": 4}, "size": 100}, {"pick": lambda r: len(r["hits"]["hits"]) == r["hits"]["total"]["value"]}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 2, "max": 4}, "size": 100}, {"pick": lambda r: r["timed_out"]}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 3, "max": 4, "field": "n"}, "size": 100}, {"pick": lambda r: r["hits"]["total"]["relation"]}),
+    ("DELETE", "/ss-1"),
+])
+
+def _items(r):
+    return [{k: {f: v.get(f) for f in ("_index", "_id", "status", "result")} | ({"error": v["error"]["type"]} if "error" in v else {})
+             for k, v in it.items()} for it in r["items"]]
+
+
+scenario("bulk_alias_targets", [
+    ("DELETE", "/bk-1?ignore_unavailable=true"), ("DELETE", "/bk-2?ignore_unavailable=true"),
+    ("DELETE", "/bk-3?ignore_unavailable=true"),
+    ("POST", "/_bulk", [{"index": {"_index": "bk-1", "_id": "1"}}, {"a": 1}, {}, {"a": 2}]),
+    ("POST", "/_bulk", [{"foo": {"_index": "bk-1"}}, {"a": 1}]),
+    ("POST", "/_bulk?refresh=true", [
+        {"index": {"_index": "bk-1", "_id": ""}}, {"f": 1},
+        {"index": {"_index": "bk-1", "_id": "id"}}, {"f": 2},
+        {"create": {"_index": "bk-1", "_id": "c"}}, {"f": 4},
+        {"index": {"_index": "bk-1", "_id": "oc", "op_type": "create"}}, {"f": 5},
+        {"index": {"_index": "bk-1", "_id": "oc", "op_type": "create"}}, {"f": 6},
+        {"update": {"_index": "bk-1", "_id": "id", "_source": True}}, {"doc": {"g": 1}},
+        {"update": {"_index": "bk-1", "_id": "missing"}}, {"doc": {"g": 1}},
+        {"delete": {"_index": "bk-1", "_id": "nope"}},
+        {"delete": {"_index": "bk-1", "_id": "c"}},
+    ], {"pick": _items}),
+    ("GET", "/bk-1/_count"),
+    ("PUT", "/bk-2", {"aliases": {"bk-al": {}}}),
+    ("PUT", "/bk-3", {"aliases": {"bk-al": {}}}),
+    ("GET", "/bk-al/_doc/1"),
+    ("PUT", "/bk-al/_doc/1", {"a": 1}),
+    ("POST", "/bk-al/_doc", {"a": 1}),
+    ("POST", "/bk-al/_update/1", {"doc": {"a": 2}}),
+    ("DELETE", "/bk-al/_doc/1"),
+    ("POST", "/_bulk", [{"index": {"_index": "bk-al", "_id": "1"}}, {"a": 1}], {"pick": _items}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "bk-3", "alias": "bk-al", "is_write_index": True}}]}),
+    ("PUT", "/bk-al/_doc/1?refresh=true", {"a": 1}, {"pick": lambda r: (r["_index"], r["result"])}),
+    ("GET", "/bk-al/_doc/1"),
+    ("GET", "/bk-3/_doc/1", None, {"pick": lambda r: r["found"]}),
+    ("POST", "/_bulk", [{"index": {"_index": "bk-al", "_id": "2"}}, {"a": 1}], {"pick": _items}),
+    ("PUT", "/bk-2/_alias/bk-al2", {"is_write_index": False}),
+    ("PUT", "/bk-al2/_doc/1", {"a": 1}),
+    ("GET", "/bk-al2/_doc/1", None, {"pick": lambda r: r["found"]}),
+    ("DELETE", "/bk-1"), ("DELETE", "/bk-2"), ("DELETE", "/bk-3"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:
