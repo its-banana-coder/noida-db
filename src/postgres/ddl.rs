@@ -506,6 +506,9 @@ impl Ddl<'_, '_> {
                 predicate: None,
                 method: "btree".into(),
                 nulls_not_distinct: !nulls_distinct,
+                include: vec![],
+                opclass: vec![],
+                nulls_first: vec![],
             });
         }
         if matches!(kind, ConstraintKind::PrimaryKey) {
@@ -943,8 +946,17 @@ impl Ddl<'_, '_> {
         let mut exprs = vec![];
         let mut expr_names = vec![];
         let mut desc = vec![];
+        let mut nulls_first = vec![];
+        let mut opclass = vec![];
         for c in &ci.columns {
-            desc.push(c.column.options.sort == Some(a::OrderBySort::Desc));
+            let is_desc = c.column.options.sort == Some(a::OrderBySort::Desc);
+            desc.push(is_desc);
+            nulls_first.push(c.column.options.nulls_first.unwrap_or(is_desc));
+            opclass.push(
+                c.operator_class
+                    .as_ref()
+                    .map(|o| name_parts(o).pop().unwrap_or_default().to_ascii_lowercase()),
+            );
             match &c.column.expr {
                 a::Expr::Identifier(id) => {
                     let n = ident(id);
@@ -988,6 +1000,14 @@ impl Ddl<'_, '_> {
                 format!("relation \"{name}\" already exists"),
             ));
         }
+        let mut include = vec![];
+        for id in &ci.include {
+            let n = ident(id);
+            let t = self.ctx.db.table(oid).unwrap();
+            include.push(t.col_index(&n).ok_or_else(|| {
+                PgError::new(code::UNDEFINED_COLUMN, format!("column \"{n}\" does not exist"))
+            })?);
+        }
         let predicate = ci.predicate.as_ref().map(|p| p.to_string());
         let idx_oid = self.ctx.db.alloc_oid();
         let method = ci
@@ -1006,6 +1026,9 @@ impl Ddl<'_, '_> {
             predicate,
             method,
             nulls_not_distinct: ci.nulls_distinct == Some(false),
+            include,
+            opclass,
+            nulls_first,
         };
         let t = self.ctx.db.table_mut(oid).unwrap();
         t.indexes.push(index);

@@ -655,12 +655,33 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
         "pg_index" => {
             for tb in db.tables.values() {
                 for idx in &tb.indexes {
-                    let keys: Vec<Value> =
+                    let mut keys: Vec<Value> =
                         idx.cols.iter().map(|c| n(c.map_or(0, |x| x as i64 + 1))).collect();
+                    keys.extend(idx.include.iter().map(|&c| n(c as i64 + 1)));
+                    let natts = keys.len() as i64;
+                    // indoption: 1 = DESC, 2 = NULLS FIRST (key columns only).
+                    let options = idx
+                        .desc
+                        .iter()
+                        .enumerate()
+                        .map(|(k, d)| {
+                            let nf = idx.nulls_first.get(k).copied().unwrap_or(*d);
+                            n(i64::from(*d) | (i64::from(nf) << 1))
+                        })
+                        .collect();
+                    let classes = idx
+                        .cols
+                        .iter()
+                        .enumerate()
+                        .map(|(k, c)| {
+                            let explicit = idx.opclass.get(k).cloned().flatten();
+                            n(opclass_for(explicit.as_deref(), c.map(|i| tb.columns[i].ty)) as i64)
+                        })
+                        .collect();
                     out.push(vec![
                         n(idx.oid as i64),
                         n(tb.oid as i64),
-                        n(idx.cols.len() as i64),
+                        n(natts),
                         n(idx.cols.len() as i64),
                         b(idx.unique),
                         b(idx.nulls_not_distinct),
@@ -675,12 +696,28 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         b(false),
                         arr(keys),
                         arr(idx.cols.iter().map(|_| n(0)).collect()),
-                        arr(idx.cols.iter().map(|_| n(0)).collect()),
-                        arr(idx.desc.iter().map(|d| n(if *d { 1 } else { 0 })).collect()),
-                        NULL,
+                        arr(classes),
+                        arr(options),
+                        // Expression keys: non-null, as clients only test it.
+                        if idx.exprs.is_empty() { NULL } else { t(idx.exprs.join(", ")) },
                         idx.predicate.clone().map_or(NULL, t),
                     ]);
                 }
+            }
+        }
+        "pg_opclass" => {
+            for (oid, name, intype, default) in OPCLASSES {
+                out.push(vec![
+                    n(*oid as i64),
+                    n(403),
+                    t(*name),
+                    n(11),
+                    n(10),
+                    n(0),
+                    n(*intype as i64),
+                    b(*default),
+                    n(0),
+                ]);
             }
         }
         "pg_constraint" => {
@@ -1846,10 +1883,26 @@ fn index_def_for(db: &DbState, tb: &Table, i: &Index) -> String {
     for (k, c) in i.cols.iter().enumerate() {
         let mut s = match c {
             Some(idx) => super::funcs::quote_ident(&tb.columns[*idx].name),
-            None => format!("({})", exprs.next().cloned().unwrap_or_default()),
+            // Postgres wraps an expression key in parentheses unless it
+            // is a bare function call.
+            None => {
+                let e = exprs.next().cloned().unwrap_or_default();
+                if is_func_call(&e) { e } else { format!("({e})") }
+            }
         };
-        if i.desc.get(k).copied().unwrap_or(false) {
+        if let Some(Some(op)) = i.opclass.get(k) {
+            s.push(' ');
+            s.push_str(op);
+        }
+        let desc = i.desc.get(k).copied().unwrap_or(false);
+        if desc {
             s.push_str(" DESC");
+        }
+        // NULLS FIRST is DESC's default and NULLS LAST ASC's.
+        match i.nulls_first.get(k) {
+            Some(true) if !desc => s.push_str(" NULLS FIRST"),
+            Some(false) if desc => s.push_str(" NULLS LAST"),
+            _ => {}
         }
         keys.push(s);
     }
@@ -1862,10 +1915,90 @@ fn index_def_for(db: &DbState, tb: &Table, i: &Index) -> String {
         i.method,
         keys.join(", ")
     );
+    if !i.include.is_empty() {
+        let cols: Vec<String> =
+            i.include.iter().map(|&c| super::funcs::quote_ident(&tb.columns[c].name)).collect();
+        s.push_str(&format!(" INCLUDE ({})", cols.join(", ")));
+    }
     if let Some(p) = &i.predicate {
         s.push_str(&format!(" WHERE {p}"));
     }
     s
+}
+
+/// `name(...)` with the parenthesis closing at the end.
+fn is_func_call(e: &str) -> bool {
+    let Some(open) = e.find('(') else { return false };
+    let name = &e[..open];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return false;
+    }
+    let mut depth = 0;
+    for (i, c) in e.char_indices().skip(open) {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == e.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// btree operator classes: (oid, name, input type oid, default for it).
+const OPCLASSES: &[(u32, &str, u32, bool)] = &[
+    (1978, "int4_ops", 23, true),
+    (1979, "int2_ops", 21, true),
+    (1981, "oid_ops", 26, true),
+    (3122, "date_ops", 1082, true),
+    (3123, "float8_ops", 701, true),
+    (3124, "int8_ops", 20, true),
+    (3125, "numeric_ops", 1700, true),
+    (3126, "text_ops", 25, true),
+    (3127, "timestamptz_ops", 1184, true),
+    (3128, "timestamp_ops", 1114, true),
+    (4217, "text_pattern_ops", 25, false),
+    (4218, "varchar_pattern_ops", 25, false),
+    (4219, "bpchar_pattern_ops", 1042, false),
+    (10000, "array_ops", 2277, true),
+    (10003, "bool_ops", 16, true),
+    (10004, "bpchar_ops", 1042, true),
+    (10006, "bytea_ops", 17, true),
+    (10012, "float4_ops", 700, true),
+    (10015, "inet_ops", 869, true),
+    (10022, "interval_ops", 1186, true),
+    (10028, "name_ops", 19, true),
+    (10038, "time_ops", 1083, true),
+    (10044, "varchar_ops", 25, false),
+    (10065, "uuid_ops", 2950, true),
+    (10088, "jsonb_ops", 3802, true),
+];
+
+/// The operator class an index key uses: the one named, else the
+/// default for the column's type (varchar uses text_ops; an expression
+/// key is taken as text).
+fn opclass_for(explicit: Option<&str>, ty: Option<Type>) -> u32 {
+    if let Some(name) = explicit
+        && let Some((oid, ..)) = OPCLASSES.iter().find(|(_, n, ..)| *n == name)
+    {
+        return *oid;
+    }
+    let Some(ty) = ty else { return 3126 };
+    if ty.array {
+        return 10000;
+    }
+    let intype = match ty.base {
+        Base::Varchar | Base::Text => 25,
+        _ => ty.oid(),
+    };
+    OPCLASSES
+        .iter()
+        .find(|(_, _, it, default)| *default && *it == intype)
+        .map_or(0, |(oid, ..)| *oid)
 }
 
 /// `pg_get_indexdef`: only has an oid to go on, so it has to search for the

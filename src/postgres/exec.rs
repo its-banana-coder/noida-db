@@ -1616,6 +1616,13 @@ fn fill_srf_slot(e: &mut Expr, v: &Value) {
 }
 
 fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
+    exec_from_with(f, ctx, &[])
+}
+
+/// `lat` is the row a lateral item to the left supplies: in
+/// `FROM x, unnest(x.a) u JOIN t ON ...` the unnest is the left end of the
+/// join to the right of the comma, and reads x's row.
+fn exec_from_with(f: &From, ctx: &mut Ctx, lat: &[Value]) -> PgResult<Vec<Row>> {
     Ok(match f {
         From::One => vec![vec![]],
         From::Table { oid, ncols } => {
@@ -1659,9 +1666,9 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             ctx.outer.pop();
             r?
         }
-        From::Func { .. } => exec_func(f, &[], ctx)?,
+        From::Func { .. } => exec_func(f, lat, ctx)?,
         From::Join { left, right, kind, on, lateral, left_cols, right_cols } => {
-            let lrows = exec_from(left, ctx)?;
+            let lrows = exec_from_with(left, ctx, lat)?;
             let mut out = vec![];
             if *lateral {
                 for l in &lrows {
@@ -1672,7 +1679,7 @@ fn exec_from(f: &From, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                     let rrows = match &**right {
                         From::Sub(q) => run_query(q, ctx),
                         f @ From::Func { .. } => exec_func(f, l, ctx),
-                        other => exec_from(other, ctx),
+                        other => exec_from_with(other, ctx, l),
                     };
                     ctx.outer.pop();
                     let rrows = rrows?;
