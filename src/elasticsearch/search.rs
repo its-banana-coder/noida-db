@@ -18,6 +18,7 @@ use super::queries;
 use super::query_string;
 use super::scoring;
 use super::sorting;
+use super::suggest;
 use super::vectors;
 
 /// A search failure, shaped the way Elasticsearch reports it: most are a
@@ -336,43 +337,53 @@ fn inner_hits(
                         b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0))
                     });
                     let max = ms.first().map(|m| m.1);
-                    let hits: Vec<Value> = ms
-                        .iter()
-                        .skip(from)
-                        .take(size)
-                        .map(|&(offset, score, ci)| {
-                            let c = &children[ci];
-                            let mut src = &c.source;
-                            for seg in path.split('.') {
-                                src = &src[seg];
+                    let inner_query = n.get("query").cloned().unwrap_or(json!({"match_all": {}}));
+                    let mut hits: Vec<Value> = Vec::new();
+                    for &(offset, score, ci) in ms.iter().skip(from).take(size) {
+                        let c = &children[ci];
+                        let mut src = &c.source;
+                        for seg in path.split('.') {
+                            src = &src[seg];
+                        }
+                        let mut hit = json!({
+                            "_index": c.index,
+                            "_id": c.id,
+                            "_nested": {"field": path, "offset": offset},
+                            "_score": score,
+                        });
+                        if !matches!(ih.get("_source"), Some(Value::Bool(false))) {
+                            hit["_source"] = apply_source_filter(src, ih.get("_source"));
+                        }
+                        if let Some(hl) = ih.get("highlight") {
+                            let settings = Value::Null;
+                            let ctx = highlight::Context {
+                                index: &c.index,
+                                doc: parent,
+                                settings: &settings,
+                                weighted: true,
+                            };
+                            if let Some(h) =
+                                highlight::highlight(hl, &inner_query, mappings, &c.source, &ctx)?
+                            {
+                                hit["highlight"] = h;
                             }
-                            let mut hit = json!({
-                                "_index": c.index,
-                                "_id": c.id,
-                                "_nested": {"field": path, "offset": offset},
-                                "_score": score,
-                            });
-                            if !matches!(ih.get("_source"), Some(Value::Bool(false))) {
-                                hit["_source"] = apply_source_filter(src, ih.get("_source"));
+                        }
+                        // `fields` of a nested hit come grouped under its
+                        // path: `{"comments": [{"author": [...]}]}`.
+                        if let Some(spec) = ih.get("fields") {
+                            let prefix = format!("{path}.");
+                            let mut grouped = Map::new();
+                            let flat = objects_along(mappings, &path);
+                            for (k, v) in fields::fetch(&flat, c, spec, fields::Kind::Fields)? {
+                                let k = k.strip_prefix(&prefix).map_or(k.clone(), str::to_string);
+                                grouped.insert(k, v);
                             }
-                            // `fields` of a nested hit come grouped under its
-                            // path: `{"comments": [{"author": [...]}]}`.
-                            if let Some(spec) = ih.get("fields") {
-                                let prefix = format!("{path}.");
-                                let mut grouped = Map::new();
-                                let flat = objects_along(mappings, &path);
-                                for (k, v) in fields::fetch(&flat, c, spec, fields::Kind::Fields)? {
-                                    let k =
-                                        k.strip_prefix(&prefix).map_or(k.clone(), str::to_string);
-                                    grouped.insert(k, v);
-                                }
-                                if !grouped.is_empty() {
-                                    hit["fields"] = json!({ (path.as_str()): [grouped] });
-                                }
+                            if !grouped.is_empty() {
+                                hit["fields"] = json!({ (path.as_str()): [grouped] });
                             }
-                            Ok(hit)
-                        })
-                        .collect::<Result<_, EsError>>()?;
+                        }
+                        hits.push(hit);
+                    }
                     by_parent.insert(
                         parent,
                         json!({"hits": {
@@ -432,6 +443,27 @@ pub(crate) fn resolve_field(mappings: &Value, field: &str) -> (String, Option<St
     (field.to_string(), None)
 }
 
+/// A keyword field's `ignore_above` (multi-fields included).
+fn ignore_above(mappings: &Value, field: &str) -> Option<usize> {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut props = mappings.get("properties");
+    for (i, seg) in segs.iter().enumerate() {
+        let node = props?.get(*seg)?;
+        let def = if i + 1 == segs.len() {
+            Some(node)
+        } else if i + 2 == segs.len() {
+            node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        } else {
+            None
+        };
+        if let Some(d) = def {
+            return d.get("ignore_above").and_then(Value::as_u64).map(|n| n as usize);
+        }
+        props = node.get("properties");
+    }
+    None
+}
+
 /// Walks a dotted field path through nested objects, flattening arrays
 /// along the way, the way Elasticsearch resolves e.g. `"meta.source"`.
 fn navigate<'a>(v: &'a Value, path: &[&str]) -> Vec<&'a Value> {
@@ -481,11 +513,15 @@ pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> 
             .collect();
     }
     let mut out = Vec::new();
+    let ignore_above = if ty == Some("keyword") { ignore_above(mappings, field) } else { None };
     for v in raw_values(source, &path) {
         match v {
             Value::String(s) => {
                 if ty == Some("keyword") {
-                    out.push(s.clone());
+                    // Values over `ignore_above` aren't indexed.
+                    if ignore_above.is_none_or(|n| s.chars().count() <= n) {
+                        out.push(s.clone());
+                    }
                 } else {
                     out.extend(analysis::standard(s));
                 }
@@ -858,15 +894,37 @@ fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashM
         .map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
-                .map(|s| {
+                .flat_map(|s| {
                     let (f, b) = parse_field_boost(s);
-                    (f.to_string(), b)
+                    highlight::expand_field_pattern(mappings, f).into_iter().map(move |f| (f, b))
                 })
                 .collect()
         })
         .unwrap_or_default();
     let op = obj.get("operator").and_then(Value::as_str).unwrap_or("or");
     let require_all = op.eq_ignore_ascii_case("and");
+    let kind = obj.get("type").and_then(Value::as_str);
+    if matches!(kind, Some("phrase") | Some("phrase_prefix")) {
+        // A phrase in any one field; the best field's score.
+        let mut best: HashMap<usize, f32> = HashMap::new();
+        for (field, boost) in &fields {
+            let mut spec = json!({"query": text});
+            if let Some(slop) = obj.get("slop") {
+                spec["slop"] = slop.clone();
+            }
+            let q = json!({ field.as_str(): spec });
+            let scores = if kind == Some("phrase") {
+                eval_match_phrase(&q, mappings, docs)
+            } else {
+                queries::match_phrase_prefix(&q, mappings, docs)
+            };
+            for (idx, score) in scores {
+                let e = best.entry(idx).or_insert(score * boost);
+                *e = e.max(score * boost);
+            }
+        }
+        return best;
+    }
 
     let mut best: HashMap<usize, f32> = HashMap::new();
     for (field, boost) in &fields {
@@ -2220,19 +2278,6 @@ fn total_hits(body: &Value, total: usize) -> Option<Value> {
     })
 }
 
-/// `POST/GET _search`: runs the query, ranks and paginates the results,
-/// and computes any `aggs`/`aggregations` over the full matched set.
-/// `typed` says `mappings` is a real mapping (a single index, or several
-/// merged), so sorting on an unmapped field is an error.
-pub fn search_typed(
-    mappings: &Value,
-    docs: &[CommittedDoc],
-    body: &Value,
-    typed: bool,
-) -> Result<Value, EsError> {
-    search_with(mappings, docs, body, &SearchOptions { typed, ..Default::default() })
-}
-
 #[derive(Default)]
 pub struct SearchOptions {
     /// `mappings` is a real mapping, so sorting on an unmapped field fails.
@@ -2243,6 +2288,9 @@ pub struct SearchOptions {
     /// A point-in-time search: a sorted one without `search_after` gets
     /// Elasticsearch's implicit `_shard_doc` tiebreaker.
     pub pit: bool,
+    /// The searched index's settings when there is exactly one (the
+    /// highlighter reads `index.highlight.*`).
+    pub settings: Value,
 }
 
 pub fn search_with(
@@ -2251,6 +2299,21 @@ pub fn search_with(
     body: &Value,
     opts: &SearchOptions,
 ) -> Result<Value, EsError> {
+    if let Some(spec) = body.get("suggest") {
+        let suggestions = suggest::suggest(spec, mappings, docs)?;
+        let mut rest = body.clone();
+        if let Some(o) = rest.as_object_mut() {
+            o.remove("suggest");
+        }
+        // A suggest-only request runs no query: no hits.
+        let only = ["query", "aggs", "aggregations"].iter().all(|k| body.get(*k).is_none());
+        let mut resp = search_with(mappings, if only { &[] } else { docs }, &rest, opts)?;
+        resp["suggest"] = suggestions;
+        return Ok(resp);
+    }
+    if let Some(h) = body.get("highlight") {
+        highlight::validate(h)?;
+    }
     let typed = opts.typed;
     let size = int_param(body, "size", 10)?;
     let from = int_param(body, "from", 0)?;
@@ -2449,10 +2512,16 @@ pub fn search_with(
             if !fetched.is_empty() {
                 hit["fields"] = Value::Object(fetched);
             }
-            if let Some(hl) = body.get("highlight")
-                && let Some(h) = highlight::highlight(hl, &query, mappings, &d.source)
-            {
-                hit["highlight"] = h;
+            if let Some(hl) = body.get("highlight") {
+                let ctx = highlight::Context {
+                    index: &d.index,
+                    doc: *idx,
+                    settings: &opts.settings,
+                    weighted: body.get("knn").is_none() && !highlight::has_nested(&query),
+                };
+                if let Some(h) = highlight::highlight(hl, &query, mappings, &d.source, &ctx)? {
+                    hit["highlight"] = h;
+                }
             }
             if !specs.is_empty() {
                 hit["sort"] = Value::Array(keys.clone());
@@ -2740,7 +2809,7 @@ mod tests {
     use super::*;
 
     fn search(mappings: &Value, docs: &[CommittedDoc], body: &Value) -> Result<Value, EsError> {
-        search_typed(mappings, docs, body, false)
+        search_with(mappings, docs, body, &SearchOptions::default())
     }
 
     fn doc(index: &str, id: &str, source: Value) -> CommittedDoc {

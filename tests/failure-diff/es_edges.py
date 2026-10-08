@@ -291,6 +291,233 @@ scenario("highlight_long", setup("long", LONG_MAPPING, LONG_DOCS) + [
     ("POST", L, {"query": {"match": {"text": "nothing"}}, "highlight": {"fields": {"text": {}}}, "_source": False}, {"pick": HL}),
 ])
 
+
+# Highlighting beyond the basics: highlighter types, tag schemas,
+# encoders, per-field queries, multi-fields, boundary scanners, nested
+# inner hits and the errors apps hit.
+HLM_DOCS = [
+    {"title": "The quick brown fox", "tags": ["fox", "animal"], "num": 42, "k": "abc", "kk": "abcdef",
+     "html": "<b>Fish & chips</b> are quick to cook",
+     "body": "The quick brown fox jumps over the lazy dog. Foxes are quick and clever animals! "
+             "Did you know a fox can run fast? The brown fox lives in the forest near the river, "
+             "where quick streams flow and the lazy dog never goes because it is far too lazy.",
+     "multi": ["first quick value", "second slow value", "third quick one here"],
+     "comments": [{"author": "ann", "text": "quick reply here"}, {"author": "bob", "text": "a slow answer"},
+                  {"author": "cy", "text": "another quick note"}]},
+    {"title": "Lazy dogs and quick cats", "tags": ["dog"], "num": 7, "k": "xyz", "kk": "x",
+     "html": "quick <i>tags</i>", "body": "Nothing about foxes here, only quick cats and lazy dogs.",
+     "multi": ["slow"], "comments": [{"author": "dan", "text": "nothing"}]},
+]
+HLM_MAPPING = {"settings": STATIC,
+               "mappings": {"properties": {
+    "title": {"type": "text", "fields": {"raw": {"type": "keyword"}, "std": {"type": "text"}}},
+    "body": {"type": "text"}, "tags": {"type": "keyword"}, "num": {"type": "integer"},
+    "k": {"type": "keyword"}, "kk": {"type": "keyword", "ignore_above": 3}, "html": {"type": "text"},
+    "multi": {"type": "text"}, "tv": {"type": "text", "term_vector": "with_positions_offsets"},
+    "comments": {"type": "nested", "properties": {"author": {"type": "keyword"}, "text": {"type": "text"}}},
+}}}
+for d in HLM_DOCS:
+    d["tv"] = d["title"]
+HM = "/hl-m/_search"
+def hl(q, h, **kw):
+    b = {"query": q, "highlight": h}
+    b.update(kw)
+    return ("POST", HM, b, {"pick": HL})
+scenario("highlight_more", setup("hl-m", HLM_MAPPING, HLM_DOCS) + [
+    hl({"multi_match": {"query": "quick fox", "fields": ["t*"]}}, {"fields": {"*": {}}}),
+    hl({"multi_match": {"query": "quick fox", "fields": ["title*"]}}, {"fields": {"title*": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"*": {}}}),
+    hl({"match_phrase": {"body": "quick brown fox"}}, {"fields": {"body": {}}}),
+    hl({"match_phrase": {"body": "quick brown fox"}}, {"fields": {"body": {"type": "plain"}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"body": "quick fox"}}, {"tags_schema": "styled", "fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"body": "quick fox"}}, {"pre_tags": ["<a>", "<b>"], "post_tags": ["</a>", "</b>"], "fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"html": "quick fish"}}, {"encoder": "html", "fields": {"html": {}}}),
+    hl({"match": {"html": "quick fish"}}, {"fields": {"html": {}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"number_of_fragments": 0}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"number_of_fragments": 1}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"type": "plain"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"no_match_size": 20}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"no_match_size": 20, "number_of_fragments": 0}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"highlight_query": {"match": {"title": "fox"}}}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"matched_fields": ["title", "title.std"]}}}),
+    hl({"match": {"title.std": "quick"}}, {"fields": {"title": {"matched_fields": ["title", "title.std"]}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"fragment_size": 30, "boundary_scanner": "word"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"fragment_size": 30, "boundary_scanner": "sentence"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"type": "plain", "fragment_size": 30}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"type": "plain", "fragment_size": 30, "number_of_fragments": 2}}}),
+    hl({"match": {"body": "lazy"}}, {"fields": {"body": {"type": "plain", "number_of_fragments": 0}}}),
+    hl({"match": {"body": "river"}}, {"fields": {"body": {}}}),
+    hl({"match": {"body": "river"}}, {"max_analyzed_offset": 20, "fields": {"body": {}}}),
+    hl({"match": {"body": "river"}}, {"max_analyzed_offset": -1, "fields": {"body": {}}}),
+    hl({"match": {"tv": "quick"}}, {"fields": {"tv": {"type": "fvh"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"type": "fvh"}}}),
+    hl({"term": {"k": "abc"}}, {"fields": {"k": {}}}),
+    hl({"term": {"num": 42}}, {"fields": {"num": {}}}),
+    hl({"prefix": {"kk": "ab"}}, {"fields": {"kk": {}}}),
+    hl({"match": {"title": "quick"}}, {"pre_tags": [], "post_tags": [], "fields": {"title": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": [{"title": {}}, {"body": {}}]}),
+    hl({"fuzzy": {"title": {"value": "quikc"}}}, {"fields": {"title": {}}}),
+    hl({"match": {"title": {"query": "quick lazy", "operator": "and"}}}, {"fields": {"title": {}}}),
+    hl({"bool": {"must": {"match": {"title": "quick"}}, "must_not": {"match": {"title": "cats"}}}}, {"fields": {"title": {}}}),
+    hl({"query_string": {"query": "qui*"}}, {"fields": {"title": {}, "body": {"number_of_fragments": 1}}}),
+    hl({"match": {"body": "quick"}}, {"order": "score", "fields": {"body": {"fragment_size": 40, "number_of_fragments": 2}}}),
+    hl({"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}},
+                   "inner_hits": {"highlight": {"fields": {"comments.text": {}}}}}}, {"fields": {"title": {}}}),
+    ("POST", HM, {"query": {"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}},
+                                       "inner_hits": {"_source": False, "highlight": {"fields": {"comments.text": {}}}}}}},
+     {"pick": lambda r: [(h["_id"], h.get("inner_hits")) for h in r["hits"]["hits"]]}),
+    hl({"match": {"title": "quick"}}, {"type": "nope", "fields": {"title": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"fragmenter": "simple", "type": "plain", "fragment_size": 10}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"fragmenter": "nope", "type": "plain"}}}),
+    hl({"match": {"html": "quick fish"}}, {"encoder": "html", "fields": {"html": {"type": "plain"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"type": "plain", "no_match_size": 20}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"type": "plain", "number_of_fragments": 0}}}),
+    hl({"match": {"multi": "quick value"}}, {"order": "score", "fields": {"multi": {"type": "plain"}}}),
+    hl({"terms": {"tags": ["fox", "dog"]}}, {"fields": {"tags": {"type": "plain"}}}),
+    hl({"match": {"body": "quick lazy"}}, {"fields": {"body": {"type": "plain", "fragment_size": 50, "number_of_fragments": 3, "order": "score"}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"type": "plain", "fragment_size": 20}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"type": "plain", "fragment_size": 20, "number_of_fragments": 2}}}),
+    hl({"match": {"multi": "quick value"}}, {"fields": {"multi": {"type": "plain", "number_of_fragments": 1}}}),
+    hl({"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}}}}, {"fields": {"*": {}}}),
+    hl({"bool": {"should": [{"match_phrase": {"body": "lazy dog"}},
+                            {"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}}}}]}},
+       {"fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match_phrase": {"title": "quick brown"}}, {"fields": {"title": {}, "title.std": {}, "tv": {"type": "fvh"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"boundary_scanner": "chars"}}}),
+    hl({"match": {"body": "fox"}}, {"tags_schema": "nope", "fields": {"body": {}}}),
+    hl({"match": {"body": "fox"}}, {"pre_tags": ["<x>"], "fields": {"body": {}}}),
+    hl({"match": {"title": "quick"}}, {"require_field_match": False, "fields": {"title": {"matched_fields": ["title.std"]}}}),
+    ("DELETE", "/hl-m"),
+] + setup("hl-o", {"settings": {"index": {"refresh_interval": "-1", "highlight.max_analyzed_offset": 30}},
+                   "mappings": {"properties": {"f": {"type": "text"}, "g": {"type": "text", "index_options": "offsets"}}}},
+          [{"f": "The quick brown fox went to the forest and saw another fox.",
+            "g": "The quick brown fox went to the forest and saw another fox."}]) + [
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"fields": {"f": {"type": "plain"}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"g": "fox"}}, "highlight": {"fields": {"g": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 20, "fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 18, "fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"g": "fox"}}, "highlight": {"max_analyzed_offset": 20, "fields": {"g": {"type": "plain"}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 50, "fields": {"f": {}}}}, {"pick": HL}),
+    ("DELETE", "/hl-o"),
+])
+
+# Suggesters: term ("did you mean"), phrase, and completion (autocomplete)
+# with weights, fuzzy, regex and category/geo contexts.
+SUG_DOCS = [
+    {"title": "Amsterdam meetup", "body": "The quick brown fox jumps", "genre": "music",
+     "loc": {"lat": 52.37, "lon": 4.89},
+     "sug": {"input": ["Nevermind", "Nirvana"], "weight": 34},
+     "csug": {"input": "Star Wars", "contexts": {"kind": ["movie", "space"]}}},
+    {"title": "Amsterdam city guide", "body": "quick brown foxes jumped over the lazy dog", "genre": "travel",
+     "loc": {"lat": 52.36, "lon": 4.90},
+     "sug": ["Nirvana band", "Nine Inch-Nails", "nirvana"],
+     "csug": {"input": "Star Trek", "weight": 5, "contexts": {"kind": "space"}}},
+    {"title": "Berlin meetup", "body": "lazy dogs sleep all day", "genre": "music",
+     "loc": {"lat": 52.52, "lon": 13.40},
+     "sug": {"input": "Nirvaan", "weight": 3},
+     "csug": {"input": "Stargate", "contexts": {"kind": "movie"}}},
+    {"title": "Amsterdam museums and meetups", "body": "the brown bear eats honey", "genre": "travel",
+     "loc": {"lat": 48.85, "lon": 2.35},
+     "sug": {"input": ["Nirvana", "Neon Indian"], "weight": 2},
+     "csug": {"input": "Star Wars", "contexts": {"kind": "movie"}}},
+    {"title": "Berlinn guide", "body": "brown brwn browns", "genre": "misc",
+     "loc": {"lat": 52.53, "lon": 13.41},
+     "sug": "Nirvana", "csug": {"input": "Starship", "contexts": {"kind": "space"}}},
+]
+SUG_MAPPING = {"settings": STATIC, "mappings": {"properties": {
+    "title": {"type": "text"}, "body": {"type": "text"}, "genre": {"type": "keyword"},
+    "loc": {"type": "geo_point"},
+    "sug": {"type": "completion"},
+    "csug": {"type": "completion", "contexts": [{"name": "kind", "type": "category"}]},
+    "gsug": {"type": "completion", "contexts": [{"name": "genre", "type": "category", "path": "genre"},
+                                                {"name": "where", "type": "geo", "precision": "10km", "path": "loc"}]},
+}}}
+for d in SUG_DOCS:
+    d["gsug"] = d["title"]
+SG = "/sug-t/_search"
+SUG = lambda r: r.get("suggest")
+scenario("suggest", setup("sug-t", SUG_MAPPING, SUG_DOCS) + [
+    ("GET", "/sug-t/_mapping"),
+    # term
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "term": {"field": "title"}}}}),
+    ("POST", SG, {"suggest": {"text": "the amsterdma meetpu", "s": {"term": {"field": "title"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn brown", "term": {"field": "body", "suggest_mode": "always"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn brown", "term": {"field": "body", "suggest_mode": "popular"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn", "term": {"field": "body", "sort": "frequency"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwnn", "term": {"field": "body", "max_edits": 1}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "rown", "term": {"field": "body", "prefix_length": 0}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "laz dgo", "term": {"field": "body", "min_word_length": 2}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn", "term": {"field": "body", "size": 1}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "body", "string_distance": "levenshtein"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "title", "string_distance": "damerau_levenshtein"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "title", "string_distance": "jaro_winkler"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "body", "string_distance": "ngram"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "musik", "term": {"field": "genre"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "term": {"field": "nope"}}}}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "term": {}}}}),
+    ("POST", SG, {"suggest": {"s": {"term": {"field": "title"}}}}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "term": {"field": "title", "suggest_mode": "nope"}}}}),
+    ("POST", SG, {"query": {"match": {"title": "meetup"}}, "suggest": {"s": {"text": "meetpu", "term": {"field": "title"}}}}, {"pick": lambda r: (ids(r), r["hits"]["total"], r["suggest"])}),
+    ("POST", SG, {"size": 0, "suggest": {"s": {"text": "meetpu", "term": {"field": "title"}}}}),
+    ("POST", SG + "?typed_keys=true", {"suggest": {"t": {"text": "meetpu", "term": {"field": "title"}},
+                                                   "c": {"prefix": "nir", "completion": {"field": "sug"}},
+                                                   "p": {"text": "meetpu", "phrase": {"field": "title"}}}}, {"pick": lambda r: sorted(r["suggest"])}),
+    # phrase
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "max_errors": 2}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "size": 1, "highlight": {"pre_tag": "<em>", "post_tag": "</em>"}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "berlni gide", "phrase": {"field": "title", "confidence": 0, "max_errors": 0.5}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "lazy dgo", "phrase": {"field": "body", "smoothing": {"laplace": {"alpha": 0.7}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn foxs", "phrase": {"field": "body", "gram_size": 2, "max_errors": 2,
+                                                                   "direct_generator": [{"field": "body", "suggest_mode": "always", "min_word_length": 3}]}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "max_errors": 2,
+                                                                           "collate": {"query": {"source": {"match_phrase": {"title": "{{suggestion}}"}}}, "prune": True}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "max_errors": 2,
+                                                                           "collate": {"query": {"source": {"match_phrase": {"title": "{{suggestion}}"}}}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "phrase": {"field": "nope"}}}}),
+    # completion
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug", "skip_duplicates": True}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug", "size": 2}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "NINE inch-n", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nrv", "completion": {"field": "sug", "fuzzy": {"fuzziness": 1}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nirv", "completion": {"field": "sug", "fuzzy": True}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nivrana", "completion": {"field": "sug", "fuzzy": {}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"regex": "n[aeiou]r", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"regex": "ne.*", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"text": "nev", "s": {"completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"kind": "movie"}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"kind": [{"context": "movie", "boost": 3}, "space"]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "skip_duplicates": True, "contexts": {"kind": ["movie", "space"]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"kind": [{"context": "mo", "prefix": True}]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"zz": "movie"}}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "a", "completion": {"field": "gsug", "contexts": {"genre": "music"}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "b", "completion": {"field": "gsug", "contexts": {"where": {"lat": 52.52, "lon": 13.40}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "", "completion": {"field": "gsug", "contexts": {"where": [{"context": {"lat": 52.37, "lon": 4.89}, "boost": 2}, {"lat": 52.52, "lon": 13.40}]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "a", "completion": {"field": "gsug", "contexts": {"where": {"context": {"lat": 52.0, "lon": 5.0}, "precision": 2}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "title"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "nope"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "nope": {"field": "sug"}}}}),
+    ("POST", SG, {"suggest": {"s": {"completion": {"field": "sug"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "123", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug"}}}, "aggs": {"g": {"terms": {"field": "genre"}}}},
+     {"pick": lambda r: (r["hits"]["total"], r["aggregations"], len(r["suggest"]["s"][0]["options"]))}),
+    ("PUT", "/sug-t/_doc/9", {"csug": {"input": "Solo"}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"input": "x", "weight": "abc"}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"input": "x", "weight": -1}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"inputs": "x"}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": 5}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"input": "Zebra", "weight": "7"}, "csug": {"input": "Solo", "contexts": {"kind": "movie"}}}),
+    ("POST", "/sug-t/_refresh"),
+    ("POST", SG, {"suggest": {"s": {"prefix": "z", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("DELETE", "/sug-t"),
+])
+
 scenario("date_math_range", setup() + [
     ("POST", S, {"query": {"range": {"date": {"gte": "2024-01-15", "lt": "2024-02-01"}}}}, {"pick": ids}),
     ("POST", S, {"query": {"range": {"date": {"gte": "2024-01-15||+1M/M"}}}}, {"pick": ids}),
@@ -1232,9 +1459,9 @@ for name, steps in SCENARIOS.items():
         if a == b:
             print(f"  ok   {i:2} {label}")
             if os.environ.get("ES_EDGES_VERBOSE"):
-                print(f"         both: {json.dumps(a)[:600]}")
+                print(f"         both: {json.dumps(a)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}")
         else:
             failures += 1
-            print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:600]}\n        noida: {json.dumps(b)[:600]}")
+            print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}\n        noida: {json.dumps(b)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}")
 print(f"\n{failures} differing steps")
 sys.exit(min(failures, 100))

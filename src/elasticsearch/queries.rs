@@ -493,7 +493,12 @@ pub fn combined_fields(
         .map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
-                .map(|f| f.split('^').next().unwrap_or(f).to_string())
+                .flat_map(|f| {
+                    super::highlight::expand_field_pattern(
+                        mappings,
+                        f.split('^').next().unwrap_or(f),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
