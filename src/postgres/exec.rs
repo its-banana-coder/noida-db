@@ -872,6 +872,17 @@ fn system_call(name: &str, a: &[Value], tys: &[Type], ret: Type, ctx: &mut Ctx) 
         "setval" => {
             let oid = a[0].as_int().unwrap_or(0) as u32;
             let v = a[1].as_int().unwrap_or(0);
+            if let Some(seq) = ctx.db.sequences.get(&oid)
+                && (v < seq.min || v > seq.max)
+            {
+                return Err(PgError::new(
+                    code::NUMERIC_VALUE_OUT_OF_RANGE,
+                    format!(
+                        "setval: value {v} is out of bounds for sequence \"{}\" ({}..{})",
+                        seq.name, seq.min, seq.max
+                    ),
+                ));
+            }
             let called = a.get(2).and_then(Value::as_bool).unwrap_or(true);
             ctx.seqs.insert(oid, SeqValue { last: v, is_called: called });
             ctx.rt.currval.insert(oid, v);

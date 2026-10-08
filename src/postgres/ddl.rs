@@ -371,6 +371,19 @@ impl Ddl<'_, '_> {
                 )
             })?);
         }
+        // A table-level CHECK names no columns: conkey is the columns its
+        // expression reads, in order of appearance.
+        if let PendingConstraint::Check(sql) = &kind
+            && idxs.is_empty()
+        {
+            for w in sql_identifiers(sql) {
+                if let Some(i) = t.col_index(&w)
+                    && !idxs.contains(&i)
+                {
+                    idxs.push(i);
+                }
+            }
+        }
         let mut fk_deferral = (false, false);
         let kind = match kind {
             PendingConstraint::Deferrable(inner, d) => {
@@ -620,11 +633,46 @@ impl Ddl<'_, '_> {
         );
         let found = match b.lookup_sequence_oid(qualifier.as_deref(), &name) {
             Ok(oid) => oid,
-            Err(_) if d.if_flag => return Ok("ALTER SEQUENCE".into()),
+            Err(_) if d.if_flag => {
+                self.ctx
+                    .rt
+                    .notices
+                    .push(PgError::notice(format!("relation \"{name}\" does not exist, skipping")));
+                return Ok("ALTER SEQUENCE".into());
+            }
             Err(e) => return Err(e),
         };
         let mut seq = self.ctx.db.sequences.get(&found).cloned().unwrap();
         let old_text = self.ctx.db.regclass_text(seq.schema, &seq.name, &self.info.search_path);
+        // AS type: bounds that were the old type's defaults become the new
+        // type's (an explicit MINVALUE/MAXVALUE below still wins).
+        if let Some(t) = d.as_type.as_deref() {
+            let ty = match t {
+                "bigint" | "int8" => Type::INT8,
+                "integer" | "int" | "int4" => Type::INT4,
+                "smallint" | "int2" => Type::INT2,
+                _ => {
+                    return Err(PgError::new(
+                        code::INVALID_PARAMETER_VALUE,
+                        "sequence type must be smallint, integer, or bigint",
+                    ));
+                }
+            };
+            let range = |b: Base| match b {
+                Base::Int2 => (i16::MIN as i64, i16::MAX as i64),
+                Base::Int4 => (i32::MIN as i64, i32::MAX as i64),
+                _ => (i64::MIN, i64::MAX),
+            };
+            let (old_lo, old_hi) = range(seq.ty.base);
+            let (new_lo, new_hi) = range(ty.base);
+            if seq.max == old_hi {
+                seq.max = new_hi;
+            }
+            if seq.min == old_lo || seq.min == old_lo + 1 {
+                seq.min = if seq.min == old_lo { new_lo } else { new_lo + 1 };
+            }
+            seq.ty = ty;
+        }
         apply_seq_options(&mut seq, d, false)?;
         if let Some(new_name) = &d.rename_to {
             if self.ctx.db.relation_exists(seq.schema, new_name) {
@@ -2188,4 +2236,61 @@ fn object_kind_name(k: a::ObjectType) -> &'static str {
         a::ObjectType::Database => "DATABASE",
         _ => "OBJECT",
     }
+}
+
+/// The identifiers in an SQL expression (unquoted ones folded to lower
+/// case), skipping string literals.
+fn sql_identifiers(sql: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                while let Some(d) = chars.next() {
+                    if d == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '"' => {
+                let mut w = String::new();
+                while let Some(d) = chars.next() {
+                    if d == '"' {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            w.push('"');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        w.push(d);
+                    }
+                }
+                out.push(w);
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let mut w = c.to_lowercase().to_string();
+                while let Some(&d) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' || d == '$' {
+                        w.extend(d.to_lowercase());
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                out.push(w);
+            }
+            c if c.is_ascii_digit() => {
+                while chars.peek().is_some_and(|d| d.is_alphanumeric() || *d == '.') {
+                    chars.next();
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
