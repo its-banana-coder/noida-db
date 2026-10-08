@@ -1082,4 +1082,15 @@ PG_EDGES.update({
         "SELECT ((SELECT 1) UNION (SELECT 2))",
         "SELECT * FROM ((SELECT 1 AS a) UNION ALL (SELECT 2)) s ORDER BY 1",
     ),
+    "pg edge: RENAME COLUMN rewrites quoted references": steps(
+        'CREATE TABLE rn1 (id int, "field_with_long_name" int CHECK ("field_with_long_name" >= 0), b int DEFAULT 0, g int GENERATED ALWAYS AS ("field_with_long_name" * 2) STORED, "Mixed" text CHECK ("Mixed" <> \'field_with_long_name\'))',
+        'CREATE INDEX rn1_e ON rn1 ((field_with_long_name + 1)) WHERE "field_with_long_name" > 0',
+        'ALTER TABLE rn1 RENAME COLUMN "field_with_long_name" TO renamed_col',
+        'ALTER TABLE rn1 RENAME COLUMN "Mixed" TO "AlsoMixed"',
+        "INSERT INTO rn1 (id, renamed_col, \"AlsoMixed\") VALUES (1, 5, 'field_with_long_name')",
+        "INSERT INTO rn1 (id, renamed_col, \"AlsoMixed\") VALUES (2, -1, 'x')",
+        "INSERT INTO rn1 (id, renamed_col, \"AlsoMixed\") VALUES (3, 7, 'y')",
+        "SELECT id, renamed_col, g, \"AlsoMixed\" FROM rn1 ORDER BY id",
+        "SELECT pg_get_constraintdef(oid) LIKE '%renamed_col%' FROM pg_constraint WHERE conrelid = 'rn1'::regclass AND contype = 'c' ORDER BY conname",
+    ),
 })

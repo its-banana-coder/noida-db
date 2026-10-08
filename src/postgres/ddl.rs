@@ -2130,39 +2130,68 @@ fn default_sql(db: &DbState, e: &a::Expr, ty: Type) -> String {
     format!("{e}::{name}")
 }
 
-/// Renames a bare identifier in stored SQL, leaving strings and quoted
-/// identifiers alone.
+/// Renames an identifier in stored SQL (defaults, CHECKs, generated
+/// columns, index expressions): unquoted words by their folded spelling,
+/// quoted ones exactly; string literals are left alone.
 fn rename_ident(sql: &str, old: &str, new: &str) -> String {
+    // The new name as it must be written: quoted unless a plain
+    // lower-case identifier.
+    let written = super::funcs::quote_ident(new);
     let mut out = String::with_capacity(sql.len());
-    let b = sql.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let quote = b[i];
-                out.push(quote as char);
-                i += 1;
-                while i < b.len() {
-                    out.push(b[i] as char);
-                    if b[i] == quote {
-                        i += 1;
+    let mut chars = sql.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\'' => {
+                out.push(c);
+                while let Some((_, d)) = chars.next() {
+                    out.push(d);
+                    if d == '\'' {
+                        if chars.peek().map(|p| p.1) == Some('\'') {
+                            out.push(chars.next().unwrap().1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            // A quoted identifier matches the old name exactly.
+            '"' => {
+                let mut name = String::new();
+                while let Some((_, d)) = chars.next() {
+                    if d == '"' {
+                        if chars.peek().map(|p| p.1) == Some('"') {
+                            chars.next();
+                            name.push('"');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        name.push(d);
+                    }
+                }
+                if name == old {
+                    out.push_str(&written);
+                } else {
+                    out.push('"');
+                    out.push_str(&name.replace('"', "\"\""));
+                    out.push('"');
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' => {
+                let mut end = i + c.len_utf8();
+                while let Some(&(k, d)) = chars.peek() {
+                    if d.is_alphanumeric() || d == '_' || d == '$' {
+                        end = k + d.len_utf8();
+                        chars.next();
+                    } else {
                         break;
                     }
-                    i += 1;
                 }
+                let word = &sql[i..end];
+                // An unquoted word folds to lower case.
+                if word.to_lowercase() == old { out.push_str(&written) } else { out.push_str(word) }
             }
-            c if c.is_ascii_alphanumeric() || c == b'_' => {
-                let start = i;
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
-                    i += 1;
-                }
-                let word = &sql[start..i];
-                if word.eq_ignore_ascii_case(old) { out.push_str(new) } else { out.push_str(word) }
-            }
-            c => {
-                out.push(c as char);
-                i += 1;
-            }
+            c => out.push(c),
         }
     }
     out
