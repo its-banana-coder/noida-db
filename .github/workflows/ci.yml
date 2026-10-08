@@ -68,6 +68,11 @@ jobs:
         env:
           MYSQL_REF_PORT: 3307
           POSTGRES_REF_PORT: 5432
+      # Elasticsearch edge cases (query DSL, sorting, scroll/PIT, painless,
+      # index management) compared response by response.
+      - run: tests/failure-diff/es_run.sh
+        env:
+          ES_REF: http://127.0.0.1:9200
       # Real MySQL drivers and ORMs: pymysql, SQLAlchemy, Django, mysql2,
       # Go database/sql + GORM, Connector/J.
       - run: tests/clients/mysql/run.sh
