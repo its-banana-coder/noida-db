@@ -498,6 +498,14 @@ impl P {
                         let args = if self.eat("(") { self.args(")")? } else { Vec::new() };
                         Ok(Expr::Static(id, m, args))
                     }
+                    // The vector functions of scoring scripts.
+                    _ if super::vectors::SCRIPT_FUNCTIONS.contains(&id.as_str())
+                        && self.is("(") =>
+                    {
+                        self.i += 1;
+                        let args = self.args(")")?;
+                        Ok(Expr::Static("fn".into(), id, args))
+                    }
                     _ => Ok(Expr::Var(id)),
                 }
             }
@@ -1044,6 +1052,27 @@ impl Env {
                     }
                 };
                 match (class.as_str(), m.as_str()) {
+                    ("fn", name) => {
+                        let field = vals.get(1).cloned().unwrap_or(Value::Null);
+                        let doc = match &field {
+                            Value::String(f) => {
+                                self.get_var("doc")?.get(f).cloned().unwrap_or(Value::Null)
+                            }
+                            // Elasticsearch 8.15 takes the field's name only.
+                            other => {
+                                return Err(format!(
+                                    "cannot implicitly cast def [{}] to java.lang.String",
+                                    if other.get("__vector").is_some() {
+                                        "org.elasticsearch.index.mapper.vectors.DenseVectorScriptDocValues"
+                                    } else {
+                                        type_name(other)
+                                    }
+                                ));
+                            }
+                        };
+                        let query = vals.first().cloned().unwrap_or(Value::Null);
+                        json!(super::vectors::script_function(name, &query, &doc)?)
+                    }
                     ("Math", "max") => n(f(0).max(f(1))),
                     ("Math", "min") => n(f(0).min(f(1))),
                     ("Math", "abs") => n(f(0).abs()),

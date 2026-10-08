@@ -865,6 +865,240 @@ scenario("index_management", mk("im-1", {"t": {"type": "text"}, "k": {"type": "k
     ("GET", "/im-*"),
 ])
 
+
+# dense_vector fields and kNN search: mapping defaults and validation,
+# document checks, the top-level `knn` option, the `knn` query and vector
+# functions in scoring scripts. Scores are compared only for HNSW/flat
+# fields: the default int8_hnsw field's scores are quantized
+# approximations in real Elasticsearch (noida's are exact), so for it only
+# the order is.
+KNN_PROPS = {
+    "name": {"type": "keyword"},
+    "l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "hnsw"}},
+    "cos": {"type": "dense_vector", "dims": 3, "similarity": "cosine", "index_options": {"type": "hnsw", "m": 32}},
+    "dot": {"type": "dense_vector", "dims": 2, "similarity": "dot_product", "index_options": {"type": "flat"}},
+    "mip": {"type": "dense_vector", "dims": 3, "similarity": "max_inner_product", "index_options": {"type": "hnsw"}},
+    "byte": {"type": "dense_vector", "dims": 3, "element_type": "byte", "similarity": "dot_product"},
+    "bytel2": {"type": "dense_vector", "dims": 3, "element_type": "byte", "similarity": "l2_norm"},
+    "bits": {"type": "dense_vector", "dims": 16, "element_type": "bit"},
+    "q8": {"type": "dense_vector", "dims": 3},
+    "raw": {"type": "dense_vector", "dims": 3, "index": False},
+    "paras": {"type": "nested", "properties": {
+        "pid": {"type": "keyword"},
+        "vec": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "hnsw"}},
+    }},
+}
+KNN_DOCS = [
+    {"name": "a", "l2": [1, 2, 3], "cos": [1, 2, 3], "dot": [0.6, 0.8], "mip": [1, 2, 3], "byte": [1, 2, 3],
+     "bytel2": [1, 2, 3], "bits": [1, 3], "q8": [1, 2, 3], "raw": [1, 1, 1],
+     "paras": [{"pid": "a0", "vec": [1, 0, 0]}, {"pid": "a1", "vec": [5, 5, 5]}]},
+    {"name": "b", "l2": [-1, 0.5, 2], "cos": [-1, 0.5, 2], "dot": [0.8, 0.6], "mip": [-1, 0.5, 2], "byte": [-100, 50, 3],
+     "bytel2": [-100, 50, 3], "bits": "ff00", "q8": [-1, 0.5, 2],
+     "paras": [{"pid": "b0", "vec": [0, 1, 0]}]},
+    {"name": "c", "l2": [3, -2, 0.1], "cos": [3, -2, 0.1], "dot": [0, 1], "mip": [3, -2, 0.1], "byte": "05f909",
+     "bytel2": [5, -7, 9], "bits": [0, 0], "q8": [3, -2, 0.1],
+     "paras": [{"pid": "c0", "vec": [9, 9, 9]}, {"pid": "c1", "vec": [0.5, 0.5, 0]}, {"pid": "c2", "vec": [2, 2, 2]}]},
+    {"name": "a", "l2": [0, 0, 1], "cos": [0, 0, 1], "dot": [1, 0], "mip": [0, 0, 1], "byte": [0, 0, 1],
+     "bytel2": [0, 0, 1], "bits": [255, 255], "q8": [0, 0, 1]},
+    {"name": "d"},
+]
+K = "/knn-docs/_search"
+ACK = {"pick": lambda r: r.get("acknowledged")}
+
+
+def knn_hits(r):
+    return [(h["_id"], h.get("_score"), h.get("matched_queries")) for h in r["hits"]["hits"]] + [r["hits"].get("total")]
+
+
+def knn_ids(r):
+    return [h["_id"] for h in r["hits"]["hits"]] + [r["hits"].get("total")]
+
+
+def knn_inner(r):
+    return [(h["_id"], h["_score"], [(x["_nested"]["offset"], x["_score"], x.get("fields"))
+                                     for x in h["inner_hits"]["paras"]["hits"]["hits"]],
+             h["inner_hits"]["paras"]["hits"]["total"]) for h in r["hits"]["hits"]]
+
+
+def knn_bad_mapping(name, prop):
+    return [("DELETE", f"/{name}?ignore_unavailable=true"),
+            ("PUT", f"/{name}", {"mappings": {"properties": {"v": prop}}})]
+
+
+def kq(field, vector, **kw):
+    return dict({"field": field, "query_vector": vector}, **kw)
+
+
+scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
+                 ("PUT", "/knn-docs", {"settings": STATIC, "mappings": {"properties": KNN_PROPS}}, ACK),
+                 ("GET", "/knn-docs/_mapping")]
+         + [("PUT", f"/knn-docs/_doc/{i}", d, {"pick": lambda r: r.get("result")}) for i, d in enumerate(KNN_DOCS, 1)]
+         + [("POST", "/knn-docs/_refresh", None, {"pick": lambda r: True})] + [
+    # Each similarity's scores.
+    ("POST", K, {"knn": kq("l2", [0.5, 1, -1], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("cos", [0.5, 1, -1], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("dot", [0.6, 0.8], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("mip", [0.5, 1, -1], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("byte", [5, -7, 9], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("byte", "05f909", k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("bytel2", [5, -7, 9], k=2), "_source": False}),
+    ("POST", K, {"knn": kq("bits", [1, 2], k=5), "_source": False}),
+    ("POST", K, {"knn": kq("bits", "0102", k=5, similarity=2), "_source": False}),
+    ("POST", K, {"knn": kq("q8", [0.5, 1, -1], k=3)}, {"pick": knn_ids}),
+    # k, num_candidates, size and from.
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "size": 2, "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "size": 2, "from": 1, "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "from": 1, "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], num_candidates=3), "size": 2}, {"pick": knn_ids}),
+    # filter, similarity, boost, _name, combined with a query.
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=2, filter={"term": {"name": "a"}}), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=2, filter=[{"term": {"name": "a"}}, {"ids": {"values": ["4"]}}]), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=4, similarity=3), "_source": False}),
+    ("POST", K, {"knn": kq("cos", [1, 2, 3], k=4, similarity=0.5), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=2, boost=2, _name="near"),
+                 "query": {"constant_score": {"filter": {"term": {"name": "c"}}, "_name": "is_c"}}, "_source": False}),
+    ("POST", K, {"knn": [kq("l2", [0, 0, 0], k=2), kq("cos", [3, -2, 0], k=2, boost=0.5)], "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "aggs": {"names": {"terms": {"field": "name"}}}, "size": 1},
+     {"pick": lambda r: (knn_ids(r), r["aggregations"])}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "sort": [{"name": "desc"}], "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "fields": ["name", "l2"], "_source": False}),
+    ("POST", "/knn-docs/_search?search_type=query_then_fetch", {"knn": kq("l2", [0, 0, 0])}),
+    # Nested vectors: the nearest parents, with their nearest objects.
+    ("POST", K, {"knn": kq("paras.vec", [1, 1, 0], k=2, inner_hits={"size": 2, "_source": False, "fields": ["paras.pid"]}),
+                 "_source": False}, {"pick": knn_inner}),
+    ("POST", K, {"knn": kq("paras.vec", [1, 1, 0], k=3, similarity=1.5, inner_hits={"_source": False}),
+                 "_source": False}, {"pick": knn_inner}),
+    ("POST", K, {"knn": kq("paras.vec", [1, 1, 0], k=3, filter={"term": {"name": "c"}}), "_source": False}),
+    ("POST", K, {"query": {"nested": {"path": "paras", "query": {"knn": kq("paras.vec", [1, 1, 0], k=2)},
+                                      "inner_hits": {"_source": False}}}, "_source": False}, {"pick": knn_inner}),
+    # The knn query.
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=2)}, "_source": False}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0])}, "size": 1, "_source": False}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], num_candidates=2)}, "_source": False}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=2, boost=3, _name="kq", filter={"term": {"name": "a"}})}, "_source": False}),
+    ("POST", K, {"query": {"bool": {"must": [{"knn": kq("l2", [0, 0, 0], k=2)}], "filter": [{"term": {"name": "a"}}]}}, "_source": False}),
+    ("POST", K, {"query": {"bool": {"should": [{"knn": kq("l2", [0, 0, 0], k=1)}, {"constant_score": {"filter": {"term": {"name": "c"}}}}]}}, "_source": False}),
+    ("POST", K, {"query": {"dis_max": {"queries": [{"knn": kq("l2", [0, 0, 0], k=2)}, {"constant_score": {"filter": {"term": {"name": "b"}}}}], "tie_breaker": 0.5}}, "_source": False}),
+    ("POST", K, {"query": {"function_score": {"query": {"knn": kq("l2", [0, 0, 0], k=3)},
+                                              "functions": [{"filter": {"term": {"name": "a"}}, "weight": 10}]}}, "_source": False}),
+    ("POST", K, {"query": {"constant_score": {"filter": {"knn": kq("l2", [0, 0, 0], k=2)}}}, "_source": False}),
+    ("POST", "/knn-docs/_count", {"query": {"knn": kq("l2", [0, 0, 0], k=2)}}),
+    # Vector functions in scoring scripts.
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "cosineSimilarity(params.qv, 'l2') + 1.0", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "dotProduct(params.qv, 'l2') + 100", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "1 / (1 + l1norm(params.qv, 'l2'))", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "1 / (1 + l2norm(params.qv, doc['l2']))", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "byte"}},
+                                            "script": {"source": "1 / (1 + hamming(params.qv, 'byte'))", "params": {"qv": [5, -7, 9]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "raw"}},
+                                            "script": {"source": "doc['raw'].vectorValue[0] + doc['raw'].magnitude"}}},
+                 "_source": False}),
+    # Search errors.
+    ("POST", K, {"knn": kq("nope", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("name", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("raw", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("l2", [0, 0])}),
+    ("POST", K, {"knn": kq("cos", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("dot", [1, 1])}),
+    ("POST", K, {"knn": kq("byte", [1.5, 2, 3])}),
+    ("POST", K, {"knn": kq("byte", [500, 2, 3])}),
+    ("POST", K, {"knn": kq("byte", "abc")}),
+    ("POST", K, {"knn": kq("l2", [1, "x", 3])}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=0)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=5, num_candidates=2)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], num_candidates=10001)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=10001)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "size": 0}),
+    ("POST", K, {"knn": {"field": "l2"}}),
+    ("POST", K, {"knn": {"query_vector": [0, 0, 0]}}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], bogus=1)}),
+    ("POST", K, {"knn": 5}),
+    ("POST", K, {"knn": []}, {"pick": knn_ids}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=5, num_candidates=3)}}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=0)}}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], inner_hits={})}}),
+    ("POST", K, {"query": {"knn": {"field": "l2"}}}),
+    ("POST", K, {"query": {"knn": kq("nope", [0, 0, 0])}}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0])}, "size": 0}),
+    # Document checks.
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1, 2]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1, 2, 3, 4]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1, "a", 3]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": "abc"}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": 5}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": {"a": 1}}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1e40, 0, 0]}),
+    ("PUT", "/knn-docs/_doc/x", {"cos": [0, 0, 0]}),
+    ("PUT", "/knn-docs/_doc/x", {"dot": [3, 4]}),
+    ("PUT", "/knn-docs/_doc/x", {"byte": [1, 2, 300]}),
+    ("PUT", "/knn-docs/_doc/x", {"byte": [1.5, 2, 3]}),
+    ("PUT", "/knn-docs/_doc/x", {"bits": [1, 2, 3]}),
+    ("PUT", "/knn-docs/_doc/x", {"paras": [{"vec": [1, 2]}]}),
+    ("POST", "/_bulk", [{"index": {"_index": "knn-docs", "_id": "y"}}, {"l2": [1, 2]},
+                        {"index": {"_index": "knn-docs", "_id": "z"}}, {"l2": [1, 2, 3]}],
+     {"pick": lambda r: [(list(i.values())[0]["status"], list(i.values())[0].get("error", {}).get("type")) for i in r["items"]]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": None, "name": "x"}, {"pick": lambda r: r.get("result")}),
+    ("DELETE", "/knn-docs/_doc/x", None, {"pick": lambda r: r.get("result")}),
+    ("DELETE", "/knn-docs/_doc/z", None, {"pick": lambda r: r.get("result")}),
+    # Mapping updates.
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw", "m": 20}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "flat"}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw", "m": 16}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 4, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw", "m": 20}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "cosine", "index_options": {"type": "int8_hnsw", "m": 20}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"dot": {"type": "dense_vector", "dims": 2, "similarity": "dot_product", "index_options": {"type": "int8_flat"}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"cos": {"type": "dense_vector", "dims": 3, "element_type": "byte", "index_options": {"type": "hnsw", "m": 32}}}}),
+    ("GET", "/knn-docs/_mapping/field/l2,dot"),
+    # Dynamic mapping: 128 to 4096 floats are a vector.
+    ("DELETE", "/knn-dyn?ignore_unavailable=true"),
+    ("PUT", "/knn-dyn/_doc/1", {"v": [i + 0.5 for i in range(128)], "short": [0.5] * 127, "ints": list(range(200)),
+                                "long": [0.5] * 4097, "o": {"inner": 1}}, {"pick": lambda r: r.get("result")}),
+    ("GET", "/knn-dyn/_mapping"),
+    ("PUT", "/knn-dyn/_doc/2", {"v": [0.5, 1.5]}),
+    ("PUT", "/knn-dyn/_doc/3", {"v": [0.0] * 128}),
+    # Mapped without dims: the first document sets them.
+    ("DELETE", "/knn-nodims?ignore_unavailable=true"),
+    ("PUT", "/knn-nodims", {"mappings": {"properties": {"v": {"type": "dense_vector"}, "b": {"type": "dense_vector", "element_type": "byte"}}}}, ACK),
+    ("POST", "/knn-nodims/_search", {"knn": kq("v", [1, 2, 3])}, {"pick": knn_ids}),
+    ("GET", "/knn-nodims/_mapping"),
+    ("PUT", "/knn-nodims/_doc/1?refresh=true", {"v": [1, 2, 3], "b": "807f0a"}, {"pick": lambda r: r.get("result")}),
+    ("GET", "/knn-nodims/_mapping"),
+    ("PUT", "/knn-nodims/_doc/2", {"v": [1, 2]}),
+] + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 5000})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 0})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": "x"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "similarity": "foo"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index": False, "similarity": "cosine"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index": False, "index_options": {"type": "hnsw"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "element_type": "foo"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {"type": "foo"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {"type": "hnsw", "bar": 1}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "foo": 1})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 8, "element_type": "bit", "similarity": "cosine"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "element_type": "byte", "index_options": {"type": "int8_hnsw"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {"type": "int4_hnsw"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index": "x"})
+  + knn_bad_mapping("knn-ok", {"type": "dense_vector", "dims": 4, "index_options": {"type": "int4_flat"}})
+  + [("GET", "/knn-ok/_mapping")]
+  + knn_bad_mapping("knn-ok", {"type": "dense_vector", "dims": 4, "index_options": {"type": "int8_hnsw", "confidence_interval": 0.5, "m": 8}})
+  + [("GET", "/knn-ok/_mapping")]
+  + knn_bad_mapping("knn-ok", {"type": "dense_vector", "dims": 4, "element_type": "byte", "index_options": {"type": "flat"}})
+  + [("GET", "/knn-ok/_mapping")] + [
+    ("DELETE", "/knn-docs"), ("DELETE", "/knn-dyn"), ("DELETE", "/knn-nodims"),
+    ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

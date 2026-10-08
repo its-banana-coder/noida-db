@@ -82,7 +82,11 @@ fn bulk_and_dynamic_mapping_match_the_milestone_contract() {
     );
     assert_eq!(properties["count"]["type"], "long");
     assert_eq!(properties["active"]["type"], "boolean");
-    assert_eq!(properties["meta"]["type"], "object");
+    // A sub-object maps its own fields, as Elasticsearch shows them.
+    assert_eq!(
+        properties["meta"],
+        json!({"properties": {"source": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}}}})
+    );
 }
 
 #[test]
