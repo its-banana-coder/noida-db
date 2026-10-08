@@ -3077,9 +3077,12 @@ impl<'a> Binder<'a> {
             };
             // float4 mixed with anything else resolves to float8.
             let ty = if ty.base == Float4 && lt != rt { Type::FLOAT8 } else { ty };
-            // ^ is float8-only unless both are numeric-ish.
+            // ^ is numeric ^ numeric or float8 ^ float8; a float operand
+            // wins (numeric casts implicitly to float8, not back).
             if op == "^" {
-                return if lt.base == Numeric || rt.base == Numeric {
+                let float =
+                    matches!(lt.base, Float4 | Float8) || matches!(rt.base, Float4 | Float8);
+                return if !float && (lt.base == Numeric || rt.base == Numeric) {
                     Some((Type::NUMERIC, Type::NUMERIC, Type::NUMERIC))
                 } else {
                     Some((Type::FLOAT8, Type::FLOAT8, Type::FLOAT8))
