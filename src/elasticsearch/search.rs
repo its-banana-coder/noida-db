@@ -18,6 +18,7 @@ use super::queries;
 use super::query_string;
 use super::scoring;
 use super::sorting;
+use super::suggest;
 
 /// A search failure, shaped the way Elasticsearch reports it: most are a
 /// plain `{"error": {"type": ...}}`, but a failure while executing the
@@ -2176,6 +2177,18 @@ pub fn search_with(
     body: &Value,
     opts: &SearchOptions,
 ) -> Result<Value, EsError> {
+    if let Some(spec) = body.get("suggest") {
+        let suggestions = suggest::suggest(spec, mappings, docs)?;
+        let mut rest = body.clone();
+        if let Some(o) = rest.as_object_mut() {
+            o.remove("suggest");
+        }
+        // A suggest-only request runs no query: no hits.
+        let only = ["query", "aggs", "aggregations"].iter().all(|k| body.get(*k).is_none());
+        let mut resp = search_with(mappings, if only { &[] } else { docs }, &rest, opts)?;
+        resp["suggest"] = suggestions;
+        return Ok(resp);
+    }
     let typed = opts.typed;
     let size = int_param(body, "size", 10)?;
     let from = int_param(body, "from", 0)?;

@@ -8,6 +8,7 @@ use super::cat;
 use super::dates;
 use super::painless;
 use super::search::{self, CommittedDoc};
+use super::suggest;
 
 #[derive(Clone)]
 pub struct Engine(Arc<Mutex<State>>);
@@ -976,7 +977,12 @@ impl Engine {
             return (200, resp);
         }
         match search::search_typed(&mappings, &docs, &req, typed) {
-            Ok(resp) => (200, resp),
+            Ok(mut resp) => {
+                if q.get("typed_keys").is_some_and(|v| v == "true") {
+                    suggest::type_keys(&req, &mut resp);
+                }
+                (200, resp)
+            }
             Err(e) => (e.status, e.to_json()),
         }
     }
@@ -1620,6 +1626,7 @@ impl Engine {
                         return e;
                     }
                     merge(&mut index.mappings, m);
+                    suggest::normalize_mappings(&mut index.mappings);
                 }
                 if let Some(st) = req.get("settings") {
                     apply_settings(&mut index.settings, st);
@@ -1704,6 +1711,7 @@ impl Engine {
                 for n in &names {
                     if let Some(i) = s.indices.get_mut(n) {
                         merge(&mut i.mappings, next.clone());
+                        suggest::normalize_mappings(&mut i.mappings);
                     }
                 }
                 (200, json!({"acknowledged":true}))
@@ -2059,6 +2067,14 @@ impl Engine {
                         error("x_content_parse_exception", "Failed to parse content to map", 400),
                     );
                 };
+                if let Err(e) = suggest::validate_doc(&i.mappings, &src) {
+                    // Missing contexts fail while indexing, after the
+                    // operation took a sequence number; parse errors don't.
+                    if e.kind == "illegal_argument_exception" {
+                        i.next_seq(q.get("routing").map_or(id.as_str(), String::as_str));
+                    }
+                    return (e.status, e.to_json());
+                }
                 dynamic_mapping(&mut i.mappings, &src);
                 let exists = i.docs.contains_key(&id);
                 let seq = i.next_seq(q.get("routing").map_or(id.as_str(), String::as_str));
