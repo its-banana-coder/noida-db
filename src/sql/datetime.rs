@@ -62,8 +62,21 @@ impl Interval {
 
     /// `interval * float8`, spilling fractions down like Postgres.
     pub fn mul(&self, f: f64) -> Result<Interval, DtErr> {
-        let months_f = self.months as f64 * f;
-        let days_f = self.days as f64 * f;
+        self.scale(|x| x * f)
+    }
+
+    /// Postgres divides (not multiplies by 1/f), so the float rounding
+    /// matches its own.
+    pub fn div(&self, f: f64) -> Result<Interval, DtErr> {
+        self.scale(|x| x / f)
+    }
+
+    /// Postgres's interval_mul/interval_div: fractional months spill into
+    /// days (30 per month) and fractional days into the time part, each
+    /// rounded with `rint` (halves to even).
+    fn scale(&self, op: impl Fn(f64) -> f64) -> Result<Interval, DtErr> {
+        let months_f = op(self.months as f64);
+        let days_f = op(self.days as f64);
         if !months_f.is_finite()
             || months_f.abs() > i32::MAX as f64
             || days_f.abs() > i32::MAX as f64
@@ -72,28 +85,26 @@ impl Interval {
         }
         let months = months_f.trunc();
         let mut days = days_f.trunc();
-        // Fractional months become days (30 per month).
-        let month_rem_days = (months_f - months) * 30.0;
-        let whole_rem_days = month_rem_days.trunc();
-        days += whole_rem_days;
+        // TSROUND: to microseconds, halves to even.
+        let tsround = |x: f64| (x * 1e6).round_ties_even() / 1e6;
+        let month_rem_days = tsround((months_f - months) * 30.0);
         let mut sec_rem =
-            (month_rem_days - whole_rem_days) * 86400.0 + (days_f - days_f.trunc()) * 86400.0;
-        // Round to microseconds to avoid float noise.
-        sec_rem = (sec_rem * 1e6).round() / 1e6;
+            tsround((days_f - days + month_rem_days - month_rem_days.trunc()) * 86400.0);
         if sec_rem.abs() >= 86400.0 {
             let d = (sec_rem / 86400.0).trunc();
             days += d;
             sec_rem -= d * 86400.0;
         }
-        let micros_f = self.micros as f64 * f + sec_rem * 1e6;
+        days += month_rem_days.trunc();
+        let micros_f = op(self.micros as f64) + sec_rem * 1e6;
         if !micros_f.is_finite() || micros_f.abs() > i64::MAX as f64 {
             return Err(DtErr::Range);
         }
-        Ok(Interval { months: months as i32, days: days as i32, micros: micros_f.round() as i64 })
-    }
-
-    pub fn div(&self, f: f64) -> Result<Interval, DtErr> {
-        self.mul(1.0 / f)
+        Ok(Interval {
+            months: months as i32,
+            days: days as i32,
+            micros: micros_f.round_ties_even() as i64,
+        })
     }
 
     pub fn justify_hours(&self) -> Interval {

@@ -890,4 +890,13 @@ PG_EDGES.update({
         "SELECT DISTINCT ON (id) id, name FROM dd ORDER BY id DESC",
         "SELECT DISTINCT ON (name) id FROM dd ORDER BY name, id",
     ),
+    "pg edge: datetime + unknown, pg_typeof(NULL), interval scaling": steps(
+        "SELECT pg_typeof(now() + NULL), pg_typeof(now() - NULL), pg_typeof(now()::timestamp + NULL), pg_typeof(current_date - NULL), pg_typeof(NULL + now()), pg_typeof(localtime + NULL), pg_typeof(localtime - NULL)",
+        "SELECT pg_typeof(now() + '1 hour'), pg_typeof(now() - '2020-01-01'), pg_typeof(current_date - '2020-01-01'), pg_typeof(NULL::int), pg_typeof(NULL)",
+        "SELECT pg_typeof(current_date + '1')",
+        "SELECT pg_typeof(timetz '10:00+00' + NULL)",
+        "SELECT timestamp '2020-01-01' + '1 day', (timestamptz '2020-01-01 00:00+00' + NULL) IS NULL",
+        "SELECT interval '0:00:00.253' * 3.2, interval '0:00:00.253' / 3.2, interval '1 day 0:00:00.253' / 3.2, 3.2 * interval '5 days 0:00:01.1', interval '0:00:00.000001' * 0.5, interval '0:00:00.000003' / 2",
+        "SELECT interval '1 month' / 3.2, interval '1 mon 1 day' * 1.5, interval '-1 mon -3 days' / 7, interval '1 year 2 mons 3 days 04:05:06.789' * 0.333, interval '7 days' / 0.7",
+    ),
 })
