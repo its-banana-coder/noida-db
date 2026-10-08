@@ -291,6 +291,233 @@ scenario("highlight_long", setup("long", LONG_MAPPING, LONG_DOCS) + [
     ("POST", L, {"query": {"match": {"text": "nothing"}}, "highlight": {"fields": {"text": {}}}, "_source": False}, {"pick": HL}),
 ])
 
+
+# Highlighting beyond the basics: highlighter types, tag schemas,
+# encoders, per-field queries, multi-fields, boundary scanners, nested
+# inner hits and the errors apps hit.
+HLM_DOCS = [
+    {"title": "The quick brown fox", "tags": ["fox", "animal"], "num": 42, "k": "abc", "kk": "abcdef",
+     "html": "<b>Fish & chips</b> are quick to cook",
+     "body": "The quick brown fox jumps over the lazy dog. Foxes are quick and clever animals! "
+             "Did you know a fox can run fast? The brown fox lives in the forest near the river, "
+             "where quick streams flow and the lazy dog never goes because it is far too lazy.",
+     "multi": ["first quick value", "second slow value", "third quick one here"],
+     "comments": [{"author": "ann", "text": "quick reply here"}, {"author": "bob", "text": "a slow answer"},
+                  {"author": "cy", "text": "another quick note"}]},
+    {"title": "Lazy dogs and quick cats", "tags": ["dog"], "num": 7, "k": "xyz", "kk": "x",
+     "html": "quick <i>tags</i>", "body": "Nothing about foxes here, only quick cats and lazy dogs.",
+     "multi": ["slow"], "comments": [{"author": "dan", "text": "nothing"}]},
+]
+HLM_MAPPING = {"settings": STATIC,
+               "mappings": {"properties": {
+    "title": {"type": "text", "fields": {"raw": {"type": "keyword"}, "std": {"type": "text"}}},
+    "body": {"type": "text"}, "tags": {"type": "keyword"}, "num": {"type": "integer"},
+    "k": {"type": "keyword"}, "kk": {"type": "keyword", "ignore_above": 3}, "html": {"type": "text"},
+    "multi": {"type": "text"}, "tv": {"type": "text", "term_vector": "with_positions_offsets"},
+    "comments": {"type": "nested", "properties": {"author": {"type": "keyword"}, "text": {"type": "text"}}},
+}}}
+for d in HLM_DOCS:
+    d["tv"] = d["title"]
+HM = "/hl-m/_search"
+def hl(q, h, **kw):
+    b = {"query": q, "highlight": h}
+    b.update(kw)
+    return ("POST", HM, b, {"pick": HL})
+scenario("highlight_more", setup("hl-m", HLM_MAPPING, HLM_DOCS) + [
+    hl({"multi_match": {"query": "quick fox", "fields": ["t*"]}}, {"fields": {"*": {}}}),
+    hl({"multi_match": {"query": "quick fox", "fields": ["title*"]}}, {"fields": {"title*": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"*": {}}}),
+    hl({"match_phrase": {"body": "quick brown fox"}}, {"fields": {"body": {}}}),
+    hl({"match_phrase": {"body": "quick brown fox"}}, {"fields": {"body": {"type": "plain"}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"body": "quick fox"}}, {"tags_schema": "styled", "fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"body": "quick fox"}}, {"pre_tags": ["<a>", "<b>"], "post_tags": ["</a>", "</b>"], "fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match": {"html": "quick fish"}}, {"encoder": "html", "fields": {"html": {}}}),
+    hl({"match": {"html": "quick fish"}}, {"fields": {"html": {}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"number_of_fragments": 0}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"number_of_fragments": 1}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"type": "plain"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"no_match_size": 20}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"no_match_size": 20, "number_of_fragments": 0}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"highlight_query": {"match": {"title": "fox"}}}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"matched_fields": ["title", "title.std"]}}}),
+    hl({"match": {"title.std": "quick"}}, {"fields": {"title": {"matched_fields": ["title", "title.std"]}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"fragment_size": 30, "boundary_scanner": "word"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"fragment_size": 30, "boundary_scanner": "sentence"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"type": "plain", "fragment_size": 30}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"type": "plain", "fragment_size": 30, "number_of_fragments": 2}}}),
+    hl({"match": {"body": "lazy"}}, {"fields": {"body": {"type": "plain", "number_of_fragments": 0}}}),
+    hl({"match": {"body": "river"}}, {"fields": {"body": {}}}),
+    hl({"match": {"body": "river"}}, {"max_analyzed_offset": 20, "fields": {"body": {}}}),
+    hl({"match": {"body": "river"}}, {"max_analyzed_offset": -1, "fields": {"body": {}}}),
+    hl({"match": {"tv": "quick"}}, {"fields": {"tv": {"type": "fvh"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"type": "fvh"}}}),
+    hl({"term": {"k": "abc"}}, {"fields": {"k": {}}}),
+    hl({"term": {"num": 42}}, {"fields": {"num": {}}}),
+    hl({"prefix": {"kk": "ab"}}, {"fields": {"kk": {}}}),
+    hl({"match": {"title": "quick"}}, {"pre_tags": [], "post_tags": [], "fields": {"title": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": [{"title": {}}, {"body": {}}]}),
+    hl({"fuzzy": {"title": {"value": "quikc"}}}, {"fields": {"title": {}}}),
+    hl({"match": {"title": {"query": "quick lazy", "operator": "and"}}}, {"fields": {"title": {}}}),
+    hl({"bool": {"must": {"match": {"title": "quick"}}, "must_not": {"match": {"title": "cats"}}}}, {"fields": {"title": {}}}),
+    hl({"query_string": {"query": "qui*"}}, {"fields": {"title": {}, "body": {"number_of_fragments": 1}}}),
+    hl({"match": {"body": "quick"}}, {"order": "score", "fields": {"body": {"fragment_size": 40, "number_of_fragments": 2}}}),
+    hl({"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}},
+                   "inner_hits": {"highlight": {"fields": {"comments.text": {}}}}}}, {"fields": {"title": {}}}),
+    ("POST", HM, {"query": {"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}},
+                                       "inner_hits": {"_source": False, "highlight": {"fields": {"comments.text": {}}}}}}},
+     {"pick": lambda r: [(h["_id"], h.get("inner_hits")) for h in r["hits"]["hits"]]}),
+    hl({"match": {"title": "quick"}}, {"type": "nope", "fields": {"title": {}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"fragmenter": "simple", "type": "plain", "fragment_size": 10}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"title": {"fragmenter": "nope", "type": "plain"}}}),
+    hl({"match": {"html": "quick fish"}}, {"encoder": "html", "fields": {"html": {"type": "plain"}}}),
+    hl({"match": {"title": "quick"}}, {"fields": {"body": {"type": "plain", "no_match_size": 20}}}),
+    hl({"match": {"multi": "quick"}}, {"fields": {"multi": {"type": "plain", "number_of_fragments": 0}}}),
+    hl({"match": {"multi": "quick value"}}, {"order": "score", "fields": {"multi": {"type": "plain"}}}),
+    hl({"terms": {"tags": ["fox", "dog"]}}, {"fields": {"tags": {"type": "plain"}}}),
+    hl({"match": {"body": "quick lazy"}}, {"fields": {"body": {"type": "plain", "fragment_size": 50, "number_of_fragments": 3, "order": "score"}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"type": "plain", "fragment_size": 20}}}),
+    hl({"match_phrase": {"body": "lazy dog"}}, {"fields": {"body": {"type": "plain", "fragment_size": 20, "number_of_fragments": 2}}}),
+    hl({"match": {"multi": "quick value"}}, {"fields": {"multi": {"type": "plain", "number_of_fragments": 1}}}),
+    hl({"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}}}}, {"fields": {"*": {}}}),
+    hl({"bool": {"should": [{"match_phrase": {"body": "lazy dog"}},
+                            {"nested": {"path": "comments", "query": {"match": {"comments.text": "quick"}}}}]}},
+       {"fields": {"body": {"number_of_fragments": 0}}}),
+    hl({"match_phrase": {"title": "quick brown"}}, {"fields": {"title": {}, "title.std": {}, "tv": {"type": "fvh"}}}),
+    hl({"match": {"body": "fox"}}, {"fields": {"body": {"boundary_scanner": "chars"}}}),
+    hl({"match": {"body": "fox"}}, {"tags_schema": "nope", "fields": {"body": {}}}),
+    hl({"match": {"body": "fox"}}, {"pre_tags": ["<x>"], "fields": {"body": {}}}),
+    hl({"match": {"title": "quick"}}, {"require_field_match": False, "fields": {"title": {"matched_fields": ["title.std"]}}}),
+    ("DELETE", "/hl-m"),
+] + setup("hl-o", {"settings": {"index": {"refresh_interval": "-1", "highlight.max_analyzed_offset": 30}},
+                   "mappings": {"properties": {"f": {"type": "text"}, "g": {"type": "text", "index_options": "offsets"}}}},
+          [{"f": "The quick brown fox went to the forest and saw another fox.",
+            "g": "The quick brown fox went to the forest and saw another fox."}]) + [
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"fields": {"f": {"type": "plain"}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"g": "fox"}}, "highlight": {"fields": {"g": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 20, "fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 18, "fields": {"f": {}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"g": "fox"}}, "highlight": {"max_analyzed_offset": 20, "fields": {"g": {"type": "plain"}}}}, {"pick": HL}),
+    ("POST", "/hl-o/_search", {"query": {"match": {"f": "fox"}}, "highlight": {"max_analyzed_offset": 50, "fields": {"f": {}}}}, {"pick": HL}),
+    ("DELETE", "/hl-o"),
+])
+
+# Suggesters: term ("did you mean"), phrase, and completion (autocomplete)
+# with weights, fuzzy, regex and category/geo contexts.
+SUG_DOCS = [
+    {"title": "Amsterdam meetup", "body": "The quick brown fox jumps", "genre": "music",
+     "loc": {"lat": 52.37, "lon": 4.89},
+     "sug": {"input": ["Nevermind", "Nirvana"], "weight": 34},
+     "csug": {"input": "Star Wars", "contexts": {"kind": ["movie", "space"]}}},
+    {"title": "Amsterdam city guide", "body": "quick brown foxes jumped over the lazy dog", "genre": "travel",
+     "loc": {"lat": 52.36, "lon": 4.90},
+     "sug": ["Nirvana band", "Nine Inch-Nails", "nirvana"],
+     "csug": {"input": "Star Trek", "weight": 5, "contexts": {"kind": "space"}}},
+    {"title": "Berlin meetup", "body": "lazy dogs sleep all day", "genre": "music",
+     "loc": {"lat": 52.52, "lon": 13.40},
+     "sug": {"input": "Nirvaan", "weight": 3},
+     "csug": {"input": "Stargate", "contexts": {"kind": "movie"}}},
+    {"title": "Amsterdam museums and meetups", "body": "the brown bear eats honey", "genre": "travel",
+     "loc": {"lat": 48.85, "lon": 2.35},
+     "sug": {"input": ["Nirvana", "Neon Indian"], "weight": 2},
+     "csug": {"input": "Star Wars", "contexts": {"kind": "movie"}}},
+    {"title": "Berlinn guide", "body": "brown brwn browns", "genre": "misc",
+     "loc": {"lat": 52.53, "lon": 13.41},
+     "sug": "Nirvana", "csug": {"input": "Starship", "contexts": {"kind": "space"}}},
+]
+SUG_MAPPING = {"settings": STATIC, "mappings": {"properties": {
+    "title": {"type": "text"}, "body": {"type": "text"}, "genre": {"type": "keyword"},
+    "loc": {"type": "geo_point"},
+    "sug": {"type": "completion"},
+    "csug": {"type": "completion", "contexts": [{"name": "kind", "type": "category"}]},
+    "gsug": {"type": "completion", "contexts": [{"name": "genre", "type": "category", "path": "genre"},
+                                                {"name": "where", "type": "geo", "precision": "10km", "path": "loc"}]},
+}}}
+for d in SUG_DOCS:
+    d["gsug"] = d["title"]
+SG = "/sug-t/_search"
+SUG = lambda r: r.get("suggest")
+scenario("suggest", setup("sug-t", SUG_MAPPING, SUG_DOCS) + [
+    ("GET", "/sug-t/_mapping"),
+    # term
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "term": {"field": "title"}}}}),
+    ("POST", SG, {"suggest": {"text": "the amsterdma meetpu", "s": {"term": {"field": "title"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn brown", "term": {"field": "body", "suggest_mode": "always"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn brown", "term": {"field": "body", "suggest_mode": "popular"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn", "term": {"field": "body", "sort": "frequency"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwnn", "term": {"field": "body", "max_edits": 1}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "rown", "term": {"field": "body", "prefix_length": 0}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "laz dgo", "term": {"field": "body", "min_word_length": 2}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn", "term": {"field": "body", "size": 1}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "body", "string_distance": "levenshtein"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "title", "string_distance": "damerau_levenshtein"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "title", "string_distance": "jaro_winkler"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "bronw berlni", "term": {"field": "body", "string_distance": "ngram"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "musik", "term": {"field": "genre"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "term": {"field": "nope"}}}}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "term": {}}}}),
+    ("POST", SG, {"suggest": {"s": {"term": {"field": "title"}}}}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "term": {"field": "title", "suggest_mode": "nope"}}}}),
+    ("POST", SG, {"query": {"match": {"title": "meetup"}}, "suggest": {"s": {"text": "meetpu", "term": {"field": "title"}}}}, {"pick": lambda r: (ids(r), r["hits"]["total"], r["suggest"])}),
+    ("POST", SG, {"size": 0, "suggest": {"s": {"text": "meetpu", "term": {"field": "title"}}}}),
+    ("POST", SG + "?typed_keys=true", {"suggest": {"t": {"text": "meetpu", "term": {"field": "title"}},
+                                                   "c": {"prefix": "nir", "completion": {"field": "sug"}},
+                                                   "p": {"text": "meetpu", "phrase": {"field": "title"}}}}, {"pick": lambda r: sorted(r["suggest"])}),
+    # phrase
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "max_errors": 2}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "size": 1, "highlight": {"pre_tag": "<em>", "post_tag": "</em>"}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "berlni gide", "phrase": {"field": "title", "confidence": 0, "max_errors": 0.5}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "lazy dgo", "phrase": {"field": "body", "smoothing": {"laplace": {"alpha": 0.7}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "brwn foxs", "phrase": {"field": "body", "gram_size": 2, "max_errors": 2,
+                                                                   "direct_generator": [{"field": "body", "suggest_mode": "always", "min_word_length": 3}]}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "max_errors": 2,
+                                                                           "collate": {"query": {"source": {"match_phrase": {"title": "{{suggestion}}"}}}, "prune": True}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "amsterdma meetpu", "phrase": {"field": "title", "max_errors": 2,
+                                                                           "collate": {"query": {"source": {"match_phrase": {"title": "{{suggestion}}"}}}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"text": "x", "phrase": {"field": "nope"}}}}),
+    # completion
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug", "skip_duplicates": True}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug", "size": 2}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "NINE inch-n", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nrv", "completion": {"field": "sug", "fuzzy": {"fuzziness": 1}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nirv", "completion": {"field": "sug", "fuzzy": True}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nivrana", "completion": {"field": "sug", "fuzzy": {}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"regex": "n[aeiou]r", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"regex": "ne.*", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"text": "nev", "s": {"completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"kind": "movie"}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"kind": [{"context": "movie", "boost": 3}, "space"]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "skip_duplicates": True, "contexts": {"kind": ["movie", "space"]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"kind": [{"context": "mo", "prefix": True}]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "csug", "contexts": {"zz": "movie"}}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "a", "completion": {"field": "gsug", "contexts": {"genre": "music"}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "b", "completion": {"field": "gsug", "contexts": {"where": {"lat": 52.52, "lon": 13.40}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "", "completion": {"field": "gsug", "contexts": {"where": [{"context": {"lat": 52.37, "lon": 4.89}, "boost": 2}, {"lat": 52.52, "lon": 13.40}]}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "a", "completion": {"field": "gsug", "contexts": {"where": {"context": {"lat": 52.0, "lon": 5.0}, "precision": 2}}}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "title"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {"field": "nope"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "completion": {}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "st", "nope": {"field": "sug"}}}}),
+    ("POST", SG, {"suggest": {"s": {"completion": {"field": "sug"}}}}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "123", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("POST", SG, {"suggest": {"s": {"prefix": "nir", "completion": {"field": "sug"}}}, "aggs": {"g": {"terms": {"field": "genre"}}}},
+     {"pick": lambda r: (r["hits"]["total"], r["aggregations"], len(r["suggest"]["s"][0]["options"]))}),
+    ("PUT", "/sug-t/_doc/9", {"csug": {"input": "Solo"}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"input": "x", "weight": "abc"}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"input": "x", "weight": -1}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"inputs": "x"}}),
+    ("PUT", "/sug-t/_doc/9", {"sug": 5}),
+    ("PUT", "/sug-t/_doc/9", {"sug": {"input": "Zebra", "weight": "7"}, "csug": {"input": "Solo", "contexts": {"kind": "movie"}}}),
+    ("POST", "/sug-t/_refresh"),
+    ("POST", SG, {"suggest": {"s": {"prefix": "z", "completion": {"field": "sug"}}}}, {"pick": SUG}),
+    ("DELETE", "/sug-t"),
+])
+
 scenario("date_math_range", setup() + [
     ("POST", S, {"query": {"range": {"date": {"gte": "2024-01-15", "lt": "2024-02-01"}}}}, {"pick": ids}),
     ("POST", S, {"query": {"range": {"date": {"gte": "2024-01-15||+1M/M"}}}}, {"pick": ids}),
@@ -865,6 +1092,359 @@ scenario("index_management", mk("im-1", {"t": {"type": "text"}, "k": {"type": "k
     ("GET", "/im-*"),
 ])
 
+scenario("filter_path_closed", setup("fpc") + [
+    ("GET", "/fpc/_search?filter_path=hits.total"),
+    ("GET", "/fpc/_search?filter_path=hits.hits._id,hits.hits._source.title&sort=price"),
+    ("GET", "/fpc/_search?filter_path=-hits.hits._source,-took,-_shards&size=2&sort=price"),
+    ("GET", "/fpc/_search?filter_path=**._id&size=2&sort=price"),
+    ("GET", "/fpc/_search?filter_path=hits.*.total"),
+    ("GET", "/fpc/_search?filter_path=nope"),
+    ("GET", "/fpc/_doc/1?filter_path=_source.*"),
+    ("GET", "/fpc/_mapping?filter_path=*.mappings.properties.title"),
+    ("GET", "/fpc/_search?filter_path=hits.hits&size=0"),
+    ("GET", "/nope-idx/_search?filter_path=error.type"),
+    ("GET", "/_cluster/health?filter_path=status,number_of_nodes"),
+    ("GET", "/fpc?features=aliases,settings", None, {"pick": lambda r: r["fpc"]["mappings"]}),
+    ("GET", "/fpc?human=true", None, {"pick": lambda r: sorted(r["fpc"]["settings"]["index"])}),
+    ("GET", "/fpc/_settings", None, {"pick": lambda r: sorted(r["fpc"]["settings"]["index"])}),
+    ("GET", "/_fpc"),
+    ("PUT", "/fpc-closed", {"settings": {"number_of_replicas": 0}}),
+    ("POST", "/fpc-closed/_close"),
+    ("GET", "/fpc-closed/_search"),
+    ("GET", "/fpc-closed/_count"),
+    ("PUT", "/fpc-closed/_doc/1", {"a": 1}),
+    ("GET", "/fpc-closed/_doc/1"),
+    ("GET", "/fpc*/_search?filter_path=hits.total"),
+    ("GET", "/fpc*/_search?expand_wildcards=all&filter_path=hits.total"),
+    ("GET", "/fpc*?expand_wildcards=closed", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/fpc*", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/fpc*/_settings/index.number_of_replicas"),
+    ("GET", "/fpc*/_mapping"),
+    ("POST", "/fpc*/_open"),
+    ("GET", "/fpc-closed/_count"),
+    ("DELETE", "/fpc-closed"),
+    ("PUT", "/fpc-a", {"aliases": {"fpc-al": {}}}),
+    ("DELETE", "/fpc-al?ignore_unavailable=true"),
+    ("DELETE", "/fpc-al,fpc-nope?ignore_unavailable=true"),
+    ("GET", "/fpc-a", None, {"pick": lambda r: list(r)}),
+    ("DELETE", "/fpc-a"),
+])
+
+def _bulk_docs(index, n):
+    out = []
+    for i in range(n):
+        out.append({"index": {"_index": index, "_id": str(i)}})
+        out.append({"n": i, "k": f"k{i % 7}"})
+    return out
+
+
+scenario("scroll_slice_shards", [
+    ("DELETE", "/ss-1?ignore_unavailable=true"),
+    ("PUT", "/ss-1", {"settings": {"number_of_shards": 3, "number_of_replicas": 0}}),
+    ("POST", "/_bulk?refresh=true", _bulk_docs("ss-1", 40), {"pick": lambda r: r["errors"]}),
+    ("GET", "/ss-1/_search?size=0", None, {"pick": lambda r: (r["_shards"], r["hits"]["total"])}),
+    ("GET", "/ss-1/_count"),
+    ("GET", "/_cluster/health/ss-1", None, {"pick": lambda r: (r["active_primary_shards"], r["active_shards"], r["unassigned_shards"], r["status"])}),
+    ("GET", "/ss-1/_search?scroll=1m&size=0"),
+    ("GET", "/ss-1/_search?scroll=1m&request_cache=true"),
+    ("GET", "/ss-1/_search?scroll=1000h"),
+    ("POST", "/ss-1/_search", {"slice": {"id": 0, "max": 2}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 2, "max": 2}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 0, "max": 1}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": -1, "max": 2}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 0, "max": 1025}}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 0, "max": 4}, "size": 100}, {"pick": lambda r: r["_shards"]["total"]}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 1, "max": 4}, "size": 100}, {"pick": lambda r: len(r["hits"]["hits"]) == r["hits"]["total"]["value"]}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 2, "max": 4}, "size": 100}, {"pick": lambda r: r["timed_out"]}),
+    ("POST", "/ss-1/_search?scroll=1m", {"slice": {"id": 3, "max": 4, "field": "n"}, "size": 100}, {"pick": lambda r: r["hits"]["total"]["relation"]}),
+    ("DELETE", "/ss-1"),
+])
+
+def _items(r):
+    return [{k: {f: v.get(f) for f in ("_index", "_id", "status", "result")} | ({"error": v["error"]["type"]} if "error" in v else {})
+             for k, v in it.items()} for it in r["items"]]
+
+
+scenario("bulk_alias_targets", [
+    ("DELETE", "/bk-1?ignore_unavailable=true"), ("DELETE", "/bk-2?ignore_unavailable=true"),
+    ("DELETE", "/bk-3?ignore_unavailable=true"),
+    ("POST", "/_bulk", [{"index": {"_index": "bk-1", "_id": "1"}}, {"a": 1}, {}, {"a": 2}]),
+    ("POST", "/_bulk", [{"foo": {"_index": "bk-1"}}, {"a": 1}]),
+    ("POST", "/_bulk?refresh=true", [
+        {"index": {"_index": "bk-1", "_id": ""}}, {"f": 1},
+        {"index": {"_index": "bk-1", "_id": "id"}}, {"f": 2},
+        {"create": {"_index": "bk-1", "_id": "c"}}, {"f": 4},
+        {"index": {"_index": "bk-1", "_id": "oc", "op_type": "create"}}, {"f": 5},
+        {"index": {"_index": "bk-1", "_id": "oc", "op_type": "create"}}, {"f": 6},
+        {"update": {"_index": "bk-1", "_id": "id", "_source": True}}, {"doc": {"g": 1}},
+        {"update": {"_index": "bk-1", "_id": "missing"}}, {"doc": {"g": 1}},
+        {"delete": {"_index": "bk-1", "_id": "nope"}},
+        {"delete": {"_index": "bk-1", "_id": "c"}},
+    ], {"pick": _items}),
+    ("GET", "/bk-1/_count"),
+    ("PUT", "/bk-2", {"aliases": {"bk-al": {}}}),
+    ("PUT", "/bk-3", {"aliases": {"bk-al": {}}}),
+    ("GET", "/bk-al/_doc/1"),
+    ("PUT", "/bk-al/_doc/1", {"a": 1}),
+    ("POST", "/bk-al/_doc", {"a": 1}),
+    ("POST", "/bk-al/_update/1", {"doc": {"a": 2}}),
+    ("DELETE", "/bk-al/_doc/1"),
+    ("POST", "/_bulk", [{"index": {"_index": "bk-al", "_id": "1"}}, {"a": 1}], {"pick": _items}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "bk-3", "alias": "bk-al", "is_write_index": True}}]}),
+    ("PUT", "/bk-al/_doc/1?refresh=true", {"a": 1}, {"pick": lambda r: (r["_index"], r["result"])}),
+    ("GET", "/bk-al/_doc/1"),
+    ("GET", "/bk-3/_doc/1", None, {"pick": lambda r: r["found"]}),
+    ("POST", "/_bulk", [{"index": {"_index": "bk-al", "_id": "2"}}, {"a": 1}], {"pick": _items}),
+    ("PUT", "/bk-2/_alias/bk-al2", {"is_write_index": False}),
+    ("PUT", "/bk-al2/_doc/1", {"a": 1}),
+    ("GET", "/bk-al2/_doc/1", None, {"pick": lambda r: r["found"]}),
+    ("DELETE", "/bk-1"), ("DELETE", "/bk-2"), ("DELETE", "/bk-3"),
+])
+
+# dense_vector fields and kNN search: mapping defaults and validation,
+# document checks, the top-level `knn` option, the `knn` query and vector
+# functions in scoring scripts. Scores are compared only for HNSW/flat
+# fields: the default int8_hnsw field's scores are quantized
+# approximations in real Elasticsearch (noida's are exact), so for it only
+# the order is.
+KNN_PROPS = {
+    "name": {"type": "keyword"},
+    "l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "hnsw"}},
+    "cos": {"type": "dense_vector", "dims": 3, "similarity": "cosine", "index_options": {"type": "hnsw", "m": 32}},
+    "dot": {"type": "dense_vector", "dims": 2, "similarity": "dot_product", "index_options": {"type": "flat"}},
+    "mip": {"type": "dense_vector", "dims": 3, "similarity": "max_inner_product", "index_options": {"type": "hnsw"}},
+    "byte": {"type": "dense_vector", "dims": 3, "element_type": "byte", "similarity": "dot_product"},
+    "bytel2": {"type": "dense_vector", "dims": 3, "element_type": "byte", "similarity": "l2_norm"},
+    "bits": {"type": "dense_vector", "dims": 16, "element_type": "bit"},
+    "q8": {"type": "dense_vector", "dims": 3},
+    "raw": {"type": "dense_vector", "dims": 3, "index": False},
+    "paras": {"type": "nested", "properties": {
+        "pid": {"type": "keyword"},
+        "vec": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "hnsw"}},
+    }},
+}
+KNN_DOCS = [
+    {"name": "a", "l2": [1, 2, 3], "cos": [1, 2, 3], "dot": [0.6, 0.8], "mip": [1, 2, 3], "byte": [1, 2, 3],
+     "bytel2": [1, 2, 3], "bits": [1, 3], "q8": [1, 2, 3], "raw": [1, 1, 1],
+     "paras": [{"pid": "a0", "vec": [1, 0, 0]}, {"pid": "a1", "vec": [5, 5, 5]}]},
+    {"name": "b", "l2": [-1, 0.5, 2], "cos": [-1, 0.5, 2], "dot": [0.8, 0.6], "mip": [-1, 0.5, 2], "byte": [-100, 50, 3],
+     "bytel2": [-100, 50, 3], "bits": "ff00", "q8": [-1, 0.5, 2],
+     "paras": [{"pid": "b0", "vec": [0, 1, 0]}]},
+    {"name": "c", "l2": [3, -2, 0.1], "cos": [3, -2, 0.1], "dot": [0, 1], "mip": [3, -2, 0.1], "byte": "05f909",
+     "bytel2": [5, -7, 9], "bits": [0, 0], "q8": [3, -2, 0.1],
+     "paras": [{"pid": "c0", "vec": [9, 9, 9]}, {"pid": "c1", "vec": [0.5, 0.5, 0]}, {"pid": "c2", "vec": [2, 2, 2]}]},
+    {"name": "a", "l2": [0, 0, 1], "cos": [0, 0, 1], "dot": [1, 0], "mip": [0, 0, 1], "byte": [0, 0, 1],
+     "bytel2": [0, 0, 1], "bits": [255, 255], "q8": [0, 0, 1]},
+    {"name": "d"},
+]
+K = "/knn-docs/_search"
+ACK = {"pick": lambda r: r.get("acknowledged")}
+
+
+def knn_hits(r):
+    return [(h["_id"], h.get("_score"), h.get("matched_queries")) for h in r["hits"]["hits"]] + [r["hits"].get("total")]
+
+
+def knn_ids(r):
+    return [h["_id"] for h in r["hits"]["hits"]] + [r["hits"].get("total")]
+
+
+def knn_inner(r):
+    return [(h["_id"], h["_score"], [(x["_nested"]["offset"], x["_score"], x.get("fields"))
+                                     for x in h["inner_hits"]["paras"]["hits"]["hits"]],
+             h["inner_hits"]["paras"]["hits"]["total"]) for h in r["hits"]["hits"]]
+
+
+def knn_bad_mapping(name, prop):
+    return [("DELETE", f"/{name}?ignore_unavailable=true"),
+            ("PUT", f"/{name}", {"mappings": {"properties": {"v": prop}}})]
+
+
+def kq(field, vector, **kw):
+    return dict({"field": field, "query_vector": vector}, **kw)
+
+
+scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
+                 ("PUT", "/knn-docs", {"settings": STATIC, "mappings": {"properties": KNN_PROPS}}, ACK),
+                 ("GET", "/knn-docs/_mapping")]
+         + [("PUT", f"/knn-docs/_doc/{i}", d, {"pick": lambda r: r.get("result")}) for i, d in enumerate(KNN_DOCS, 1)]
+         + [("POST", "/knn-docs/_refresh", None, {"pick": lambda r: True})] + [
+    # Each similarity's scores.
+    ("POST", K, {"knn": kq("l2", [0.5, 1, -1], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("cos", [0.5, 1, -1], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("dot", [0.6, 0.8], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("mip", [0.5, 1, -1], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("byte", [5, -7, 9], k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("byte", "05f909", k=5, num_candidates=10), "_source": False}),
+    ("POST", K, {"knn": kq("bytel2", [5, -7, 9], k=2), "_source": False}),
+    ("POST", K, {"knn": kq("bits", [1, 2], k=5), "_source": False}),
+    ("POST", K, {"knn": kq("bits", "0102", k=5, similarity=2), "_source": False}),
+    ("POST", K, {"knn": kq("q8", [0.5, 1, -1], k=3)}, {"pick": knn_ids}),
+    # k, num_candidates, size and from.
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "size": 2, "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "size": 2, "from": 1, "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "from": 1, "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], num_candidates=3), "size": 2}, {"pick": knn_ids}),
+    # filter, similarity, boost, _name, combined with a query.
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=2, filter={"term": {"name": "a"}}), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=2, filter=[{"term": {"name": "a"}}, {"ids": {"values": ["4"]}}]), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=4, similarity=3), "_source": False}),
+    ("POST", K, {"knn": kq("cos", [1, 2, 3], k=4, similarity=0.5), "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=2, boost=2, _name="near"),
+                 "query": {"constant_score": {"filter": {"term": {"name": "c"}}, "_name": "is_c"}}, "_source": False}),
+    ("POST", K, {"knn": [kq("l2", [0, 0, 0], k=2), kq("cos", [3, -2, 0], k=2, boost=0.5)], "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "aggs": {"names": {"terms": {"field": "name"}}}, "size": 1},
+     {"pick": lambda r: (knn_ids(r), r["aggregations"])}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "sort": [{"name": "desc"}], "_source": False}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=3), "fields": ["name", "l2"], "_source": False}),
+    ("POST", "/knn-docs/_search?search_type=query_then_fetch", {"knn": kq("l2", [0, 0, 0])}),
+    # Nested vectors: the nearest parents, with their nearest objects.
+    ("POST", K, {"knn": kq("paras.vec", [1, 1, 0], k=2, inner_hits={"size": 2, "_source": False, "fields": ["paras.pid"]}),
+                 "_source": False}, {"pick": knn_inner}),
+    ("POST", K, {"knn": kq("paras.vec", [1, 1, 0], k=3, similarity=1.5, inner_hits={"_source": False}),
+                 "_source": False}, {"pick": knn_inner}),
+    ("POST", K, {"knn": kq("paras.vec", [1, 1, 0], k=3, filter={"term": {"name": "c"}}), "_source": False}),
+    ("POST", K, {"query": {"nested": {"path": "paras", "query": {"knn": kq("paras.vec", [1, 1, 0], k=2)},
+                                      "inner_hits": {"_source": False}}}, "_source": False}, {"pick": knn_inner}),
+    # The knn query.
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=2)}, "_source": False}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0])}, "size": 1, "_source": False}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], num_candidates=2)}, "_source": False}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=2, boost=3, _name="kq", filter={"term": {"name": "a"}})}, "_source": False}),
+    ("POST", K, {"query": {"bool": {"must": [{"knn": kq("l2", [0, 0, 0], k=2)}], "filter": [{"term": {"name": "a"}}]}}, "_source": False}),
+    ("POST", K, {"query": {"bool": {"should": [{"knn": kq("l2", [0, 0, 0], k=1)}, {"constant_score": {"filter": {"term": {"name": "c"}}}}]}}, "_source": False}),
+    ("POST", K, {"query": {"dis_max": {"queries": [{"knn": kq("l2", [0, 0, 0], k=2)}, {"constant_score": {"filter": {"term": {"name": "b"}}}}], "tie_breaker": 0.5}}, "_source": False}),
+    ("POST", K, {"query": {"function_score": {"query": {"knn": kq("l2", [0, 0, 0], k=3)},
+                                              "functions": [{"filter": {"term": {"name": "a"}}, "weight": 10}]}}, "_source": False}),
+    ("POST", K, {"query": {"constant_score": {"filter": {"knn": kq("l2", [0, 0, 0], k=2)}}}, "_source": False}),
+    ("POST", "/knn-docs/_count", {"query": {"knn": kq("l2", [0, 0, 0], k=2)}}),
+    # Vector functions in scoring scripts.
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "cosineSimilarity(params.qv, 'l2') + 1.0", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "dotProduct(params.qv, 'l2') + 100", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "1 / (1 + l1norm(params.qv, 'l2'))", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "l2"}},
+                                            "script": {"source": "1 / (1 + l2norm(params.qv, doc['l2']))", "params": {"qv": [0.5, 1, -1]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "byte"}},
+                                            "script": {"source": "1 / (1 + hamming(params.qv, 'byte'))", "params": {"qv": [5, -7, 9]}}}},
+                 "_source": False}),
+    ("POST", K, {"query": {"script_score": {"query": {"exists": {"field": "raw"}},
+                                            "script": {"source": "doc['raw'].vectorValue[0] + doc['raw'].magnitude"}}},
+                 "_source": False}),
+    # Search errors.
+    ("POST", K, {"knn": kq("nope", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("name", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("raw", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("l2", [0, 0])}),
+    ("POST", K, {"knn": kq("cos", [0, 0, 0])}),
+    ("POST", K, {"knn": kq("dot", [1, 1])}),
+    ("POST", K, {"knn": kq("byte", [1.5, 2, 3])}),
+    ("POST", K, {"knn": kq("byte", [500, 2, 3])}),
+    ("POST", K, {"knn": kq("byte", "abc")}),
+    ("POST", K, {"knn": kq("l2", [1, "x", 3])}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=0)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=5, num_candidates=2)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], num_candidates=10001)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], k=10001)}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0]), "size": 0}),
+    ("POST", K, {"knn": {"field": "l2"}}),
+    ("POST", K, {"knn": {"query_vector": [0, 0, 0]}}),
+    ("POST", K, {"knn": kq("l2", [0, 0, 0], bogus=1)}),
+    ("POST", K, {"knn": 5}),
+    ("POST", K, {"knn": []}, {"pick": knn_ids}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=5, num_candidates=3)}}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], k=0)}}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0], inner_hits={})}}),
+    ("POST", K, {"query": {"knn": {"field": "l2"}}}),
+    ("POST", K, {"query": {"knn": kq("nope", [0, 0, 0])}}),
+    ("POST", K, {"query": {"knn": kq("l2", [0, 0, 0])}, "size": 0}),
+    # Only knn and exists queries work on a vector field.
+    ("POST", K, {"query": {"exists": {"field": "l2"}}}, {"pick": knn_ids}),
+    ("POST", K, {"query": {"term": {"l2": 1}}}),
+    ("POST", K, {"query": {"terms": {"l2": [1]}}}),
+    ("POST", K, {"query": {"match": {"l2": "x"}}}),
+    ("POST", K, {"query": {"range": {"l2": {"gte": 1}}}}),
+    ("POST", K, {"query": {"prefix": {"l2": "x"}}}),
+    ("POST", K, {"sort": ["l2"]}),
+    ("POST", K, {"aggs": {"x": {"terms": {"field": "l2"}}}}),
+    ("POST", K, {"aggs": {"x": {"avg": {"field": "l2"}}}}),
+    ("POST", K, {"docvalue_fields": ["l2"]}),
+    # Document checks.
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1, 2]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1, 2, 3, 4]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1, "a", 3]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": "abc"}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": 5}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": {"a": 1}}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": [1e40, 0, 0]}),
+    ("PUT", "/knn-docs/_doc/x", {"cos": [0, 0, 0]}),
+    ("PUT", "/knn-docs/_doc/x", {"dot": [3, 4]}),
+    ("PUT", "/knn-docs/_doc/x", {"byte": [1, 2, 300]}),
+    ("PUT", "/knn-docs/_doc/x", {"byte": [1.5, 2, 3]}),
+    ("PUT", "/knn-docs/_doc/x", {"bits": [1, 2, 3]}),
+    ("PUT", "/knn-docs/_doc/x", {"paras": [{"vec": [1, 2]}]}),
+    ("POST", "/_bulk", [{"index": {"_index": "knn-docs", "_id": "y"}}, {"l2": [1, 2]},
+                        {"index": {"_index": "knn-docs", "_id": "z"}}, {"l2": [1, 2, 3]}],
+     {"pick": lambda r: [(list(i.values())[0]["status"], list(i.values())[0].get("error", {}).get("type")) for i in r["items"]]}),
+    ("PUT", "/knn-docs/_doc/x", {"l2": None, "name": "x"}, {"pick": lambda r: r.get("result")}),
+    ("DELETE", "/knn-docs/_doc/x", None, {"pick": lambda r: r.get("result")}),
+    ("DELETE", "/knn-docs/_doc/z", None, {"pick": lambda r: r.get("result")}),
+    # Mapping updates.
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw", "m": 20}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "flat"}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw", "m": 16}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 4, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw", "m": 20}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"l2": {"type": "dense_vector", "dims": 3, "similarity": "cosine", "index_options": {"type": "int8_hnsw", "m": 20}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"dot": {"type": "dense_vector", "dims": 2, "similarity": "dot_product", "index_options": {"type": "int8_flat"}}}}),
+    ("PUT", "/knn-docs/_mapping", {"properties": {"cos": {"type": "dense_vector", "dims": 3, "element_type": "byte", "index_options": {"type": "hnsw", "m": 32}}}}),
+    ("GET", "/knn-docs/_mapping/field/l2,dot"),
+    # Dynamic mapping: 128 to 4096 floats are a vector.
+    ("DELETE", "/knn-dyn?ignore_unavailable=true"),
+    ("PUT", "/knn-dyn/_doc/1", {"v": [i + 0.5 for i in range(128)], "short": [0.5] * 127, "ints": list(range(200)),
+                                "long": [0.5] * 4097, "o": {"inner": 1}}, {"pick": lambda r: r.get("result")}),
+    ("GET", "/knn-dyn/_mapping"),
+    ("PUT", "/knn-dyn/_doc/2", {"v": [0.5, 1.5]}),
+    ("PUT", "/knn-dyn/_doc/3", {"v": [0.0] * 128}),
+    # Mapped without dims: the first document sets them.
+    ("DELETE", "/knn-nodims?ignore_unavailable=true"),
+    ("PUT", "/knn-nodims", {"mappings": {"properties": {"v": {"type": "dense_vector"}, "b": {"type": "dense_vector", "element_type": "byte"}}}}, ACK),
+    ("POST", "/knn-nodims/_search", {"knn": kq("v", [1, 2, 3])}, {"pick": knn_ids}),
+    ("GET", "/knn-nodims/_mapping"),
+    ("PUT", "/knn-nodims/_doc/1?refresh=true", {"v": [1, 2, 3], "b": "807f0a"}, {"pick": lambda r: r.get("result")}),
+    ("GET", "/knn-nodims/_mapping"),
+    ("PUT", "/knn-nodims/_doc/2", {"v": [1, 2]}),
+] + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 5000})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 0})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": "x"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "similarity": "foo"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index": False, "similarity": "cosine"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index": False, "index_options": {"type": "hnsw"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "element_type": "foo"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {"type": "foo"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {"type": "hnsw", "bar": 1}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "foo": 1})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 8, "element_type": "bit", "similarity": "cosine"})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "element_type": "byte", "index_options": {"type": "int8_hnsw"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index_options": {"type": "int4_hnsw"}})
+  + knn_bad_mapping("knn-bad", {"type": "dense_vector", "dims": 3, "index": "x"})
+  + knn_bad_mapping("knn-ok", {"type": "dense_vector", "dims": 4, "index_options": {"type": "int4_flat"}})
+  + [("GET", "/knn-ok/_mapping")]
+  + knn_bad_mapping("knn-ok", {"type": "dense_vector", "dims": 4, "index_options": {"type": "int8_hnsw", "confidence_interval": 0.5, "m": 8}})
+  + [("GET", "/knn-ok/_mapping")]
+  + knn_bad_mapping("knn-ok", {"type": "dense_vector", "dims": 4, "element_type": "byte", "index_options": {"type": "flat"}})
+  + [("GET", "/knn-ok/_mapping")] + [
+    ("DELETE", "/knn-docs"), ("DELETE", "/knn-dyn"), ("DELETE", "/knn-nodims"),
+    ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:
@@ -879,9 +1459,9 @@ for name, steps in SCENARIOS.items():
         if a == b:
             print(f"  ok   {i:2} {label}")
             if os.environ.get("ES_EDGES_VERBOSE"):
-                print(f"         both: {json.dumps(a)[:600]}")
+                print(f"         both: {json.dumps(a)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}")
         else:
             failures += 1
-            print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:600]}\n        noida: {json.dumps(b)[:600]}")
+            print(f"  DIFF {i:2} {label}\n         real: {json.dumps(a)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}\n        noida: {json.dumps(b)[:int(os.environ.get('ES_EDGES_WIDTH', '600'))]}")
 print(f"\n{failures} differing steps")
 sys.exit(min(failures, 100))

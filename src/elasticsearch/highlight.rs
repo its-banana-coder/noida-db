@@ -1,15 +1,23 @@
-//! `highlight`: the unified highlighter's output for the common cases —
-//! the query's terms (per field unless `require_field_match: false`)
-//! wrapped in `pre_tags`/`post_tags` (default `<em>`), a matched phrase as
-//! one span, keyword fields highlighted whole, and the text cut into
-//! sentence fragments around the matches (`fragment_size`,
-//! `number_of_fragments`, 0 for the whole value).
+//! `highlight`: the unified (default), plain and fvh highlighters' output
+//! for the common cases — the query's terms (per field unless
+//! `require_field_match: false`, plus `matched_fields`) wrapped in
+//! `pre_tags`/`post_tags` (default `<em>`, or the `styled` schema), HTML
+//! encoding, a matched phrase as one span (the unified highlighter's
+//! weighted matches) or term by term, keyword fields highlighted whole,
+//! and the text cut into fragments around the matches: the unified
+//! highlighter's sentence (or word) passages, never spanning two values
+//! of a multi-valued field, and the plain highlighter's Lucene
+//! `Highlighter` fragments (`span` / `simple` fragmenters). The fast
+//! vector highlighter is validated like Elasticsearch's and otherwise
+//! produces the unified highlighter's fragments.
+
+use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
 
 use super::analysis;
 use super::query_string;
-use super::search::{raw_values, resolve_field};
+use super::search::{EsError, raw_values, resolve_field};
 
 #[derive(Debug, Clone)]
 enum Hl {
@@ -40,6 +48,74 @@ fn field_spec(v: &Value) -> Option<(&String, &Value)> {
     v.as_object()?.iter().find(|(k, _)| k.as_str() != "boost" && k.as_str() != "_name")
 }
 
+/// `AUTO` fuzziness: no edits up to 2 characters, one up to 5, then two.
+fn auto_edits(term: &str, fuzziness: Option<&Value>) -> usize {
+    let n = term.chars().count();
+    match fuzziness {
+        Some(Value::Number(x)) => x.as_u64().unwrap_or(0).min(2) as usize,
+        Some(Value::String(s)) if s.parse::<usize>().is_ok() => {
+            s.parse::<usize>().unwrap_or(0).min(2)
+        }
+        _ => {
+            if n < 3 {
+                0
+            } else if n < 6 {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
+
+/// The fields a query's field list names: `title^2` is `title`, and a
+/// pattern (`title*`) the mapped text-like fields it matches.
+fn query_fields(mappings: &Value, list: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in list.and_then(Value::as_array).cloned().unwrap_or_default() {
+        let Some(f) = f.as_str() else { continue };
+        let f = f.split('^').next().unwrap_or(f);
+        out.extend(expand_field_pattern(mappings, f));
+    }
+    out
+}
+
+/// A field name, or for a pattern every mapped field (multi-fields
+/// included) of a text or keyword type it matches.
+pub(crate) fn expand_field_pattern(mappings: &Value, pattern: &str) -> Vec<String> {
+    if !pattern.contains('*') {
+        return vec![pattern.to_string()];
+    }
+    let mut all = Vec::new();
+    fn walk(props: Option<&Value>, prefix: &str, out: &mut Vec<(String, String)>) {
+        let Some(obj) = props.and_then(Value::as_object) else { return };
+        for (k, v) in obj {
+            let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+            match v.get("properties") {
+                Some(p) => walk(Some(p), &full, out),
+                None => {
+                    let ty = v.get("type").and_then(Value::as_str).unwrap_or("object");
+                    out.push((full.clone(), ty.to_string()));
+                    if let Some(subs) = v.get("fields").and_then(Value::as_object) {
+                        for (s, sd) in subs {
+                            let ty = sd.get("type").and_then(Value::as_str).unwrap_or("keyword");
+                            out.push((format!("{full}.{s}"), ty.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    walk(mappings.get("properties"), "", &mut all);
+    all.into_iter()
+        .filter(|(f, ty)| {
+            matches!(ty.as_str(), "text" | "match_only_text" | "keyword" | "constant_keyword")
+                && glob(pattern, f)
+        })
+        .map(|(f, _)| f)
+        .collect()
+}
+
 /// The highlightable terms in `query`, tagged with the field they target.
 fn collect(query: &Value, mappings: &Value, out: &mut Vec<(String, Hl)>) {
     let Some(obj) = query.as_object() else { return };
@@ -47,9 +123,9 @@ fn collect(query: &Value, mappings: &Value, out: &mut Vec<(String, Hl)>) {
         match kind.as_str() {
             "match" | "match_phrase" | "match_phrase_prefix" | "match_bool_prefix" => {
                 let Some((field, spec)) = field_spec(body) else { continue };
-                let text = match spec {
-                    Value::Object(o) => text_of(o.get("query")),
-                    other => text_of(Some(other)),
+                let (text, fuzziness) = match spec {
+                    Value::Object(o) => (text_of(o.get("query")), o.get("fuzziness")),
+                    other => (text_of(Some(other)), None),
                 };
                 let terms = analyze(mappings, field, &text);
                 if kind == "match_phrase" && terms.len() > 1 {
@@ -58,16 +134,22 @@ fn collect(query: &Value, mappings: &Value, out: &mut Vec<(String, Hl)>) {
                     let last = terms.len().saturating_sub(1);
                     for (i, t) in terms.into_iter().enumerate() {
                         let prefix = kind.ends_with("prefix") && i == last;
-                        out.push((field.clone(), if prefix { Hl::Prefix(t) } else { Hl::Term(t) }));
+                        let h = if prefix {
+                            Hl::Prefix(t)
+                        } else if fuzziness.is_some() {
+                            let n = auto_edits(&t, fuzziness);
+                            Hl::Fuzzy(t, n)
+                        } else {
+                            Hl::Term(t)
+                        };
+                        out.push((field.clone(), h));
                     }
                 }
             }
-            "multi_match" => {
+            "multi_match" | "combined_fields" => {
                 let text = text_of(body.get("query"));
                 let phrase = body.get("type").and_then(Value::as_str) == Some("phrase");
-                for f in body.get("fields").and_then(Value::as_array).cloned().unwrap_or_default() {
-                    let Some(f) = f.as_str() else { continue };
-                    let f = f.split('^').next().unwrap_or(f).to_string();
+                for f in query_fields(mappings, body.get("fields")) {
                     let terms = analyze(mappings, &f, &text);
                     if phrase && terms.len() > 1 {
                         out.push((f, Hl::Phrase(terms)));
@@ -92,24 +174,15 @@ fn collect(query: &Value, mappings: &Value, out: &mut Vec<(String, Hl)>) {
             }
             "prefix" | "wildcard" | "fuzzy" | "regexp" => {
                 let Some((field, spec)) = field_spec(body) else { continue };
-                let v = match spec {
-                    Value::Object(o) => text_of(o.get("value")),
-                    other => text_of(Some(other)),
+                let (v, fuzziness) = match spec {
+                    Value::Object(o) => (text_of(o.get("value")), o.get("fuzziness")),
+                    other => (text_of(Some(other)), None),
                 };
                 let h = match kind.as_str() {
                     "prefix" => Hl::Prefix(v),
                     "fuzzy" => {
-                        let n = v.chars().count();
-                        Hl::Fuzzy(
-                            v,
-                            if n < 3 {
-                                0
-                            } else if n < 6 {
-                                1
-                            } else {
-                                2
-                            },
-                        )
+                        let n = auto_edits(&v, fuzziness);
+                        Hl::Fuzzy(v, n)
                     }
                     "regexp" => continue,
                     _ => Hl::Wildcard(v),
@@ -156,6 +229,16 @@ fn collect(query: &Value, mappings: &Value, out: &mut Vec<(String, Hl)>) {
     }
 }
 
+/// Whether `query` holds a `nested` clause (which turns the unified
+/// highlighter's weighted matches off).
+pub(crate) fn has_nested(query: &Value) -> bool {
+    match query {
+        Value::Object(o) => o.iter().any(|(k, v)| k == "nested" || has_nested(v)),
+        Value::Array(a) => a.iter().any(has_nested),
+        _ => false,
+    }
+}
+
 fn glob(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
@@ -171,32 +254,49 @@ fn glob(pattern: &str, text: &str) -> bool {
     rec(&p, &t)
 }
 
+/// Levenshtein distance with adjacent transpositions (fuzzy queries'
+/// default `transpositions: true`).
 fn edit_distance(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, v) in d[0].iter_mut().enumerate() {
+        *v = j;
+    }
     for i in 1..=a.len() {
-        let mut cur = vec![i; b.len() + 1];
         for j in 1..=b.len() {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
         }
-        prev = cur;
     }
-    prev[b.len()]
+    d[a.len()][b.len()]
 }
 
-/// Byte spans of `text` to tag, each with the matched text (lowercased,
-/// the passage scorer's notion of "the same term").
-fn spans(text: &str, keyword: bool, hls: &[&Hl]) -> Vec<(usize, usize)> {
-    let tokens: Vec<(String, usize, usize)> = if keyword {
-        vec![(text.to_string(), 0, text.len())]
+/// A token: its term and byte range in the text.
+type Token = (String, usize, usize);
+
+fn tokenize(text: &str, keyword: bool) -> Vec<Token> {
+    if keyword {
+        if text.is_empty() { vec![] } else { vec![(text.to_string(), 0, text.len())] }
     } else {
         analysis::standard_with_offsets(text)
-    };
-    let mut out: Vec<(usize, usize)> = Vec::new();
-    for (i, (tok, s, e)) in tokens.iter().enumerate() {
+    }
+}
+
+/// Which tokens a query term matches, and where its phrases occur (as
+/// inclusive token ranges).
+fn token_matches(tokens: &[Token], hls: &[&Hl]) -> (Vec<bool>, Vec<(usize, usize)>) {
+    let mut hit = vec![false; tokens.len()];
+    let mut phrases = Vec::new();
+    for (i, (tok, _, _)) in tokens.iter().enumerate() {
         for h in hls {
-            let hit = match h {
+            let m = match h {
                 Hl::Term(t) => tok == t,
                 Hl::Prefix(p) => tok.starts_with(p.as_str()),
                 Hl::Wildcard(w) => glob(w, tok),
@@ -205,14 +305,28 @@ fn spans(text: &str, keyword: bool, hls: &[&Hl]) -> Vec<(usize, usize)> {
                     if tokens.len() >= i + terms.len()
                         && terms.iter().enumerate().all(|(k, t)| &tokens[i + k].0 == t)
                     {
-                        out.push((*s, tokens[i + terms.len() - 1].2));
+                        phrases.push((i, i + terms.len() - 1));
                     }
                     false
                 }
             };
-            if hit {
-                out.push((*s, *e));
-            }
+            hit[i] |= m;
+        }
+    }
+    (hit, phrases)
+}
+
+/// Byte spans of `tokens` to tag: matched terms, and each phrase either
+/// as one span (`weighted`) or term by term.
+fn spans(tokens: &[Token], hls: &[&Hl], weighted: bool) -> Vec<(usize, usize)> {
+    let (hit, phrases) = token_matches(tokens, hls);
+    let mut out: Vec<(usize, usize)> =
+        tokens.iter().zip(&hit).filter(|(_, h)| **h).map(|(t, _)| (t.1, t.2)).collect();
+    for (a, b) in phrases {
+        if weighted {
+            out.push((tokens[a].1, tokens[b].2));
+        } else {
+            out.extend(tokens[a..=b].iter().map(|t| (t.1, t.2)));
         }
     }
     out.sort();
@@ -225,6 +339,29 @@ fn spans(text: &str, keyword: bool, hls: &[&Hl]) -> Vec<(usize, usize)> {
         }
     }
     merged
+}
+
+/// `encoder: html`: the characters Elasticsearch escapes.
+fn push_encoded(out: &mut String, s: &str, html: bool) {
+    if !html {
+        out.push_str(s);
+        return;
+    }
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            '/' => out.push_str("&#x2F;"),
+            c => out.push(c),
+        }
+    }
+}
+
+fn push_chars(out: &mut String, c: &[char], html: bool) {
+    push_encoded(out, &c.iter().collect::<String>(), html);
 }
 
 /// Java's sentence `BreakIterator` boundaries (approximately): after `!`
@@ -375,17 +512,33 @@ fn passage_score(
     score * (1.0 + 1.0 / ((pivot + p.0 as f32) as f64).ln() as f32)
 }
 
+/// How the unified highlighter cuts passages.
+#[derive(Clone, Copy, PartialEq)]
+enum Scanner {
+    Sentence,
+    Word,
+}
+
+/// The tag pair and encoding a field's fragments are written with.
+struct Format<'a> {
+    pre: &'a str,
+    post: &'a str,
+    html: bool,
+}
+
 /// The fragments for one field's (joined) content, Lucene's way: walk the
 /// matches in order, open a passage at each match outside the current
-/// one, keep the best `count` by score, then order them.
+/// one, keep the best `count` by score, then order them. Each value of a
+/// multi-valued field (joined by U+2029) is scanned on its own, as
+/// Elasticsearch's splitting break iterator does.
 fn fragment_text(
     content: &str,
     byte_spans: &[(usize, usize)],
     max_len: usize,
     count: usize,
     by_score: bool,
-    pre: &str,
-    post: &str,
+    scanner: Scanner,
+    fmt: &Format,
 ) -> Vec<String> {
     let chars: Vec<char> = content.chars().collect();
     let mut char_of = vec![0usize; content.len() + 1];
@@ -395,27 +548,61 @@ fn fragment_text(
     char_of[content.len()] = chars.len();
     let spans: Vec<(usize, usize)> =
         byte_spans.iter().map(|&(s, e)| (char_of[s], char_of[e])).collect();
-    let sentences = sentence_breaks(&chars);
-    let words = word_breaks(&chars);
-    let mut bounded = Bounded {
-        sentences: &sentences,
-        words: &words,
-        len: chars.len(),
-        max_len,
-        window_start: 0,
-        window_end: 0,
-        inner_start: 0,
-        inner_end: 0,
-    };
+    // Each value's [start, end) in `chars`.
+    let mut segments = Vec::new();
+    let mut seg_start = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\u{2029}' {
+            segments.push((seg_start, i));
+            seg_start = i + 1;
+        }
+    }
+    segments.push((seg_start, chars.len()));
+    let mut current: Option<(usize, Vec<usize>, Vec<usize>)> = None;
+    let mut state = (0usize, 0usize, 0usize, 0usize);
     let mut passages: Vec<(Span, Vec<Span>)> = Vec::new();
     for &(s, e) in &spans {
-        match passages.last_mut() {
-            Some((p, m)) if s < p.1 => m.push((s, e)),
-            _ => {
-                let p = bounded.passage(s);
-                passages.push((p, vec![(s, e)]));
-            }
+        if let Some((p, m)) = passages.last_mut()
+            && s < p.1
+        {
+            m.push((s, e));
+            continue;
         }
+        let si = segments.iter().position(|&(a, b)| s >= a && s <= b).unwrap_or(0);
+        let (a, b) = segments[si];
+        if current.as_ref().is_none_or(|c| c.0 != si) {
+            let seg = &chars[a..b];
+            current = Some((si, sentence_breaks(seg), word_breaks(seg)));
+            state = (0, 0, 0, 0);
+        }
+        let (_, sentences, words) = current.as_ref().unwrap();
+        let p = match scanner {
+            Scanner::Word => {
+                let off = s - a;
+                (preceding(words, off + 1), following(words, off, b - a).max(off))
+            }
+            Scanner::Sentence => {
+                let mut bounded = Bounded {
+                    sentences,
+                    words,
+                    len: b - a,
+                    max_len,
+                    window_start: state.0,
+                    window_end: state.1,
+                    inner_start: state.2,
+                    inner_end: state.3,
+                };
+                let p = bounded.passage(s - a);
+                state = (
+                    bounded.window_start,
+                    bounded.window_end,
+                    bounded.inner_start,
+                    bounded.inner_end,
+                );
+                p
+            }
+        };
+        passages.push(((p.0 + a, p.1 + a), vec![(s, e)]));
     }
     let mut scored: Vec<(f32, Span, Vec<Span>)> =
         passages.into_iter().map(|(p, m)| (passage_score(&m, p, &chars, &spans), p, m)).collect();
@@ -432,72 +619,328 @@ fn fragment_text(
         .map(|(_, (ps, pe), m)| {
             let mut out = String::new();
             let mut pos = ps;
-            for (s, e) in m {
-                let e = e.min(pe.max(e));
+            let mut i = 0;
+            while i < m.len() {
+                let (s, mut e) = m[i];
+                while i + 1 < m.len() && m[i + 1].0 < e {
+                    i += 1;
+                    e = e.max(m[i].1);
+                }
+                i += 1;
                 if s < pos {
                     continue;
                 }
-                out.extend(&chars[pos..s]);
-                out.push_str(pre);
-                out.extend(&chars[s..e]);
-                out.push_str(post);
+                let e = e.min(pe).max(s);
+                push_chars(&mut out, &chars[pos..s], fmt.html);
+                out.push_str(fmt.pre);
+                push_chars(&mut out, &chars[s..e], fmt.html);
+                out.push_str(fmt.post);
                 pos = e;
             }
             if pos < pe {
-                out.extend(&chars[pos..pe]);
+                push_chars(&mut out, &chars[pos..pe], fmt.html);
             }
             out.trim_matches(|c: char| c.is_whitespace() || c == '\u{2029}').to_string()
         })
         .collect()
 }
 
-fn tag(text: &str, spans: &[(usize, usize)], pre: &str, post: &str) -> String {
+fn tag(text: &str, spans: &[(usize, usize)], fmt: &Format) -> String {
     let mut out = String::new();
     let mut pos = 0;
     for &(s, e) in spans {
-        out.push_str(&text[pos..s]);
-        out.push_str(pre);
-        out.push_str(&text[s..e]);
-        out.push_str(post);
+        push_encoded(&mut out, &text[pos..s], fmt.html);
+        out.push_str(fmt.pre);
+        push_encoded(&mut out, &text[s..e], fmt.html);
+        out.push_str(fmt.post);
         pos = e;
     }
-    out.push_str(&text[pos..]);
+    push_encoded(&mut out, &text[pos..], fmt.html);
     out
 }
 
-fn field_names(pattern: &str, mappings: &Value) -> Vec<String> {
-    if !pattern.contains('*') {
-        return vec![pattern.to_string()];
+/// The plain highlighter's fragmenters.
+#[derive(Clone, Copy, PartialEq)]
+enum Fragmenter {
+    /// `span` (the default): new fragments every `fragment_size`
+    /// characters, never inside a matched phrase.
+    Span,
+    Simple,
+    /// `number_of_fragments: 0`: the whole value.
+    Null,
+}
+
+/// Lucene's `Highlighter.getBestTextFragments` for one value: (score,
+/// fragment number, text) of each fragment.
+fn plain_fragments(
+    text: &str,
+    tokens: &[Token],
+    hls: &[&Hl],
+    size: usize,
+    fragmenter: Fragmenter,
+    fmt: &Format,
+) -> Vec<(f32, usize, String)> {
+    let (term_hit, phrases) = token_matches(tokens, hls);
+    let mut hit = term_hit.clone();
+    for &(a, b) in &phrases {
+        hit[a..=b].iter_mut().for_each(|h| *h = true);
     }
-    let mut all = Vec::new();
-    fn walk(props: Option<&Value>, prefix: &str, out: &mut Vec<String>) {
-        let Some(obj) = props.and_then(Value::as_object) else { return };
-        for (k, v) in obj {
-            let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
-            match v.get("properties") {
-                Some(p) => walk(Some(p), &full, out),
-                None => out.push(full),
+    // Every term of a matched phrase, with the phrase spans it starts.
+    let phrase_term = |t: &str| {
+        phrases
+            .iter()
+            .filter(|&&(a, b)| tokens[a..=b].iter().any(|x| x.0 == t))
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let utf16 = |b: usize| text[..b].encode_utf16().count();
+    let text_size = utf16(text.len());
+    let mut new_text = String::new();
+    // (start, end, score) of each fragment in `new_text`.
+    let mut frags: Vec<(usize, usize, f32)> = vec![(0, 0, 0.0)];
+    let mut found: HashSet<&str> = HashSet::new();
+    let mut total = 0f32;
+    let mut last_end = 0usize;
+    let mut pending: Option<usize> = None;
+    let (mut position, mut wait, mut num_frags) = (-1i64, -1i64, 1usize);
+    let flush = |g: usize, new_text: &mut String, last_end: &mut usize| {
+        let (_, s, e) = &tokens[g];
+        if *s > *last_end {
+            push_encoded(new_text, &text[*last_end..*s], fmt.html);
+        }
+        if hit[g] {
+            new_text.push_str(fmt.pre);
+            push_encoded(new_text, &text[*s..*e], fmt.html);
+            new_text.push_str(fmt.post);
+        } else {
+            push_encoded(new_text, &text[*s..*e], fmt.html);
+        }
+        *last_end = (*last_end).max(*e);
+    };
+    for (i, tok) in tokens.iter().enumerate() {
+        if let Some(g) = pending.take() {
+            flush(g, &mut new_text, &mut last_end);
+            let end = utf16(tok.2);
+            let new = match fragmenter {
+                Fragmenter::Null => false,
+                Fragmenter::Simple => {
+                    let n = end >= size * num_frags;
+                    if n {
+                        num_frags += 1;
+                    }
+                    n
+                }
+                Fragmenter::Span => {
+                    position += 1;
+                    let mut blocked = false;
+                    if wait <= position {
+                        wait = -1;
+                    } else if wait != -1 {
+                        blocked = true;
+                    }
+                    if blocked {
+                        false
+                    } else {
+                        if hit[i]
+                            && let Some(&(_, b)) =
+                                phrase_term(&tok.0).iter().find(|&&(a, _)| a as i64 == position)
+                        {
+                            wait = b as i64 + 1;
+                        }
+                        let n =
+                            end >= size * num_frags && text_size.saturating_sub(end) >= size / 2;
+                        if n {
+                            num_frags += 1;
+                        }
+                        n
+                    }
+                }
+            };
+            if new {
+                let last = frags.last_mut().unwrap();
+                last.1 = new_text.len();
+                last.2 = total;
+                frags.push((new_text.len(), 0, 0.0));
+                found.clear();
+                total = 0.0;
             }
         }
+        if hit[i] && found.insert(tok.0.as_str()) {
+            total += 1.0;
+        }
+        pending = Some(i);
     }
-    walk(mappings.get("properties"), "", &mut all);
-    all.into_iter().filter(|f| glob(pattern, f)).collect()
+    if let Some(g) = pending {
+        flush(g, &mut new_text, &mut last_end);
+    }
+    if last_end < text.len() {
+        push_encoded(&mut new_text, &text[last_end..], fmt.html);
+    }
+    let last = frags.last_mut().unwrap();
+    last.1 = new_text.len();
+    last.2 = total;
+    frags
+        .into_iter()
+        .enumerate()
+        .map(|(n, (s, e, sc))| (sc, n, new_text[s..e].to_string()))
+        .collect()
+}
+
+/// The plain highlighter's `no_match_size` excerpt: up to the end of the
+/// last token ending within the size.
+fn plain_no_match(text: &str, tokens: &[Token], size: usize) -> Option<String> {
+    let utf16 = |b: usize| text[..b].encode_utf16().count();
+    let mut end: Option<usize> = None;
+    for (_, _, e) in tokens {
+        let u = utf16(*e);
+        if u >= size {
+            if u == size {
+                end = Some(*e);
+            }
+            break;
+        }
+        end = Some(*e);
+    }
+    end.filter(|&e| e > 0).map(|e| text[..e].to_string())
+}
+
+/// The definition of `field` in `mappings` (multi-fields included).
+fn field_def<'a>(mappings: &'a Value, field: &str) -> Option<&'a Value> {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut props = mappings.get("properties");
+    for (i, seg) in segs.iter().enumerate() {
+        let node = props?.get(*seg)?;
+        if i + 1 == segs.len() {
+            return Some(node);
+        }
+        if i + 2 == segs.len()
+            && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        {
+            return Some(sub);
+        }
+        props = node.get("properties");
+    }
+    None
+}
+
+/// Where a hit is being highlighted: what the index settings and the
+/// search request decide beyond the `highlight` section itself.
+pub struct Context<'a> {
+    pub index: &'a str,
+    /// The document's number in its index (error messages name it).
+    pub doc: usize,
+    /// The index's settings (`index.highlight.*`).
+    pub settings: &'a Value,
+    /// A `nested` or `knn` part of the search turns weighted matches off.
+    pub weighted: bool,
+}
+
+impl Context<'_> {
+    fn setting(&self, key: &str) -> Option<&Value> {
+        let h = self.settings.get("index")?.get("highlight")?;
+        let mut node = h;
+        for k in key.split('.') {
+            node = node.get(k)?;
+        }
+        Some(node)
+    }
+}
+
+fn num(v: Option<&Value>) -> Option<i64> {
+    match v? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn tags_of(v: Option<&Value>) -> Option<Vec<String>> {
+    v.and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+}
+
+/// Request-level checks Elasticsearch makes while parsing `highlight`.
+pub fn validate(spec: &Value) -> Result<(), EsError> {
+    let parse = |field: &str, cause: &str| {
+        EsError::new(
+            400,
+            "x_content_parse_exception",
+            &format!("[highlight] failed to parse field [{field}]"),
+        )
+        .caused_by("illegal_argument_exception", cause)
+    };
+    let mut levels = vec![spec];
+    match spec.get("fields") {
+        Some(Value::Object(o)) => levels.extend(o.values()),
+        Some(Value::Array(a)) => {
+            levels.extend(a.iter().filter_map(Value::as_object).flat_map(|o| o.values()))
+        }
+        _ => {}
+    }
+    for l in levels {
+        let (pre, post) = (tags_of(l.get("pre_tags")), tags_of(l.get("post_tags")));
+        if pre.as_ref().is_some_and(Vec::is_empty) || post.as_ref().is_some_and(Vec::is_empty) {
+            return Err(EsError::parsing("pre_tags or post_tags must not be empty"));
+        }
+        if pre.is_some() && post.is_none() && spec.get("post_tags").is_none() {
+            return Err(EsError::parsing("pre_tags are set but post_tags are not set"));
+        }
+        if let Some(m) = l.get("max_analyzed_offset")
+            && num(Some(m)).is_none_or(|n| n < 1)
+        {
+            return Err(parse(
+                "max_analyzed_offset",
+                "[max_analyzed_offset] must be a positive integer",
+            ));
+        }
+        if let Some(b) = l.get("boundary_scanner")
+            && !matches!(b.as_str(), Some("chars" | "word" | "sentence"))
+        {
+            return Err(parse(
+                "boundary_scanner",
+                &format!(
+                    "No enum constant org.elasticsearch.search.fetch.subphase.highlight.HighlightBuilder.BoundaryScannerType.{}",
+                    b.as_str().unwrap_or("").to_uppercase()
+                ),
+            ));
+        }
+    }
+    if let Some(t) = spec.get("tags_schema")
+        && !matches!(t.as_str(), Some("styled" | "default"))
+    {
+        return Err(parse(
+            "tags_schema",
+            &format!("Unknown tag schema [{}]", t.as_str().unwrap_or("")),
+        ));
+    }
+    Ok(())
+}
+
+const STYLED: &[&str] = &[
+    "<em class=\"hlt1\">",
+    "<em class=\"hlt2\">",
+    "<em class=\"hlt3\">",
+    "<em class=\"hlt4\">",
+    "<em class=\"hlt5\">",
+    "<em class=\"hlt6\">",
+    "<em class=\"hlt7\">",
+    "<em class=\"hlt8\">",
+    "<em class=\"hlt9\">",
+    "<em class=\"hlt10\">",
+];
+
+fn shard_err(reason: &str) -> EsError {
+    EsError::shard_failure("illegal_argument_exception", reason)
 }
 
 /// A hit's `highlight` object, or `None` when nothing in it matched.
-pub fn highlight(spec: &Value, query: &Value, mappings: &Value, source: &Value) -> Option<Value> {
-    let q = spec.get("highlight_query").unwrap_or(query);
-    let mut terms = Vec::new();
-    collect(q, mappings, &mut terms);
-    let tags = |key: &str, d: &str| -> String {
-        spec.get(key)
-            .and_then(Value::as_array)
-            .and_then(|a| a.first())
-            .and_then(Value::as_str)
-            .unwrap_or(d)
-            .to_string()
-    };
-    let (pre, post) = (tags("pre_tags", "<em>"), tags("post_tags", "</em>"));
+pub fn highlight(
+    spec: &Value,
+    query: &Value,
+    mappings: &Value,
+    source: &Value,
+    ctx: &Context,
+) -> Result<Option<Value>, EsError> {
     let mut out = Map::new();
     let fields: Vec<(String, Value)> = match spec.get("fields") {
         Some(Value::Object(o)) => o.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -508,29 +951,52 @@ pub fn highlight(spec: &Value, query: &Value, mappings: &Value, source: &Value) 
             .collect(),
         _ => Vec::new(),
     };
+    let index_limit = num(ctx.setting("max_analyzed_offset")).unwrap_or(1_000_000).max(0) as usize;
+    let weight_setting = ctx
+        .setting("weight_matches_mode.enabled")
+        .or_else(|| ctx.setting("weight_matches_mode").and_then(|w| w.get("enabled")))
+        .is_none_or(|v| v != "false" && v != &json!(false));
     for (pattern, opts) in fields {
         let get = |k: &str| opts.get(k).or_else(|| spec.get(k));
+        let ty = get("type").and_then(Value::as_str).unwrap_or("unified").to_string();
         let require = get("require_field_match").and_then(Value::as_bool).unwrap_or(true);
         let size = get("fragment_size").and_then(Value::as_u64).unwrap_or(100) as usize;
         let count = get("number_of_fragments").and_then(Value::as_u64).unwrap_or(5) as usize;
         let no_match = get("no_match_size").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let (fpre, fpost) = (
-            opts.get("pre_tags")
-                .and_then(|a| a.get(0))
-                .and_then(Value::as_str)
-                .unwrap_or(&pre)
-                .to_string(),
-            opts.get("post_tags")
-                .and_then(|a| a.get(0))
-                .and_then(Value::as_str)
-                .unwrap_or(&post)
-                .to_string(),
-        );
-        for field in field_names(&pattern, mappings) {
-            let (path, ty) = resolve_field(mappings, &field);
-            let keyword = matches!(ty.as_deref(), Some("keyword") | Some("constant_keyword"));
+        let by_score = get("order").and_then(Value::as_str) == Some("score");
+        let html = get("encoder").and_then(Value::as_str) == Some("html");
+        let request_limit = num(get("max_analyzed_offset")).map(|n| n.max(0) as usize);
+        let styled = spec.get("tags_schema").and_then(Value::as_str) == Some("styled");
+        let pre = tags_of(get("pre_tags"))
+            .and_then(|t| t.into_iter().next())
+            .unwrap_or_else(|| if styled { STYLED[0].to_string() } else { "<em>".to_string() });
+        let post = tags_of(get("post_tags"))
+            .and_then(|t| t.into_iter().next())
+            .unwrap_or_else(|| "</em>".to_string());
+        let fmt = Format { pre: &pre, post: &post, html };
+        let matched_fields: Vec<String> = opts
+            .get("matched_fields")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let hl_query = opts.get("highlight_query").or_else(|| spec.get("highlight_query"));
+        let mut terms = Vec::new();
+        collect(hl_query.unwrap_or(query), mappings, &mut terms);
+        for field in expand_field_pattern(mappings, &pattern) {
+            if !matches!(ty.as_str(), "unified" | "plain" | "fvh") {
+                return Err(shard_err(&format!(
+                    "unknown highlighter type [{ty}] for the field [{field}]"
+                )));
+            }
+            if !matched_fields.is_empty() && !require {
+                return Err(shard_err(
+                    "Matched fields are not supported when [require_field_match] is set to [false]",
+                ));
+            }
+            let (path, fty) = resolve_field(mappings, &field);
+            let keyword = matches!(fty.as_deref(), Some("keyword") | Some("constant_keyword"));
             if !matches!(
-                ty.as_deref(),
+                fty.as_deref(),
                 None | Some("text")
                     | Some("match_only_text")
                     | Some("keyword")
@@ -538,11 +1004,37 @@ pub fn highlight(spec: &Value, query: &Value, mappings: &Value, source: &Value) 
             ) {
                 continue;
             }
+            let def = field_def(mappings, &field);
+            let def_str = |k: &str| def.and_then(|d| d.get(k)).and_then(Value::as_str);
+            if ty == "fvh" && def_str("term_vector") != Some("with_positions_offsets") {
+                return Err(shard_err(&format!(
+                    "the field [{field}] should be indexed with term vector with position offsets to be used with fast vector highlighter"
+                )));
+            }
+            let scanner = match get("boundary_scanner").and_then(Value::as_str) {
+                Some("word") => Scanner::Word,
+                Some("chars") if ty == "unified" => {
+                    return Err(shard_err("Invalid boundary scanner type: chars"));
+                }
+                _ => Scanner::Sentence,
+            };
+            let fragmenter = match (count, get("fragmenter").and_then(Value::as_str)) {
+                (0, _) => Fragmenter::Null,
+                (_, None | Some("span")) => Fragmenter::Span,
+                (_, Some("simple")) => Fragmenter::Simple,
+                (_, Some(other)) if ty == "plain" => {
+                    return Err(shard_err(&format!(
+                        "unknown fragmenter option [{other}] for the field [{field}]"
+                    )));
+                }
+                _ => Fragmenter::Span,
+            };
             let hls: Vec<&Hl> = terms
                 .iter()
-                .filter(|(f, _)| !require || f == &field || (field.contains('*')))
+                .filter(|(f, _)| !require || f == &field || matched_fields.contains(f))
                 .map(|(_, h)| h)
                 .collect();
+            let ignore_above = def.and_then(|d| d.get("ignore_above")).and_then(Value::as_u64);
             let values: Vec<String> = raw_values(source, &path)
                 .into_iter()
                 .filter_map(|v| match v {
@@ -550,42 +1042,119 @@ pub fn highlight(spec: &Value, query: &Value, mappings: &Value, source: &Value) 
                     Value::Number(n) => Some(n.to_string()),
                     _ => None,
                 })
+                .filter(|s| !keyword || ignore_above.is_none_or(|n| s.chars().count() as u64 <= n))
                 .collect();
-            let by_score = get("order").and_then(Value::as_str) == Some("score");
-            let mut frags: Vec<String> = Vec::new();
-            if count == 0 || keyword {
-                for text in &values {
-                    let sp = spans(text, keyword, &hls);
-                    if !sp.is_empty() {
-                        frags.push(tag(text, &sp, &fpre, &fpost));
+            if values.is_empty() {
+                continue;
+            }
+            let synthetic =
+                mappings.get("_source").and_then(|s| s.get("mode")).and_then(Value::as_str)
+                    == Some("synthetic");
+            if ty == "fvh" && synthetic && values.len() > 1 {
+                return Err(shard_err(&format!(
+                    "The fast vector highlighter doesn't support loading multi-valued fields from _source in index [{}] because _source can reorder field values",
+                    ctx.index
+                )));
+            }
+            // Analysis stops at `max_analyzed_offset`: past the index
+            // limit it's an error (unless the unified highlighter can read
+            // stored offsets), below it a request limit truncates.
+            let has_offsets = def_str("index_options") == Some("offsets")
+                || def_str("term_vector").is_some_and(|t| t.contains("offsets"));
+            let limit = match request_limit {
+                Some(r) if r < index_limit => Some(r),
+                _ => {
+                    let len = if ty == "plain" {
+                        values.iter().map(|v| v.encode_utf16().count()).max().unwrap_or(0)
+                    } else {
+                        values.iter().map(|v| v.encode_utf16().count() + 1).sum::<usize>() - 1
+                    };
+                    if len > index_limit && !(ty != "plain" && has_offsets) {
+                        return Err(shard_err(&format!(
+                            "The length [{len}] of field [{field}] in doc[{}]/index[{}] exceeds the [index.highlight.max_analyzed_offset] limit [{index_limit}]. To avoid this error, set the query parameter [max_analyzed_offset] to a value less than index setting [{index_limit}] and this will tolerate long field values by truncating them.",
+                            ctx.doc, ctx.index
+                        )));
                     }
+                    request_limit
+                }
+            };
+            let limited = |text: &str, toks: Vec<Token>| -> Vec<Token> {
+                match limit {
+                    Some(l) => toks
+                        .into_iter()
+                        .filter(|t| text[..t.1].encode_utf16().count() <= l)
+                        .collect(),
+                    None => toks,
+                }
+            };
+            let mut frags: Vec<String> = Vec::new();
+            if ty == "plain" {
+                let mut all: Vec<(f32, usize, String)> = Vec::new();
+                for text in &values {
+                    let toks = limited(text, tokenize(text, keyword));
+                    let mut fs = plain_fragments(text, &toks, &hls, size, fragmenter, &fmt);
+                    fs.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.1.cmp(&b.1))
+                    });
+                    fs.truncate(count.max(1));
+                    // The best fragments, back in text order.
+                    fs.sort_by_key(|f| f.1);
+                    all.extend(fs.into_iter().filter(|f| f.0 > 0.0));
+                }
+                if by_score {
+                    all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                }
+                if !(count == 0 && values.len() > 1) {
+                    all.truncate(count.max(1));
+                }
+                frags = all.into_iter().map(|f| f.2).collect();
+                if frags.is_empty()
+                    && no_match > 0
+                    && let Some(e) =
+                        plain_no_match(&values[0], &tokenize(&values[0], keyword), no_match)
+                {
+                    let mut s = String::new();
+                    push_encoded(&mut s, &e, html);
+                    frags.push(s);
                 }
             } else {
-                // Values are highlighted as one text, separated so no
-                // passage spans two of them.
-                let content = values.join("\u{2029}");
-                let sp = spans(&content, false, &hls);
-                if !sp.is_empty() {
-                    frags = fragment_text(&content, &sp, size, count, by_score, &fpre, &fpost);
-                }
-            }
-            if frags.is_empty()
-                && no_match > 0
-                && let Some(text) = values.first()
-            {
-                // `no_match_size` characters, extended to the end of a word.
-                let chars: Vec<char> = text.chars().collect();
-                let end = if no_match >= chars.len() {
-                    chars.len()
+                // The fast vector highlighter always tags a phrase whole.
+                let weighted = ty == "fvh" || (ctx.weighted && weight_setting);
+                if count == 0 || keyword {
+                    for text in &values {
+                        let sp = spans(&limited(text, tokenize(text, keyword)), &hls, weighted);
+                        if !sp.is_empty() {
+                            frags.push(tag(text, &sp, &fmt));
+                        }
+                    }
                 } else {
-                    following(&word_breaks(&chars), no_match - 1, chars.len())
-                };
-                frags.push(chars[..end].iter().collect::<String>().trim().to_string());
+                    // Values are highlighted as one text, separated so no
+                    // passage spans two of them.
+                    let content = values.join("\u{2029}");
+                    let sp = spans(&limited(&content, tokenize(&content, false)), &hls, weighted);
+                    if !sp.is_empty() {
+                        frags = fragment_text(&content, &sp, size, count, by_score, scanner, &fmt);
+                    }
+                }
+                if frags.is_empty() && no_match > 0 {
+                    // `no_match_size` characters, extended to the end of a word.
+                    let chars: Vec<char> = values[0].chars().collect();
+                    let end = if no_match >= chars.len() {
+                        chars.len()
+                    } else {
+                        following(&word_breaks(&chars), no_match, chars.len())
+                    };
+                    let mut s = String::new();
+                    push_chars(&mut s, &chars[..end], html);
+                    frags.push(s.trim().to_string());
+                }
             }
             if !frags.is_empty() {
                 out.insert(field, json!(frags));
             }
         }
     }
-    (!out.is_empty()).then_some(Value::Object(out))
+    Ok((!out.is_empty()).then_some(Value::Object(out)))
 }

@@ -13,7 +13,7 @@ use super::search::{
     CommittedDoc, analyze_for, bm25_scores, doc_tokens, eval, field_and_spec, query_text,
     raw_values, resolve_field, sloppy_phrase_matches,
 };
-use super::{dates, painless};
+use super::{dates, painless, vectors};
 
 type Scores = HashMap<usize, f32>;
 
@@ -378,6 +378,12 @@ fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
         rest = &rest[i + 4..];
         let q = rest.chars().next().unwrap_or('\'');
         let name: String = rest[1..].chars().take_while(|c| *c != q).collect();
+        if let Some(v) = vectors::field_def(mappings, &name)
+            .and_then(|def| vectors::doc_view(def, &d.source, &name))
+        {
+            m.insert(name, v);
+            continue;
+        }
         let is_date =
             matches!(resolve_field(mappings, &name).1.as_deref(), Some("date" | "date_nanos"));
         let vals: Vec<Value> = if is_date {
@@ -390,7 +396,29 @@ fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
             json!({"value": vals.first().cloned().unwrap_or(Value::Null), "values": vals, "length": vals.len(), "empty": vals.is_empty()}),
         );
     }
+    // Vector fields a vector function names: `cosineSimilarity(v, 'field')`.
+    if vectors::SCRIPT_FUNCTIONS.iter().any(|f| src.contains(f)) {
+        for name in string_literals(src) {
+            if let Some(v) = vectors::field_def(mappings, &name)
+                .and_then(|def| vectors::doc_view(def, &d.source, &name))
+            {
+                m.entry(name).or_insert(v);
+            }
+        }
+    }
     Value::Object(m)
+}
+
+/// The quoted string literals in a script's source.
+fn string_literals(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut chars = src.chars();
+    while let Some(c) = chars.next() {
+        if c == '\'' || c == '"' {
+            out.push(chars.by_ref().take_while(|x| *x != c).collect());
+        }
+    }
+    out
 }
 
 fn run_score_script(
@@ -406,9 +434,11 @@ fn run_score_script(
     vars.insert("doc".into(), doc_view(mappings, d, &src));
     vars.insert("_score".into(), json!(score));
     vars.insert("params".into(), params);
-    let v = compiled
-        .value(vars)
-        .map_err(|e| EsError::new(400, "script_exception", &format!("runtime error: {e}")))?;
+    // A script failing on a document fails the search on that shard.
+    let v = compiled.value(vars).map_err(|e| {
+        EsError::shard_failure("script_exception", "runtime error")
+            .caused_by("illegal_argument_exception", &e)
+    })?;
     v.as_f64().ok_or_else(|| {
         EsError::new(400, "script_exception", "script score function must return a number")
     })
@@ -463,7 +493,12 @@ pub fn combined_fields(
         .map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
-                .map(|f| f.split('^').next().unwrap_or(f).to_string())
+                .flat_map(|f| {
+                    super::highlight::expand_field_pattern(
+                        mappings,
+                        f.split('^').next().unwrap_or(f),
+                    )
+                })
                 .collect()
         })
         .unwrap_or_default();
