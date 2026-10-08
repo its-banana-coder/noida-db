@@ -504,7 +504,7 @@ pub(crate) fn eval(name: &str, a: &[Value]) -> Result<Value, MySqlError> {
             Some(t) => Value::Int(field(name, t)),
             None => Value::Null,
         },
-        "EXTRACT" => {
+        "EXTRACT" | "NOIDA_EXTRACT" => {
             need(2)?;
             let unit = text(0).unwrap_or_default();
             match to_ts(&arg(1)) {
@@ -1079,8 +1079,30 @@ fn field(unit: &str, t: i64) -> i64 {
         "DAYOFWEEK" => dow + 1,
         "WEEKDAY" => (dow + 6) % 7,
         "DAYOFYEAR" => days - date_from_ymd(y, 1, 1) as i64 + 1,
-        _ => 0,
+        "WEEK" => calc_week(days as i32, week_mode(0)).1,
+        // Compound units: the fields' digits run together.
+        "YEAR_MONTH" => y * 100 + m as i64,
+        _ => compound(unit, d as i64, us).unwrap_or(0),
     }
+}
+
+/// `DAY_SECOND`, `HOUR_MICROSECOND`, ...: DDHHMMSS-style integers.
+fn compound(unit: &str, day: i64, us: i64) -> Option<i64> {
+    let (from, to) = unit.split_once('_')?;
+    let parts = ["DAY", "HOUR", "MINUTE", "SECOND", "MICROSECOND"];
+    let lo = parts.iter().position(|p| *p == from)?;
+    let hi = parts.iter().position(|p| *p == to)?;
+    if lo >= hi {
+        return None;
+    }
+    let vals = [
+        (day, 100),
+        (us / (3600 * USECS_PER_SEC), 100),
+        (us / (60 * USECS_PER_SEC) % 60, 100),
+        (us / USECS_PER_SEC % 60, 100),
+        (us % USECS_PER_SEC, 1_000_000),
+    ];
+    Some(vals[lo..=hi].iter().fold(0, |acc, (v, width)| acc * width + v))
 }
 
 const MONTHS: [&str; 12] = [

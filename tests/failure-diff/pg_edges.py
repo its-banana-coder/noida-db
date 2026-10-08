@@ -874,6 +874,11 @@ PG_EDGES.update({
         "CLOSE ALL",
         "SELECT count(*) FROM pg_cursors",
     ),
+    "pg edge: EXTRACT seconds and milliseconds": steps(
+        "SELECT EXTRACT(SECOND FROM timestamptz '2015-06-15 14:30:50.000321+00'), EXTRACT(SECOND FROM timestamp '2015-06-15 14:30:50.000321'), date_part('second', timestamp '2015-06-15 14:30:50.000321')",
+        "SELECT EXTRACT(MILLISECONDS FROM timestamp '2015-06-15 14:30:50.000321'), EXTRACT(MICROSECONDS FROM timestamp '2015-06-15 14:30:50.000321'), EXTRACT(SECOND FROM timestamp '2015-06-15 14:30:05')",
+        "SELECT date_part('milliseconds', timestamptz '2015-06-15 14:30:50.5+00'), EXTRACT(MILLISECONDS FROM time '01:02:03.5'), EXTRACT(SECOND FROM interval '1 minute 2.5 seconds')",
+    ),
     "pg edge: DISTINCT ON output names and positions": steps(
         "CREATE TABLE dd (id int, name text)",
         "INSERT INTO dd VALUES (1, 'B'), (2, 'a'), (3, 'b')",

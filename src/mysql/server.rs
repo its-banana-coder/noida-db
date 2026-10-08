@@ -276,6 +276,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 // Stmt Prepare
                 let sql = String::from_utf8_lossy(&payload[1..]).to_string();
                 let dialect = MySqlDialect {};
+                let sql = crate::mysql::engine::rewrite_extract_units(&sql).unwrap_or(sql);
                 let rewritten = crate::mysql::engine::rewrite_table_comment(&sql)
                     .or_else(|| crate::mysql::engine::rewrite_drop_check(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_rename_key(&sql))
