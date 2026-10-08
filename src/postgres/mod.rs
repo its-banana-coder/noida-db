@@ -66,7 +66,18 @@ pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
     let sql4 = after_overriding.as_deref().unwrap_or(sql3);
     let after_subscripts = arrayset::rewrite(sql4);
     let sql = after_subscripts.as_deref().unwrap_or(sql4);
-    Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(syntax_error)
+    match Parser::parse_sql(&PostgreSqlDialect {}, sql) {
+        Ok(v) => Ok(v),
+        // `((SELECT ...) UNION (SELECT ...))` as an expression: sqlparser
+        // reads `((SELECT` as a parenthesised subquery and stops at the
+        // set operator. Retried with the group as a derived table.
+        Err(e) => match crate::sql::rewrite_paren_setops(sql) {
+            Some(fixed) => {
+                Parser::parse_sql(&PostgreSqlDialect {}, &fixed).map_err(|_| syntax_error(e))
+            }
+            None => Err(syntax_error(e)),
+        },
+    }
 }
 
 /// `EXPLAIN [ANALYZE] [VERBOSE] (SELECT ...) UNION (...)`: sqlparser reads
