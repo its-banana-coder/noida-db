@@ -395,6 +395,32 @@ impl Binder {
                 let (db, table) = self.resolve_table_name(&target.name)?;
                 Ok(Plan::Truncate { db, table })
             }
+            // `EXPLAIN [ANALYZE] [FORMAT=x] stmt`, `DESCRIBE stmt`.
+            Statement::Explain { statement, analyze, format, .. } => {
+                use crate::mysql::explain::Format;
+                let format = match &format {
+                    None => Format::Traditional,
+                    Some(f) => {
+                        let text = f.to_string();
+                        let name = text.rsplit(['=', ' ']).next().unwrap_or("").trim();
+                        Format::parse(name).ok_or_else(|| {
+                            MySqlError::new(
+                                1235,
+                                "42000",
+                                format!(
+                                    "This version of MySQL doesn't yet support 'FORMAT={name}'"
+                                ),
+                            )
+                        })?
+                    }
+                };
+                let format = if analyze { Format::Tree } else { format };
+                // EXPLAIN ANALYZE runs only a query (on DML MySQL prints
+                // "<not executable by iterator executor>").
+                let analyze = analyze && matches!(*statement, Statement::Query(_));
+                let inner = self.bind_statement(*statement)?;
+                Ok(Plan::Explain { format, analyze, inner: Box::new(inner) })
+            }
             // `DESCRIBE t` / `DESC t` / `EXPLAIN t` are SHOW COLUMNS.
             Statement::ExplainTable { table_name, .. } => {
                 let (db, table) = self.resolve_table_name(&table_name)?;

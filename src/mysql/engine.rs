@@ -352,7 +352,8 @@ impl Engine {
             .or_else(|| rewrite_drop_check(sql))
             .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
-            .or_else(|| rewrite_comma_update(sql));
+            .or_else(|| rewrite_comma_update(sql))
+            .or_else(|| rewrite_explain_format(sql));
         let text = rewritten.as_deref().unwrap_or(sql);
         let asts = match Parser::parse_sql(&dialect, text) {
             Ok(a) => a,
@@ -386,7 +387,8 @@ impl Engine {
             .or_else(|| rewrite_drop_check(sql))
             .or_else(|| rewrite_rename_key(sql))
             .or_else(|| rewrite_trailing_into(sql))
-            .or_else(|| rewrite_comma_update(sql));
+            .or_else(|| rewrite_comma_update(sql))
+            .or_else(|| rewrite_explain_format(sql));
         let sql = rewritten.as_deref().unwrap_or(sql);
         let mut asts = Parser::parse_sql(&dialect, sql)
             .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
@@ -1059,6 +1061,16 @@ pub fn rewrite_extract_units(sql: &str) -> Option<String> {
         })
         .into_owned()
     })
+}
+
+/// `EXPLAIN [ANALYZE] FORMAT=TRADITIONAL stmt`, which sqlparser doesn't
+/// take: TRADITIONAL is the default, so the clause is dropped.
+pub fn rewrite_explain_format(sql: &str) -> Option<String> {
+    let re = regex_lite::Regex::new(
+        r"(?is)^(\s*(?:explain|describe|desc)(?:\s+analyze)?)\s+format\s*=\s*traditional\b",
+    )
+    .expect("regex");
+    re.is_match(sql).then(|| re.replace(sql, "$1").into_owned())
 }
 
 pub fn rewrite_rename_key(sql: &str) -> Option<String> {

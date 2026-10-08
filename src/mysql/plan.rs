@@ -342,6 +342,12 @@ use crate::mysql::catalog::Column;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plan {
     Dummy, // SELECT 1
+    /// `EXPLAIN [ANALYZE] [FORMAT=...] stmt` / `DESCRIBE stmt`.
+    Explain {
+        format: crate::mysql::explain::Format,
+        analyze: bool,
+        inner: Box<Plan>,
+    },
     ShowDatabases,
     /// `SHOW [FULL] TABLES [FROM db] [LIKE 'p']`.
     ShowTables {
@@ -777,6 +783,12 @@ pub fn column_names(plan: &Plan, db: &DbState) -> Vec<String> {
             }
         }
         Plan::RecursiveCte { columns, .. } | Plan::CteRef { columns, .. } => columns.clone(),
+        Plan::Explain {
+            format: crate::mysql::explain::Format::Traditional,
+            analyze: false,
+            ..
+        } => crate::mysql::explain::COLUMNS.iter().map(|c| c.to_string()).collect(),
+        Plan::Explain { .. } => vec!["EXPLAIN".to_string()],
         Plan::ShowDatabases => vec!["Database".to_string()],
         Plan::ShowTables { db: db_name, full, .. } => {
             let mut v = vec![format!("Tables_in_{db_name}")];
