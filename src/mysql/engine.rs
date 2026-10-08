@@ -353,7 +353,7 @@ impl Engine {
             .or_else(|| rewrite_comma_update(sql))
             .or_else(|| rewrite_explain_format(sql));
         let text = rewritten.as_deref().unwrap_or(sql);
-        let asts = match Parser::parse_sql(&dialect, text) {
+        let asts = match parse_with_fallback(&dialect, text) {
             Ok(a) => a,
             Err(e) => {
                 return vec![StatementResult::from(
@@ -386,7 +386,7 @@ impl Engine {
             .or_else(|| rewrite_comma_update(sql))
             .or_else(|| rewrite_explain_format(sql));
         let sql = rewritten.as_deref().unwrap_or(sql);
-        let mut asts = Parser::parse_sql(&dialect, sql)
+        let mut asts = parse_with_fallback(&dialect, sql)
             .map_err(|e| MySqlError::syntax_error(&e.to_string()))?;
 
         if asts.is_empty() {
@@ -1052,6 +1052,19 @@ pub fn rewrite_explain_format(sql: &str) -> Option<String> {
     )
     .expect("regex");
     re.is_match(sql).then(|| re.replace(sql, "$1").into_owned())
+}
+
+/// Parses, retrying a failed parse with parenthesised set operations in
+/// expression position (`((SELECT ..) UNION (SELECT ..))`) made derived
+/// tables, which sqlparser can read.
+pub fn parse_with_fallback(
+    dialect: &MySqlDialect,
+    sql: &str,
+) -> Result<Vec<sqlparser::ast::Statement>, sqlparser::parser::ParserError> {
+    Parser::parse_sql(dialect, sql).or_else(|e| match crate::sql::rewrite_paren_setops(sql) {
+        Some(fixed) => Parser::parse_sql(dialect, &fixed).map_err(|_| e),
+        None => Err(e),
+    })
 }
 
 pub fn rewrite_rename_key(sql: &str) -> Option<String> {

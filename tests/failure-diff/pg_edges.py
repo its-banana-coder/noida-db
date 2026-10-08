@@ -885,4 +885,16 @@ PG_EDGES.update({
         "SELECT DISTINCT ON (id) id, name FROM dd ORDER BY id DESC",
         "SELECT DISTINCT ON (name) id FROM dd ORDER BY name, id",
     ),
+    "pg edge: parenthesised set operation as an expression": steps(
+        "CREATE TABLE num (id int, num int)",
+        'CREATE TABLE rn (id int, name text, "order" int)',
+        "INSERT INTO num VALUES (1, 1), (2, 5), (3, 8), (4, 9)",
+        "INSERT INTO rn VALUES (1, 'rn1', 8), (2, 'rn2', 1), (3, 'rn3', 5)",
+        'SELECT rn."order", ((SELECT U0.num FROM num U0 WHERE U0.num > 7 AND U0.num = rn."order") UNION (SELECT U0.num FROM num U0 WHERE U0.num < 2 AND U0.num = rn."order")) AS number FROM rn ORDER BY 1',
+        'SELECT rn."order" FROM rn WHERE rn.id IN ((SELECT 1) UNION (SELECT 2)) ORDER BY 1',
+        """SELECT rn.name FROM rn WHERE rn."order" = ((SELECT 8) EXCEPT (SELECT 9)) ORDER BY 1""",
+        "SELECT ((SELECT 1) UNION (SELECT 1))",
+        "SELECT ((SELECT 1) UNION (SELECT 2))",
+        "SELECT * FROM ((SELECT 1 AS a) UNION ALL (SELECT 2)) s ORDER BY 1",
+    ),
 })
