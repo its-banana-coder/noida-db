@@ -1177,6 +1177,80 @@ pub fn top_level_query(
     }))
 }
 
+/// A query clause on a `dense_vector` field that only `knn` and
+/// `exists` queries support: the error Elasticsearch gives.
+pub fn unsupported_query(query: &Map<String, Value>, mappings: &Value) -> Option<EsError> {
+    let (kind, spec) = query.iter().next()?;
+    let field = match kind.as_str() {
+        "term"
+        | "terms"
+        | "match"
+        | "match_phrase"
+        | "match_phrase_prefix"
+        | "range"
+        | "prefix"
+        | "wildcard"
+        | "regexp"
+        | "fuzzy" => spec.as_object()?.keys().find(|k| !matches!(k.as_str(), "boost" | "_name"))?,
+        _ => return None,
+    };
+    field_def(mappings, field).and_then(Field::of)?;
+    let reason = match kind.as_str() {
+        "term" | "terms" => {
+            format!("Field [{field}] of type [dense_vector] doesn't support term queries")
+        }
+        "range" => format!("Field [{field}] of type [dense_vector] does not support range queries"),
+        "prefix" | "wildcard" => format!(
+            "Can only use {kind} queries on keyword, text and wildcard fields - not on [{field}] which is of type [dense_vector]"
+        ),
+        "regexp" | "fuzzy" => format!(
+            "Can only use {kind} queries on keyword and text fields - not on [{field}] which is of type [dense_vector]"
+        ),
+        _ => format!("Field [{field}] of type [dense_vector] does not support match queries"),
+    };
+    Some(create_failure(&reason))
+}
+
+/// A `dense_vector` field named by an aggregation (or `docvalue_fields`):
+/// the error Elasticsearch gives.
+pub fn unsupported_doc_values(body: &Value, mappings: &Value) -> Option<EsError> {
+    fn fields<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+        match v {
+            Value::Object(o) => {
+                if let Some(f) = o.get("field").and_then(Value::as_str) {
+                    out.push(f);
+                }
+                o.values().for_each(|x| fields(x, out));
+            }
+            Value::Array(a) => a.iter().for_each(|x| fields(x, out)),
+            _ => {}
+        }
+    }
+    let mut names = Vec::new();
+    if let Some(a) = body.get("aggs").or_else(|| body.get("aggregations")) {
+        fields(a, &mut names);
+    }
+    match body.get("docvalue_fields") {
+        Some(Value::Array(a)) => {
+            for x in a {
+                match x {
+                    Value::String(s) => names.push(s),
+                    other => fields(other, &mut names),
+                }
+            }
+        }
+        Some(Value::String(s)) => names.push(s),
+        _ => {}
+    }
+    let f = names.into_iter().find(|f| field_def(mappings, f).and_then(Field::of).is_some())?;
+    Some(EsError::shard_failure(
+        "illegal_argument_exception",
+        &format!(
+            "Field [{f}] of type [dense_vector] doesn't support docvalue_fields or aggregations"
+        ),
+    ))
+}
+
 // --- Script functions -------------------------------------------------
 
 /// The `doc['field']` view of a vector for scoring scripts.

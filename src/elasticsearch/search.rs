@@ -1209,6 +1209,9 @@ pub fn eval(
             )));
         }
     }
+    if let Some(e) = vectors::unsupported_query(obj, mappings) {
+        return Err(e);
+    }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
     }
@@ -2322,6 +2325,9 @@ pub fn search_with(
         ));
     }
 
+    if let Some(e) = vectors::unsupported_doc_values(body, mappings) {
+        return Err(e);
+    }
     let mut query = match vectors::top_level_query(body, mappings, size)? {
         Some(q) => q,
         None => body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}})),
