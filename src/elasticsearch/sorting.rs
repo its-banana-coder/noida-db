@@ -118,6 +118,12 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
                         &format!("No mapping found for [{f}] in order to sort on"),
                     ));
                 }
+                if ty.as_deref() == Some("dense_vector") {
+                    return Err(EsError::shard_failure(
+                        "illegal_argument_exception",
+                        &format!("Field [{f}] of type [dense_vector] doesn't support sort"),
+                    ));
+                }
                 if ty.as_deref() == Some("text") {
                     return Err(EsError::shard_failure(
                         "illegal_argument_exception",

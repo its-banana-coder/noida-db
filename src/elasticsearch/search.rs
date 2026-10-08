@@ -18,6 +18,7 @@ use super::queries;
 use super::query_string;
 use super::scoring;
 use super::sorting;
+use super::vectors;
 
 /// A search failure, shaped the way Elasticsearch reports it: most are a
 /// plain `{"error": {"type": ...}}`, but a failure while executing the
@@ -29,11 +30,19 @@ pub struct EsError {
     pub kind: String,
     pub reason: String,
     pub shard: bool,
+    /// The underlying cause (`caused_by`), as (type, reason).
+    pub cause: Option<(String, String)>,
 }
 
 impl EsError {
     pub fn new(status: u16, kind: &str, reason: &str) -> Self {
-        Self { status, kind: kind.to_string(), reason: reason.to_string(), shard: false }
+        Self {
+            status,
+            kind: kind.to_string(),
+            reason: reason.to_string(),
+            shard: false,
+            cause: None,
+        }
     }
 
     pub fn parsing(reason: &str) -> Self {
@@ -41,15 +50,30 @@ impl EsError {
     }
 
     pub fn shard_failure(kind: &str, reason: &str) -> Self {
-        Self { status: 400, kind: kind.to_string(), reason: reason.to_string(), shard: true }
+        Self {
+            status: 400,
+            kind: kind.to_string(),
+            reason: reason.to_string(),
+            shard: true,
+            cause: None,
+        }
+    }
+
+    /// The same error with a `caused_by`.
+    pub fn caused_by(mut self, kind: &str, reason: &str) -> Self {
+        self.cause = Some((kind.to_string(), reason.to_string()));
+        self
     }
 
     pub fn to_json(&self) -> Value {
-        let cause = json!({"type": self.kind, "reason": self.reason});
+        let mut cause = json!({"type": self.kind, "reason": self.reason});
+        if let Some((kind, reason)) = &self.cause {
+            cause["caused_by"] = json!({"type": kind, "reason": reason});
+        }
         if self.shard {
             json!({
                 "error": {
-                    "root_cause": [cause.clone()],
+                    "root_cause": [{"type": self.kind, "reason": self.reason}],
                     "type": "search_phase_execution_exception",
                     "reason": "all shards failed",
                     "phase": "query",
@@ -60,10 +84,12 @@ impl EsError {
                 "status": self.status,
             })
         } else {
-            json!({
-                "error": {"root_cause": [cause], "type": self.kind, "reason": self.reason},
-                "status": self.status,
-            })
+            let mut err = json!({"root_cause": [{"type": self.kind, "reason": self.reason}],
+                                 "type": self.kind, "reason": self.reason});
+            if let Some(c) = cause.get("caused_by") {
+                err["caused_by"] = c.clone();
+            }
+            json!({"error": err, "status": self.status})
         }
     }
 }
@@ -221,7 +247,7 @@ fn check_nested_path(mappings: &Value, v: &Value) -> Result<Option<String>, EsEr
 }
 
 /// Per matching parent, its matching children: (offset, score, child).
-type InnerMatches = HashMap<usize, Vec<(usize, f32, usize)>>;
+pub(crate) type InnerMatches = HashMap<usize, Vec<(usize, f32, usize)>>;
 
 fn nested_matches(
     v: &Value,
@@ -231,6 +257,11 @@ fn nested_matches(
     let Some(path) = check_nested_path(mappings, v)? else { return Ok(None) };
     let inner = v.get("query").cloned().unwrap_or_else(|| json!({"match_all": {}}));
     let (children, owners) = nested_children(docs, 0..docs.len(), &path);
+    // kNN over nested vectors finds the nearest parents, not children.
+    if let Some(knn) = inner.get("knn").filter(|_| vectors::is_knn(&inner)) {
+        let per = vectors::nested_knn(knn, mappings, docs, &children, &owners)?;
+        return Ok(Some((children, per)));
+    }
     let mut per: InnerMatches = HashMap::new();
     for (ci, score) in eval(&inner, mappings, &children)? {
         let (parent, offset) = owners[ci];
@@ -247,7 +278,10 @@ fn eval_nested(
     docs: &[CommittedDoc],
 ) -> Result<HashMap<usize, f32>, EsError> {
     let Some((_, per)) = nested_matches(v, mappings, docs)? else { return Ok(HashMap::new()) };
-    let mode = v.get("score_mode").and_then(Value::as_str).unwrap_or("avg");
+    // A parent matches a nested kNN query through its nearest vector.
+    let knn = v.get("query").is_some_and(vectors::is_knn);
+    let mode =
+        if knn { "max" } else { v.get("score_mode").and_then(Value::as_str).unwrap_or("avg") };
     let boost = v.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     Ok(per
         .into_iter()
@@ -263,6 +297,19 @@ fn eval_nested(
             (parent, s * boost)
         })
         .collect())
+}
+
+/// `mappings` with the objects along `path` mapped as plain objects (a
+/// nested object's own fields, fetched for its inner hit).
+fn objects_along(mappings: &Value, path: &str) -> Value {
+    let mut out = mappings.clone();
+    let mut node = &mut out;
+    for seg in path.split('.') {
+        let Some(next) = node.get_mut("properties").and_then(|p| p.get_mut(seg)) else { break };
+        next["type"] = json!("object");
+        node = next;
+    }
+    out
 }
 
 /// The `inner_hits` of every `nested` clause in `query` that asks for
@@ -299,15 +346,33 @@ fn inner_hits(
                             for seg in path.split('.') {
                                 src = &src[seg];
                             }
-                            json!({
+                            let mut hit = json!({
                                 "_index": c.index,
                                 "_id": c.id,
                                 "_nested": {"field": path, "offset": offset},
                                 "_score": score,
-                                "_source": apply_source_filter(src, ih.get("_source")),
-                            })
+                            });
+                            if !matches!(ih.get("_source"), Some(Value::Bool(false))) {
+                                hit["_source"] = apply_source_filter(src, ih.get("_source"));
+                            }
+                            // `fields` of a nested hit come grouped under its
+                            // path: `{"comments": [{"author": [...]}]}`.
+                            if let Some(spec) = ih.get("fields") {
+                                let prefix = format!("{path}.");
+                                let mut grouped = Map::new();
+                                let flat = objects_along(mappings, &path);
+                                for (k, v) in fields::fetch(&flat, c, spec, fields::Kind::Fields)? {
+                                    let k =
+                                        k.strip_prefix(&prefix).map_or(k.clone(), str::to_string);
+                                    grouped.insert(k, v);
+                                }
+                                if !grouped.is_empty() {
+                                    hit["fields"] = json!({ (path.as_str()): [grouped] });
+                                }
+                            }
+                            Ok(hit)
                         })
-                        .collect();
+                        .collect::<Result<_, EsError>>()?;
                     by_parent.insert(
                         parent,
                         json!({"hits": {
@@ -503,7 +568,11 @@ fn value_and_boost(spec: &Value) -> (Value, f32) {
 
 fn eval_term(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let (value, boost) = value_and_boost(spec);
+    // `{"term": "x"}` is accepted for `{"value": "x"}`.
+    let (value, boost) = match spec.get("term").filter(|_| spec.get("value").is_none()) {
+        Some(t) => (t.clone(), spec.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32),
+        None => value_and_boost(spec),
+    };
     let target = value_to_term(&value);
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
@@ -1140,6 +1209,9 @@ pub fn eval(
             )));
         }
     }
+    if let Some(e) = vectors::unsupported_query(obj, mappings) {
+        return Err(e);
+    }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
     }
@@ -1221,6 +1293,9 @@ pub fn eval(
     }
     if let Some(v) = obj.get("combined_fields") {
         return queries::combined_fields(v, mappings, docs);
+    }
+    if let Some(v) = obj.get("knn") {
+        return vectors::eval_knn(v, mappings, docs);
     }
     if let Some(v) = obj.get("geo_distance") {
         return queries::geo_distance(v, docs);
@@ -2250,7 +2325,14 @@ pub fn search_with(
         ));
     }
 
-    let query = body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}}));
+    if let Some(e) = vectors::unsupported_doc_values(body, mappings) {
+        return Err(e);
+    }
+    let mut query = match vectors::top_level_query(body, mappings, size)? {
+        Some(q) => q,
+        None => body.get("query").cloned().unwrap_or_else(|| json!({"match_all":{}})),
+    };
+    vectors::fill_defaults(&mut query, size);
     // Queries and aggregations see the root-level view (no nested
     // objects); hits are built from the originals.
     let view = root_view(mappings, docs);

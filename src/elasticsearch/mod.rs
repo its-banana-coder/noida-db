@@ -15,6 +15,7 @@ mod search;
 mod server;
 mod sorting;
 mod templates;
+mod vectors;
 
 #[cfg(test)]
 mod tests;

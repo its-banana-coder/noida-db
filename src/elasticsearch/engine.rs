@@ -15,6 +15,7 @@ pub struct Engine(Arc<Mutex<State>>);
 use serde::{Deserialize, Serialize};
 
 use super::templates::Templates;
+use super::vectors;
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
@@ -535,6 +536,7 @@ impl Engine {
             "_search" | "_count" => {
                 self.search_or_count(method, segments[1], segments[0], &q, body)
             }
+            "_knn_search" if segments.len() == 2 => self.knn_search(method, segments[0], &q, body),
             "_pit" if method == "POST" => self.open_pit(index_name, &q),
             "_stats" if method == "GET" => self.stats_api(index_name),
             "_delete_by_query" | "_update_by_query" => {
@@ -991,6 +993,17 @@ impl Engine {
             .get("scroll")
             .cloned()
             .or_else(|| req.get("scroll").and_then(Value::as_str).map(str::to_string));
+        if q.contains_key("search_type") && req.get("knn").is_some() {
+            return (
+                400,
+                error(
+                    "illegal_argument_exception",
+                    "cannot set [search_type] when using [knn] search, since the search type is \
+                     determined automatically",
+                    400,
+                ),
+            );
+        }
         let mut s = self.0.lock().unwrap();
         if let Err(e) =
             validate_scroll_and_slice(&s, index_pattern, &req, q, scroll_param.as_deref())
@@ -1160,6 +1173,30 @@ impl Engine {
         }
     }
 
+    /// `/<index>/_knn_search` (deprecated since 8.4 for the search API's
+    /// `knn` option): a kNN search with its own top-level `filter`,
+    /// returning `k` hits.
+    fn knn_search(
+        &self,
+        method: &str,
+        index: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
+        let Some(mut req) = parse_json(body) else {
+            return (400, malformed_body());
+        };
+        if let Some(f) = req.as_object_mut().and_then(|o| o.remove("filter"))
+            && req.get("knn").is_some_and(Value::is_object)
+        {
+            req["knn"]["filter"] = f;
+        }
+        let k = req.get("knn").and_then(|k| k.get("k")).and_then(Value::as_i64).unwrap_or(10);
+        req["size"] = json!(k);
+        let body = serde_json::to_vec(&req).unwrap_or_default();
+        self.search_or_count(method, "_search", index, q, &body)
+    }
+
     /// Health of `indices` (all when `None`): green when no index wants
     /// replicas, yellow otherwise (a single node can't place them).
     fn health_of(s: &State, names: &[String]) -> Value {
@@ -1288,7 +1325,9 @@ impl Engine {
                     200,
                     json!({"cluster_name": "docker-cluster", "cluster_uuid": "noida-local",
                            "status": Self::health_of(&s, &s.indices.keys().cloned().collect::<Vec<_>>())["status"],
-                           "indices": {"count": s.indices.len(), "docs": {"count": docs, "deleted": 0}},
+                           "indices": {"count": s.indices.len(), "docs": {"count": docs, "deleted": 0},
+                                       "mappings": {"field_types": field_type_stats(&s),
+                                                    "runtime_field_types": []}},
                            "nodes": {"count": {"total": 1, "data": 1, "master": 1}}}),
                 )
             }
@@ -1808,8 +1847,11 @@ impl Engine {
                 let req: Value = parse_json(body).unwrap_or_else(|| json!({}));
                 let mut index = new_index_from_templates(&s.templates, name);
                 if let Some(m) = req.get("mappings") {
-                    let m = expand_dotted(m);
+                    let mut m = expand_dotted(m);
                     if let Err(e) = validate_mapping(&json!({}), &m) {
+                        return e;
+                    }
+                    if let Err(e) = vectors::prepare_mapping(&index.mappings, &mut m) {
                         return e;
                     }
                     merge(&mut index.mappings, m);
@@ -1886,13 +1928,19 @@ impl Engine {
                         ),
                     );
                 }
-                let next = expand_dotted(&next);
+                let mut next = expand_dotted(&next);
                 for n in &names {
-                    if let Some(i) = s.indices.get(n)
-                        && let Err(e) = validate_mapping(&i.mappings, &next)
-                    {
-                        return e;
+                    if let Some(i) = s.indices.get(n) {
+                        if let Err(e) = validate_mapping(&i.mappings, &next) {
+                            return e;
+                        }
+                        if let Err(e) = vectors::prepare_mapping(&i.mappings, &mut next.clone()) {
+                            return e;
+                        }
                     }
+                }
+                if let Err(e) = vectors::prepare_mapping(&json!({}), &mut next) {
+                    return e;
                 }
                 for n in &names {
                     if let Some(i) = s.indices.get_mut(n) {
@@ -2181,8 +2229,17 @@ impl Engine {
                     (200, json!({"acknowledged":true,"shards_acknowledged":true,"indices":out}))
                 }
             }
-            // `_flush`, `_forcemerge`, `_cache/clear`: nothing to do in
-            // memory beyond acknowledging every shard.
+            // A force merge leaves the merged segments searchable.
+            "_forcemerge" => {
+                for n in &names {
+                    if let Some(i) = s.indices.get_mut(n) {
+                        i.refresh(n);
+                    }
+                }
+                (200, shards)
+            }
+            // `_flush`, `_cache/clear`: nothing to do in memory beyond
+            // acknowledging every shard.
             _ => (200, shards),
         }
     }
@@ -2271,7 +2328,9 @@ impl Engine {
                         error("x_content_parse_exception", "Failed to parse content to map", 400),
                     );
                 };
-                dynamic_mapping(&mut i.mappings, &src);
+                if let Err(e) = index_mapping(&mut i.mappings, &src, &id) {
+                    return e;
+                }
                 let exists = i.docs.contains_key(&id);
                 let seq = i.next_seq(q.get("routing").map_or(id.as_str(), String::as_str));
                 // A new version goes to the end of the index order, as
@@ -2480,7 +2539,9 @@ impl Engine {
                     )
                 }
                 "index" | "create" => {
-                    dynamic_mapping(&mut i.mappings, &new_source);
+                    if let Err(e) = index_mapping(&mut i.mappings, &new_source, id) {
+                        return e;
+                    }
                     let key = d.routing.clone().unwrap_or_else(|| id.to_string());
                     let seq = i.next_seq(&key);
                     i.order.retain(|x| x != id);
@@ -2531,7 +2592,9 @@ impl Engine {
                     Err(e) => return e,
                 }
             }
-            dynamic_mapping(&mut i.mappings, &src);
+            if let Err(e) = index_mapping(&mut i.mappings, &src, id) {
+                return e;
+            }
             let seq = i.next_seq(q.get("routing").map_or(id, String::as_str));
             i.order.push(id.to_string());
             i.docs.insert(
@@ -2966,6 +3029,13 @@ impl Engine {
                     }
                     continue;
                 }
+                if op != "delete"
+                    && let Err((status, e)) = index_mapping(&mut i.mappings, &src, &snap.id)
+                {
+                    failures.push(json!({"index": name, "id": snap.id, "cause": e["error"],
+                                         "status": status}));
+                    continue;
+                }
                 wrote = true;
                 done += 1;
                 let key = i.docs.get(&snap.id).and_then(|d| d.routing.clone());
@@ -2974,7 +3044,6 @@ impl Engine {
                     i.docs.remove(&snap.id);
                     i.order.retain(|x| x != &snap.id);
                 } else {
-                    dynamic_mapping(&mut i.mappings, &src);
                     let d = i.docs.get_mut(&snap.id).unwrap();
                     d.source = src;
                     d.seq = seq;
@@ -4432,6 +4501,12 @@ pub(super) fn expand_dotted(m: &Value) -> Value {
 }
 
 pub(super) fn merge(a: &mut Value, b: Value) {
+    // A `dense_vector` definition comes complete (defaults filled in, see
+    // `vectors::prepare_mapping`) and replaces the old one.
+    if b.get("type").and_then(Value::as_str) == Some("dense_vector") {
+        *a = b;
+        return;
+    }
     if let (Some(x), Some(y)) = (a.as_object_mut(), b.as_object()) {
         for (k, v) in y {
             if let Some(existing) = x.get_mut(k) {
@@ -4444,6 +4519,16 @@ pub(super) fn merge(a: &mut Value, b: Value) {
         *a = b;
     }
 }
+/// The mapping a document is indexed with: dynamic mapping applied, and
+/// its vectors checked (only a document Elasticsearch accepts changes it).
+fn index_mapping(m: &mut Value, src: &Value, id: &str) -> Result<(), (u16, Value)> {
+    let mut next = m.clone();
+    dynamic_mapping(&mut next, src);
+    vectors::check_source(&mut next, src, id)?;
+    *m = next;
+    Ok(())
+}
+
 fn dynamic_mapping(m: &mut Value, src: &Value) {
     if m.get("properties").is_none() {
         m["properties"] = json!({});
@@ -4451,7 +4536,35 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
     let props = m["properties"].as_object_mut().unwrap();
     if let Some(fields) = src.as_object() {
         for (k, v) in fields {
-            if props.contains_key(k) {
+            // An object (or an array of them) maps its own fields, as
+            // Elasticsearch maps sub-objects: `{"properties": {...}}`.
+            let objects: Vec<&Value> = match v {
+                Value::Object(_) => vec![v],
+                Value::Array(a) => a.iter().filter(|e| e.is_object()).collect(),
+                _ => Vec::new(),
+            };
+            if let Some(existing) = props.get_mut(k) {
+                let ty = existing.get("type").and_then(Value::as_str);
+                if existing.get("properties").is_some() || matches!(ty, Some("object" | "nested")) {
+                    for o in objects {
+                        dynamic_mapping(existing, o);
+                    }
+                }
+                continue;
+            }
+            // No value (null, `[]`) maps nothing yet.
+            if v.is_null() || v.as_array().is_some_and(|a| a.iter().all(Value::is_null)) {
+                continue;
+            }
+            if !objects.is_empty() && v.as_array().is_none_or(|a| a[0].is_object()) {
+                let mut def = json!({});
+                for o in objects {
+                    dynamic_mapping(&mut def, o);
+                }
+                if def["properties"].as_object().is_some_and(Map::is_empty) {
+                    def = json!({"type": "object"});
+                }
+                props.insert(k.clone(), def);
                 continue;
             }
             let ty = match v {
@@ -4485,6 +4598,12 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
                     .unwrap_or("object"),
                 _ => "object",
             };
+            if let Value::Array(a) = v
+                && let Some(def) = vectors::dynamic_def(a)
+            {
+                props.insert(k.clone(), def);
+                continue;
+            }
             props.insert(k.clone(),if ty=="text"{json!({"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}})}else{json!({"type":ty})});
         }
     }
@@ -4503,7 +4622,11 @@ fn new_index_from_templates(templates: &Templates, name: &str) -> Index {
         ..Index::default()
     };
     if let Some(r) = templates.resolve(name) {
-        merge(&mut index.mappings, r.mappings);
+        let mut m = r.mappings;
+        // Template mappings were checked when the template was stored;
+        // this fills in the vector defaults.
+        let _ = vectors::prepare_mapping(&json!({}), &mut m);
+        merge(&mut index.mappings, m);
         apply_settings(&mut index.settings, &r.settings);
         index.aliases.extend(r.aliases);
     }
@@ -4653,6 +4776,62 @@ const FIELD_TYPES: &[&str] = &[
     "passthrough",
 ];
 
+/// `_cluster/stats` `indices.mappings.field_types`: per mapped field type,
+/// how many fields and indices use it (and, for `dense_vector`, the
+/// indexed vectors' dimensions).
+fn field_type_stats(s: &State) -> Value {
+    fn walk(props: &Value, out: &mut Vec<Value>) {
+        let Some(p) = props.as_object() else { return };
+        for def in p.values() {
+            out.push(def.clone());
+            if let Some(Value::Object(subs)) = def.get("fields") {
+                out.extend(subs.values().cloned());
+            }
+            if let Some(inner) = def.get("properties") {
+                walk(inner, out);
+            }
+        }
+    }
+    // type -> (fields, indices, indexed vectors, min dims, max dims)
+    let mut stats: std::collections::BTreeMap<String, (u64, u64, u64, i64, i64)> =
+        std::collections::BTreeMap::new();
+    for i in s.indices.values() {
+        let mut defs = Vec::new();
+        walk(i.mappings.get("properties").unwrap_or(&Value::Null), &mut defs);
+        let mut seen = std::collections::HashSet::new();
+        for def in defs {
+            let ty = def.get("type").and_then(Value::as_str).unwrap_or("object").to_string();
+            let e = stats.entry(ty.clone()).or_insert((0, 0, 0, i64::MAX, i64::MIN));
+            e.0 += 1;
+            if seen.insert(ty.clone()) {
+                e.1 += 1;
+            }
+            if ty == "dense_vector" && def.get("index") != Some(&json!(false)) {
+                e.2 += 1;
+                if let Some(d) = def.get("dims").and_then(Value::as_i64) {
+                    e.3 = e.3.min(d);
+                    e.4 = e.4.max(d);
+                }
+            }
+        }
+    }
+    Value::Array(
+        stats
+            .into_iter()
+            .map(|(name, (count, indices, vectors, min, max))| {
+                if name == "dense_vector" {
+                    let (min, max) = if min > max { (-1, -1) } else { (min, max) };
+                    json!({"name": name, "count": count, "index_count": indices,
+                           "indexed_vector_count": vectors, "indexed_vector_dim_min": min,
+                           "indexed_vector_dim_max": max})
+                } else {
+                    json!({"name": name, "count": count, "index_count": indices, "script_count": 0})
+                }
+            })
+            .collect(),
+    )
+}
+
 /// The mapping as GET shows it: no `properties` key when there are none.
 fn shown_mappings(m: &Value) -> Value {
     match m.as_object() {
@@ -4699,6 +4878,27 @@ fn validate_mapping(current: &Value, incoming: &Value) -> Result<(), (u16, Value
         for (k, def) in props {
             let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
             let existing = cur.and_then(|c| c.get("properties")).and_then(|p| p.get(k));
+            if !def.is_object() {
+                let class = match def {
+                    Value::String(_) => "java.lang.String",
+                    Value::Bool(_) => "java.lang.Boolean",
+                    Value::Number(n) if n.is_i64() => "java.lang.Integer",
+                    Value::Number(_) => "java.lang.Double",
+                    Value::Array(_) => "java.util.ArrayList",
+                    _ => "null",
+                };
+                let reason = format!(
+                    "Expected map for property [fields] on field [{k}] but got a class {class}"
+                );
+                return Err((
+                    400,
+                    error(
+                        "mapper_parsing_exception",
+                        &format!("Failed to parse mapping: {reason}"),
+                        400,
+                    ),
+                ));
+            }
             if let Some(t) = def.get("type").and_then(Value::as_str) {
                 if !FIELD_TYPES.contains(&t) {
                     return Err((
