@@ -5,7 +5,6 @@ use crate::mysql::error::MySqlError;
 use crate::mysql::plan::{self, Plan};
 use crate::mysql::types::Value;
 use sqlparser::dialect::MySqlDialect;
-use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -276,13 +275,17 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 // Stmt Prepare
                 let sql = String::from_utf8_lossy(&payload[1..]).to_string();
                 let dialect = MySqlDialect {};
+                let sql = crate::mysql::engine::rewrite_extract_units(&sql).unwrap_or(sql);
                 let rewritten = crate::mysql::engine::rewrite_table_comment(&sql)
                     .or_else(|| crate::mysql::engine::rewrite_drop_check(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_rename_key(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_trailing_into(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_comma_update(&sql))
                     .or_else(|| crate::mysql::engine::rewrite_explain_format(&sql));
-                match Parser::parse_sql(&dialect, rewritten.as_deref().unwrap_or(&sql)) {
+                match crate::mysql::engine::parse_with_fallback(
+                    &dialect,
+                    rewritten.as_deref().unwrap_or(&sql),
+                ) {
                     Ok(mut asts) => {
                         if asts.is_empty() {
                             let _ = send_err(

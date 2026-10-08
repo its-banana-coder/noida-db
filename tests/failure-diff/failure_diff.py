@@ -909,6 +909,15 @@ MYSQL_QUERIES = {
         (A, "SELECT g, std(x), stddev(x), stddev_pop(x), stddev_samp(x), variance(x), var_pop(x), var_samp(x), bit_and(i), bit_or(i), bit_xor(i) FROM ag GROUP BY g ORDER BY g"),
         (A, "SELECT stddev_pop(i) AS a, var_samp(i) AS b, bit_and(i) AS c FROM ag WHERE g = 9"),
     ],
+    "parenthesised set operation as an expression": [
+        (A, "CREATE TABLE rn (id int, o int)"),
+        (A, "INSERT INTO rn VALUES (1,8),(2,1),(3,5)"),
+        (A, "SELECT id FROM rn WHERE id IN ((SELECT 1) UNION (SELECT 3)) ORDER BY 1"),
+        (A, "SELECT o, ((SELECT 8 AS n) UNION (SELECT 9)) AS x FROM rn ORDER BY 1"),
+        (A, "SELECT o, ((SELECT 8 AS n) UNION (SELECT 8)) AS x FROM rn ORDER BY 1"),
+        (A, "SELECT o, ((SELECT n FROM (SELECT 8 AS n) a WHERE a.n = rn.o) UNION (SELECT 1 FROM (SELECT 1) b WHERE rn.o = 1)) AS x FROM rn ORDER BY 1"),
+        (A, "SELECT '((SELECT 1) UNION (SELECT 2))' AS s"),
+    ],
 }
 MYSQL.update(MYSQL_QUERIES)
 

@@ -874,6 +874,11 @@ PG_EDGES.update({
         "CLOSE ALL",
         "SELECT count(*) FROM pg_cursors",
     ),
+    "pg edge: EXTRACT seconds and milliseconds": steps(
+        "SELECT EXTRACT(SECOND FROM timestamptz '2015-06-15 14:30:50.000321+00'), EXTRACT(SECOND FROM timestamp '2015-06-15 14:30:50.000321'), date_part('second', timestamp '2015-06-15 14:30:50.000321')",
+        "SELECT EXTRACT(MILLISECONDS FROM timestamp '2015-06-15 14:30:50.000321'), EXTRACT(MICROSECONDS FROM timestamp '2015-06-15 14:30:50.000321'), EXTRACT(SECOND FROM timestamp '2015-06-15 14:30:05')",
+        "SELECT date_part('milliseconds', timestamptz '2015-06-15 14:30:50.5+00'), EXTRACT(MILLISECONDS FROM time '01:02:03.5'), EXTRACT(SECOND FROM interval '1 minute 2.5 seconds')",
+    ),
     "pg edge: DISTINCT ON output names and positions": steps(
         "CREATE TABLE dd (id int, name text)",
         "INSERT INTO dd VALUES (1, 'B'), (2, 'a'), (3, 'b')",
@@ -896,5 +901,17 @@ PG_EDGES.update({
         "SELECT p.id, (SELECT b2.pages FROM book b2 WHERE b2.id = b.id) FROM pub p JOIN book b ON p.id = b.pub_id GROUP BY p.id",
         "SELECT EXISTS (SELECT 1 FROM book U0 WHERE U0.pub_id = p.id), count(*) FROM pub p GROUP BY p.id ORDER BY 2, 1",
         "SELECT p.id, count(*) FROM pub p WHERE p.id IN (SELECT U0.pub_id FROM book U0) GROUP BY p.id HAVING p.id IN (SELECT pub_id FROM book WHERE pages > p.id) ORDER BY 1",
+    ),
+    "pg edge: parenthesised set operation as an expression": steps(
+        "CREATE TABLE num (id int, num int)",
+        'CREATE TABLE rn (id int, name text, "order" int)',
+        "INSERT INTO num VALUES (1, 1), (2, 5), (3, 8), (4, 9)",
+        "INSERT INTO rn VALUES (1, 'rn1', 8), (2, 'rn2', 1), (3, 'rn3', 5)",
+        'SELECT rn."order", ((SELECT U0.num FROM num U0 WHERE U0.num > 7 AND U0.num = rn."order") UNION (SELECT U0.num FROM num U0 WHERE U0.num < 2 AND U0.num = rn."order")) AS number FROM rn ORDER BY 1',
+        'SELECT rn."order" FROM rn WHERE rn.id IN ((SELECT 1) UNION (SELECT 2)) ORDER BY 1',
+        """SELECT rn.name FROM rn WHERE rn."order" = ((SELECT 8) EXCEPT (SELECT 9)) ORDER BY 1""",
+        "SELECT ((SELECT 1) UNION (SELECT 1))",
+        "SELECT ((SELECT 1) UNION (SELECT 2))",
+        "SELECT * FROM ((SELECT 1 AS a) UNION ALL (SELECT 2)) s ORDER BY 1",
     ),
 })

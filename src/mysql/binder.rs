@@ -3008,6 +3008,8 @@ impl Binder {
             | "JSON_SEARCH"
             | "JSON_OVERLAPS"
             | "JSON_PRETTY"
+            | "NOIDA_EXTRACT"
+            | "MICROSECOND"
             | "MD5"
             | "SHA"
             | "SHA1"
