@@ -27,6 +27,8 @@ pub struct CursorInfo {
 }
 
 pub struct Runtime {
+    /// SET ROLE (None: the session user).
+    pub role: Option<String>,
     /// The session's open cursors when the statement started (`pg_cursors`).
     pub cursors: Vec<CursorInfo>,
     pub pid: i32,

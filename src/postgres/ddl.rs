@@ -83,6 +83,7 @@ impl Ddl<'_, '_> {
             self.ctx.db.clone(),
             SessionInfo {
                 user: self.info.user.clone(),
+                role: self.info.role.clone(),
                 database: self.info.database.clone(),
                 search_path: self.info.search_path.clone(),
                 fmt: self.info.fmt.clone(),

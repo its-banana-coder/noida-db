@@ -13,7 +13,10 @@ use super::types::{self, Base, FmtCtx, Type, Value};
 
 /// What the binder needs to know about the session.
 pub struct SessionInfo {
+    /// The session user (login).
     pub user: String,
+    /// The current role (SET ROLE), what current_user reports.
+    pub role: String,
     pub database: String,
     pub search_path: Vec<String>,
     pub fmt: FmtCtx,
@@ -3489,8 +3492,9 @@ impl<'a> Binder<'a> {
                 },
                 Type::of(Base::Time),
             )),
-            "current_user" | "user" | "session_user" | "current_role" => {
-                konst(Value::text(self.sess.user.clone()), Type::NAME)
+            "session_user" => konst(Value::text(self.sess.user.clone()), Type::NAME),
+            "current_user" | "user" | "current_role" => {
+                konst(Value::text(self.sess.role.clone()), Type::NAME)
             }
             "current_catalog" | "current_database" => {
                 konst(Value::text(self.sess.database.clone()), Type::NAME)

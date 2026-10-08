@@ -164,6 +164,28 @@ pub struct Snapshot {
     pub next_db_oid: u32,
 }
 
+/// Roles made with CREATE ROLE (cluster-wide, like Postgres's), beside the
+/// session users that always exist.
+fn roles() -> &'static Mutex<std::collections::BTreeSet<String>> {
+    static ROLES: std::sync::OnceLock<Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    ROLES.get_or_init(|| Mutex::new(["postgres".to_string()].into()))
+}
+
+fn role_exists(s: &Session, name: &str) -> bool {
+    name == s.rt.user || roles().lock().unwrap().contains(name)
+}
+
+fn no_role(name: &str) -> PgError {
+    PgError::new(code::UNDEFINED_OBJECT, format!("role \"{name}\" does not exist"))
+}
+
+/// SET ROLE / SET SESSION AUTHORIZATION to a missing role: an invalid
+/// parameter value (22023), unlike DROP ROLE's 42704.
+fn no_role_setting(name: &str) -> PgError {
+    PgError::new(code::INVALID_PARAMETER_VALUE, format!("role \"{name}\" does not exist"))
+}
+
 struct GlobalDb {
     oid: u32,
     name: String,
@@ -305,6 +327,7 @@ impl Engine {
             pid,
             secret,
             rt: Runtime {
+                role: None,
                 cursors: vec![],
                 pid,
                 user: user.to_string(),
@@ -416,6 +439,7 @@ impl Engine {
     fn info(&self, s: &Session) -> SessionInfo {
         SessionInfo {
             user: s.rt.user.clone(),
+            role: s.rt.role.clone().unwrap_or_else(|| s.rt.user.clone()),
             database: s.rt.database.clone(),
             search_path: s.rt.settings.lookup_path(&s.rt.user),
             fmt: s.rt.settings.fmt(),
@@ -940,7 +964,40 @@ impl Engine {
             S::Grant { .. } => Ok(StmtResult::tag("GRANT")),
             S::Revoke { .. } => Ok(StmtResult::tag("REVOKE")),
             S::Lock { .. } => Ok(StmtResult::tag("LOCK TABLE")),
-            S::CreateRole { .. } => Ok(StmtResult::tag("CREATE ROLE")),
+            S::CreateRole(cr) => {
+                let mut set = roles().lock().unwrap();
+                for n in &cr.names {
+                    let name = name_parts(n).pop().unwrap_or_default();
+                    if set.contains(&name) || name == s.rt.user {
+                        return Err(PgError::new(
+                            code::DUPLICATE_OBJECT,
+                            format!("role \"{name}\" already exists"),
+                        ));
+                    }
+                    set.insert(name);
+                }
+                Ok(StmtResult::tag("CREATE ROLE"))
+            }
+            S::Drop { object_type: a::ObjectType::Role, if_exists, names, .. } => {
+                let mut r = StmtResult::tag("DROP ROLE");
+                let mut set = roles().lock().unwrap();
+                for n in names {
+                    let name = name_parts(n).pop().unwrap_or_default();
+                    if name == s.rt.user {
+                        return Err(PgError::new("55006", "current user cannot be dropped"));
+                    }
+                    if !set.remove(&name) {
+                        if *if_exists {
+                            r.notices.push(PgError::notice(format!(
+                                "role \"{name}\" does not exist, skipping"
+                            )));
+                        } else {
+                            return Err(no_role(&name));
+                        }
+                    }
+                }
+                Ok(r)
+            }
             other => self.run_data_statement(s, other, params, param_types),
         }
     }
@@ -1005,6 +1062,7 @@ impl Engine {
         };
         let info = SessionInfo {
             user: ctx.rt.user.clone(),
+            role: ctx.rt.role.clone().unwrap_or_else(|| ctx.rt.user.clone()),
             database: ctx.rt.database.clone(),
             search_path: ctx.rt.settings.lookup_path(&ctx.rt.user),
             fmt: ctx.rt.settings.fmt(),
@@ -1188,14 +1246,69 @@ impl Engine {
                 }
                 return Ok(StmtResult::tag("SET"));
             }
+            // `SET SESSION AUTHORIZATION name | DEFAULT`
+            a::Set::SetSessionParam(p)
+                if p.to_string()
+                    .to_lowercase()
+                    .trim_start_matches("set ")
+                    .starts_with("session authorization") =>
+            {
+                let text = p.to_string();
+                let text = text.trim_start();
+                let text = if text.to_lowercase().starts_with("set ") { &text[4..] } else { text };
+                let raw = text["session authorization".len()..].trim();
+                let name = if raw.eq_ignore_ascii_case("default") {
+                    s.rt.user.clone()
+                } else if let Some(q) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                    q.to_string()
+                } else {
+                    raw.trim_matches('\'').to_lowercase()
+                };
+                if !role_exists(s, &name) {
+                    return Err(no_role_setting(&name));
+                }
+                s.rt.role = (name != s.rt.user).then(|| name.clone());
+                if let Some(c) = s.rt.settings.set("session_authorization", &name)? {
+                    changed.push((c.to_string(), s.rt.settings.get(c)?));
+                }
+            }
             a::Set::SetSessionParam(p) => {
                 return Err(unsupported(&format!("SET {p}")));
             }
             a::Set::SetRole { role_name, .. } => {
                 let name = role_name
                     .as_ref()
-                    .map(|r| r.value.clone())
+                    .map(|r| {
+                        if r.quote_style.is_some() {
+                            r.value.clone()
+                        } else {
+                            r.value.to_lowercase()
+                        }
+                    })
                     .unwrap_or_else(|| s.rt.user.clone());
+                if !role_exists(s, &name) {
+                    return Err(no_role_setting(&name));
+                }
+                s.rt.role = (name != s.rt.user).then(|| name.clone());
+                if let Some(c) = s.rt.settings.set("session_authorization", &name)? {
+                    changed.push((c.to_string(), s.rt.settings.get(c)?));
+                }
+            }
+            // `SET SESSION AUTHORIZATION name | DEFAULT`
+            other if other.to_string().to_lowercase().starts_with("set session authorization") => {
+                let text = other.to_string();
+                let raw = text["set session authorization".len()..].trim();
+                let name = if raw.eq_ignore_ascii_case("default") {
+                    s.rt.user.clone()
+                } else if let Some(q) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                    q.to_string()
+                } else {
+                    raw.trim_matches('\'').to_lowercase()
+                };
+                if !role_exists(s, &name) {
+                    return Err(no_role_setting(&name));
+                }
+                s.rt.role = (name != s.rt.user).then(|| name.clone());
                 if let Some(c) = s.rt.settings.set("session_authorization", &name)? {
                     changed.push((c.to_string(), s.rt.settings.get(c)?));
                 }
@@ -1212,9 +1325,18 @@ impl Engine {
         let n = match &r.reset {
             a::Reset::ALL => "all".to_string(),
             a::Reset::SessionAuthorization => "session_authorization".to_string(),
+            // RESET ROLE: back to the session user.
+            a::Reset::ConfigurationParameter(n)
+                if name_parts(n).join(".").eq_ignore_ascii_case("role") =>
+            {
+                "session_authorization".to_string()
+            }
             a::Reset::ConfigurationParameter(n) => name_parts(n).join("."),
         };
         let mut changed = vec![];
+        if matches!(n.to_ascii_lowercase().as_str(), "session_authorization" | "all") {
+            s.rt.role = None;
+        }
         if let Some(c) = s.rt.settings.reset(&n)? {
             changed.push((c.to_string(), s.rt.settings.get(c)?));
         }
@@ -1696,6 +1818,7 @@ fn ddl<'a, 'b>(ctx: &'a mut Ctx<'b>, info: &SessionInfo) -> Ddl<'a, 'b> {
         ctx,
         info: SessionInfo {
             user: info.user.clone(),
+            role: info.role.clone(),
             database: info.database.clone(),
             search_path: info.search_path.clone(),
             fmt: info.fmt.clone(),
