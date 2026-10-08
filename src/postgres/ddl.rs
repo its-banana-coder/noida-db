@@ -220,7 +220,9 @@ impl Ddl<'_, '_> {
                         }
                     }
                     a::ColumnOption::Comment(cm) => c.comment = Some(cm.clone()),
-                    a::ColumnOption::Collation(_) => {}
+                    a::ColumnOption::Collation(n) => {
+                        c.collation = Some(column_collation(self.ctx.db, c.ty, n)?);
+                    }
                     other => return Err(unsupported(&format!("column option {other}"))),
                 }
             }
@@ -1018,7 +1020,13 @@ impl Ddl<'_, '_> {
                 }
                 other => {
                     let mut b2 = Binder::new(&db, &info, &[]);
-                    b2.bind_table_expr(t, &other.to_string())?;
+                    let bound = b2.bind_table_expr(t, &other.to_string())?;
+                    if super::binder::uses_mutable(&bound) {
+                        return Err(PgError::new(
+                            code::INVALID_OBJECT_DEFINITION,
+                            "functions in index expression must be marked IMMUTABLE",
+                        ));
+                    }
                     cols.push(None);
                     exprs.push(other.to_string());
                     expr_names.push(b2.index_column_name(other));
@@ -1057,6 +1065,17 @@ impl Ddl<'_, '_> {
             })?);
         }
         let predicate = ci.predicate.as_ref().map(|p| p.to_string());
+        if let Some(p) = &predicate {
+            let (db, info) = self.binder();
+            let t = db.table(oid).unwrap();
+            let mut b2 = Binder::new(&db, &info, &[]);
+            if super::binder::uses_mutable(&b2.bind_table_expr(t, p)?) {
+                return Err(PgError::new(
+                    code::INVALID_OBJECT_DEFINITION,
+                    "functions in index predicate must be marked IMMUTABLE",
+                ));
+            }
+        }
         let idx_oid = self.ctx.db.alloc_oid();
         let method = ci
             .using
@@ -1552,6 +1571,9 @@ impl Ddl<'_, '_> {
                                 c.identity = Some((false, 0));
                             }
                         }
+                        a::ColumnOption::Collation(n) => {
+                            c.collation = Some(column_collation(self.ctx.db, c.ty, n)?);
+                        }
                         _ => {}
                     }
                 }
@@ -1768,6 +1790,22 @@ impl Ddl<'_, '_> {
                     a::AlterColumnOperation::DropNotNull => {
                         self.ctx.db.table_mut(oid).unwrap().columns[idx].not_null = false;
                     }
+                    // `TYPE t COLLATE x` (rewritten; see `rewrite_django_ddl`).
+                    a::AlterColumnOperation::SetDefault { value }
+                        if value.to_string().starts_with("noida_collate(") =>
+                    {
+                        let a::Expr::Function(f) = value else { unreachable!() };
+                        let arg = match &f.args {
+                            a::FunctionArguments::List(l) => l.args.first().map(|x| x.to_string()),
+                            _ => None,
+                        }
+                        .unwrap_or_default();
+                        let name = arg.trim_matches('\'').trim_matches('"').replace("''", "'");
+                        let ty = self.ctx.db.table(oid).unwrap().columns[idx].ty;
+                        let obj = a::ObjectName::from(vec![a::Ident::with_quote('"', name)]);
+                        let coll = column_collation(self.ctx.db, ty, &obj)?;
+                        self.ctx.db.table_mut(oid).unwrap().columns[idx].collation = Some(coll);
+                    }
                     // `DROP IDENTITY [IF EXISTS]` (rewritten; see `rewrite_django_ddl`).
                     a::AlterColumnOperation::SetDefault { value }
                         if value.to_string().starts_with("noida_drop_identity(") =>
@@ -1858,6 +1896,9 @@ impl Ddl<'_, '_> {
                         let t = self.ctx.db.table_mut(oid).unwrap();
                         t.columns[idx].ty = ty;
                         t.columns[idx].typmod = typmod;
+                        // A new type takes its default collation unless a
+                        // COLLATE follows (the noida_collate marker).
+                        t.columns[idx].collation = None;
                         for (r, v) in t.rows.iter_mut().zip(new_vals) {
                             r[idx] = v;
                         }
@@ -2322,4 +2363,17 @@ fn sql_identifiers(sql: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// `COLLATE name` on a column of type `ty`: the name it is stored under.
+fn column_collation(db: &DbState, ty: Type, name: &a::ObjectName) -> PgResult<String> {
+    let n = name_parts(name).pop().unwrap_or_default();
+    if !super::collation::collatable(ty) {
+        return Err(PgError::new(
+            code::DATATYPE_MISMATCH,
+            format!("collations are not supported by type {}", ty.display(-1)),
+        ));
+    }
+    super::collation::resolve(db, &n)?;
+    Ok(n)
 }

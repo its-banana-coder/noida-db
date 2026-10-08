@@ -1639,6 +1639,14 @@ pub(crate) fn run_one(
             let tag = super::plpgsql::ddl(ctx, info, &call_arg_text(f))?;
             Ok(StmtResult::tag(tag))
         }
+        // CREATE / DROP COLLATION arrive as a CALL (see collation.rs).
+        S::Call(f) if f.name.to_string() == super::collation::CALL_NAME => {
+            let (tag, notice) = super::collation::ddl(ctx.db, &call_arg_text(f))?;
+            if let Some(n) = notice {
+                ctx.rt.notices.push(PgError::notice(n));
+            }
+            Ok(StmtResult::tag(tag))
+        }
         S::Call(f) if f.name.to_string() == super::refresh::CALL_NAME => {
             let r = super::refresh::parse(&call_arg_text(f))?;
             let mut d = ddl(ctx, info);

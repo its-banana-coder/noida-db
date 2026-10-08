@@ -10,6 +10,7 @@ pub mod auth;
 pub mod binder;
 pub mod casts;
 pub mod catalog;
+pub mod collation;
 pub mod copy;
 pub mod ddl;
 pub mod dml;
@@ -45,6 +46,9 @@ use sqlparser::parser::Parser;
 
 /// Parses a SQL string into statements.
 pub fn parse_sql(sql: &str) -> PgResult<Vec<a::Statement>> {
+    if let Some(call) = collation::rewrite(sql) {
+        return Parser::parse_sql(&PostgreSqlDialect {}, &call).map_err(syntax_error);
+    }
     let after_netops = rewrite_net_ops(sql);
     let sql = after_netops.as_deref().unwrap_or(sql);
     let after_explain = rewrite_explain_paren(sql);
@@ -355,7 +359,8 @@ fn split_qualified(n: &str) -> Vec<String> {
 /// Clauses Django's Postgres backend emits that sqlparser doesn't take:
 /// - `ALTER COLUMN c DROP IDENTITY [IF EXISTS]` -> a marked SET DEFAULT
 ///   (handled by `Ddl::alter_op`);
-/// - `ALTER COLUMN c TYPE t COLLATE "x"` -> the COLLATE dropped (noida-db
+/// - `ALTER COLUMN c TYPE t COLLATE "x"` -> the type change plus a marker
+///   setting the collation (noida-db
 ///   compares text bytewise, as the C collation);
 /// - `CREATE INDEX ... TABLESPACE ts` -> TABLESPACE dropped;
 /// - `FOR NO KEY UPDATE` / `FOR KEY SHARE` -> `FOR UPDATE` / `FOR SHARE`,
@@ -369,7 +374,13 @@ fn rewrite_django_ddl(sql: &str) -> Option<String> {
     let rules: [(&str, &str); 6] = [
         (r"(?i)\bdrop\s+identity\s+if\s+exists\b", "SET DEFAULT noida_drop_identity(true)"),
         (r"(?i)\bdrop\s+identity\b", "SET DEFAULT noida_drop_identity(false)"),
-        (r#"(?i)(\btype\s+[a-z0-9_ ()\[\],."]+?)\s+collate\s+("[^"]+"|[a-z0-9_.]+)"#, "$1"),
+        // `ALTER COLUMN c TYPE t COLLATE x [USING e]`: sqlparser has no
+        // COLLATE there; it becomes a marker operation after the type
+        // change (see `Ddl::alter_op`).
+        (
+            r#"(?i)\b(alter\s+(?:column\s+)?("[^"]+"|[a-z0-9_]+)\s+(?:set\s+data\s+)?type\s+[a-z0-9_ ()\[\],."]+?)\s+collate\s+("[^"]+"|[a-z0-9_.]+)(\s+using\s+[^,;]+?)?(\s*[,;]|\s*$)"#,
+            "$1$4, ALTER COLUMN $2 SET DEFAULT noida_collate('$3')$5",
+        ),
         (
             r#"(?i)^(\s*create\s+(?:unique\s+)?index\b[^;]*?)\s+tablespace\s+("[^"]+"|[a-z0-9_]+)"#,
             "$1",

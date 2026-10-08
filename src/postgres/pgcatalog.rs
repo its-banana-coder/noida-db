@@ -527,7 +527,13 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         b(c.dropped),
                         b(true),
                         n(0),
-                        n(if ty.is_string() { 100 } else { 0 }),
+                        n(match &c.collation {
+                            Some(name) => {
+                                super::collation::lookup(db, name).map_or(100, |i| i.oid as i64)
+                            }
+                            None if super::collation::collatable(ty) => 100,
+                            None => 0,
+                        }),
                         NULL,
                         NULL,
                         NULL,
@@ -1140,34 +1146,34 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
             }
         }
         "pg_collation" => {
-            out.push(vec![
-                n(100),
-                t("default"),
-                n(PG_CATALOG_NS as i64),
-                n(10),
-                ch('d'),
-                b(true),
-                n(-1),
-                NULL,
-                NULL,
-                NULL,
-                NULL,
-                NULL,
-            ]);
-            out.push(vec![
-                n(950),
-                t("C"),
-                n(PG_CATALOG_NS as i64),
-                n(10),
-                ch('c'),
-                b(true),
-                n(-1),
-                t("C"),
-                t("C"),
-                NULL,
-                NULL,
-                NULL,
-            ]);
+            let row =
+                |oid: u32, name: &str, schema: u32, provider: char, det: bool, locale: &str| {
+                    let (enc, coll) = match provider {
+                        // Postgres 15+: an ICU collation's locale is in colliculocale.
+                        'd' | 'i' => (-1, NULL),
+                        _ => (if name == "ucs_basic" { 6 } else { -1 }, t(locale)),
+                    };
+                    vec![
+                        n(oid as i64),
+                        t(name),
+                        n(schema as i64),
+                        n(10),
+                        ch(provider),
+                        b(det),
+                        n(enc),
+                        coll.clone(),
+                        coll,
+                        if provider == 'i' { t(locale) } else { NULL },
+                        NULL,
+                        NULL,
+                    ]
+                };
+            for (oid, name, provider, locale) in super::collation::BUILTIN {
+                out.push(row(*oid, name, PG_CATALOG_NS, *provider, true, locale));
+            }
+            for (name, c) in &db.collations {
+                out.push(row(c.oid, name, c.schema, c.provider, c.deterministic, &c.locale));
+            }
         }
         "pg_extension" => {
             let version = |name: &str| {
@@ -1335,6 +1341,13 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         }
                         _ => ("pg_catalog".to_string(), ty.name()),
                     };
+                    // A column's explicit collation (information_schema shows
+                    // none for the default).
+                    let coll = c.collation.as_ref().map(|name| {
+                        let sch =
+                            if db.collations.contains_key(name) { "public" } else { "pg_catalog" };
+                        (sch.to_string(), name.clone())
+                    });
                     out.push(vec![
                         t(&database),
                         t(db.schema_name(tb.schema)),
@@ -1355,9 +1368,9 @@ pub fn rows(name: &str, ctx: &mut Ctx) -> PgResult<Vec<Row>> {
                         NULL,
                         NULL,
                         NULL,
-                        NULL,
-                        NULL,
-                        NULL,
+                        coll.as_ref().map_or(NULL, |_| t(&database)),
+                        coll.as_ref().map_or(NULL, |(sch, _)| t(sch.clone())),
+                        coll.as_ref().map_or(NULL, |(_, n)| t(n.clone())),
                         NULL,
                         NULL,
                         NULL,

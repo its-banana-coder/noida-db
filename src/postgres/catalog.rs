@@ -35,6 +35,9 @@ pub struct Column {
     pub generated: Option<String>,
     pub dropped: bool,
     pub comment: Option<String>,
+    /// `COLLATE x` (None: the type's default collation).
+    #[serde(default)]
+    pub collation: Option<String>,
 }
 
 impl Column {
@@ -49,6 +52,7 @@ impl Column {
             generated: None,
             dropped: false,
             comment: None,
+            collation: None,
         }
     }
 }
@@ -346,6 +350,9 @@ pub struct DbState {
     /// Extensions created (beyond the built-in plpgsql): name -> (OID, schema).
     #[serde(default)]
     pub extensions: BTreeMap<String, (u32, u32)>,
+    /// `CREATE COLLATION`s, by name.
+    #[serde(default)]
+    pub collations: BTreeMap<String, super::collation::Collation>,
 }
 
 /// Extensions whose functions and types noida-db provides: (name, version,
@@ -451,6 +458,7 @@ impl Default for DbState {
             functions: BTreeMap::new(),
             triggers: BTreeMap::new(),
             extensions: BTreeMap::new(),
+            collations: BTreeMap::new(),
         }
     }
 }
