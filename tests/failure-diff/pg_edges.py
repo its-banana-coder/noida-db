@@ -885,4 +885,16 @@ PG_EDGES.update({
         "SELECT DISTINCT ON (id) id, name FROM dd ORDER BY id DESC",
         "SELECT DISTINCT ON (name) id FROM dd ORDER BY name, id",
     ),
+    "pg edge: correlated subqueries in a grouped query": steps(
+        "CREATE TABLE pub (id int PRIMARY KEY, name text)",
+        "CREATE TABLE book (id int PRIMARY KEY, pub_id int, pubdate date, pages int)",
+        "INSERT INTO pub VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        "INSERT INTO book VALUES (1, 1, '2020-01-01', 10), (2, 1, '2021-01-01', 20), (3, 2, '2019-05-05', 30)",
+        "SELECT p.id, p.name, (SELECT U0.pubdate FROM book U0 WHERE U0.pub_id = (p.id) ORDER BY U0.pubdate DESC LIMIT 1) AS latest, COUNT(b.id) AS cnt FROM pub p LEFT OUTER JOIN book b ON (p.id = b.pub_id) GROUP BY p.id ORDER BY 1",
+        "SELECT p.name, (SELECT count(*) FROM book U0 WHERE U0.pub_id = p.id) AS n, SUM(b.pages) FROM pub p LEFT JOIN book b ON p.id = b.pub_id GROUP BY p.name ORDER BY 1",
+        "SELECT (SELECT p.name) FROM pub p GROUP BY p.id ORDER BY 1",
+        "SELECT p.id, (SELECT b2.pages FROM book b2 WHERE b2.id = b.id) FROM pub p JOIN book b ON p.id = b.pub_id GROUP BY p.id",
+        "SELECT EXISTS (SELECT 1 FROM book U0 WHERE U0.pub_id = p.id), count(*) FROM pub p GROUP BY p.id ORDER BY 2, 1",
+        "SELECT p.id, count(*) FROM pub p WHERE p.id IN (SELECT U0.pub_id FROM book U0) GROUP BY p.id HAVING p.id IN (SELECT pub_id FROM book WHERE pages > p.id) ORDER BY 1",
+    ),
 })
