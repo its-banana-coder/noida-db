@@ -16,6 +16,7 @@ use super::fields;
 use super::highlight;
 use super::queries;
 use super::query_string;
+use super::rescore;
 use super::scoring;
 use super::sorting;
 use super::suggest;
@@ -421,19 +422,28 @@ fn inner_hits(
 pub(crate) fn resolve_field(mappings: &Value, field: &str) -> (String, Option<String>) {
     let segs: Vec<&str> = field.split('.').collect();
     let mut props = mappings.get("properties");
-    for (i, seg) in segs.iter().enumerate() {
-        let Some(node) = props.and_then(|p| p.get(*seg)) else { break };
-        if i + 1 == segs.len() {
+    let mut i = 0;
+    while i < segs.len() {
+        // A mapped name may itself hold dots (`subobjects: false`): the
+        // longest one present wins.
+        let Some((j, node)) = (i + 1..=segs.len())
+            .rev()
+            .find_map(|j| props.and_then(|p| p.get(segs[i..j].join("."))).map(|n| (j, n)))
+        else {
+            break;
+        };
+        if j == segs.len() {
             let ty = node.get("type").and_then(Value::as_str).unwrap_or("object");
             return (field.to_string(), Some(ty.to_string()));
         }
-        if i + 2 == segs.len()
-            && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        if j + 1 == segs.len()
+            && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[j]))
         {
             let ty = sub.get("type").and_then(Value::as_str).unwrap_or("keyword");
-            return (segs[..=i].join("."), Some(ty.to_string()));
+            return (segs[..j].join("."), Some(ty.to_string()));
         }
         props = node.get("properties");
+        i = j;
     }
     // Unmapped (e.g. a search across indices): `x.keyword` is the dynamic
     // keyword sub-field of `x`.
@@ -478,7 +488,16 @@ fn navigate<'a>(v: &'a Value, path: &[&str]) -> Vec<&'a Value> {
         };
     }
     match v {
-        Value::Object(m) => m.get(path[0]).map(|nv| navigate(nv, &path[1..])).unwrap_or_default(),
+        // A key may itself hold dots (`{"a.b": 1}` is field `a.b` too).
+        Value::Object(m) => {
+            let mut out = m.get(path[0]).map(|nv| navigate(nv, &path[1..])).unwrap_or_default();
+            for i in 2..=path.len() {
+                if let Some(nv) = m.get(&path[..i].join(".")) {
+                    out.extend(navigate(nv, &path[i..]));
+                }
+            }
+            out
+        }
         Value::Array(arr) => arr.iter().flat_map(|e| navigate(e, path)).collect(),
         _ => Vec::new(),
     }
@@ -539,6 +558,7 @@ fn meta_tokens(mappings: &Value, d: &CommittedDoc, field: &str) -> Vec<String> {
     match field {
         "_id" => vec![d.id.clone()],
         "_index" => vec![d.index.clone()],
+        "_ignored" => super::docparse::ignored_fields(mappings, &Value::Null, d.full()),
         _ => tokens_for(mappings, &d.source, field),
     }
 }
@@ -1301,6 +1321,15 @@ pub fn eval(
         return eval_range(v, mappings, docs);
     }
     if let Some(v) = obj.get("exists") {
+        // `_ignored` exists on documents with an ignored value.
+        if v.get("field").and_then(Value::as_str) == Some("_ignored") {
+            return Ok(docs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| !meta_tokens(mappings, d, "_ignored").is_empty())
+                .map(|(i, _)| (i, 1.0))
+                .collect());
+        }
         return Ok(eval_exists(v, docs));
     }
     if let Some(v) = obj.get("prefix") {
@@ -2291,6 +2320,9 @@ pub struct SearchOptions {
     /// The searched index's settings when there is exactly one (the
     /// highlighter reads `index.highlight.*`).
     pub settings: Value,
+    /// Only these documents (positions in `docs`) can match: a collapse
+    /// group's inner hits are a search over its documents alone.
+    pub restrict: Option<HashSet<usize>>,
 }
 
 pub fn search_with(
@@ -2328,7 +2360,7 @@ pub fn search_with(
         return Err(EsError::new(
             400,
             "illegal_argument_exception",
-            &format!("[from] parameter cannot be negative, found [{from}]"),
+            &format!("[from] parameter cannot be negative but was [{from}]"),
         ));
     }
     if body.get("terminate_after").and_then(Value::as_i64).is_some_and(|n| n < 0) {
@@ -2355,14 +2387,15 @@ pub fn search_with(
             "Validation Failed: 1: [from] parameter must be set to 0 when [search_after] is used;",
         ));
     }
-    if from + size > 10_000 && !opts.all_hits {
+    let window = super::limits::setting(&opts.settings, "max_result_window").unwrap_or(10_000);
+    if from + size > window && !opts.all_hits {
         return Err(EsError::shard_failure(
             "illegal_argument_exception",
             &format!(
-                "Result window is too large, from + size must be less than or equal to: [10000] \
-                 but was [{}]. See the scroll api for a more efficient way to request large data \
-                 sets. This limit can be set by changing the [index.max_result_window] index \
-                 level setting.",
+                "Result window is too large, from + size must be less than or equal to: \
+                 [{window}] but was [{}]. See the scroll api for a more efficient way to request \
+                 large data sets. This limit can be set by changing the \
+                 [index.max_result_window] index level setting.",
                 from + size
             ),
         ));
@@ -2402,6 +2435,9 @@ pub fn search_with(
     let originals = docs;
     let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     let mut scores = eval(&query, mappings, docs)?;
+    if let Some(only) = &opts.restrict {
+        scores.retain(|i, _| only.contains(i));
+    }
     apply_indices_boost(body, docs, &mut scores);
     let named = named_queries(&query, mappings, docs)?;
     let mut inner = Vec::new();
@@ -2430,7 +2466,7 @@ pub fn search_with(
     };
     let track_scores = body.get("track_scores").and_then(Value::as_bool).unwrap_or(false);
     let shows_scores = specs.is_empty() || track_scores || specs.iter().any(|s| s.is_score());
-    let max_score =
+    let mut max_score =
         if size == 0 || !(specs.is_empty() || track_scores) { None } else { max_of(&ranked) };
     if let Some(after) = search_after {
         let after = after.as_array().cloned().unwrap_or_else(|| vec![after.clone()]);
@@ -2438,11 +2474,26 @@ pub fn search_with(
         ranked.retain(|h| sorting::compare_keys(&specs, &h.2, &after) == Ordering::Greater);
     }
     // Field collapsing: the top hit of each value; inner hits per group.
-    let all_ranked = ranked.clone();
     if let Some(c) = &collapse {
         let mut seen = HashSet::new();
         ranked.retain(|h| seen.insert(collapse_key(&docs[h.0], c).to_string()));
     }
+    // `rescore`: the top hits scored again by a second query.
+    rescore::check_sort(body, specs.is_empty() || (specs.len() == 1 && specs[0].is_score()))?;
+    if body.get("rescore").is_some_and(|r| !r.is_null()) {
+        let mut pairs: Vec<(usize, f32)> = ranked.iter().map(|h| (h.0, h.1)).collect();
+        let keep = if opts.all_hits { pairs.len() } else { (from + size) as usize };
+        if rescore::apply(body, &mut pairs, mappings, docs, keep)? {
+            ranked = pairs
+                .into_iter()
+                .map(|(i, sc)| (i, sc, sorting::keys(&specs, &docs[i], i, sc)))
+                .collect();
+            if size != 0 {
+                max_score = ranked.first().map(|h| h.1);
+            }
+        }
+    }
+    let explain = body.get("explain").and_then(Value::as_bool).unwrap_or(false);
 
     let source_filter = body.get("_source");
     let stored = body.get("stored_fields");
@@ -2473,6 +2524,12 @@ pub fn search_with(
             } else {
                 json!({"_index": d.index, "_id": d.id})
             };
+            if explain {
+                hit["_shard"] = json!(format!("[{}][0]", d.index));
+                hit["_node"] = json!("noida");
+                hit["_explanation"] =
+                    json!({"value": score, "description": "sum of:", "details": []});
+            }
             if show_version {
                 hit["_version"] = json!(d.version);
             }
@@ -2493,6 +2550,23 @@ pub fn search_with(
                 && (stored_wants_source || source_filter.is_some())
             {
                 hit["_source"] = apply_source_filter(&d.source, source_filter);
+            }
+            // `_ignored`, and with `fields` the values that were ignored.
+            if !stored_none {
+                let ignored = super::docparse::ignored_values(mappings, &opts.settings, d.full());
+                if !ignored.is_empty() {
+                    hit["_ignored"] = json!(ignored.iter().map(|(f, _)| f).collect::<Vec<_>>());
+                    if let Some(spec) = body.get("fields") {
+                        let ifv: Map<String, Value> = ignored
+                            .iter()
+                            .filter(|(f, _)| fields::requested(spec, f))
+                            .map(|(f, v)| (f.clone(), json!(v)))
+                            .collect();
+                        if !ifv.is_empty() {
+                            hit["ignored_field_values"] = Value::Object(ifv);
+                        }
+                    }
+                }
             }
             let mut fetched = Map::new();
             for (key, kind) in [
@@ -2534,14 +2608,13 @@ pub fn search_with(
             if let Some(c) = &collapse {
                 let key = collapse_key(&docs[*idx], c);
                 hit["fields"][c.field.as_str()] = json!([key.clone()]);
-                for ih in &c.inner {
-                    let group: Vec<(usize, f32)> = all_ranked
-                        .iter()
-                        .filter(|h| collapse_key(&docs[h.0], c) == key)
-                        .map(|h| (h.0, h.1))
-                        .collect();
-                    hit["inner_hits"][ih.name.as_str()] =
-                        collapse_inner_hits(ih, &group, mappings, docs, originals)?;
+                if !c.inner.is_empty() {
+                    let group: HashSet<usize> =
+                        (0..docs.len()).filter(|i| collapse_key(&docs[*i], c) == key).collect();
+                    for ih in &c.inner {
+                        hit["inner_hits"][ih.name.as_str()] =
+                            collapse_inner_hits(ih, body, &group, mappings, originals, opts)?;
+                    }
                 }
             }
             let names: Vec<&String> =
@@ -2649,13 +2722,13 @@ fn collect_named(v: &Value, out: &mut Vec<(String, Value)>) {
 
 struct CollapseInner {
     name: String,
-    from: usize,
-    size: usize,
-    sort: Option<Value>,
+    spec: Value,
 }
 
 struct CollapseSpec {
     field: String,
+    /// Where the values live: the field, or a field alias's target.
+    path: String,
     ty: Option<String>,
     inner: Vec<CollapseInner>,
 }
@@ -2665,7 +2738,18 @@ fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSp
         .get("field")
         .and_then(Value::as_str)
         .ok_or_else(|| EsError::parsing("Required [field]"))?;
-    let (_, ty) = resolve_field(mappings, field);
+    let (_, mut ty) = resolve_field(mappings, field);
+    let mut path = field.to_string();
+    if ty.as_deref() == Some("alias") {
+        let mut node = mappings;
+        for seg in field.split('.') {
+            node = &node["properties"][seg];
+        }
+        if let Some(p) = node.get("path").and_then(Value::as_str) {
+            path = p.to_string();
+            ty = resolve_field(mappings, p).1;
+        }
+    }
     match ty.as_deref() {
         None => {
             return Err(EsError::shard_failure(
@@ -2701,13 +2785,14 @@ fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSp
         Some(Value::Array(a)) => a.iter().map(inner_spec).collect(),
         Some(o) => vec![inner_spec(o)],
     };
-    Ok(CollapseSpec { field: field.to_string(), ty, inner })
+    Ok(CollapseSpec { field: field.to_string(), path, ty, inner })
 }
 
 fn sort_field_name(v: &Value) -> Option<&str> {
     match v {
         Value::String(s) => Some(s),
-        Value::Object(o) => o.keys().next().map(String::as_str),
+        // `{"a": "asc", "b": "desc"}` sorts on two fields.
+        Value::Object(o) if o.len() == 1 => o.keys().next().map(String::as_str),
         _ => None,
     }
 }
@@ -2715,16 +2800,19 @@ fn sort_field_name(v: &Value) -> Option<&str> {
 fn inner_spec(v: &Value) -> CollapseInner {
     CollapseInner {
         name: v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-        from: v.get("from").and_then(Value::as_u64).unwrap_or(0) as usize,
-        size: v.get("size").and_then(Value::as_u64).unwrap_or(3) as usize,
-        sort: v.get("sort").cloned(),
+        spec: v.clone(),
     }
 }
 
 /// A document's collapse value (`null` for none).
 fn collapse_key(d: &CommittedDoc, c: &CollapseSpec) -> Value {
-    raw_values(&d.source, &c.field)
-        .into_iter()
+    // A search over several indices may reach the field directly in one
+    // and through an alias in another.
+    let mut vals = raw_values(&d.source, &c.path);
+    if vals.is_empty() {
+        vals = raw_values(&d.source, &c.field);
+    }
+    vals.into_iter()
         .next()
         .map(|v| match (c.ty.as_deref(), v) {
             (Some("long" | "integer" | "short" | "byte"), Value::Number(n)) => {
@@ -2735,50 +2823,48 @@ fn collapse_key(d: &CommittedDoc, c: &CollapseSpec) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// A collapse group's inner hits: the original query searched again over
+/// the group's documents alone (as Elasticsearch's expand phase does,
+/// with the group's value as a filter), shaped by the inner hit
+/// definition (`from`, `size`, `sort`, fetch options, a second-level
+/// `collapse`). Without a query the group's hits score 0.
 fn collapse_inner_hits(
     ih: &CollapseInner,
-    group: &[(usize, f32)],
+    body: &Value,
+    group: &HashSet<usize>,
     mappings: &Value,
-    docs: &[CommittedDoc],
     originals: &[CommittedDoc],
+    opts: &SearchOptions,
 ) -> Result<Value, EsError> {
-    let specs = match &ih.sort {
-        Some(s) => sorting::parse(s, mappings, true)?,
-        None => vec![],
-    };
-    let mut ranked: Vec<(usize, f32, Vec<Value>)> =
-        group.iter().map(|(i, s)| (*i, *s, sorting::keys(&specs, &docs[*i], *i, *s))).collect();
-    if specs.is_empty() {
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
-    } else {
-        ranked.sort_by(|a, b| sorting::compare_keys(&specs, &a.2, &b.2).then(a.0.cmp(&b.0)));
-    }
-    let shows_scores = specs.is_empty() || specs.iter().any(|s| s.is_score());
-    let max_score = if shows_scores {
-        ranked.iter().map(|h| h.1).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
-    } else {
-        None
-    };
-    let hits: Vec<Value> = ranked
-        .iter()
-        .skip(ih.from)
-        .take(ih.size)
-        .map(|(i, sc, keys)| {
-            let d = &originals[*i];
-            let mut h = json!({"_index": d.index, "_id": d.id,
-                "_score": if shows_scores { json!(sc) } else { Value::Null },
-                "_source": d.source});
-            if !specs.is_empty() {
-                h["sort"] = Value::Array(keys.clone());
+    let mut sub = Map::new();
+    sub.insert(
+        "query".into(),
+        body.get("query")
+            .cloned()
+            .unwrap_or_else(|| json!({"bool": {"filter": [{"match_all": {}}]}})),
+    );
+    sub.insert("size".into(), json!(3));
+    if let Some(o) = ih.spec.as_object() {
+        for (k, v) in o {
+            if !matches!(k.as_str(), "name" | "ignore_unmapped") {
+                sub.insert(k.clone(), v.clone());
             }
-            h
-        })
-        .collect();
-    Ok(json!({"hits": {
-        "total": {"value": group.len(), "relation": "eq"},
-        "max_score": max_score,
-        "hits": hits,
-    }}))
+        }
+    }
+    let sub_opts = SearchOptions {
+        typed: opts.typed,
+        settings: opts.settings.clone(),
+        restrict: Some(group.clone()),
+        ..Default::default()
+    };
+    let mut resp = search_with(mappings, originals, &Value::Object(sub), &sub_opts)?;
+    if let Some(h) = resp["hits"].as_object_mut() {
+        // Every inner hit is counted exactly.
+        if h.get("total").is_none() {
+            h.insert("total".into(), json!({"value": group.len(), "relation": "eq"}));
+        }
+    }
+    Ok(json!({"hits": resp["hits"].take()}))
 }
 
 /// Evaluates `query` over the root-level view of `docs` (nested objects

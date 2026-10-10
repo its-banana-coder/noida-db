@@ -3,19 +3,26 @@
 mod analysis;
 mod cat;
 mod dates;
+mod docparse;
 mod engine;
 mod field_caps;
 mod fields;
 mod highlight;
+mod jsonpos;
+mod limits;
+mod names;
 mod painless;
+mod profile;
 mod queries;
 mod query_string;
+mod rescore;
 mod scoring;
 mod search;
 mod server;
 mod sorting;
 mod suggest;
 mod templates;
+mod termvectors;
 mod vectors;
 
 #[cfg(test)]

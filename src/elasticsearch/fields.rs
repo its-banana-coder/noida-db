@@ -19,7 +19,8 @@ pub enum Kind {
 }
 
 /// A mapped leaf field: its full name, where its values live in
-/// `_source` (a multi-field reads its parent's), its type and mapping.
+/// `_source` (relative to the nested object it's in; a multi-field reads
+/// its parent's), its type and mapping.
 struct Leaf {
     name: String,
     path: String,
@@ -27,37 +28,42 @@ struct Leaf {
     node: Value,
 }
 
-fn leaves(props: &Value, prefix: &str, out: &mut Vec<Leaf>) {
+/// A `nested` field: its objects' fields come back grouped per object.
+struct Nested {
+    name: String,
+    path: String,
+    node: Value,
+}
+
+fn join(a: &str, b: &str) -> String {
+    if a.is_empty() { b.to_string() } else { format!("{a}.{b}") }
+}
+
+fn leaves(props: &Value, prefix: &str, path: &str, out: &mut Vec<Leaf>, nested: &mut Vec<Nested>) {
     let Some(m) = props.as_object() else { return };
     for (k, node) in m {
-        let name = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        let name = join(prefix, k);
+        let at = join(path, k);
         let ty = node.get("type").and_then(Value::as_str).unwrap_or("object");
         match ty {
             "object" => {
                 if let Some(p) = node.get("properties") {
-                    leaves(p, &name, out);
+                    leaves(p, &name, &at, out, nested);
                 }
             }
-            // Nested objects come back grouped per object, which isn't
-            // modelled here: they are left out rather than flattened.
-            "nested" => {}
+            "nested" => nested.push(Nested { name, path: at, node: node.clone() }),
             _ => {
                 if let Some(Value::Object(subs)) = node.get("fields") {
                     for (sk, sn) in subs {
                         out.push(Leaf {
                             name: format!("{name}.{sk}"),
-                            path: name.clone(),
+                            path: at.clone(),
                             ty: sn.get("type").and_then(Value::as_str).unwrap_or("keyword").into(),
                             node: sn.clone(),
                         });
                     }
                 }
-                out.push(Leaf {
-                    name: name.clone(),
-                    path: name,
-                    ty: ty.into(),
-                    node: node.clone(),
-                });
+                out.push(Leaf { name, path: at, ty: ty.into(), node: node.clone() });
             }
         }
     }
@@ -136,6 +142,10 @@ fn format_value(leaf: &Leaf, v: &Value, format: Option<&str>) -> Option<Value> {
             let f = as_f64(v)?;
             Some(json!(f))
         }
+        "token_count" => match v {
+            Value::String(s) => Some(json!(super::analysis::standard(s).len())),
+            _ => None,
+        },
         "boolean" => match v {
             Value::Bool(b) => Some(json!(b)),
             Value::String(s) if s == "true" => Some(json!(true)),
@@ -177,8 +187,18 @@ fn geo_point(v: &Value) -> Option<Value> {
     Some(json!({"type": "Point", "coordinates": [lon, lat]}))
 }
 
+/// A GeoJSON point as WKT.
+fn wkt(p: &Value) -> Value {
+    let c = &p["coordinates"];
+    let num = |v: &Value| v.as_f64().map_or(String::new(), |f| f.to_string());
+    json!(format!("POINT ({} {})", num(&c[0]), num(&c[1])))
+}
+
 /// The values of `leaf` in `source`.
 fn values_of(leaf: &Leaf, source: &Value, format: Option<&str>) -> Vec<Value> {
+    if leaf.ty == "geo_point" && format == Some("wkt") {
+        return values_of(leaf, source, None).iter().map(wkt).collect();
+    }
     if leaf.ty == "geo_point" {
         let mut node = Some(source);
         for seg in leaf.path.split('.') {
@@ -213,61 +233,69 @@ fn source_leaves(v: &Value, prefix: &str, out: &mut Vec<(String, Value)>) {
     }
 }
 
-/// The `fields` object of one hit for the requested `specs` (an array of
-/// patterns or `{"field", "format", "include_unmapped"}` objects).
-pub fn fetch(
-    mappings: &Value,
-    doc: &CommittedDoc,
-    specs: &Value,
+/// One requested field pattern.
+struct Spec<'a> {
+    pat: &'a str,
+    format: Option<&'a str>,
+    unmapped: bool,
+}
+
+/// Formats each field type supports.
+fn supports_format(ty: &str, format: &str) -> bool {
+    ty.starts_with("date")
+        || is_numeric(ty)
+        || (matches!(ty, "geo_point" | "geo_shape" | "point" | "shape")
+            && matches!(format, "geojson" | "wkt"))
+}
+
+fn format_error(leaf_name: &str, ty: &str, pat: &str) -> EsError {
+    let matched = if pat.contains('*') { format!(" which matched [{pat}]") } else { String::new() };
+    EsError::shard_failure(
+        "illegal_argument_exception",
+        &format!(
+            "error fetching [{leaf_name}]{matched}: Field [{leaf_name}] of type [{ty}] doesn't support formats."
+        ),
+    )
+}
+
+/// The fields of `source`, an object at nested scope `scope` (`""` at
+/// the document root) mapped by `props`, keyed relative to the scope.
+fn fetch_scope(
+    props: Option<&Value>,
+    source: &Value,
+    scope: &str,
+    specs: &[Spec],
     kind: Kind,
-) -> Result<Map<String, Value>, EsError> {
+    out: &mut Map<String, Value>,
+) -> Result<(), EsError> {
     let mut all = Vec::new();
-    if let Some(p) = mappings.get("properties") {
-        leaves(p, "", &mut all);
+    let mut nested = Vec::new();
+    if let Some(p) = props {
+        leaves(p, scope, "", &mut all, &mut nested);
     }
-    let source_enabled = mappings
-        .get("_source")
-        .and_then(|s| s.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let specs: Vec<Value> = match specs {
-        Value::Array(a) => a.clone(),
-        Value::Null => Vec::new(),
-        other => vec![other.clone()],
-    };
-    let mut out = Map::new();
-    for spec in &specs {
-        let (pat, format, unmapped) = match spec {
-            Value::String(s) => (s.as_str(), None, false),
-            Value::Object(m) => (
-                m.get("field").and_then(Value::as_str).unwrap_or(""),
-                m.get("format").and_then(Value::as_str),
-                m.get("include_unmapped").and_then(Value::as_bool).unwrap_or(false),
-            ),
-            _ => continue,
-        };
-        match pat {
-            "_id" => {
-                out.insert("_id".into(), json!([doc.id]));
-                continue;
-            }
-            "_index" => {
-                out.insert("_index".into(), json!([doc.index]));
-                continue;
-            }
-            "_none_" | "_source" | "_routing" | "_ignored" => continue,
-            _ => {}
+    // A field alias reads its target's values, as its target's type.
+    let targets: Vec<(String, String, Value)> =
+        all.iter().map(|l| (l.name.clone(), l.path.clone(), l.node.clone())).collect();
+    for leaf in all.iter_mut().filter(|l| l.ty == "alias") {
+        let target = leaf.node.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+        if let Some((_, path, node)) = targets.iter().find(|(n, _, _)| *n == target) {
+            leaf.path = path.clone();
+            leaf.ty = node.get("type").and_then(Value::as_str).unwrap_or("keyword").into();
+            leaf.node = node.clone();
+        } else {
+            leaf.ty = format!("alias:{target}");
         }
-        let source = if source_enabled { &doc.source } else { &Value::Null };
+    }
+    let rel = |name: &str| -> String {
+        if scope.is_empty() { name.to_string() } else { name[scope.len() + 1..].to_string() }
+    };
+    for spec in specs {
+        let (pat, format) = (spec.pat, spec.format);
         for leaf in all.iter().filter(|l| glob(pat, &l.name)) {
-            if format.is_some() && !(leaf.ty.starts_with("date") || is_numeric(&leaf.ty)) {
-                return Err(EsError::shard_failure(
-                    "illegal_argument_exception",
-                    &format!(
-                        "Field [{}] of type [{}] doesn't support formats.",
-                        leaf.name, leaf.ty
-                    ),
-                ));
+            if let Some(f) = format
+                && !supports_format(&leaf.ty, f)
+            {
+                return Err(format_error(&leaf.name, &leaf.ty, pat));
             }
             match kind {
                 Kind::Stored
@@ -308,23 +336,169 @@ pub fn fetch(
             let vals =
                 if kind == Kind::DocValue { sorted_doc_values(&leaf.ty, vals) } else { vals };
             if !vals.is_empty() {
-                out.insert(leaf.name.clone(), Value::Array(vals));
+                out.insert(rel(&leaf.name), Value::Array(vals));
             }
         }
-        if unmapped && kind == Kind::Fields {
+        // A flattened field's keys by exact name: `flattened.some_field`.
+        if kind == Kind::Fields && !pat.contains('*') {
+            for leaf in all.iter().filter(|l| l.ty == "flattened") {
+                if let Some(key) = pat.strip_prefix(&format!("{}.", leaf.name)) {
+                    if format.is_some() {
+                        return Err(format_error(pat, "flattened", pat));
+                    }
+                    let mut vals = vec![];
+                    for obj in raw_values(source, &leaf.path) {
+                        for v in raw_values(obj, key) {
+                            if !v.is_object() && !v.is_null() {
+                                vals.push(json!(match v {
+                                    Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                }));
+                            }
+                        }
+                    }
+                    if !vals.is_empty() {
+                        out.insert(rel(pat), Value::Array(vals));
+                    }
+                }
+            }
+        }
+        if spec.unmapped && kind == Kind::Fields {
             let mut src = Vec::new();
             source_leaves(source, "", &mut src);
-            for (name, v) in src {
+            for (path, v) in src {
+                let name = join(scope, &path);
+                // Mapped fields (and whatever is inside one, like a
+                // flattened object's keys) and nested objects' fields
+                // aren't unmapped.
+                let inside = |n: &str| name == n || name.starts_with(&format!("{n}."));
                 if glob(pat, &name)
-                    && !all.iter().any(|l| l.name == name)
-                    && let Some(a) = out.entry(name).or_insert_with(|| json!([])).as_array_mut()
+                    && !all.iter().any(|l| inside(&l.name))
+                    && !nested.iter().any(|n| inside(&n.name))
+                    && let Some(a) = out.entry(path).or_insert_with(|| json!([])).as_array_mut()
                 {
                     a.push(v);
                 }
             }
         }
     }
+    // Nested objects: one entry per object, with its fields.
+    if kind == Kind::Fields {
+        for n in &nested {
+            let mut group = vec![];
+            for obj in raw_values(source, &n.path) {
+                let mut m = Map::new();
+                fetch_scope(n.node.get("properties"), obj, &n.name, specs, kind, &mut m)?;
+                if !m.is_empty() {
+                    group.push(Value::Object(m));
+                }
+            }
+            if !group.is_empty() {
+                out.insert(rel(&n.name), Value::Array(group));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `fields` object of one hit for the requested `specs` (an array of
+/// patterns or `{"field", "format", "include_unmapped"}` objects).
+pub fn fetch(
+    mappings: &Value,
+    doc: &CommittedDoc,
+    specs: &Value,
+    kind: Kind,
+) -> Result<Map<String, Value>, EsError> {
+    let source_enabled = mappings
+        .get("_source")
+        .and_then(|s| s.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let specs: Vec<Value> = match specs {
+        Value::Array(a) => a.clone(),
+        Value::Null => Vec::new(),
+        other => vec![other.clone()],
+    };
+    let mut out = Map::new();
+    let mut wanted = vec![];
+    for spec in &specs {
+        let (pat, format, unmapped) = match spec {
+            Value::String(s) => (s.as_str(), None, false),
+            Value::Object(m) => (
+                m.get("field").and_then(Value::as_str).unwrap_or(""),
+                m.get("format").and_then(Value::as_str),
+                m.get("include_unmapped").and_then(Value::as_bool).unwrap_or(false),
+            ),
+            _ => continue,
+        };
+        // Metadata fields are fetched by exact name only.
+        match pat {
+            "_id" => {
+                out.insert("_id".into(), json!([doc.id]));
+                continue;
+            }
+            "_index" => {
+                out.insert("_index".into(), json!([doc.index]));
+                continue;
+            }
+            "_version" if kind == Kind::Fields => {
+                out.insert("_version".into(), json!([doc.version]));
+                continue;
+            }
+            "_ignored" if kind == Kind::Fields => {
+                let ignored = super::docparse::ignored_fields(mappings, &Value::Null, doc.full());
+                if !ignored.is_empty() {
+                    out.insert("_ignored".into(), json!(ignored));
+                }
+                continue;
+            }
+            "_seq_no" | "_source" | "_primary_term" | "_field_names" if kind == Kind::Fields => {
+                let mut e = EsError::shard_failure(
+                    "unsupported_operation_exception",
+                    &format!("Cannot fetch values for internal field [{pat}]."),
+                );
+                e.status = 500;
+                return Err(e);
+            }
+            "_none_" | "_source" | "_routing" | "_ignored" | "_seq_no" | "_version" => continue,
+            _ => {}
+        }
+        wanted.push(Spec { pat, format, unmapped });
+    }
+    let source = if source_enabled { &doc.source } else { &Value::Null };
+    let mut fetched = Map::new();
+    fetch_scope(mappings.get("properties"), source, "", &wanted, kind, &mut fetched)?;
+    // An alias of `_id` reads the document's id.
+    let mut all = vec![];
+    let mut nested = vec![];
+    if let Some(p) = mappings.get("properties") {
+        leaves(p, "", "", &mut all, &mut nested);
+    }
+    for l in all.iter().filter(|l| l.ty == "alias") {
+        if l.node.get("path").and_then(Value::as_str) == Some("_id")
+            && kind == Kind::Fields
+            && wanted.iter().any(|w| glob(w.pat, &l.name))
+        {
+            fetched.insert(l.name.clone(), json!([doc.id]));
+        }
+    }
+    for (k, v) in fetched {
+        out.insert(k, v);
+    }
     Ok(out)
+}
+
+/// Whether a `fields` request (`specs`) asks for field `name`.
+pub fn requested(specs: &Value, name: &str) -> bool {
+    let one = |s: &Value| match s {
+        Value::String(p) => glob(p, name),
+        Value::Object(m) => m.get("field").and_then(Value::as_str).is_some_and(|p| glob(p, name)),
+        _ => false,
+    };
+    match specs {
+        Value::Array(a) => a.iter().any(one),
+        other => one(other),
+    }
 }
 
 /// Doc values come back sorted (and keyword doc values deduplicated).
