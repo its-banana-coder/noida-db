@@ -48,7 +48,7 @@ tests/official/redis/run.sh 6379
 | Suite | Real server (ceiling here) | noida-db | Date |
 |---|---|---|---|
 | Postgres `pg_regress` (REL_14_STABLE, 216 files, ~40k statements) | PostgreSQL 14: 99.3% of statements, 179/216 files identical | 44.9% of statements, no crashes (before #109/#113) | 2026-10-06 |
-| Elasticsearch YAML REST tests (v8.15.3, all 122 dirs, 1708 tests run) | Elasticsearch 8.15.3: 90.4% on a subset (full calibration pending) | 930 / 1708 (54.4%), up from 675 (39.5%) earlier on 2026-10-08, 598 (35.0%) on 2026-10-07 and 165 (9.6%) before #123/#125/#130/#140/#147 | 2026-10-08 |
+| Elasticsearch YAML REST tests (v8.15.3, all 122 dirs, 1786 tests run; the runner now also runs the `_internal.*` APIs, `capabilities` and `exists` tests it used to skip) | Elasticsearch 8.15.3: 90.4% on a subset (full calibration pending) | 1735 / 1786 (97.1%), up from 930 / 1708 (54.4%) on 2026-10-08, 598 (35.0%) on 2026-10-07 and 165 (9.6%) before #123/#125/#130/#140/#147 | 2026-10-10 |
 | Redis TCL suite (7.2.12, external mode, without `unit/moduleapi`) | Redis 7.2.12 (`--enable-debug-command yes`): ok 1990, err 1, exception 1 (`unit/replybufsize`, `unit/type/set`: need the server pid / DEBUG internals) | not run yet | 2026-10-07 |
 
 What the real server misses here is environmental (Postgres's C test
