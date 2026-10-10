@@ -1814,7 +1814,9 @@ impl Engine {
                         if !alias_selected(&patterns, a) {
                             continue;
                         }
-                        if !hidden_ok && spec.get("is_hidden").and_then(Value::as_bool) == Some(true) {
+                        if !hidden_ok
+                            && spec.get("is_hidden").and_then(Value::as_bool) == Some(true)
+                        {
                             continue;
                         }
                         let w = spec
@@ -2053,7 +2055,12 @@ impl Engine {
 
     /// `POST /<index>/_pit?keep_alive=1m`: freezes the index's searchable
     /// documents for later `pit` searches.
-    fn open_pit(&self, index_pattern: &str, q: &HashMap<String, String>, body: &[u8]) -> (u16, Value) {
+    fn open_pit(
+        &self,
+        index_pattern: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
         let Some(keep) = q.get("keep_alive").and_then(|k| parse_keep_alive(k)) else {
             return (
                 400,
@@ -3063,7 +3070,10 @@ impl Engine {
                         400,
                         error(
                             "illegal_argument_exception",
-                            &format!("Action/metadata line [{}] contains an unknown parameter [{bad}]", n + 1),
+                            &format!(
+                                "Action/metadata line [{}] contains an unknown parameter [{bad}]",
+                                n + 1
+                            ),
                             400,
                         ),
                     );
@@ -3643,8 +3653,11 @@ impl Engine {
         // Item fields the parser knows (`_routing`, `_version` and the
         // like are long gone).
         for d in &docs {
-            let known = ["_index", "_id", "routing", "stored_fields", "_source", "version", "version_type"];
-            if let Some(bad) = d.as_object().and_then(|m| m.keys().find(|k| !known.contains(&k.as_str()))) {
+            let known =
+                ["_index", "_id", "routing", "stored_fields", "_source", "version", "version_type"];
+            if let Some(bad) =
+                d.as_object().and_then(|m| m.keys().find(|k| !known.contains(&k.as_str())))
+            {
                 return (
                     400,
                     error(

@@ -9,7 +9,11 @@ use super::queries::doc_view;
 use super::search::{CommittedDoc, EsError, resolve_field};
 
 /// The script fields of one hit.
-pub fn values(body: &Value, mappings: &Value, d: &CommittedDoc) -> Result<Map<String, Value>, EsError> {
+pub fn values(
+    body: &Value,
+    mappings: &Value,
+    d: &CommittedDoc,
+) -> Result<Map<String, Value>, EsError> {
     let mut out = Map::new();
     let Some(Value::Object(specs)) = body.get("script_fields") else { return Ok(out) };
     for (name, spec) in specs {

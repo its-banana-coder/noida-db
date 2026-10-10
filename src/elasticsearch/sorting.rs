@@ -159,9 +159,8 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
                     DateSort {
                         parse: field_format(mappings, &path),
                         show: opts.get("format").and_then(Value::as_str).map(str::to_string),
-                        nanos: numeric.map_or(ty.as_deref() == Some("date_nanos"), |n| {
-                            n == "date_nanos"
-                        }),
+                        nanos: numeric
+                            .map_or(ty.as_deref() == Some("date_nanos"), |n| n == "date_nanos"),
                     }
                 });
                 Key::Field { path, ty, date }
@@ -209,8 +208,12 @@ fn epoch_nanos(v: &Value, format: Option<&str>) -> Option<i64> {
 
 /// A date sort key: epoch millis, or nanos at `date_nanos` resolution.
 fn date_key(v: &Value, d: &DateSort) -> Option<Value> {
-    if d.nanos { epoch_nanos(v, d.parse.as_deref()) } else { dates::value_millis(v, d.parse.as_deref()) }
-        .map(|n| json!(n))
+    if d.nanos {
+        epoch_nanos(v, d.parse.as_deref())
+    } else {
+        dates::value_millis(v, d.parse.as_deref())
+    }
+    .map(|n| json!(n))
 }
 
 /// One field value as a sort key of the field's type.
@@ -365,7 +368,11 @@ pub fn after_keys(specs: &[SortSpec], after: &[Value]) -> Result<Vec<Value>, EsE
             // the field's).
             Key::Field { date: Some(d), .. } if v.is_string() => {
                 let fmt = d.show.as_deref().or(d.parse.as_deref()).map(|f| {
-                    if f == "strict_date_optional_time_nanos" { "strict_date_optional_time" } else { f }
+                    if f == "strict_date_optional_time_nanos" {
+                        "strict_date_optional_time"
+                    } else {
+                        f
+                    }
                 });
                 let d2 = DateSort { parse: fmt.map(str::to_string), ..d.clone() };
                 date_key(v, &d2).ok_or_else(|| {
@@ -395,8 +402,11 @@ pub fn display(specs: &[SortSpec], keys: &[Value]) -> Vec<Value> {
             (Key::Field { date: Some(DateSort { show: Some(f), nanos, .. }), .. }, Some(n))
                 if n != i64::MAX && n != i64::MIN =>
             {
-                let (ms, sub) =
-                    if *nanos { (n.div_euclid(1_000_000), n.rem_euclid(1_000_000)) } else { (n, 0) };
+                let (ms, sub) = if *nanos {
+                    (n.div_euclid(1_000_000), n.rem_euclid(1_000_000))
+                } else {
+                    (n, 0)
+                };
                 if f == "strict_date_optional_time_nanos" {
                     let base = dates::format(ms, None, 0);
                     if sub == 0 {

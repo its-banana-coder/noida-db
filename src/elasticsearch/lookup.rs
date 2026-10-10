@@ -52,7 +52,8 @@ fn queried(q: &Value, names: &[String]) -> Option<(String, String)> {
         Value::Object(m) => {
             for (kind, body) in m {
                 if kind != "exists"
-                    && let Some(n) = body.as_object().and_then(|b| b.keys().find(|k| names.contains(k)))
+                    && let Some(n) =
+                        body.as_object().and_then(|b| b.keys().find(|k| names.contains(k)))
                 {
                     return Some((n.clone(), kind.clone()));
                 }

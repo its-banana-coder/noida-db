@@ -106,8 +106,7 @@ const PARAMS: &[&str] = &[
 
 /// A URL parameter the API doesn't take, as Elasticsearch names it.
 pub fn unknown_param(q: &HashMap<String, String>) -> Option<&str> {
-    let mut bad: Vec<&str> =
-        q.keys().map(String::as_str).filter(|k| !PARAMS.contains(k)).collect();
+    let mut bad: Vec<&str> = q.keys().map(String::as_str).filter(|k| !PARAMS.contains(k)).collect();
     bad.sort();
     bad.first().copied()
 }

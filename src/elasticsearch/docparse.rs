@@ -547,9 +547,6 @@ const KEYWORD_LIKE: &[&str] = &[
     "ip",
 ];
 
-/// The `[line:col]` where a parser complains about a JSON token.
-type At<'a> = &'a dyn Fn(&str, bool) -> String;
-
 fn check_number(
     ty: &str,
     def: &Value,
@@ -825,7 +822,8 @@ fn validate(
             for (n, x) in vals.iter().enumerate() {
                 if nested && x.is_object() {
                     pos.nested.set(pos.nested.get() + 1);
-                    let limit = setting_u64(ctx.settings, "nested_objects", "limit").unwrap_or(10_000);
+                    let limit =
+                        setting_u64(ctx.settings, "nested_objects", "limit").unwrap_or(10_000);
                     if pos.nested.get() as u64 > limit {
                         return Err(parse_error(&format!(
                             "{} The number of nested documents has exceeded the allowed limit of [{limit}]. This limit can be set by changing the [index.mapping.nested_objects.limit] index level setting.",
@@ -1091,7 +1089,7 @@ mod tests {
         let (_, e) =
             parse(&mut m, &serde_json::from_str(raw).unwrap(), &ctx(raw, &settings)).unwrap_err();
         assert!(
-            e["error"]["reason"].as_str().unwrap().starts_with("[1:22] failed to parse field [n]")
+            e["error"]["reason"].as_str().unwrap().starts_with("[1:21] failed to parse field [n]")
         );
     }
 

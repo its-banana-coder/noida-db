@@ -465,7 +465,7 @@ pub fn build(req: &Value, mappings: &Value, shards: &[Shard], dfs: bool, elapsed
                             let cands = k
                                 .get("num_candidates")
                                 .and_then(Value::as_u64)
-                                .or_else(|| k.get("k").and_then(Value::as_u64).map(|n| (n * 3 / 2).max(100).min(10_000)))
+                                .or_else(|| k.get("k").and_then(Value::as_u64).map(|n| (n * 3 / 2).clamp(100, 10_000)))
                                 .unwrap_or(100);
                             json!({
                                 "vector_operations_count": sh.vectors,

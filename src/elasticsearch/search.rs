@@ -2699,13 +2699,16 @@ fn apply_indices_boost(body: &Value, docs: &[CommittedDoc], scores: &mut HashMap
     }
 }
 
+/// Matching documents and their scores.
+type Scores = HashMap<usize, f32>;
+
 /// Every clause of `query` carrying a `_name`, with the documents it
-/// matches (for each hit's `matched_queries`).
+/// matches and their scores (for each hit's `matched_queries`).
 fn named_queries(
     query: &Value,
     mappings: &Value,
     docs: &[CommittedDoc],
-) -> Result<Vec<(String, HashMap<usize, f32>)>, EsError> {
+) -> Result<Vec<(String, Scores)>, EsError> {
     let mut found: Vec<(String, Value)> = vec![];
     collect_named(query, &mut found);
     found.into_iter().map(|(n, q)| Ok((n, eval(&q, mappings, docs)?))).collect()
