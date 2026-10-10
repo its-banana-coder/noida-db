@@ -557,26 +557,26 @@ fn common_grams(tokens: Vec<Token>, words: &HashSet<String>, ignore_case: bool) 
 /// Lucene's `CommonGramsQueryFilter` over a common-grams stream: a word
 /// is dropped when a gram starts at it, and the last word after a gram.
 fn common_grams_query(stream: Vec<Token>) -> Vec<Token> {
-    // (token, dropped): a word is dropped when a gram starts or ends at it.
-    let mut items: Vec<(Token, bool)> = Vec::new();
-    let mut last_word: Option<usize> = None;
-    let mut drop_next = false;
+    // Matches Lucene's CommonGramsQueryFilter: a word followed by a gram is
+    // replaced by it, and a trailing word that ends a gram is dropped.
+    let mut out: Vec<Token> = Vec::new();
     for t in stream {
         if t.ty == "gram" {
-            if let Some(i) = last_word {
-                items[i].1 = true;
+            if out.last().is_some_and(|l| l.ty != "gram") {
+                out.pop();
             }
-            drop_next = true;
             let mut g = t;
             g.pos_inc = 1;
             g.pos_len = 1;
-            items.push((g, false));
+            out.push(g);
         } else {
-            last_word = Some(items.len());
-            items.push((t, std::mem::take(&mut drop_next)));
+            out.push(t);
         }
     }
-    items.into_iter().filter(|(_, d)| !d).map(|(t, _)| t).collect()
+    if out.len() >= 2 && out[out.len() - 1].ty != "gram" && out[out.len() - 2].ty == "gram" {
+        out.pop();
+    }
+    out
 }
 
 fn scandinavian_folding(t: &str) -> String {

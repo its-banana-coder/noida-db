@@ -622,9 +622,9 @@ impl Defs<'_> {
                     words: p_list(def, "keep_words")
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|w| if case { w } else { w.to_lowercase() })
+                        .map(|w| if case { w.to_lowercase() } else { w })
                         .collect(),
-                    case_sensitive: case,
+                    case_sensitive: !case,
                 }
             }
             "keep_types" => {
@@ -1112,13 +1112,9 @@ fn builtin_filter(name: &str) -> Option<TokenFilter> {
         "porter_stem" => TokenFilter::Stem(Stem::Porter),
         "scandinavian_folding" => TokenFilter::ScandinavianFolding,
         "scandinavian_normalization" => TokenFilter::ScandinavianNormalization,
-        "arabic_stem" | "armenian_stem" | "basque_stem" | "catalan_stem" | "danish_stem"
-        | "dutch_stem" | "finnish_stem" | "french_stem" | "german_stem" | "hungarian_stem"
-        | "italian_stem" | "norwegian_stem" | "portuguese_stem" | "romanian_stem"
-        | "russian_stem" | "spanish_stem" | "swedish_stem" | "turkish_stem" | "lithuanian_stem"
-        | "irish_stem" | "estonian_stem" | "sorani_stem" | "bulgarian_stem" | "hindi_stem"
-        | "indonesian_stem" | "latvian_stem" | "german2_stem" | "kp_stem" | "lovins_stem"
-        | "brazilian_stem" | "czech_stem" | "galician_stem" | "persian_stem" => {
+        // Only legacy names verified against Elasticsearch; the others (french,
+        // german, brazilian, czech, persian) stay unknown rather than approximate.
+        "arabic_stem" | "dutch_stem" | "russian_stem" => {
             return stemmer_filter(name.trim_end_matches("_stem")).ok();
         }
         "kstem" => TokenFilter::Stem(Stem::KStem),
