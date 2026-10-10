@@ -255,6 +255,20 @@ pub fn fetch(
                 out.insert("_index".into(), json!([doc.index]));
                 continue;
             }
+            // A time-series document's metadata (only when asked for).
+            "_tsid" | "_ts_routing_hash" => {
+                if let Some(tsid) = &doc.tsid {
+                    let v = if pat == "_tsid" {
+                        Some(tsid.clone())
+                    } else {
+                        super::tsdb::routing_hash_of_id(&doc.id)
+                    };
+                    if let Some(v) = v {
+                        out.insert(pat.into(), json!([v]));
+                    }
+                }
+                continue;
+            }
             "_none_" | "_source" | "_routing" | "_ignored" => continue,
             _ => {}
         }
@@ -375,6 +389,7 @@ mod tests {
             version: 1,
             seq: 0,
             full_source: None,
+            tsid: None,
         }
     }
 

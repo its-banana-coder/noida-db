@@ -37,6 +37,13 @@ Loader.yaml_implicit_resolvers = {
     k: [r for r in v if r[0] != "tag:yaml.org,2002:timestamp"]
     for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()
 }
+# YAML 1.2 floats (as the Java runner reads them): `2.012916202E9`, an
+# exponent without a sign, is a number, not a string.
+Loader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    re.compile(r"^[-+]?[0-9][0-9_]*\.[0-9_]*[eE][-+]?[0-9]+$"),
+    list("-+0123456789"),
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SUITE = os.environ.get(
@@ -261,6 +268,8 @@ class Runner:
             escape = False
             cur_seg.append(ch)
         segs.append("".join(cur_seg))
+        # Empty segments (`key.`) are dropped, as ObjectPath drops them.
+        segs = [s for s in segs if s]
         for seg in segs:
             if seg == "_arbitrary_key_" and isinstance(cur, dict) and cur:
                 return next(iter(cur))

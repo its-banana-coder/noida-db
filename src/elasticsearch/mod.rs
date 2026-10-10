@@ -3,6 +3,7 @@
 mod analysis;
 mod cat;
 mod dates;
+mod dynamic;
 mod engine;
 mod field_caps;
 mod fields;
@@ -10,12 +11,14 @@ mod highlight;
 mod painless;
 mod queries;
 mod query_string;
+mod ranges;
 mod scoring;
 mod search;
 mod server;
 mod sorting;
 mod suggest;
 mod templates;
+mod tsdb;
 mod vectors;
 
 #[cfg(test)]

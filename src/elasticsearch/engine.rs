@@ -16,6 +16,7 @@ pub struct Engine(Arc<Mutex<State>>);
 use serde::{Deserialize, Serialize};
 
 use super::templates::Templates;
+use super::tsdb;
 use super::vectors;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -138,6 +139,7 @@ impl Index {
                     version: d.version,
                     seq: d.seq,
                     full_source: None,
+                    tsid: d.tsid.clone(),
                 })
             })
             .collect();
@@ -152,6 +154,9 @@ struct Document {
     /// The `routing` value it was written with, returned as `_routing`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     routing: Option<String>,
+    /// A time-series document's `_tsid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tsid: Option<String>,
 }
 
 static IDS: AtomicU64 = AtomicU64::new(1);
@@ -775,6 +780,11 @@ impl Engine {
         self.0.lock().unwrap().indices.values().any(|i| i.aliases.contains_key(name))
     }
 
+    /// Whether `name` (an index) is a time-series index.
+    fn is_time_series_index(&self, name: &str) -> bool {
+        self.0.lock().unwrap().indices.get(name).is_some_and(|i| tsdb::is_time_series(&i.settings))
+    }
+
     /// Index names/patterns matching Elasticsearch's rules for `_search`
     /// targets: an exact name, a comma-separated list, a `name*` prefix
     /// wildcard, or `_all`/`*` for every index.
@@ -1051,6 +1061,13 @@ impl Engine {
             if let Some(i) = s.indices.get_mut(n) {
                 i.auto_refresh(n);
             }
+        }
+        let targets: Vec<(&str, &Value, &Value)> = names
+            .iter()
+            .filter_map(|n| s.indices.get(n).map(|i| (n.as_str(), &i.settings, &i.mappings)))
+            .collect();
+        if let Err(e) = tsdb::check_search(&targets, q.contains_key("routing"), &req) {
+            return e;
         }
         let ignore_unavailable = q.get("ignore_unavailable").is_some_and(|v| v == "true");
         if names.is_empty() && !is_wildcard {
@@ -1867,6 +1884,12 @@ impl Engine {
                 if let Some(st) = req.get("settings") {
                     apply_settings(&mut index.settings, st);
                 }
+                if let Err(e) = tsdb::validate_new_settings(&index.settings)
+                    .and_then(|_| tsdb::validate_mapping(&index.mappings))
+                    .and_then(|_| tsdb::prepare_new_mapping(&index.settings, &mut index.mappings))
+                {
+                    return e;
+                }
                 if let Some(a) = req.get("aliases").and_then(Value::as_object) {
                     index.aliases.extend(a.iter().map(|(k, v)| (k.clone(), normalize_alias(v))));
                 }
@@ -1943,6 +1966,14 @@ impl Engine {
                             return e;
                         }
                         if let Err(e) = vectors::prepare_mapping(&i.mappings, &mut next.clone()) {
+                            return e;
+                        }
+                        let mut merged = i.mappings.clone();
+                        merge(&mut merged, next.clone());
+                        if let Err(e) = tsdb::check_param_updates(&i.mappings, &next)
+                            .and_then(|_| tsdb::validate_mapping(&merged))
+                            .and_then(|_| tsdb::validate_tsdb_mapping(&i.settings, &merged))
+                        {
                             return e;
                         }
                     }
@@ -2070,6 +2101,18 @@ impl Engine {
                     Some(inner) if req.as_object().is_some_and(|m| m.len() == 1) => inner.clone(),
                     _ => req,
                 };
+                for n in &names {
+                    if let Some(i) = s.indices.get(n)
+                        && let Err(e) = tsdb::validate_settings_update(
+                            n,
+                            &i.settings,
+                            i.opened,
+                            &flat_settings(&req),
+                        )
+                    {
+                        return e;
+                    }
+                }
                 if let Err(e) = validate_settings(&req, true) {
                     return e;
                 }
@@ -2302,6 +2345,17 @@ impl Engine {
         if id.is_empty() && method != "POST" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
         }
+        if tsdb::is_time_series(&i.settings) {
+            if matches!(method, "PUT" | "POST") {
+                return write_time_series(i, index, id, kind, q, body);
+            }
+            if method == "DELETE"
+                && let Err(e) =
+                    tsdb::check_doc_access(index, id, q.get("routing").map(String::as_str))
+            {
+                return e;
+            }
+        }
         let id = if id.is_empty() { auto_id() } else { id.to_string() };
         let shards = shards_header(i);
         if matches!(method, "GET" | "HEAD")
@@ -2361,6 +2415,7 @@ impl Engine {
                     version: 0,
                     seq,
                     routing: None,
+                    tsid: None,
                 });
                 d.source = src;
                 d.version = match external {
@@ -2435,6 +2490,9 @@ impl Engine {
     ) -> (u16, Value) {
         if method != "POST" {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        if self.is_time_series_index(index) {
+            return tsdb::update_error(index);
         }
         let Some(req) = parse_json(body) else { return (400, malformed_body()) };
         const KNOWN: &[&str] = &[
@@ -2616,7 +2674,13 @@ impl Engine {
             i.order.push(id.to_string());
             i.docs.insert(
                 id.to_string(),
-                Document { source: src, version: 1, seq, routing: q.get("routing").cloned() },
+                Document {
+                    source: src,
+                    version: 1,
+                    seq,
+                    routing: q.get("routing").cloned(),
+                    tsid: None,
+                },
             );
             (201, doc_response(index, id, i.docs.get(id).unwrap(), "created"))
         };
@@ -2822,9 +2886,29 @@ impl Engine {
                 let data = lines.next().unwrap_or("").as_bytes();
                 let verb = if action == "create" { "POST" } else { "PUT" };
                 let kind = if action == "create" { "_create" } else { "_doc" };
-                let (status, res) = self.document_api(verb, ix, &id, kind, &item_q, data);
+                // A time-series index makes the `_id` itself.
+                let generated = given_id.is_none() && self.is_time_series_index(ix);
+                let (status, res) = if generated {
+                    let mut item_q = item_q.clone();
+                    item_q.insert("op_type".into(), action.into());
+                    self.document_api("POST", ix, "", kind, &item_q, data)
+                } else {
+                    self.document_api(verb, ix, &id, kind, &item_q, data)
+                };
                 errors |= status >= 300;
-                let res = bulk_item(ix, &id, status, res);
+                let mut res = bulk_item(ix, &id, status, res);
+                if generated && status >= 300 {
+                    // A conflict names the generated id (`[<id>][<tsid>@...]`).
+                    let reason = res["error"]["reason"].as_str().unwrap_or("");
+                    res["_id"] = match reason.strip_prefix('[').and_then(|r| r.split_once(']')) {
+                        Some((id, _))
+                            if res["error"]["type"] == "version_conflict_engine_exception" =>
+                        {
+                            json!(id)
+                        }
+                        _ => Value::Null,
+                    };
+                }
                 let mut item = Map::new();
                 item.insert(action.to_string(), res);
                 items.push(Value::Object(item));
@@ -3210,6 +3294,13 @@ impl Engine {
                     return e;
                 }
                 let spec = alias_spec(&req);
+                if alias_routes(&spec)
+                    && indices.iter().any(|n| {
+                        s.indices.get(n).is_some_and(|i| tsdb::is_time_series(&i.settings))
+                    })
+                {
+                    return tsdb::alias_routing_error();
+                }
                 for n in indices {
                     if let Some(i) = s.indices.get_mut(&n) {
                         i.aliases.insert(name.to_string(), spec.clone());
@@ -3343,6 +3434,13 @@ impl Engine {
                         );
                     }
                     let spec = alias_spec(v);
+                    if alias_routes(&spec)
+                        && indices.iter().any(|n| {
+                            s.indices.get(n).is_some_and(|i| tsdb::is_time_series(&i.settings))
+                        })
+                    {
+                        return tsdb::alias_routing_error();
+                    }
                     for a in &alias_names {
                         if let Err(e) = validate_alias_name(a, |n| {
                             s.indices.contains_key(n) && !drop_indices.iter().any(|d| d == n)
@@ -3430,6 +3528,12 @@ fn filtered_docs(
 /// Alias definitions as GET returns them.
 fn aliases_out(m: &HashMap<String, Value>) -> Map<String, Value> {
     m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// Whether an alias definition routes (`routing`, `index_routing` or
+/// `search_routing`), which a time-series index refuses.
+fn alias_routes(spec: &Value) -> bool {
+    ["routing", "index_routing", "search_routing"].iter().any(|k| spec.get(*k).is_some())
 }
 
 /// An alias definition from a request body (`filter`, routing,
@@ -3990,6 +4094,11 @@ impl GetOpts {
 /// One document as GET returns it: real-time from the live documents, or
 /// (`realtime=false`) from the last refresh.
 fn get_doc(i: &Index, index: &str, id: &str, o: &GetOpts) -> (u16, Value) {
+    if tsdb::is_time_series(&i.settings)
+        && let Err(e) = tsdb::check_doc_access(index, id, o.routing.as_deref())
+    {
+        return e;
+    }
     let found = if o.realtime {
         i.docs.get(id).map(|d| (d.source.clone(), d.version, d.seq))
     } else {
@@ -4044,6 +4153,7 @@ fn get_doc(i: &Index, index: &str, id: &str, o: &GetOpts) -> (u16, Value) {
             version,
             seq,
             full_source: None,
+            tsid: i.docs.get(id).and_then(|d| d.tsid.clone()),
         };
         if let Ok(f) = super::fields::fetch(&i.mappings, &doc, sf, super::fields::Kind::Stored)
             && !f.is_empty()
@@ -4186,6 +4296,77 @@ fn check_seq_no(
         return Err((409, error("version_conflict_engine_exception", &reason, 409)));
     }
     Ok(())
+}
+
+/// An index or create write to a time-series index: the `_id` comes from
+/// the document's dimensions and `@timestamp` (a given one must match),
+/// and routing is refused.
+fn write_time_series(
+    i: &mut Index,
+    index: &str,
+    requested_id: &str,
+    kind: &str,
+    q: &HashMap<String, String>,
+    body: &[u8],
+) -> (u16, Value) {
+    if q.contains_key("routing") {
+        return tsdb::routing_error(index);
+    }
+    let Some(src) = parse_json(body) else {
+        return (400, error("x_content_parse_exception", "Failed to parse content to map", 400));
+    };
+    // The document is parsed with its dynamic mapping applied (a dynamic
+    // template can add dimensions); the mapping update must still keep
+    // every routing field a dimension.
+    if let Err(e) = tsdb::check_unmapped_routing(&i.settings, &i.mappings, &src, body) {
+        return e;
+    }
+    let mut mappings = i.mappings.clone();
+    if let Err(e) = index_mapping(&mut mappings, &src, requested_id) {
+        return e;
+    }
+    let doc = match tsdb::prepare_doc(index, &i.settings, &mappings, &src, body, requested_id) {
+        Ok(d) => d,
+        Err(e) => return e,
+    };
+    if let Err(e) = tsdb::check_runtime_routing(&i.settings, &i.mappings, &src)
+        .and_then(|_| tsdb::validate_tsdb_mapping(&i.settings, &mappings))
+    {
+        return e;
+    }
+    let id = doc.id.clone();
+    // Without an id the index API creates (`op_type` defaults to `create`).
+    let create =
+        kind == "_create" || q.get("op_type").map_or(requested_id.is_empty(), |o| o == "create");
+    if create && let Some(d) = i.docs.get(&id) {
+        return tsdb::create_conflict(index, &doc, d.version);
+    }
+    if let Err(e) = check_seq_no(i.docs.get(&id), &id, q) {
+        return e;
+    }
+    i.mappings = mappings;
+    let exists = i.docs.contains_key(&id);
+    let seq = i.next_seq(&id);
+    if exists {
+        i.order.retain(|x| x != &id);
+    }
+    i.order.push(id.clone());
+    let d = i.docs.entry(id.clone()).or_insert_with(|| Document {
+        source: json!({}),
+        version: 0,
+        seq,
+        routing: None,
+        tsid: None,
+    });
+    d.source = src;
+    d.version += 1;
+    d.seq = seq;
+    d.tsid = Some(doc.tsid);
+    let mut resp = doc_response(index, &id, d, if exists { "updated" } else { "created" });
+    resp["_shards"] = shards_header(i);
+    maybe_refresh(i, index, q);
+    mark_forced_refresh(&mut resp, q);
+    (if exists { 200 } else { 201 }, resp)
 }
 
 /// Request validation for an index/create write.
@@ -4540,90 +4721,19 @@ pub(super) fn merge(a: &mut Value, b: Value) {
 /// its vectors checked (only a document Elasticsearch accepts changes it).
 fn index_mapping(m: &mut Value, src: &Value, id: &str) -> Result<(), (u16, Value)> {
     let mut next = m.clone();
-    dynamic_mapping(&mut next, src);
+    if let Err((field, within)) = super::dynamic::apply(&mut next, src) {
+        // The parser's position: the end of the (compact) document.
+        let at = serde_json::to_string(src).map_or(1, |t| t.chars().count());
+        let reason = format!(
+            "[1:{at}] mapping set to strict, dynamic introduction of [{field}] within [{within}] is not allowed"
+        );
+        return Err((400, error("strict_dynamic_mapping_exception", &reason, 400)));
+    }
     vectors::check_source(&mut next, src, id)?;
+    tsdb::check_date_nanos(&next, src, id)?;
+    super::ranges::check_doc(&next, src, id)?;
     *m = next;
     Ok(())
-}
-
-fn dynamic_mapping(m: &mut Value, src: &Value) {
-    if m.get("properties").is_none() {
-        m["properties"] = json!({});
-    }
-    let props = m["properties"].as_object_mut().unwrap();
-    if let Some(fields) = src.as_object() {
-        for (k, v) in fields {
-            // An object (or an array of them) maps its own fields, as
-            // Elasticsearch maps sub-objects: `{"properties": {...}}`.
-            let objects: Vec<&Value> = match v {
-                Value::Object(_) => vec![v],
-                Value::Array(a) => a.iter().filter(|e| e.is_object()).collect(),
-                _ => Vec::new(),
-            };
-            if let Some(existing) = props.get_mut(k) {
-                let ty = existing.get("type").and_then(Value::as_str);
-                if existing.get("properties").is_some() || matches!(ty, Some("object" | "nested")) {
-                    for o in objects {
-                        dynamic_mapping(existing, o);
-                    }
-                }
-                continue;
-            }
-            // No value (null, `[]`) maps nothing yet.
-            if v.is_null() || v.as_array().is_some_and(|a| a.iter().all(Value::is_null)) {
-                continue;
-            }
-            if !objects.is_empty() && v.as_array().is_none_or(|a| a[0].is_object()) {
-                let mut def = json!({});
-                for o in objects {
-                    dynamic_mapping(&mut def, o);
-                }
-                if def["properties"].as_object().is_some_and(Map::is_empty) {
-                    def = json!({"type": "object"});
-                }
-                props.insert(k.clone(), def);
-                continue;
-            }
-            let ty = match v {
-                // `date_detection` (on by default): an ISO date string maps
-                // as a date, not text.
-                Value::String(s) if looks_like_date(s) => "date",
-                Value::String(_) => "text",
-                Value::Bool(_) => "boolean",
-                Value::Number(n) => {
-                    if n.is_i64() {
-                        "long"
-                    } else {
-                        "float"
-                    }
-                }
-                Value::Array(a) => a
-                    .first()
-                    .map(|v| match v {
-                        Value::String(_) => "text",
-                        Value::Bool(_) => "boolean",
-                        Value::Number(n) => {
-                            if n.is_i64() {
-                                "long"
-                            } else {
-                                "float"
-                            }
-                        }
-                        Value::Object(_) => "object",
-                        _ => "object",
-                    })
-                    .unwrap_or("object"),
-                _ => "object",
-            };
-            if let Value::Array(a) = v
-                && let Some(def) = vectors::dynamic_def(a)
-            {
-                props.insert(k.clone(), def);
-                continue;
-            }
-            props.insert(k.clone(),if ty=="text"{json!({"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}})}else{json!({"type":ty})});
-        }
-    }
 }
 
 /// A new index's starting state: the defaults, then whatever the
@@ -4706,7 +4816,7 @@ fn source_filter_from_params(q: &HashMap<String, String>) -> Option<Value> {
 
 /// `strict_date_optional_time`: `yyyy-MM-dd` optionally followed by
 /// `THH:mm[:ss[.fff]]` and a zone.
-fn looks_like_date(s: &str) -> bool {
+pub(super) fn looks_like_date(s: &str) -> bool {
     let b = s.as_bytes();
     let digits =
         |r: std::ops::Range<usize>| r.clone().all(|i| b.get(i).is_some_and(u8::is_ascii_digit));
@@ -5041,6 +5151,7 @@ const KNOWN_SETTINGS: &[&str] = &[
     "max_adjacency_matrix_filters",
     "blocks",
     "routing",
+    "routing_path",
     "mapping",
     "analysis",
     "lifecycle",
@@ -5103,6 +5214,8 @@ const STATIC_SETTINGS: &[&str] = &[
     "index.soft_deletes.enabled",
     "index.store.type",
     "index.mode",
+    "index.time_series.start_time",
+    "index.routing_path",
 ];
 
 /// A settings update: unknown settings and (on an open index) static

@@ -290,7 +290,9 @@ impl Ctx<'_> {
                 Some(json!({"match_phrase": {f: {"query": text, "slop": slop}}}))
             }
             "keyword" => Some(json!({"term": {f: text}})),
-            _ => None,
+            // A quoted date or number is still one term of its type.
+            "date" | "date_nanos" => Some(json!({"range": {f: {"gte": text, "lte": text}}})),
+            _ => text.parse::<f64>().ok().map(|n| json!({"term": {f: n}})),
         })
     }
 }

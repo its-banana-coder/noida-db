@@ -17,6 +17,8 @@ enum Key {
         path: String,
         ty: Option<String>,
     },
+    /// A time-series document's `_tsid` (ordered by its bytes).
+    Tsid,
     /// `_geo_distance`: from `origin` (lat, lon), in meters per `unit`.
     Geo {
         path: String,
@@ -108,6 +110,7 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
             }
             "_score" => Key::Score,
             "_doc" | "_shard_doc" => Key::Doc,
+            "_tsid" => Key::Tsid,
             f => {
                 let (path, ty) = resolve_field(mappings, f);
                 let unmapped = opts.get("unmapped_type").and_then(Value::as_str);
@@ -163,9 +166,9 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
 /// One field value as a sort key of the field's type.
 fn typed_value(v: &Value, ty: Option<&str>) -> Option<Value> {
     match ty {
-        Some(t) if t == "date" || t == "date_nanos" => {
-            dates::value_millis(v, None).map(|m| json!(m))
-        }
+        // `date_nanos` sorts (and reports) nanoseconds.
+        Some("date_nanos") => super::tsdb::date_nanos(v).map(|n| json!(n)),
+        Some(t) if t == "date" => dates::value_millis(v, None).map(|m| json!(m)),
         Some(t) if is_long(t) => match v {
             Value::Number(n) => {
                 n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).map(|n| json!(n))
@@ -233,6 +236,7 @@ pub fn keys(specs: &[SortSpec], doc: &CommittedDoc, doc_idx: usize, score: f32) 
         .map(|s| match &s.key {
             Key::Score => json!(score),
             Key::Doc => json!(doc_idx),
+            Key::Tsid => doc.tsid.as_ref().map_or(Value::Null, |t| json!(t)),
             Key::Geo { path, origin, unit_m } => {
                 let mode_max = s.mode.as_deref() == Some("max") || (s.mode.is_none() && s.desc);
                 match super::queries::sort_distance(doc, path, *origin, *unit_m, mode_max) {
@@ -281,7 +285,12 @@ pub fn compare_keys(specs: &[SortSpec], a: &[Value], b: &[Value]) -> Ordering {
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
             _ => {
-                let o = compare_values(x, y);
+                let o = match (&s.key, x, y) {
+                    (Key::Tsid, Value::String(a), Value::String(b)) => {
+                        super::tsdb::tsid_sort_key(a).cmp(&super::tsdb::tsid_sort_key(b))
+                    }
+                    _ => compare_values(x, y),
+                };
                 if s.desc { o.reverse() } else { o }
             }
         };
@@ -305,6 +314,9 @@ pub fn after_keys(specs: &[SortSpec], after: &[Value]) -> Result<Vec<Value>, EsE
         .iter()
         .zip(after)
         .map(|(s, v)| match &s.key {
+            Key::Field { ty, .. } if ty.as_deref() == Some("date_nanos") && v.is_number() => {
+                v.clone()
+            }
             Key::Field { ty, .. } => typed_value(v, ty.as_deref()).unwrap_or_else(|| v.clone()),
             _ => v.clone(),
         })
