@@ -48,7 +48,7 @@ pub enum CharFilter {
         rules: Vec<(Vec<char>, Vec<char>)>,
     },
     PatternReplace {
-        re: Regex,
+        re: JPattern,
         replacement: String,
     },
 }
@@ -137,7 +137,7 @@ pub fn parse_mapping_rules(rules: &[String]) -> Result<Vec<(Vec<char>, Vec<char>
         out.retain(|(f, _)| *f != from);
         out.push((from, to));
     }
-    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out.sort_by_key(|r| std::cmp::Reverse(r.0.len()));
     Ok(out)
 }
 

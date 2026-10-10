@@ -535,7 +535,7 @@ fn pattern(text: &[char], re: &JPattern, group: i64) -> Vec<Token> {
     } else {
         for g in re.captures_all(text) {
             if let Some(Some((a, b))) = g.get(group as usize)
-                && b > *a
+                && *b > *a
             {
                 out.push(piece(text, *a, *b));
             }

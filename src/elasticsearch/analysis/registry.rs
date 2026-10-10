@@ -443,7 +443,7 @@ impl Defs<'_> {
                 } else {
                     match stemmers::snowball_algorithm(lang) {
                         Some(a) => TokenFilter::Stem(Stem::Snowball(a)),
-                        None => return Err(iae(format!("Unknown snowball language [{lang}]"))),
+                        None => return Err(invalid_stemmer(lang)),
                     }
                 }
             }
@@ -613,6 +613,91 @@ impl Defs<'_> {
             "delimited_payload" => TokenFilter::DelimitedPayload {
                 delimiter: p_str(def, "delimiter").and_then(|s| s.chars().next()).unwrap_or('|'),
             },
+            "keep" => {
+                if def.get("keep_words").is_none() && def.get("keep_words_path").is_none() {
+                    return Err(iae("keep requires either `keep_words` or `keep_words_path` to be configured"));
+                }
+                let case = p_bool(def, "keep_words_case", false)?;
+                TokenFilter::Keep {
+                    words: p_list(def, "keep_words")
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|w| if case { w } else { w.to_lowercase() })
+                        .collect(),
+                    case_sensitive: case,
+                }
+            }
+            "keep_types" => {
+                let Some(types) = p_list(def, "types") else {
+                    return Err(iae("keep_types requires `types` to be configured"));
+                };
+                let include = match p_str(def, "mode").unwrap_or("include") {
+                    "include" => true,
+                    "exclude" => false,
+                    m => {
+                        return Err(iae(format!(
+                            "`mode` must be `include` or `exclude` for token filter [{name}] but was [{m}]"
+                        )));
+                    }
+                };
+                TokenFilter::KeepTypes { types: types.into_iter().collect(), include }
+            }
+            "pattern_capture" => {
+                let Some(pats) = p_list_raw(def, "patterns") else {
+                    return Err(iae(format!(
+                        "required setting 'patterns' is missing for token filter [{name}]"
+                    )));
+                };
+                let mut patterns = Vec::new();
+                for p in &pats {
+                    patterns.push(regex(p, "")?);
+                }
+                TokenFilter::PatternCapture { patterns, preserve: p_bool(def, "preserve_original", true)? }
+            }
+            "common_grams" => {
+                let words = p_list(def, "common_words").unwrap_or_default();
+                if words.is_empty() && def.get("common_words_path").is_none() {
+                    return Err(iae("missing or empty [common_words] or [common_words_path] configuration for common_grams token filter"));
+                }
+                TokenFilter::CommonGrams {
+                    words: words.into_iter().collect(),
+                    ignore_case: p_bool(def, "ignore_case", false)?,
+                    query_mode: p_bool(def, "query_mode", false)?,
+                }
+            }
+            "multiplexer" => {
+                let mut chains = Vec::new();
+                for entry in p_list_raw(def, "filters").unwrap_or_default() {
+                    let mut chain = Vec::new();
+                    for f in entry.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+                        match self.filter_named(f, prev) {
+                            Some(r) => chain.push(r?),
+                            None => {
+                                return Err(iae(format!("Unknown token filter type [{f}]")));
+                            }
+                        }
+                    }
+                    chains.push(chain);
+                }
+                TokenFilter::Multiplexer { chains, preserve: p_bool(def, "preserve_original", true)? }
+            }
+            "dictionary_decompounder" => {
+                let words = p_list(def, "word_list").unwrap_or_default();
+                if words.is_empty() && def.get("word_list_path").is_none() {
+                    return Err(iae(format!(
+                        "word_list must be provided for [{name}], either as a path to a file, or directly"
+                    )));
+                }
+                TokenFilter::Decompounder {
+                    words: words.into_iter().map(|w| w.to_lowercase()).collect(),
+                    min_word: p_usize(def, "min_word_size", 5)?,
+                    min_sub: p_usize(def, "min_subword_size", 2)?,
+                    max_sub: p_usize(def, "max_subword_size", 15)?,
+                    longest_only: p_bool(def, "only_longest_match", false)?,
+                }
+            }
+            "scandinavian_folding" => TokenFilter::ScandinavianFolding,
+            "scandinavian_normalization" => TokenFilter::ScandinavianNormalization,
             "flatten_graph" | "type_as_payload" | "standard" => TokenFilter::Identity,
             other => return Err(iae(format!("Unknown filter type [{other}] for [{name}]"))),
         })
@@ -978,6 +1063,12 @@ fn default_articles() -> HashSet<String> {
         .collect()
 }
 
+fn invalid_stemmer(lang: &str) -> AnalysisError {
+    let mut c = lang.chars();
+    let cap: String = c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default();
+    AnalysisError::new("illegal_argument_exception", format!("Invalid stemmer class specified: {cap}"))
+}
+
 fn stemmer_filter(lang: &str) -> Result<TokenFilter, AnalysisError> {
     let l = lang.to_ascii_lowercase();
     Ok(TokenFilter::Stem(match l.as_str() {
@@ -999,7 +1090,7 @@ fn stemmer_filter(lang: &str) -> Result<TokenFilter, AnalysisError> {
                 .trim_end_matches("2");
             match stemmers::snowball_algorithm(base) {
                 Some(a) => Stem::Snowball(a),
-                None => return Err(iae(format!("Unknown stemmer [{lang}]"))),
+                None => return Err(invalid_stemmer(lang)),
             }
         }
     }))
@@ -1019,6 +1110,17 @@ fn builtin_filter(name: &str) -> Option<TokenFilter> {
             remove_trailing: true,
         },
         "porter_stem" => TokenFilter::Stem(Stem::Porter),
+        "scandinavian_folding" => TokenFilter::ScandinavianFolding,
+        "scandinavian_normalization" => TokenFilter::ScandinavianNormalization,
+        "arabic_stem" | "armenian_stem" | "basque_stem" | "catalan_stem" | "danish_stem"
+        | "dutch_stem" | "finnish_stem" | "french_stem" | "german_stem" | "hungarian_stem"
+        | "italian_stem" | "norwegian_stem" | "portuguese_stem" | "romanian_stem"
+        | "russian_stem" | "spanish_stem" | "swedish_stem" | "turkish_stem" | "lithuanian_stem"
+        | "irish_stem" | "estonian_stem" | "sorani_stem" | "bulgarian_stem" | "hindi_stem"
+        | "indonesian_stem" | "latvian_stem" | "german2_stem" | "kp_stem" | "lovins_stem"
+        | "brazilian_stem" | "czech_stem" | "galician_stem" | "persian_stem" => {
+            return stemmer_filter(name.trim_end_matches("_stem")).ok();
+        }
         "kstem" => TokenFilter::Stem(Stem::KStem),
         "stemmer" => TokenFilter::Stem(Stem::Porter),
         "snowball" => TokenFilter::Stem(Stem::Snowball(rust_stemmers::Algorithm::English)),

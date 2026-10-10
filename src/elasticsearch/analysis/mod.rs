@@ -6,6 +6,7 @@
 //! An index's analysis settings reach the search code through a
 //! per-request scope ([`enter`]), set up by the engine before it runs a
 //! request against that index; built analyzers are cached in it.
+#![allow(clippy::type_complexity, clippy::enum_variant_names, clippy::collapsible_if, clippy::explicit_counter_loop)]
 
 mod api;
 mod backtrack;

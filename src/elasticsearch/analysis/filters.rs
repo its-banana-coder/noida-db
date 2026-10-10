@@ -557,32 +557,26 @@ fn common_grams(tokens: Vec<Token>, words: &HashSet<String>, ignore_case: bool) 
 /// Lucene's `CommonGramsQueryFilter` over a common-grams stream: a word
 /// is dropped when a gram starts at it, and the last word after a gram.
 fn common_grams_query(stream: Vec<Token>) -> Vec<Token> {
-    let mut out = Vec::new();
-    let mut previous: Option<Token> = None;
-    let mut previous_was_gram = false;
-    let fix = |mut t: Token| {
+    // (token, dropped): a word is dropped when a gram starts or ends at it.
+    let mut items: Vec<(Token, bool)> = Vec::new();
+    let mut last_word: Option<usize> = None;
+    let mut drop_next = false;
+    for t in stream {
         if t.ty == "gram" {
-            t.pos_inc = 1;
-            t.pos_len = 1;
+            if let Some(i) = last_word {
+                items[i].1 = true;
+            }
+            drop_next = true;
+            let mut g = t;
+            g.pos_inc = 1;
+            g.pos_len = 1;
+            items.push((g, false));
+        } else {
+            last_word = Some(items.len());
+            items.push((t, std::mem::take(&mut drop_next)));
         }
-        t
-    };
-    for cur in stream {
-        if cur.ty != "gram"
-            && let Some(p) = previous.take()
-        {
-            previous_was_gram = p.ty == "gram";
-            out.push(fix(p));
-        }
-        previous = Some(cur);
     }
-    if let Some(p) = previous
-        && !(previous_was_gram && p.ty != "gram" && false)
-        && !out.last().is_some_and(|l: &Token| l.ty == "gram" && p.ty != "gram")
-    {
-        out.push(fix(p));
-    }
-    out
+    items.into_iter().filter(|(_, d)| !d).map(|(t, _)| t).collect()
 }
 
 fn scandinavian_folding(t: &str) -> String {
@@ -755,13 +749,13 @@ fn cjk_width(t: &str) -> String {
             {
                 let p = *prev as u32;
                 let voiced =
-                    matches!(p, 0x30AB..=0x30C2 | 0x30C4..=0x30C9 | 0x30CF..=0x30DD) && p % 1 == 0;
+                    matches!(p, 0x30AB..=0x30C2 | 0x30C4..=0x30C9 | 0x30CF..=0x30DD);
                 if u == 0xFF9E && p == 0x30A6 {
                     *prev = 'ヴ';
                     continue;
                 }
                 if voiced {
-                    let is_ha_row = (0x30CF..=0x30DD).contains(&p) && (p - 0x30CF) % 3 == 0;
+                    let is_ha_row = (0x30CF..=0x30DD).contains(&p) && (p - 0x30CF).is_multiple_of(3);
                     let is_kt_row = matches!(p, 0x30AB..=0x30C2 | 0x30C4..=0x30C9) && {
                         let base = if p >= 0x30C4 { p - 0x30C4 } else { p - 0x30AB };
                         base % 2 == 0
