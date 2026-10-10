@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 use super::templates::Templates;
 use super::vectors;
 
+mod ingest;
+mod lifecycle;
+mod reindex;
+mod scripts;
+mod snapshots;
+
 #[derive(Default, Serialize, Deserialize)]
 struct State {
     indices: HashMap<String, Index>,
@@ -26,6 +32,10 @@ struct State {
     /// `PUT _cluster/settings` values (persistent, transient).
     #[serde(default)]
     cluster_settings: HashMap<String, Value>,
+    /// Snapshot repositories and snapshots, ingest pipelines and stored
+    /// scripts (see `lifecycle.rs`).
+    #[serde(default)]
+    admin: lifecycle::Admin,
     /// Open scrolls and points in time (in memory only, like a node's).
     #[serde(skip)]
     contexts: HashMap<String, SearchContext>,
@@ -310,6 +320,20 @@ impl Engine {
             .collect();
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let q = query_params(query);
+        // Stored scripts a request names by `id` run as inline scripts.
+        let inlined;
+        let body = match self.inline_stored_scripts(&segments, body) {
+            Ok(Some(b)) => {
+                inlined = b;
+                &inlined[..]
+            }
+            Ok(None) => body,
+            Err(e) => return e,
+        };
+        // Rollover, resize, blocks, snapshots, ingest, stored scripts, ...
+        if let Some(r) = self.lifecycle_route(method, &segments, &q, body) {
+            return r;
+        }
         if path == "/" || path.is_empty() {
             return (
                 200,
@@ -548,10 +572,10 @@ impl Engine {
             }
             "_analyze" => self.analyze(body),
             "_doc" | "_create" | "_source" if segments.len() == 3 => {
-                self.document_api(method, index_name, segments[2], segments[1], &q, body)
+                self.index_with_pipelines(method, index_name, segments[2], segments[1], &q, body)
             }
             "_doc" if method == "POST" && segments.len() == 2 => {
-                self.document_api(method, index_name, "", "_doc", &q, body)
+                self.index_with_pipelines(method, index_name, "", "_doc", &q, body)
             }
             "_bulk" => self.bulk(method, index_name, &q, body),
             "_update" if segments.len() == 3 => {
@@ -2268,6 +2292,11 @@ impl Engine {
         {
             return e;
         }
+        if matches!(method, "PUT" | "POST" | "DELETE")
+            && let Some(e) = lifecycle::write_blocked(&s, index)
+        {
+            return e;
+        }
         // Real Elasticsearch auto-creates an index on its first write
         // (`action.auto_create_index`, on by default) -- found via
         // testing before a public release: this engine required the
@@ -2485,6 +2514,9 @@ impl Engine {
             );
         }
         let mut s = self.0.lock().unwrap();
+        if let Some(e) = lifecycle::write_blocked(&s, index) {
+            return e;
+        }
         if !s.indices.contains_key(index) {
             if req.get("upsert").is_none() && req.get("doc_as_upsert").is_none() {
                 return missing_index(index);
@@ -2731,7 +2763,9 @@ impl Engine {
             let id = given_id.map(str::to_string).unwrap_or_else(auto_id);
             // Per-item options, as the single-document APIs take them.
             let mut item_q: HashMap<String, String> = HashMap::new();
-            for k in ["routing", "version", "version_type", "if_seq_no", "if_primary_term"] {
+            for k in
+                ["routing", "version", "version_type", "if_seq_no", "if_primary_term", "pipeline"]
+            {
                 if let Some(v) = opts.get(k) {
                     item_q.insert(
                         k.to_string(),
@@ -2739,8 +2773,10 @@ impl Engine {
                     );
                 }
             }
-            if let Some(r) = q.get("routing") {
-                item_q.entry("routing".into()).or_insert_with(|| r.clone());
+            for k in ["routing", "pipeline"] {
+                if let Some(r) = q.get(k) {
+                    item_q.entry(k.into()).or_insert_with(|| r.clone());
+                }
             }
             for k in ["_source", "_source_includes", "_source_excludes"] {
                 if let Some(v) = q.get(k) {
@@ -2822,7 +2858,7 @@ impl Engine {
                 let data = lines.next().unwrap_or("").as_bytes();
                 let verb = if action == "create" { "POST" } else { "PUT" };
                 let kind = if action == "create" { "_create" } else { "_doc" };
-                let (status, res) = self.document_api(verb, ix, &id, kind, &item_q, data);
+                let (status, res) = self.index_with_pipelines(verb, ix, &id, kind, &item_q, data);
                 errors |= status >= 300;
                 let res = bulk_item(ix, &id, status, res);
                 let mut item = Map::new();

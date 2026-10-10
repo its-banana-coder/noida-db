@@ -371,6 +371,10 @@ class Runner:
                 if actual is None or not hasattr(actual, "__len__") or len(actual) != self.subst(n):
                     raise Fail(f"length {path}: expected {n}, got {json.dumps(actual)[:200]}")
             return
+        if kind == "exists":
+            if self.lookup(self.subst(arg)) is None:
+                raise Fail(f"exists {arg}: missing")
+            return
         if kind in ("is_true", "is_false"):
             v = self.lookup(self.subst(arg))
             # As the Java runner: only null, false, "", "false" and 0 are false.
@@ -430,6 +434,16 @@ class Runner:
             streams = []
         for ds in streams:
             calls.append(("DELETE", f"/_data_stream/{urllib.parse.quote(ds)}", {}))
+        # Snapshots and repositories go too (the Java runner's
+        # wipeSnapshots): a snapshot left behind would clash by name.
+        try:
+            status, raw, _ = self.http("GET", "/_snapshot/_all", {}, None, {}, False)
+            for repo, spec in (json.loads(raw) if status == 200 else {}).items():
+                if spec.get("type") == "fs":
+                    calls.append(("DELETE", f"/_snapshot/{urllib.parse.quote(repo)}/*", {}))
+                calls.append(("DELETE", f"/_snapshot/{urllib.parse.quote(repo)}", {}))
+        except Exception:  # noqa: BLE001
+            pass
         # Dot-prefixed indices a test created go too (as the Java runner's
         # wipe does); a real system index just refuses the delete.
         for n in names:
