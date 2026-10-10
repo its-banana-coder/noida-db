@@ -399,6 +399,63 @@ fn new_field(
     })))
 }
 
+/// What dynamic mapping adds besides objects' own properties.
+struct DynState {
+    /// New fields under `dynamic: runtime` objects: root runtime fields.
+    runtime: Map<String, Value>,
+    /// How many more fields may be mapped when the index ignores dynamic
+    /// fields beyond `index.mapping.total_fields.limit` (`None`: no limit
+    /// kept).
+    budget: Option<usize>,
+}
+
+impl DynState {
+    /// Takes `n` fields from the budget, if they fit.
+    fn take(&mut self, n: usize) -> bool {
+        match &mut self.budget {
+            None => true,
+            Some(left) if *left >= n => {
+                *left -= n;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+}
+
+/// The fields left under `index.mapping.total_fields.limit` (objects,
+/// multi-fields and runtime fields count) -- kept only with
+/// `ignore_dynamic_beyond_limit`.
+fn dynamic_budget(m: &Value, settings: &Value) -> Option<usize> {
+    fn count(m: &Value) -> usize {
+        m.get("properties")
+            .and_then(Value::as_object)
+            .map_or(0, |props| props.values().map(|d| 1 + count(d) + multi_fields(d)).sum())
+    }
+    let ignore = &settings["index"]["mapping"]["total_fields"]["ignore_dynamic_beyond_limit"];
+    if !(ignore == true || ignore == "true") {
+        return None;
+    }
+    let limit = setting_u64(settings, "total_fields", "limit").unwrap_or(1000) as usize;
+    let runtime = m.get("runtime").and_then(Value::as_object).map_or(0, Map::len);
+    Some(limit.saturating_sub(count(m) + runtime))
+}
+
+fn multi_fields(def: &Value) -> usize {
+    def.get("fields").and_then(Value::as_object).map_or(0, Map::len)
+}
+
+/// Every value of a (possibly nested) array but nulls and objects.
+fn scalars(a: &[Value]) -> Vec<&Value> {
+    a.iter()
+        .flat_map(|v| match v {
+            Value::Array(inner) => scalars(inner),
+            Value::Null | Value::Object(_) => vec![],
+            other => vec![other],
+        })
+        .collect()
+}
+
 /// Dynamic mapping of the fields of `src` (an object at `path`) into
 /// `node` (that object's mapping).
 #[allow(clippy::too_many_arguments)]
@@ -408,7 +465,7 @@ fn map_object(
     path: &str,
     dynamic: Dynamic,
     root: &Value,
-    runtime: &mut Map<String, Value>,
+    st: &mut DynState,
     ctx: &Ctx,
     at: &dyn Fn(&str, bool) -> String,
 ) -> Result<(), Failure> {
@@ -423,11 +480,13 @@ fn map_object(
             }
             let d = dynamic_of(child, dynamic);
             for o in objects(v) {
-                map_object(child, o, &full, d, root, runtime, ctx, at)?;
+                map_object(child, o, &full, d, root, st, ctx, at)?;
             }
             continue;
         }
-        if root.get("runtime").and_then(|r| r.get(&full)).is_some() || runtime.contains_key(&full) {
+        if root.get("runtime").and_then(|r| r.get(&full)).is_some()
+            || st.runtime.contains_key(&full)
+        {
             continue;
         }
         if v.is_null() || v.as_array().is_some_and(|a| a.iter().all(Value::is_null)) {
@@ -452,9 +511,39 @@ fn map_object(
         match new_field(k, &full, v, dynamic, root, ctx, at)? {
             None => {}
             Some(NewField::Runtime(def)) => {
-                runtime.insert(full.clone(), def);
+                if st.take(1) {
+                    st.runtime.insert(full.clone(), def);
+                }
             }
             Some(NewField::Mapped(def)) => {
+                // Every value of an array maps the same way.
+                if let Value::Array(a) = v
+                    && !is_object_def(&def)
+                    && def.get("type").and_then(Value::as_str) != Some("dense_vector")
+                {
+                    let first = def.get("type").and_then(Value::as_str).unwrap_or("");
+                    for x in scalars(a) {
+                        let Some(NewField::Mapped(d)) =
+                            new_field(k, &full, x, dynamic, root, ctx, at)?
+                        else {
+                            continue;
+                        };
+                        let ty = d.get("type").and_then(Value::as_str).unwrap_or("");
+                        if !ty.is_empty() && ty != first {
+                            let reason = format!(
+                                "mapper [{full}] cannot be changed from type [{first}] to [{ty}]"
+                            );
+                            return Err((
+                                400,
+                                json!({"error": {"root_cause": [{"type": "illegal_argument_exception", "reason": reason}],
+                                    "type": "illegal_argument_exception", "reason": reason}, "status": 400}),
+                            ));
+                        }
+                    }
+                }
+                if !st.take(1 + multi_fields(&def)) {
+                    continue;
+                }
                 if node.get("properties").is_none() {
                     node["properties"] = json!({});
                 }
@@ -463,7 +552,7 @@ fn map_object(
                 if is_object_def(child) && child.get("enabled") != Some(&json!(false)) {
                     let d = dynamic_of(child, dynamic);
                     for o in objects(v) {
-                        map_object(child, o, &full, d, root, runtime, ctx, at)?;
+                        map_object(child, o, &full, d, root, st, ctx, at)?;
                     }
                     if child.get("type").is_none()
                         && child
@@ -597,8 +686,22 @@ fn check_number(
             let plain = s
                 .bytes()
                 .all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E'));
+            let java = matches!(s.trim_start_matches(['-', '+']), "NaN" | "Infinity");
             match s.parse::<f64>() {
                 Ok(f) if plain && f.is_finite() => f,
+                // A floating point type parses `NaN`, `Infinity` (and
+                // overflows to it), then refuses the value.
+                Ok(f) if !integral && (plain || java) => {
+                    let shown = if f.is_nan() {
+                        "NaN".to_string()
+                    } else if f > 0.0 {
+                        "Infinity".to_string()
+                    } else {
+                        "-Infinity".to_string()
+                    };
+                    let verb = if ty == "scaled_float" { "only supports" } else { "supports only" };
+                    return Err(iae(&format!("[{ty}] {verb} finite values, but got [{shown}]")));
+                }
                 _ => return Err(iae(&format!("For input string: \"{s}\""))),
             }
         }
@@ -909,6 +1012,10 @@ impl Positions {
 /// checked.
 pub fn parse(mappings: &mut Value, src: &Value, ctx: &Ctx) -> Result<(), Failure> {
     let Some(obj) = src.as_object() else { return Ok(()) };
+    // A disabled root maps and checks nothing: the source is kept as sent.
+    if mappings.get("enabled") == Some(&json!(false)) {
+        return Ok(());
+    }
     let serialized;
     let raw = match ctx.raw {
         Some(r) => r,
@@ -921,14 +1028,14 @@ pub fn parse(mappings: &mut Value, src: &Value, ctx: &Ctx) -> Result<(), Failure
     let at = |path: &str, end: bool| pos.at(path, 0, end);
     let mut next = mappings.clone();
     let root = next.clone();
-    let mut runtime = Map::new();
+    let mut st = DynState { runtime: Map::new(), budget: dynamic_budget(&root, ctx.settings) };
     let dynamic = dynamic_of(&root, Dynamic::True);
-    map_object(&mut next, obj, "", dynamic, &root, &mut runtime, ctx, &at)?;
-    if !runtime.is_empty() {
+    map_object(&mut next, obj, "", dynamic, &root, &mut st, ctx, &at)?;
+    if !st.runtime.is_empty() {
         if next.get("runtime").is_none() {
             next["runtime"] = json!({});
         }
-        for (k, v) in runtime {
+        for (k, v) in st.runtime {
             next["runtime"][k] = v;
         }
     }
@@ -1009,18 +1116,35 @@ pub fn ignored_values(
 }
 
 /// A mapping as Elasticsearch stores (and shows) it: `dynamic` as a
-/// string, and no `"type": "object"` on an object that has properties.
+/// string (`false` is `"false"`), and `"type": "object"` spelled out only
+/// on an object without fields.
 pub fn normalize(m: &mut Value) {
     let Some(o) = m.as_object_mut() else { return };
     if let Some(Value::Bool(b)) = o.get("dynamic") {
         let s = b.to_string();
         o.insert("dynamic".into(), Value::String(s));
     }
-    if o.get("type").and_then(Value::as_str) == Some("object") && o.contains_key("properties") {
-        o.remove("type");
-    }
     if let Some(Value::Object(props)) = o.get_mut("properties") {
-        props.values_mut().for_each(normalize);
+        for def in props.values_mut() {
+            normalize(def);
+            if let Some(d) = def.as_object_mut() {
+                object_def(d);
+            }
+        }
+    }
+}
+
+/// An object field's mapping as Elasticsearch shows it: `"type":
+/// "object"` spelled out only for an object without fields.
+fn object_def(o: &mut Map<String, Value>) {
+    if o.get("type").and_then(Value::as_str).is_some_and(|t| t != "object") {
+        return;
+    }
+    if o.get("properties").and_then(Value::as_object).is_some_and(|p| !p.is_empty()) {
+        o.remove("type");
+    } else {
+        o.remove("properties");
+        o.insert("type".into(), json!("object"));
     }
 }
 
@@ -1113,5 +1237,34 @@ mod tests {
         assert_eq!(m["properties"]["d_f"], json!({"type": "float"}));
         assert_eq!(m["properties"]["o"]["properties"]["p"], json!({"type": "date"}));
         assert_eq!(m["properties"]["t"]["format"], "yyyy/MM/dd HH:mm:ss||yyyy/MM/dd||epoch_millis");
+    }
+
+    #[test]
+    fn mixed_arrays_limits_and_non_finite_values() {
+        let settings = json!({});
+        let fail = |m: &mut Value, raw: &str, settings: &Value| {
+            let (_, e) =
+                parse(m, &serde_json::from_str(raw).unwrap(), &ctx(raw, settings)).unwrap_err();
+            e["error"].clone()
+        };
+        let mut m = json!({"properties": {}});
+        assert_eq!(
+            fail(&mut m, r#"{"x":[1,"a"]}"#, &settings)["reason"],
+            "mapper [x] cannot be changed from type [long] to [text]"
+        );
+        let mut m = json!({"properties": {"d": {"type": "double"}}});
+        assert_eq!(
+            fail(&mut m, r#"{"d":"NaN"}"#, &settings)["caused_by"]["reason"],
+            "[double] supports only finite values, but got [NaN]"
+        );
+        // Beyond the total fields limit, new fields stay unmapped.
+        let settings = json!({"index": {"mapping": {"total_fields": {
+            "limit": "3", "ignore_dynamic_beyond_limit": "true"}}}});
+        let mut m = json!({"properties": {"a": {"type": "keyword"}}});
+        let raw = r#"{"b":1,"c":"x","o":{"p":1}}"#;
+        parse(&mut m, &serde_json::from_str(raw).unwrap(), &ctx(raw, &settings)).unwrap();
+        assert_eq!(m["properties"]["b"], json!({"type": "long"}));
+        assert!(m["properties"].get("c").is_none());
+        assert_eq!(m["properties"]["o"], json!({"type": "object"}));
     }
 }

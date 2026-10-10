@@ -915,6 +915,7 @@ mod tests {
             version: 1,
             seq: 0,
             full_source: None,
+            tsid: None,
         }
     }
 

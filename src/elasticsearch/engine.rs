@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex};
 use super::analysis;
 use super::cat;
 use super::dates;
+use super::index_sort;
+use super::names;
 use super::painless;
 use super::search::{self, CommittedDoc};
 use super::suggest;
+use super::synthetic;
 use super::termvectors;
 
 #[derive(Clone)]
@@ -194,13 +197,14 @@ impl Index {
             };
             order.sort_by_key(|id| rank(id));
         }
+        // Searches see `_source` as the index returns it (synthetic or not).
         self.committed = order
             .into_iter()
             .filter_map(|id| {
                 self.docs.get(id).map(|d| CommittedDoc {
                     index: name.to_string(),
                     id: id.clone(),
-                    source: d.source.clone(),
+                    source: synthetic::view(&self.mappings, &self.settings, &d.source),
                     version: d.version,
                     seq: d.seq,
                     full_source: None,
@@ -208,6 +212,7 @@ impl Index {
                 })
             })
             .collect();
+        index_sort::apply(&self.settings, &self.mappings, &mut self.committed);
     }
 
     /// Whether `@timestamp` is mapped as a date (segments then sort by it).
@@ -395,14 +400,31 @@ impl Engine {
             .filter(|s| !s.is_empty())
             .map(percent_decode_segment)
             .collect();
-        // Date math in the index expression: `<logs-{now/d}>`.
-        if let Some(first) = decoded.first_mut()
-            && first.contains('<')
-        {
-            *first = first.split(',').map(super::names::resolve).collect::<Vec<_>>().join(",");
+        // Date math in index and alias names (`<logs-{now/d}>`).
+        for n in 0..decoded.len() {
+            let names_part =
+                n == 0 || (n > 0 && matches!(decoded[n - 1].as_str(), "_alias" | "_aliases"));
+            if names_part && decoded[n].contains('<') {
+                match names::resolve_list(&decoded[n]) {
+                    Ok(r) => decoded[n] = r,
+                    Err(e) => return (400, error("parse_exception", &e, 400)),
+                }
+            }
         }
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let q = query_params(query);
+        if let Some(v) = q.get("force_synthetic_source")
+            && !matches!(v.as_str(), "true" | "false" | "")
+        {
+            return (
+                400,
+                error(
+                    "illegal_argument_exception",
+                    &format!("Failed to parse value [{v}] as only [true] or [false] are allowed."),
+                    400,
+                ),
+            );
+        }
         // Stored scripts a request names by `id` run as inline scripts.
         let inlined;
         let body = match self.inline_stored_scripts(&segments, body) {
@@ -1382,6 +1404,14 @@ impl Engine {
             }
             (json!({"properties": props}), docs, !names.is_empty())
         };
+        let docs = if q.get("force_synthetic_source").is_some_and(|v| v == "true" || v.is_empty()) {
+            match force_synthetic(&s, &names, docs) {
+                Ok(d) => d,
+                Err(e) => return (e.status, e.to_json()),
+            }
+        } else {
+            docs
+        };
         // Every primary shard of the targets is searched.
         let shard_total: u64 =
             names.iter().filter_map(|n| s.indices.get(n)).map(|i| shard_counts(i).0.max(1)).sum();
@@ -1958,12 +1988,24 @@ impl Engine {
                     merge(&mut index.mappings, m);
                     suggest::normalize_mappings(&mut index.mappings);
                     super::docparse::normalize(&mut index.mappings);
+                    synthetic::tidy_source(&mut index.mappings);
                 }
                 if let Some(st) = req.get("settings") {
                     if let Err(e) = translog_retention_check(st) {
                         return e;
                     }
                     apply_settings(&mut index.settings, st);
+                }
+                if index.settings["index"]["soft_deletes"]["enabled"] == "false" {
+                    return (
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            "Creating indices with soft-deletes disabled is no longer supported. \
+                             Please do not specify a value for setting [index.soft_deletes.enabled].",
+                            400,
+                        ),
+                    );
                 }
                 if let Err(e) = tsdb::validate_new_settings(&index.settings)
                     .and_then(|_| tsdb::validate_mapping(&index.mappings))
@@ -1972,7 +2014,20 @@ impl Engine {
                     return e;
                 }
                 if let Some(a) = req.get("aliases").and_then(Value::as_object) {
-                    index.aliases.extend(a.iter().map(|(k, v)| (k.clone(), normalize_alias(v))));
+                    for (k, v) in a {
+                        match names::resolve(k) {
+                            Ok(alias) => {
+                                index.aliases.insert(alias, normalize_alias(v));
+                            }
+                            Err(e) => return (400, error("parse_exception", &e, 400)),
+                        }
+                    }
+                }
+                if let Err(e) = synthetic::check_mapping(&index.mappings, &index.settings) {
+                    return e;
+                }
+                if let Err(e) = index_sort::validate(&index.settings, &index.mappings) {
+                    return e;
                 }
                 index.sort_on_timestamp = index.timestamp_mapped();
                 s.indices.insert(name.to_string(), index);
@@ -2047,6 +2102,14 @@ impl Engine {
                         if let Err(e) = validate_mapping(&i.mappings, &next) {
                             return e;
                         }
+                        let mut merged = i.mappings.clone();
+                        synthetic::put_source(&mut merged, &next);
+                        merge(&mut merged, next.clone());
+                        if let Err(e) =
+                            synthetic::check_update(&i.mappings, &next, &merged, &i.settings)
+                        {
+                            return e;
+                        }
                         if let Err(e) = vectors::prepare_mapping(&i.mappings, &mut next.clone()) {
                             return e;
                         }
@@ -2065,9 +2128,11 @@ impl Engine {
                 }
                 for n in &names {
                     if let Some(i) = s.indices.get_mut(n) {
+                        synthetic::put_source(&mut i.mappings, &next);
                         merge(&mut i.mappings, next.clone());
                         suggest::normalize_mappings(&mut i.mappings);
                         super::docparse::normalize(&mut i.mappings);
+                        synthetic::tidy_source(&mut i.mappings);
                     }
                 }
                 (200, json!({"acknowledged":true}))
@@ -2698,8 +2763,10 @@ impl Engine {
         }
         let visible = routed_visible(i, id, q.get("routing").map(String::as_str));
         let mut result = if let Some(d) = i.docs.get(id).filter(|_| visible) {
+            // An update starts from `_source` as a get returns it.
+            let current = synthetic::view(&i.mappings, &i.settings, &d.source);
             let (new_source, op) = match &script {
-                Some(sc) => match run_script(sc, d.source.clone(), "index", d.version) {
+                Some(sc) => match run_script(sc, current.clone(), "index", d.version) {
                     Ok(ctx) => (
                         ctx.get("_source").cloned().unwrap_or_default(),
                         ctx.get("op").and_then(Value::as_str).unwrap_or("index").to_string(),
@@ -2707,11 +2774,11 @@ impl Engine {
                     Err(e) => return e,
                 },
                 None => {
-                    let mut src = d.source.clone();
+                    let mut src = current.clone();
                     merge(&mut src, patch.clone().unwrap_or_default());
                     let detect_noop =
                         req.get("detect_noop").and_then(Value::as_bool).unwrap_or(true);
-                    let op = if detect_noop && src == d.source { "noop" } else { "index" };
+                    let op = if detect_noop && src == current { "noop" } else { "index" };
                     (src, op.to_string())
                 }
             };
@@ -2831,8 +2898,9 @@ impl Engine {
         if let Some(filter) = want_get
             && let Some(d) = i.docs.get(id)
         {
+            let source = synthetic::view(&i.mappings, &i.settings, &d.source);
             result.1["get"] = json!({"_seq_no": d.seq, "_primary_term": 1, "found": true,
-                                     "_source": search::filter_source(&d.source, filter.as_ref())});
+                                     "_source": search::filter_source(&source, filter.as_ref())});
         }
         maybe_refresh(i, index, q);
         if result.1["result"] != "noop" {
@@ -3960,14 +4028,15 @@ impl Engine {
             let mut out = Vec::new();
             for k in [one, many] {
                 match v.get(k) {
-                    Some(Value::String(x)) => out.push(super::names::resolve(x)),
+                    Some(Value::String(x)) => out.push(x.clone()),
                     Some(Value::Array(a)) => {
-                        out.extend(a.iter().filter_map(Value::as_str).map(super::names::resolve))
+                        out.extend(a.iter().filter_map(Value::as_str).map(str::to_string))
                     }
                     _ => {}
                 }
             }
-            out
+            // Date math names (`<logs-{now/d}>`) name what they resolve to.
+            out.into_iter().map(|n| names::resolve(&n).unwrap_or(n)).collect::<Vec<_>>()
         };
         let mut s = self.0.lock().unwrap();
         // Indices a `remove_index` action drops: an alias may take the
@@ -4151,6 +4220,36 @@ fn terms_lookup(s: &State, q: &mut Value) {
 
 /// An index's searchable documents, narrowed to those matching any of
 /// the alias filters it was reached through.
+/// `force_synthetic_source` on a search: hits from indices that store
+/// their source get the synthetic view (an index whose mapping can't
+/// produce one fails the search).
+fn force_synthetic(
+    s: &State,
+    names: &[String],
+    docs: Vec<CommittedDoc>,
+) -> Result<Vec<CommittedDoc>, search::EsError> {
+    for n in names {
+        if let Some(i) = s.indices.get(n)
+            && !synthetic::enabled(&i.mappings, &i.settings)
+            && let Some(reason) = synthetic::unsupported(&i.mappings, &i.settings)
+        {
+            return Err(search::EsError::shard_failure("illegal_argument_exception", &reason)
+                .caused_by("illegal_argument_exception", &reason));
+        }
+    }
+    Ok(docs
+        .into_iter()
+        .map(|mut d| {
+            if let Some(i) = s.indices.get(&d.index)
+                && !synthetic::enabled(&i.mappings, &i.settings)
+            {
+                d.source = synthetic::source(&i.mappings, &d.source);
+            }
+            d
+        })
+        .collect())
+}
+
 fn filtered_docs(
     i: &Index,
     filters: Option<&Option<Vec<Value>>>,
@@ -4520,6 +4619,9 @@ fn validate_scroll_and_slice(
         if q.get("request_cache").is_some_and(|v| v == "true") {
             return invalid("[request_cache] cannot be used in a scroll context");
         }
+        if req.get("track_total_hits").is_some_and(|t| t.is_number() || t == false) {
+            return invalid("disabling [track_total_hits] is not allowed in a scroll context");
+        }
         if let Some(keep) = parse_keep_alive(sc)
             && keep > max_keep
         {
@@ -4710,11 +4812,17 @@ struct GetOpts {
     realtime: bool,
     version: Option<i64>,
     routing: Option<String>,
+    /// `force_synthetic_source`: a synthetic `_source` from an index that
+    /// stores it.
+    force_synthetic: bool,
 }
 
 impl GetOpts {
     fn from_params(q: &HashMap<String, String>) -> Self {
         GetOpts {
+            force_synthetic: q
+                .get("force_synthetic_source")
+                .is_some_and(|v| v == "true" || v.is_empty()),
             source: source_filter_from_params(q),
             source_explicit: q.contains_key("_source")
                 || q.contains_key("_source_includes")
@@ -4747,6 +4855,20 @@ fn get_doc(i: &Index, index: &str, id: &str, o: &GetOpts) -> (u16, Value) {
     }
     let Some((source, version, seq)) = found else {
         return missing_doc(index, id);
+    };
+    let synthetic = synthetic::enabled(&i.mappings, &i.settings);
+    if o.force_synthetic
+        && !synthetic
+        && let Some(reason) = synthetic::unsupported(&i.mappings, &i.settings)
+    {
+        return (400, error("illegal_argument_exception", &reason, 400));
+    }
+    // The last refresh holds the synthetic view already; live documents
+    // hold what was sent.
+    let source = if (o.realtime && synthetic) || (o.force_synthetic && !synthetic) {
+        synthetic::source(&i.mappings, &source)
+    } else {
+        source
     };
     if !routed_visible(i, id, o.routing.as_deref()) {
         return missing_doc(index, id);
@@ -5603,16 +5725,14 @@ fn field_type_stats(s: &State) -> Value {
 
 /// The mapping as GET shows it: no `properties` key when there are none.
 fn shown_mappings(m: &Value) -> Value {
-    match m.as_object() {
-        Some(o)
-            if o.len() == 1
-                && o.get("properties")
-                    .is_some_and(|p| p.as_object().is_some_and(Map::is_empty)) =>
-        {
-            json!({})
-        }
-        _ => m.clone(),
+    let mut out = m.clone();
+    // No fields mapped yet: no `properties` at all.
+    if let Some(o) = out.as_object_mut()
+        && o.get("properties").is_some_and(|p| p.as_object().is_some_and(Map::is_empty))
+    {
+        o.remove("properties");
     }
+    out
 }
 
 /// Every mapped leaf field as (dotted full name, definition).
@@ -5658,6 +5778,23 @@ fn validate_mapping(current: &Value, incoming: &Value) -> Result<(), (u16, Value
             }
             let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
             let existing = cur.and_then(|c| c.get("properties")).and_then(|p| p.get(k));
+            if k.trim().is_empty() {
+                let why = if k.is_empty() {
+                    "field name cannot be an empty string"
+                } else {
+                    "field name cannot contain only whitespaces"
+                };
+                return Err((
+                    400,
+                    json!({"error": {
+                        "root_cause": [{"type": "mapper_parsing_exception",
+                                        "reason": format!("Failed to parse mapping: {why}")}],
+                        "type": "mapper_parsing_exception",
+                        "reason": format!("Failed to parse mapping: {why}"),
+                        "caused_by": {"type": "illegal_argument_exception", "reason": why}},
+                        "status": 400}),
+                ));
+            }
             if !def.is_object() {
                 let class = match def {
                     Value::String(_) => "java.lang.String",
