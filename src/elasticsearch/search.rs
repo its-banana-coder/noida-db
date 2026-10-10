@@ -12,10 +12,14 @@ use std::collections::{HashMap, HashSet};
 
 use super::analysis;
 use super::dates;
+use super::dsl;
+use super::explain;
 use super::fields;
+use super::fuzzy;
 use super::highlight;
 use super::queries;
 use super::query_string;
+use super::rescore;
 use super::scoring;
 use super::sorting;
 use super::suggest;
@@ -683,80 +687,6 @@ pub(super) fn eval_match(
     scores
 }
 
-/// Damerau-Levenshtein (optimal string alignment) distance.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in d.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in d[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
-            }
-        }
-    }
-    d[a.len()][b.len()]
-}
-
-/// `fuzziness` as a maximum edit count for a term (`AUTO` = 0 below 3
-/// characters, 1 below 6, else 2).
-fn max_edits(fuzziness: Option<&Value>, term: &str) -> usize {
-    let len = term.chars().count();
-    match fuzziness {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or(0).min(2) as usize,
-        Some(Value::String(s)) if s.parse::<usize>().is_ok() => s.parse::<usize>().unwrap().min(2),
-        _ => {
-            if len < 3 {
-                0
-            } else if len < 6 {
-                1
-            } else {
-                2
-            }
-        }
-    }
-}
-
-/// `fuzzy`: terms within the edit distance, scored like the terms they
-/// matched.
-fn eval_fuzzy(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
-    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let (value, fuzziness, prefix_len, boost) = match spec {
-        Value::Object(o) => (
-            query_text(o.get("value")),
-            o.get("fuzziness").cloned(),
-            o.get("prefix_length").and_then(Value::as_u64).unwrap_or(0) as usize,
-            o.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32,
-        ),
-        other => (query_text(Some(other)), None, 0, 1.0),
-    };
-    let edits = max_edits(fuzziness.as_ref(), &value);
-    let prefix: String = value.chars().take(prefix_len).collect();
-    let mut candidates: HashSet<String> = HashSet::new();
-    for d in docs {
-        for t in meta_tokens(mappings, d, field) {
-            if t.starts_with(&prefix) && edit_distance(&t, &value) <= edits {
-                candidates.insert(t);
-            }
-        }
-    }
-    let mut out: HashMap<usize, f32> = HashMap::new();
-    for term in candidates {
-        for (i, s) in bm25_scores(mappings, docs, field, std::slice::from_ref(&term), false) {
-            let e = out.entry(i).or_insert(0.0);
-            *e = e.max(s * boost);
-        }
-    }
-    out
-}
-
 /// `dis_max`: a document's best sub-query score, plus `tie_breaker` times
 /// the others.
 fn eval_dis_max(
@@ -1222,7 +1152,10 @@ fn eval_bool(
     }
     if !should.is_empty() {
         let default_msm = if must.is_empty() && filter.is_empty() { 1 } else { 0 };
-        let msm = v.get("minimum_should_match").and_then(Value::as_i64).unwrap_or(default_msm);
+        let msm = match v.get("minimum_should_match") {
+            Some(spec) => fuzzy::min_should_match(spec, should.len())? as i64,
+            None => default_msm,
+        };
         let mut should_count: HashMap<usize, i64> = HashMap::new();
         for q in &should {
             for (i, s) in eval(q, mappings, docs)? {
@@ -1269,6 +1202,9 @@ pub fn eval(
     }
     if let Some(e) = vectors::unsupported_query(obj, mappings) {
         return Err(e);
+    }
+    if let Some(r) = dsl::eval_extra(obj, mappings, docs) {
+        return r;
     }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
@@ -1318,9 +1254,6 @@ pub fn eval(
     if let Some(v) = obj.get("nested") {
         return eval_nested(v, mappings, docs);
     }
-    if let Some(v) = obj.get("fuzzy") {
-        return Ok(eval_fuzzy(v, mappings, docs));
-    }
     if let Some(v) = obj.get("query_string") {
         let q = query_string::query_string(v, mappings)?;
         return eval(&q, mappings, docs);
@@ -1336,9 +1269,6 @@ pub fn eval(
     }
     if let Some(v) = obj.get("match_phrase_prefix") {
         return Ok(queries::match_phrase_prefix(v, mappings, docs));
-    }
-    if let Some(v) = obj.get("match_bool_prefix") {
-        return Ok(queries::match_bool_prefix(v, mappings, docs));
     }
     if let Some(v) = obj.get("boosting") {
         return queries::boosting(v, mappings, docs);
@@ -1369,7 +1299,7 @@ pub fn eval(
     // unsupported. See `docs/specs/README.md`'s own stated principle:
     // "never silently wrong."
     let clause = obj.keys().next().map(String::as_str).unwrap_or("<empty>");
-    Err(EsError::parsing(&format!("unknown query [{clause}]")))
+    Err(dsl::unknown_query(clause))
 }
 
 fn parse_sort(s: &Value) -> (String, String) {
@@ -2411,6 +2341,11 @@ pub fn search_with(
         scores.retain(|_, s| *s >= min_score);
     }
     let matched: Vec<usize> = scores.keys().copied().collect();
+    // `post_filter` narrows the hits after aggregations saw them all.
+    if let Some(pf) = body.get("post_filter") {
+        let keep = eval(pf, mappings, docs)?;
+        scores.retain(|i, _| keep.contains_key(i));
+    }
     let total = scores.len();
 
     let mut ranked: Vec<(usize, f32, Vec<Value>)> = scores
@@ -2425,6 +2360,17 @@ pub fn search_with(
     } else {
         ranked.sort_by(|a, b| sorting::compare_keys(&specs, &a.2, &b.2).then(a.0.cmp(&b.0)));
     }
+    // `rescore` re-ranks the top of a score-ordered result (a field sort
+    // refuses it).
+    let field_sort = specs.iter().any(|s| !s.is_score());
+    let rescored = if specs.is_empty() || field_sort {
+        rescore::apply(body, field_sort, &mut ranked, mappings, docs)?
+    } else {
+        HashMap::new()
+    };
+    let explain = body.get("explain").and_then(Value::as_bool).unwrap_or(false);
+    let named_scores =
+        body.get("include_named_queries_score").and_then(Value::as_bool).unwrap_or(false);
     let max_of = |r: &[(usize, f32, Vec<Value>)]| {
         r.iter().map(|h| h.1).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
     };
@@ -2481,6 +2427,18 @@ pub fn search_with(
                 hit["_primary_term"] = json!(1);
             }
             hit["_score"] = if shows_scores { json!(score) } else { Value::Null };
+            if explain {
+                hit["_shard"] = json!(format!("[{}][0]", d.index));
+                hit["_node"] = json!("noida");
+                hit["_explanation"] = explain::hit_explanation(
+                    &query,
+                    mappings,
+                    docs,
+                    *idx,
+                    *score,
+                    rescored.get(idx),
+                );
+            }
             // `"_source": false` omits the key, as Elasticsearch does.
             let source_enabled = mappings
                 .get("_source")
@@ -2544,10 +2502,14 @@ pub fn search_with(
                         collapse_inner_hits(ih, &group, mappings, docs, originals)?;
                 }
             }
-            let names: Vec<&String> =
-                named.iter().filter(|(_, m)| m.contains(idx)).map(|(n, _)| n).collect();
+            let names: Vec<(&String, f32)> =
+                named.iter().filter_map(|(n, m)| m.get(idx).map(|s| (n, *s))).collect();
             if !names.is_empty() {
-                hit["matched_queries"] = json!(names);
+                hit["matched_queries"] = if named_scores {
+                    Value::Object(names.iter().map(|(n, s)| ((*n).clone(), json!(s))).collect())
+                } else {
+                    json!(names.iter().map(|(n, _)| n).collect::<Vec<_>>())
+                };
             }
             Ok(hit)
         })
@@ -2601,18 +2563,15 @@ fn apply_indices_boost(body: &Value, docs: &[CommittedDoc], scores: &mut HashMap
 }
 
 /// Every clause of `query` carrying a `_name`, with the documents it
-/// matches (for each hit's `matched_queries`).
+/// matches and their scores (for each hit's `matched_queries`).
 fn named_queries(
     query: &Value,
     mappings: &Value,
     docs: &[CommittedDoc],
-) -> Result<Vec<(String, HashSet<usize>)>, EsError> {
+) -> Result<Vec<(String, HashMap<usize, f32>)>, EsError> {
     let mut found: Vec<(String, Value)> = vec![];
     collect_named(query, &mut found);
-    found
-        .into_iter()
-        .map(|(n, q)| Ok((n, eval(&q, mappings, docs)?.into_keys().collect())))
-        .collect()
+    found.into_iter().map(|(n, q)| Ok((n, eval(&q, mappings, docs)?))).collect()
 }
 
 fn collect_named(v: &Value, out: &mut Vec<(String, Value)>) {

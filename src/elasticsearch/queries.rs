@@ -1,5 +1,5 @@
 //! Query types beyond the core set in `search.rs`: autocomplete
-//! (`match_phrase_prefix`, `match_bool_prefix`), relevance tuning
+//! (`match_phrase_prefix`), relevance tuning
 //! (`boosting`, `function_score`, `script_score`), `combined_fields`, and
 //! geo (`geo_distance`, `geo_bounding_box`). Scores follow
 //! Elasticsearch's formulas so ordering and `_score` match.
@@ -58,46 +58,6 @@ pub fn match_phrase_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -
             let e = out.entry(i).or_insert(0.0);
             *e = e.max(s);
         }
-    }
-    let b = boost_of(o);
-    out.values_mut().for_each(|s| *s *= b);
-    out
-}
-
-/// `match_bool_prefix`: every term a should/must `term` clause, the last
-/// one a constant-score `prefix`.
-pub fn match_bool_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Scores {
-    let Some((field, spec)) = field_and_spec(v) else { return Scores::new() };
-    let (text, o) = obj_spec(spec);
-    let and = o
-        .and_then(|o| o.get("operator"))
-        .and_then(Value::as_str)
-        .is_some_and(|op| op.eq_ignore_ascii_case("and"));
-    let terms = analyze_for(mappings, field, &text);
-    let Some((last, head)) = terms.split_last() else { return Scores::new() };
-    let per_doc = doc_tokens(mappings, docs, field);
-    let mut clauses: Vec<Scores> = head
-        .iter()
-        .map(|t| bm25_scores(mappings, docs, field, std::slice::from_ref(t), false))
-        .collect();
-    clauses.push(
-        per_doc
-            .iter()
-            .enumerate()
-            .filter(|(_, toks)| toks.iter().any(|t| t.starts_with(last.as_str())))
-            .map(|(i, _)| (i, 1.0))
-            .collect(),
-    );
-    let mut out = Scores::new();
-    let mut hits: HashMap<usize, usize> = HashMap::new();
-    for c in &clauses {
-        for (i, s) in c {
-            *out.entry(*i).or_insert(0.0) += s;
-            *hits.entry(*i).or_insert(0) += 1;
-        }
-    }
-    if and {
-        out.retain(|i, _| hits.get(i) == Some(&clauses.len()));
     }
     let b = boost_of(o);
     out.values_mut().for_each(|s| *s *= b);
@@ -584,7 +544,7 @@ fn at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 /// A document's points for `field` (a single point or an array of them).
-fn points(d: &CommittedDoc, field: &str) -> Vec<(f64, f64)> {
+pub(crate) fn points(d: &CommittedDoc, field: &str) -> Vec<(f64, f64)> {
     let Some(v) = at_path(&d.source, field) else { return vec![] };
     match v {
         // `[lon, lat]` is one point; an array of points is several.

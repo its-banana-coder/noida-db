@@ -371,6 +371,9 @@ impl Engine {
         if segments.first() == Some(&"_analyze") {
             return self.analyze(body);
         }
+        if segments == ["_validate", "query"] {
+            return self.validate_api(method, "_all", &q, body);
+        }
         if segments.first() == Some(&"_bulk") {
             // The global bulk endpoint -- no index in the URL, each
             // action line names its own `_index` instead. Found missing
@@ -562,6 +565,12 @@ impl Engine {
                 self.field_caps_api(method, segments[0], &q, body)
             }
             "_msearch" if segments.len() == 2 => self.msearch(method, segments[0], &q, body),
+            "_explain" if segments.len() == 3 => {
+                self.explain_api(method, segments[0], index_name, segments[2], &q, body)
+            }
+            "_validate" if segments.get(2) == Some(&"query") && segments.len() == 3 => {
+                self.validate_api(method, segments[0], &q, body)
+            }
             _ => no_handler(method, path),
         }
     }
@@ -893,7 +902,7 @@ impl Engine {
         Ok(names)
     }
 
-    fn search_or_count(
+    pub(super) fn search_or_count(
         &self,
         method: &str,
         action: &str,
@@ -928,6 +937,7 @@ impl Engine {
             "track_scores",
             "timeout",
             "min_score",
+            "include_named_queries_score",
         ] {
             if let Some(v) = q.get(key)
                 && req.get(key).is_none()
@@ -1011,6 +1021,10 @@ impl Engine {
         {
             return e;
         }
+        let _dsl = match Self::prepare_query(&s, index_pattern, action == "_search", &mut req) {
+            Ok(g) => g,
+            Err(e) => return e,
+        };
         let now = std::time::Instant::now();
         s.contexts.retain(|_, c| c.expires > now);
         if let Some(pit) = req.get("pit") {
@@ -1178,6 +1192,61 @@ impl Engine {
             }
             Err(e) => (e.status, e.to_json()),
         }
+    }
+
+    /// The searchable indices `pattern` names, with their mappings.
+    pub(super) fn index_mappings(&self, pattern: &str) -> Vec<(String, Value)> {
+        let s = self.0.lock().unwrap();
+        Self::resolve_indices(&s, pattern)
+            .into_iter()
+            .filter_map(|n| s.indices.get(&n).map(|i| (n.clone(), i.mappings.clone())))
+            .collect()
+    }
+
+    /// `dsl::prepare` against this node's indices (terms lookups and
+    /// `more_like_this` documents read like a real-time GET), and the
+    /// cluster's `search.allow_expensive_queries` in effect until the
+    /// returned guard drops.
+    fn prepare_query(
+        s: &State,
+        index_pattern: &str,
+        search: bool,
+        req: &mut Value,
+    ) -> Result<super::dsl::Guard, (u16, Value)> {
+        let names = Self::resolve_indices(s, index_pattern);
+        let fetch = |index: &str, id: &str, _routing: Option<&str>| {
+            let target = Self::resolve_indices(s, index);
+            let Some(i) = target.first().and_then(|n| s.indices.get(n)) else {
+                return Err(missing_index(index));
+            };
+            Ok(i.docs.get(id).map(|d| d.source.clone()))
+        };
+        let max_terms_count = names
+            .iter()
+            .filter_map(|n| s.indices.get(n))
+            .map(|i| {
+                let v = &i.settings["index"]["max_terms_count"];
+                v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).unwrap_or(65_536)
+            })
+            .min()
+            .unwrap_or(65_536) as usize;
+        let env = super::dsl::Env {
+            fetch: &fetch,
+            default_index: names.first().cloned(),
+            max_terms_count,
+            search,
+        };
+        super::dsl::prepare(req, &env)?;
+        let allow = ["transient", "persistent"]
+            .iter()
+            .find_map(|k| {
+                s.cluster_settings
+                    .get(*k)
+                    .and_then(|m| m.get("search.allow_expensive_queries"))
+                    .and_then(Value::as_str)
+            })
+            .is_none_or(|v| v != "false");
+        Ok(super::dsl::enter(allow))
     }
 
     /// `/<index>/_knn_search` (deprecated since 8.4 for the search API's
