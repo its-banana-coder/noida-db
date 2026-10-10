@@ -510,14 +510,18 @@ struct Pruning {
     only_pruned: bool,
 }
 
-fn pruning_config(owner: &str, v: Option<&Value>, prune: bool) -> Result<Option<Pruning>, EsError> {
-    let bad = |reason: &str| {
-        parse_error(&format!("[{owner}] failed to parse field [pruning_config]"))
-            .caused_by("illegal_argument_exception", reason)
-    };
+/// `pruning_config` (on with `prune`, or given): why not, as (type,
+/// reason).
+fn pruning_config(v: Option<&Value>, prune: bool) -> Result<Option<Pruning>, (String, String)> {
+    let bad = |reason: &str| ("illegal_argument_exception".to_string(), reason.to_string());
     let spec = match v {
         Some(Value::Object(o)) => Some(o.clone()),
-        Some(_) => return Err(bad("pruning_config must be an object")),
+        Some(other) => {
+            return Err((
+                "parsing_exception".into(),
+                format!("[pruning_config] unknown token [{}]", token_name(other)),
+            ));
+        }
         None => None,
     };
     if let Some(o) = &spec
@@ -530,7 +534,7 @@ fn pruning_config(owner: &str, v: Option<&Value>, prune: bool) -> Result<Option<
             )
         })
     {
-        return Err(bad(&format!("[pruning_config] unknown field [{k}]")));
+        return Err(("parsing_exception".into(), format!("[pruning_config] unknown token [{k}]")));
     }
     let o = spec.clone().unwrap_or_default();
     let ratio = param(&o, "tokens_freq_ratio_threshold").unwrap_or(5.0);
@@ -591,6 +595,7 @@ fn prune(
 
 /// `{"token": weight, ...}` (or an array of such objects).
 fn parse_tokens(v: Option<&Value>, owner: &str) -> Result<Vec<(String, f32)>, EsError> {
+    let weighted = owner == "weighted_tokens";
     let objects: Vec<&Value> = match v {
         Some(Value::Array(a)) => a.iter().collect(),
         Some(o @ Value::Object(_)) => vec![o],
@@ -601,6 +606,9 @@ fn parse_tokens(v: Option<&Value>, owner: &str) -> Result<Vec<(String, f32)>, Es
         for (k, w) in o.as_object().into_iter().flatten() {
             match number(w) {
                 Some(Ok(x)) => out.push((k.clone(), x)),
+                Some(Err(e)) if weighted => {
+                    return Err(EsError::new(400, "number_format_exception", &e));
+                }
                 _ => {
                     return Err(EsError::parsing(&format!(
                         "Failed to build [{owner}] after last required field arrived"
@@ -669,10 +677,13 @@ fn sparse_vector(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<S
             .caused_by("illegal_argument_exception", reason)
     };
     let pruning = pruning_config(
-        "sparse_vector",
         o.get("pruning_config"),
         o.get("prune").and_then(Value::as_bool).unwrap_or(false),
-    )?;
+    )
+    .map_err(|(kind, reason)| {
+        let outer = "[sparse_vector] failed to parse field [pruning_config]";
+        EsError::parsing(outer).caused_by("x_content_parse_exception", &format!("{outer}: {kind}: {reason}"))
+    })?;
     let tokens = match (o.get("query_vector"), o.get("inference_id")) {
         (Some(_), Some(_)) | (None, None) => {
             return Err(build_failure(
@@ -704,6 +715,11 @@ fn weighted_tokens(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result
         return Err(EsError::parsing("No fieldname specified for query"));
     };
     let o = spec.as_object().cloned().unwrap_or_default();
+    if let Some(k) =
+        o.keys().find(|k| !matches!(k.as_str(), "tokens" | "pruning_config" | "boost" | "_name"))
+    {
+        return Err(EsError::parsing(&format!("unknown field [{k}]")));
+    }
     let tokens = parse_tokens(o.get("tokens"), "weighted_tokens")?;
     if tokens.is_empty() {
         return Err(EsError::new(
@@ -712,7 +728,8 @@ fn weighted_tokens(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result
             "[weighted_tokens] requires at least one token",
         ));
     }
-    let pruning = pruning_config("weighted_tokens", o.get("pruning_config"), false)?;
+    let pruning = pruning_config(o.get("pruning_config"), false)
+        .map_err(|(kind, reason)| EsError::new(400, &kind, &reason))?;
     let Some(def) = field_def(mappings, field) else { return Ok(Scores::new()) };
     let ty = type_of(def).unwrap_or("object");
     if !matches!(ty, "sparse_vector" | "rank_features") {

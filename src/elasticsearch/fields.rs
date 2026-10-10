@@ -132,7 +132,7 @@ fn format_value(leaf: &Leaf, v: &Value, format: Option<&str>) -> Option<Value> {
             let f = as_f64(v)?;
             Some(json!(f.trunc() as i64))
         }
-        "double" | "float" | "half_float" | "scaled_float" => {
+        "double" | "float" | "half_float" | "scaled_float" | "rank_feature" => {
             let f = as_f64(v)?;
             Some(json!(f))
         }

@@ -1277,6 +1277,30 @@ pub fn unsupported_doc_values(body: &Value, mappings: &Value) -> Option<EsError>
         Some(Value::String(s)) => names.push(s),
         _ => {}
     }
+    // Feature fields refuse sorting too.
+    let mut sorted: Vec<&str> = Vec::new();
+    let sorts = match body.get("sort") {
+        Some(Value::Array(a)) => a.iter().collect(),
+        Some(s) => vec![s],
+        None => Vec::new(),
+    };
+    for s in sorts {
+        match s {
+            Value::String(f) => sorted.push(f),
+            Value::Object(o) => sorted.extend(o.keys().map(String::as_str)),
+            _ => {}
+        }
+    }
+    let feature = names.iter().chain(&sorted).find_map(|f| {
+        let ty = field_def(mappings, f)?.get("type")?.as_str()?;
+        matches!(ty, "rank_feature" | "rank_features" | "sparse_vector").then_some(ty)
+    });
+    if let Some(ty) = feature {
+        return Some(EsError::shard_failure(
+            "illegal_argument_exception",
+            &format!("[{ty}] fields do not support sorting, scripting or aggregating"),
+        ));
+    }
     let f = names.into_iter().find(|f| field_def(mappings, f).and_then(Field::of).is_some())?;
     Some(EsError::shard_failure(
         "illegal_argument_exception",
@@ -1323,15 +1347,24 @@ pub fn script_function(name: &str, query: &Value, doc: &Value) -> Result<f64, St
         _ => return Err("query vector must be a list of numbers or a hex string".into()),
     };
     let element = doc.get("__vector").and_then(Value::as_str).unwrap_or("float");
-    if element == "bit" && name != "hamming" {
-        return Err(format!("[{name}] is not supported on [bit] vectors by noida"));
-    }
     if q.len() != v.len() {
         let (qd, vd) =
             if element == "bit" { (q.len() * 8, v.len() * 8) } else { (q.len(), v.len()) };
         return Err(format!(
             "The query vector has a different number of dimensions [{qd}] than the document vectors [{vd}]."
         ));
+    }
+    // A bit vector's L1 distance is its Hamming distance (L2: the root of
+    // it); dot product and cosine aren't defined for bits.
+    let bits = || -> f64 {
+        q.iter().zip(&v).map(|(a, b)| ((*a as i8 as u8) ^ (*b as i8 as u8)).count_ones() as f64).sum()
+    };
+    if element == "bit" {
+        return match name {
+            "hamming" | "l1norm" => Ok(bits()),
+            "l2norm" => Ok(bits().sqrt() as f32 as f64),
+            _ => Err(format!("{name} is not supported for bit vectors.")),
+        };
     }
     let dot: f64 = q.iter().zip(&v).map(|(a, b)| a * b).sum();
     Ok(match name {

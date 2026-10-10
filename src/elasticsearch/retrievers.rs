@@ -1043,5 +1043,62 @@ mod tests {
             "field": "t", "inference_id": "x", "inference_text": "a"}}}))
         .unwrap_err();
         assert_eq!(e.status, 404);
+        // Nothing to rerank: the child's (empty) results.
+        let r = run(json!({"retriever": {"text_similarity_reranker": {
+            "retriever": {"standard": {"query": {"term": {"k": "none"}}}},
+            "field": "t", "inference_id": "x", "inference_text": "a"}}}))
+        .unwrap();
+        assert_eq!(r["hits"]["total"]["value"], 0);
+    }
+
+    #[test]
+    fn rrf_window_pagination_and_aggregations() {
+        // Each result set keeps its top `rank_window_size`; the total and
+        // the aggregations cover every match.
+        let r = run(json!({
+            "sub_searches": [{"query": {"match": {"t": "a"}}}, {"query": {"term": {"k": "x"}}}],
+            "rank": {"rrf": {"rank_window_size": 1, "rank_constant": 10}},
+            "size": 1,
+            "aggs": {"k": {"terms": {"field": "k"}}},
+        }))
+        .unwrap();
+        assert_eq!(r["hits"]["total"]["value"], 3);
+        assert_eq!(r["aggregations"]["k"]["buckets"][0]["doc_count"], 2);
+        assert_eq!(ids(&r), ["2"]);
+        let r = run(json!({
+            "query": {"match": {"t": "a"}},
+            "knn": {"field": "v", "query_vector": [3.0, 3.0], "k": 3, "num_candidates": 3},
+            "rank": {"rrf": {}},
+            "from": 1,
+            "size": 2,
+            "explain": true,
+        }))
+        .unwrap();
+        assert_eq!(ids(&r), ["1", "3"]);
+        assert_eq!(r["hits"]["hits"][0]["_rank"], 2);
+        let e = &r["hits"]["hits"][1]["_explanation"];
+        assert!(e["description"].as_str().unwrap().contains("initial ranks [0, 1]"));
+        assert_eq!(e["details"][0]["value"], 0.0);
+    }
+
+    #[test]
+    fn rrf_errors() {
+        let two = json!([{"standard": {"query": {"match_all": {}}}}, {"standard": {"query": {"match_all": {}}}}]);
+        let e = run(json!({"retriever": {"rrf": {"retrievers": two, "rank_window_size": 5}}, "size": 6}))
+            .unwrap_err();
+        assert!(e.reason.contains("[rank] requires [rank_window_size: 5] be greater than or equal to [size: 6]"));
+        let e = run(json!({"retriever": {"rrf": {"retrievers": [
+            {"rrf": {"retrievers": two}}, {"standard": {}}]}}}))
+        .unwrap_err();
+        assert_eq!(e.reason, "[rank] cannot be used in children of compound retrievers");
+        let e = run(json!({"retriever": {"rrf": {"retrievers": two, "rank_constant": 0}}})).unwrap_err();
+        assert_eq!(e.reason, "[rank_constant] must be greater than or equal to [1] for [rrf]");
+        let e = run(json!({"sub_searches": [{"query": {"match_all": {}}}, {"query": {"match_all": {}}}],
+                           "rank": {"rrf": {}}, "sort": ["n"], "collapse": {"field": "k"}}))
+        .unwrap_err();
+        assert_eq!(
+            e.reason,
+            "Validation Failed: 1: [rank] cannot be used with [sort];2: [rank] cannot be used with [collapse];"
+        );
     }
 }
