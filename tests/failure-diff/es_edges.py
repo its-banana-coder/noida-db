@@ -1946,6 +1946,7 @@ scenario("lc_reindex", lc_clean("lc-ri-src,lc-ri-dst,lc-ri-q,lc-ri-s,lc-ri-b,lc-
     ("GET", "/lc-ri-p/_doc/1", None, {"pick": lambda r: r["_source"]}),
     ("DELETE", "/_ingest/pipeline/lc-ri-p"),
     ("POST", "/_reindex?wait_for_completion=false", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-w"}}, {"pick": lambda r: sorted(r)}),
+    ("sleep", 2),
 ] + lc_clean("lc-ri-src,lc-ri-dst,lc-ri-q,lc-ri-s,lc-ri-b,lc-ri-p,lc-ri-w,lc-ri-x"))
 
 scenario("lc_misc", lc_clean("lc-misc") + [

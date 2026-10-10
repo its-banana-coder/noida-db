@@ -481,7 +481,13 @@ class Runner:
             pass
         for method, path, q in calls:
             try:
-                self.http(method, path, q, None, {}, False)
+                status, _, _ = self.http(method, path, q, None, {}, False)
+                # An index a failed test left read-only (or metadata-
+                # blocked) refuses the delete: lift its blocks and retry.
+                if status == 403 and method == "DELETE" and not path.startswith("/_"):
+                    unblock = {"index.blocks.read_only": None, "index.blocks.metadata": None}
+                    self.http("PUT", path + "/_settings", {}, unblock, {}, False)
+                    self.http(method, path, q, None, {}, False)
             except Exception:  # noqa: BLE001
                 pass
 
