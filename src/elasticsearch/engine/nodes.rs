@@ -310,9 +310,11 @@ impl Engine {
                                           "survivor": {"used_in_bytes": 0, "max_in_bytes": 0, "peak_used_in_bytes": 0, "peak_max_in_bytes": 0}}},
                         "threads": {"count": 64, "peak_count": 64},
                         "gc": {"collectors": {"young": {"collection_count": 0, "collection_time_in_millis": 0},
+                                              "G1 Concurrent GC": {"collection_count": 0, "collection_time_in_millis": 0},
                                               "old": {"collection_count": 0, "collection_time_in_millis": 0}}},
                         "buffer_pools": {"mapped": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0},
-                                         "direct": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0}},
+                                         "direct": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0},
+                                         "mapped - 'non-volatile memory'": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0}},
                         "classes": {"current_loaded_count": 0, "total_loaded_count": 0, "total_unloaded_count": 0}})),
                     "thread_pool" => {
                         let pools: Map<String, Value> = node::thread_pools()
@@ -335,7 +337,11 @@ impl Engine {
                     "transport" => ("transport", json!({"server_open": 0, "total_outbound_connections": 0,
                         "rx_count": 0, "rx_size_in_bytes": 0, "tx_count": 0, "tx_size_in_bytes": 0,
                         "inbound_handling_time_histogram": [], "outbound_handling_time_histogram": []})),
-                    "http" => ("http", node::http_stats()),
+                    "http" => {
+                        let mut h = node::http_stats();
+                        h["routes"] = json!({});
+                        ("http", h)
+                    }
                     "breaker" => {
                         let b = |limit: u64, overhead: f64| json!({"limit_size_in_bytes": limit,
                             "limit_size": node::human_size(limit), "estimated_size_in_bytes": 0,
@@ -344,7 +350,8 @@ impl Engine {
                             "inflight_requests": b(536_870_912, 2.0), "parent": b(510_027_366, 1.0)}))
                     }
                     "script" => ("script", json!({"compilations": 0, "cache_evictions": 0,
-                        "compilation_limit_triggered": 0})),
+                        "compilation_limit_triggered": 0,
+                        "compilations_history": {"5m": 0, "15m": 0, "24h": 0}, "contexts": []})),
                     "discovery" => {
                         let t = |extra: &[&str]| {
                             let mut m = Map::new();

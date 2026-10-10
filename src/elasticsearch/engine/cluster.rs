@@ -326,6 +326,16 @@ impl Engine {
             }
             out["routing_table"] = json!({"indices": indices});
         }
+        if metric.is_none_or(|m| m == "_all") {
+            out["repository_cleanup"] = json!({"repository_cleanup": []});
+            out["snapshots"] = json!({"snapshots": [], "node_ids_for_removal": []});
+            out["restore"] = json!({"snapshots": []});
+            out["snapshot_deletions"] = json!({"snapshot_deletions": []});
+            out["health"] = json!({"disk": {"high_watermark": "90%", "high_max_headroom": "150gb",
+                "flood_stage_watermark": "95%", "flood_stage_max_headroom": "100gb",
+                "frozen_flood_stage_watermark": "95%", "frozen_flood_stage_max_headroom": "20gb"},
+                "shard_limits": {"max_shards_per_node": 1000, "max_shards_per_node_frozen": 3000}});
+        }
         if wanted.contains(&"routing_nodes") {
             let (mut assigned, mut unassigned) = (vec![], vec![]);
             for n in &names {
@@ -461,6 +471,9 @@ impl Engine {
         });
         if stats::human(q) {
             node::add_human(&mut out);
+            if let Some(v) = out["indices"]["versions"].get_mut(0) {
+                v["total_primary_size"] = json!(node::human_size(docs_bytes));
+            }
         }
         (200, out)
     }
@@ -1044,6 +1057,7 @@ impl Engine {
         let mut names: Vec<&String> = s.indices.keys().collect();
         names.sort();
         let mut routing = Map::new();
+        let mut sizes = Map::new();
         let (mut shard_count, mut bytes) = (0u64, 0u64);
         for n in &names {
             let i = &s.indices[*n];
@@ -1057,7 +1071,9 @@ impl Engine {
                 let started = a > 0;
                 if started {
                     shard_count += 1;
-                    bytes += stats::shard_store(i, sh);
+                    let b = stats::shard_store(i, sh);
+                    bytes += b;
+                    sizes.insert(format!("[{n}][{sh}][p]_bytes"), json!(b));
                 }
                 let copy = |primary: bool, started: bool| {
                     json!({"index": n, "shard_id": sh, "state": if started { "STARTED" } else { "UNASSIGNED" },
@@ -1104,7 +1120,7 @@ impl Engine {
             "cluster_balance_stats": {"shard_count": shard_count, "undesired_shard_allocation_count": 0,
                                       "tiers": tiers, "nodes": nodes},
             "routing_table": routing,
-            "cluster_info": {"nodes": info_nodes, "shard_sizes": {}, "shard_data_set_sizes": {},
+            "cluster_info": {"nodes": info_nodes, "shard_sizes": sizes, "shard_data_set_sizes": {},
                              "shard_paths": {}, "reserved_sizes": []},
         }))
     }

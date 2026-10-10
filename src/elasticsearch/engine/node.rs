@@ -353,8 +353,24 @@ pub(crate) fn human_time(ms: i64) -> String {
 /// Epoch timestamps (`*_time_in_millis` of a start, `timestamp`) are left
 /// alone.
 pub(crate) fn add_human(v: &mut Value) {
-    fn companion(k: &str, x: &Value) -> Option<(String, Value)> {
+    add_human_in(v, "");
+}
+
+fn add_human_in(v: &mut Value, parent: &str) {
+    fn companion(parent: &str, k: &str, x: &Value) -> Option<(String, Value)> {
         let n = x.as_i64()?;
+        // Elasticsearch's own names for a few of them.
+        match (parent, k) {
+            ("get", "time_in_millis") => return Some(("getTime".into(), json!(human_time(n)))),
+            (_, "total_time_excluding_waiting_on_lock_in_millis") => {
+                return Some(("total_time_excluding_waiting".into(), json!(human_time(n))));
+            }
+            (_, "fixed_bit_set_memory_in_bytes") => {
+                return Some(("fixed_bit_set".into(), json!(human_size(n.max(0) as u64))));
+            }
+            ("bulk", "total_size_in_bytes" | "avg_size_in_bytes") => return None,
+            _ => {}
+        }
         if let Some(base) = k.strip_suffix("_in_bytes") {
             return Some((base.to_string(), json!(human_size(n.max(0) as u64))));
         }
@@ -362,18 +378,20 @@ pub(crate) fn add_human(v: &mut Value) {
         if epoch.iter().any(|e| k.starts_with(e)) {
             return None;
         }
-        let base = k.strip_suffix("_in_millis").or_else(|| k.strip_suffix("_time_millis").map(|_| &k[..k.len() - 7]))?;
+        let base = k
+            .strip_suffix("_in_millis")
+            .or_else(|| k.strip_suffix("_time_millis").map(|_| &k[..k.len() - 7]))?;
         Some((base.to_string(), json!(human_time(n))))
     }
     match v {
         Value::Object(m) => {
-            for x in m.values_mut() {
-                add_human(x);
+            for (k, x) in m.iter_mut() {
+                add_human_in(x, k);
             }
             let old = std::mem::take(m);
             let keys: Vec<String> = old.keys().cloned().collect();
             for (k, x) in old {
-                if let Some((name, h)) = companion(&k, &x)
+                if let Some((name, h)) = companion(parent, &k, &x)
                     && !keys.contains(&name)
                     && !m.contains_key(&name)
                 {
@@ -382,7 +400,7 @@ pub(crate) fn add_human(v: &mut Value) {
                 m.insert(k, x);
             }
         }
-        Value::Array(a) => a.iter_mut().for_each(add_human),
+        Value::Array(a) => a.iter_mut().for_each(|x| add_human_in(x, parent)),
         _ => {}
     }
 }
@@ -479,6 +497,9 @@ mod tests {
         add_human(&mut v);
         assert_eq!(v["size"], json!("2kb"));
         assert_eq!(v["total_time"], json!("0s"));
+        let mut g = json!({"get": {"time_in_millis": 3}});
+        add_human(&mut g);
+        assert_eq!(g["get"]["getTime"], json!("3ms"));
         let mut d = json!({"computation_time_millis": 1500, "opened_time_millis": 5});
         add_human(&mut d);
         assert_eq!(d["computation_time"], json!("1.5s"));
