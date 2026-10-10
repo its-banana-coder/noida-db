@@ -20,6 +20,7 @@ use super::rescore;
 use super::scoring;
 use super::sorting;
 use super::suggest;
+use super::tsdb;
 use super::vectors;
 
 /// A search failure, shaped the way Elasticsearch reports it: most are a
@@ -121,6 +122,8 @@ pub struct CommittedDoc {
     /// objects removed (a nested object's fields aren't visible to
     /// queries outside a `nested` query, as in Elasticsearch).
     pub full_source: Option<Value>,
+    /// The `_tsid` of a document in a time-series index.
+    pub tsid: Option<String>,
 }
 
 impl CommittedDoc {
@@ -224,6 +227,7 @@ fn nested_children(
                 version: d.version,
                 seq: d.seq,
                 full_source: None,
+                tsid: None,
             });
             owners.push((p, offset));
         }
@@ -1139,7 +1143,12 @@ fn date_bounds(
             continue;
         }
         let round_up = op == "gt" || op == "lte";
+        let explicit_format = cond.get("format").is_some();
         let t = match b {
+            // With a `format`, a number is a date in it (`2023` as `uuuu`).
+            Value::Number(n) if explicit_format => {
+                dates::parse_math(&n.to_string(), now, round_up, format.as_deref(), tz)
+            }
             Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
             Value::String(s) => dates::parse_math(s, now, round_up, format.as_deref(), tz),
             _ => None,
@@ -1289,6 +1298,10 @@ pub fn eval(
     }
     if let Some(e) = vectors::unsupported_query(obj, mappings) {
         return Err(e);
+    }
+    tsdb::check_query(obj)?;
+    if let Some(r) = super::ranges::eval(obj, mappings, docs) {
+        return r;
     }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
@@ -1587,6 +1600,8 @@ fn agg_values(mappings: &Value, source: &Value, field: &str) -> Vec<Value> {
             Value::String(s) => {
                 if ty == Some("keyword") {
                     out.push(Value::String(s.clone()));
+                } else if ty == Some("ip") {
+                    out.push(json!(tsdb::format_ip(s).unwrap_or_else(|| s.clone())));
                 } else {
                     out.extend(analysis::standard(s).into_iter().map(Value::String));
                 }
@@ -1643,7 +1658,12 @@ fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
     let mut buckets: HashMap<String, (Value, Vec<usize>)> = HashMap::new();
     for &idx in bucket {
         let mut seen = HashSet::new();
-        for v in agg_values(mappings, &docs[idx].source, field) {
+        let values = if field == "_tsid" {
+            docs[idx].tsid.iter().map(|t| json!(t)).collect()
+        } else {
+            agg_values(mappings, &docs[idx].source, field)
+        };
+        for v in values {
             let key = value_to_term(&v);
             if seen.insert(key.clone()) {
                 buckets.entry(key).or_insert_with(|| (v, Vec::new())).1.push(idx);
@@ -1651,8 +1671,41 @@ fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
         }
     }
     let mut entries: Vec<(Value, Vec<usize>)> = buckets.into_values().collect();
+    let ip = resolve_field(mappings, field).1.as_deref() == Some("ip");
+    let key_cmp = |a: &Value, b: &Value| -> Ordering {
+        match (a, b) {
+            _ if field == "_tsid" => {
+                tsdb::tsid_sort_key(&value_to_term(a)).cmp(&tsdb::tsid_sort_key(&value_to_term(b)))
+            }
+            (Value::Number(_), Value::Number(_)) => number_cmp(a, b).unwrap_or(Ordering::Equal),
+            (Value::String(x), Value::String(y)) if ip => {
+                let bits = |s: &str| match s.parse::<std::net::IpAddr>() {
+                    Ok(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped().octets(),
+                    Ok(std::net::IpAddr::V6(v6)) => v6.octets(),
+                    Err(_) => [0xff; 16],
+                };
+                bits(x).cmp(&bits(y))
+            }
+            _ => value_to_term(a).cmp(&value_to_term(b)),
+        }
+    };
+    // `order`: `{"_key"|"_count": "asc"|"desc"}` or a list of them; the
+    // default is by count, most first.
+    let order: Vec<(bool, bool)> = match inner.get("order") {
+        Some(Value::Array(a)) => a.iter().filter_map(terms_order).collect(),
+        Some(o) => terms_order(o).into_iter().collect(),
+        None => Vec::new(),
+    };
+    let order = if order.is_empty() { vec![(false, false)] } else { order };
     entries.sort_by(|a, b| {
-        b.1.len().cmp(&a.1.len()).then_with(|| value_to_term(&a.0).cmp(&value_to_term(&b.0)))
+        for (by_key, asc) in &order {
+            let o = if *by_key { key_cmp(&a.0, &b.0) } else { a.1.len().cmp(&b.1.len()) };
+            let o = if *asc { o } else { o.reverse() };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        key_cmp(&a.0, &b.0)
     });
     let sum_other: usize = entries.iter().skip(size).map(|(_, idxs)| idxs.len()).sum();
     let out_buckets: Vec<Value> = entries
@@ -1666,6 +1719,18 @@ fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
         })
         .collect();
     json!({"doc_count_error_upper_bound": 0, "sum_other_doc_count": sum_other, "buckets": out_buckets})
+}
+
+/// One `terms` `order` entry: (by key, ascending). Orders on sub-aggs
+/// aren't modelled.
+fn terms_order(o: &Value) -> Option<(bool, bool)> {
+    let (k, dir) = o.as_object()?.iter().next()?;
+    let asc = dir.as_str()? == "asc";
+    match k.as_str() {
+        "_key" | "_term" => Some((true, asc)),
+        "_count" => Some((false, asc)),
+        _ => None,
+    }
 }
 
 fn range_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
@@ -2931,6 +2996,7 @@ mod tests {
             version: 1,
             seq: 0,
             full_source: None,
+            tsid: None,
         }
     }
 

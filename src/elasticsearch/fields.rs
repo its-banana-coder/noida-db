@@ -450,6 +450,20 @@ pub fn fetch(
                 out.insert("_version".into(), json!([doc.version]));
                 continue;
             }
+            // A time-series document's metadata (only when asked for).
+            "_tsid" | "_ts_routing_hash" => {
+                if let Some(tsid) = &doc.tsid {
+                    let v = if pat == "_tsid" {
+                        Some(tsid.clone())
+                    } else {
+                        super::tsdb::routing_hash_of_id(&doc.id)
+                    };
+                    if let Some(v) = v {
+                        out.insert(pat.into(), json!([v]));
+                    }
+                }
+                continue;
+            }
             "_ignored" if kind == Kind::Fields => {
                 let ignored = super::docparse::ignored_fields(mappings, &Value::Null, doc.full());
                 if !ignored.is_empty() {
@@ -554,6 +568,7 @@ mod tests {
             version: 1,
             seq: 0,
             full_source: None,
+            tsid: None,
         }
     }
 

@@ -16,6 +16,7 @@ mod painless;
 mod profile;
 mod queries;
 mod query_string;
+mod ranges;
 mod rescore;
 mod scoring;
 mod script_fields;
@@ -25,6 +26,7 @@ mod sorting;
 mod suggest;
 mod templates;
 mod termvectors;
+mod tsdb;
 mod typed_keys;
 mod vectors;
 

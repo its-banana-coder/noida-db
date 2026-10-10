@@ -2226,6 +2226,266 @@ scenario("resp_misc", setup("resp-misc", {"settings": STATIC, "mappings": {"prop
                                     "query": {"match": {"loc": "x"}}}),
     ("DELETE", "/resp-misc"), ("DELETE", "/resp-dm-2022-12-31"),
 ])
+# --- time-series indices (index.mode: time_series) and range fields -------
+
+TSDB_TS = {"start_time": "2021-04-28T00:00:00Z", "end_time": "2021-04-29T00:00:00Z"}
+
+
+def tsdb_index(name, mappings, routing_path=("metricset", "k8s.pod.uid"), **settings):
+    index = {"mode": "time_series", "routing_path": list(routing_path),
+             "time_series": dict(TSDB_TS), "refresh_interval": "-1"}
+    index.update(settings)
+    return [("DELETE", f"/{name}?ignore_unavailable=true"),
+            ("PUT", f"/{name}", {"settings": {"index": index}, "mappings": mappings}, ACK)]
+
+
+TSDB_MAPPING = {"properties": {
+    "@timestamp": {"type": "date"},
+    "metricset": {"type": "keyword", "time_series_dimension": True},
+    "k8s": {"properties": {"pod": {"properties": {
+        "uid": {"type": "keyword", "time_series_dimension": True},
+        "name": {"type": "keyword"},
+        "ip": {"type": "ip", "time_series_dimension": True},
+        "network": {"properties": {"tx": {"type": "long", "time_series_metric": "counter"},
+                                   "rx": {"type": "long", "time_series_metric": "gauge"}}}}}}}}}
+
+TSDB_DOCS = []
+for _ts, _name, _uid, _ip, _tx in [
+        ("2021-04-28T18:50:04.467Z", "cat", "947e4ced-1786-4e53-9e0c-5c447e959507", "10.10.55.1", 2001818691),
+        ("2021-04-28T18:50:24.467Z", "cat", "947e4ced-1786-4e53-9e0c-5c447e959507", "10.10.55.1", 2005177954),
+        ("2021-04-28T18:51:04.467Z", "cat", "947e4ced-1786-4e53-9e0c-5c447e959507", "10.10.55.2", 2012916202),
+        ("2021-04-28T18:50:03.142Z", "dog", "df3145b3-0563-4d3b-a0f7-897eb2876ea9", "10.10.55.3", 1434521831),
+        ("2021-04-28T18:50:53.142Z", "dog", "df3145b3-0563-4d3b-a0f7-897eb2876ea9", "::ffff:10.10.55.3", 1434587694)]:
+    TSDB_DOCS += [{"index": {}}, {"@timestamp": _ts, "metricset": "pod", "k8s": {"pod": {
+        "name": _name, "uid": _uid, "ip": _ip, "network": {"tx": _tx, "rx": 802133794}}}}]
+
+
+def items(r):
+    return [(k, v["status"], v.get("_id"), v.get("result"), v.get("error", {}).get("type"))
+            for i in r["items"] for k, v in i.items()]
+
+
+def hit_meta(r):
+    return [(h["_id"], h.get("sort"), h.get("fields")) for h in r["hits"]["hits"]]
+
+
+scenario("tsdb_ids", tsdb_index("tsdb-ids", TSDB_MAPPING) + [
+    ("POST", "/tsdb-ids/_bulk?refresh=true", TSDB_DOCS, {"pick": items}),
+    # The same series and timestamp again: the same _id, overwritten.
+    ("POST", "/tsdb-ids/_bulk?refresh=true", TSDB_DOCS[:2], {"pick": items}),
+    ("POST", "/tsdb-ids/_search", {"sort": ["_tsid", "@timestamp"], "fields": ["_tsid", "_ts_routing_hash"],
+                                   "_source": False}, {"pick": hit_meta}),
+    ("POST", "/tsdb-ids/_search", {"size": 0, "aggs": {"t": {"terms": {"field": "_tsid", "order": {"_key": "desc"}}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("POST", "/tsdb-ids/_search", {"size": 0, "aggs": {"t": {"terms": {"field": "k8s.pod.ip", "order": {"_key": "asc"}}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("POST", "/tsdb-ids/_search", {"query": {"ids": {"values": ["cZZNs7B9sSWsyrL5AAABeRnRGTM"]}}, "_source": False},
+     {"pick": hit_meta}),
+    ("GET", "/tsdb-ids/_doc/cZZNs7B9sSWsyrL5AAABeRnRGTM", None, {"pick": lambda r: (r["_id"], r["found"])}),
+    ("GET", "/tsdb-ids/_doc/cZZNs7B9sSWsyrL5AAABeRnRGTM?routing=x"),
+    ("GET", "/tsdb-ids/_doc/nope"),
+    ("DELETE", "/tsdb-ids/_doc/nope"),
+    ("POST", "/tsdb-ids/_mget", {"ids": ["cZZNs7B9sSWsyrL5AAABeRnRGTM", "nope"]},
+     {"pick": lambda r: [(d["_id"], d.get("found"), d.get("error", {}).get("type")) for d in r["docs"]]}),
+    # The index API without an id creates: the same document again conflicts.
+    ("POST", "/tsdb-ids/_doc", TSDB_DOCS[1]),
+    ("POST", "/tsdb-ids/_doc?op_type=index", TSDB_DOCS[1], {"pick": lambda r: (r["_id"], r["result"], r["_version"])}),
+    ("PUT", "/tsdb-ids/_doc/abc", TSDB_DOCS[1]),
+    ("PUT", "/tsdb-ids/_doc/cZZNs7B9sSWsyrL5AAABeRnRGTM", TSDB_DOCS[1], {"pick": lambda r: (r["_id"], r["result"])}),
+    ("POST", "/tsdb-ids/_bulk", [{"create": {}}, TSDB_DOCS[1], {"delete": {"_id": "cZZNs7B9sSWsyrL5AAABeRnRGTM"}},
+                                 {"delete": {"_id": "bad id"}}], {"pick": items}),
+    ("DELETE", "/tsdb-ids"),
+])
+
+scenario("tsdb_errors", tsdb_index("tsdb-err", TSDB_MAPPING) + [
+    ("POST", "/tsdb-err/_doc", {"metricset": "pod", "k8s": {"pod": {"uid": "u"}}}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-28T01:00:00Z"}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-27T23:59:59.999Z", "metricset": "pod"}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-29T00:00:00Z", "metricset": "pod"}),
+    ("POST", "/tsdb-err/_doc?routing=r", {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "pod"}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-28T01:00:00Z", "metricset": ["a", "b"]}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-28T01:00:00Z", "metricset": True}),
+    ("POST", "/tsdb-err/_bulk", [{"index": {}}, {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "a", "k8s": {"pod": {"ip": ["1.1.1.1", "2.2.2.2"]}}},
+                                 {"index": {"routing": "r"}}, {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "a"},
+                                 {"update": {"_id": "x"}}, {"doc": {}},
+                                 {"index": {}}, {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "a", "unmapped": "x"}],
+     {"pick": items}),
+    ("POST", "/tsdb-err/_update/x", {"doc": {}}),
+    ("POST", "/tsdb-err/_search?routing=x"),
+    ("POST", "/tsdb-err/_search", {"sort": ["_id"]}),
+    ("POST", "/tsdb-err/_search", {"aggs": {"i": {"terms": {"field": "_id"}}}}),
+    ("POST", "/tsdb-err/_search", {"query": {"term": {"_tsid": "x"}}}),
+    ("POST", "/tsdb-err/_search", {"size": 0, "aggs": {"f": {"filter": {"term": {"_tsid": "x"}}}}}),
+    ("POST", "/tsdb-err/_search", {"runtime_mappings": {"metricset": {"type": "keyword"}}}),
+    ("POST", "/tsdb-err/_alias/tsdb-err-a", {"routing": "x"}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "tsdb-err", "alias": "tsdb-err-b", "search_routing": "x"}}]}),
+    ("PUT", "/tsdb-err/_mapping", {"properties": {"k8s": {"properties": {"pod": {"properties": {"uid": {"type": "keyword"}}}}}}}),
+    ("PUT", "/tsdb-err/_mapping", {"properties": {"metricset2": {"type": "keyword"}}}, ACK),
+    ("PUT", "/tsdb-err/_mapping", {"properties": {"n": {"type": "nested"}}}),
+    ("PUT", "/tsdb-err/_settings", {"index": {"time_series": {"end_time": "2021-04-28T12:00:00Z"}}}),
+    ("PUT", "/tsdb-err/_settings", {"index": {"time_series": {"end_time": "2021-04-30T00:00:00Z"}}}, ACK),
+    ("PUT", "/tsdb-err/_settings", {"index": {"time_series": {"start_time": "2021-04-27T00:00:00Z"}}}),
+    ("PUT", "/tsdb-err/_settings", {"index": {"routing_path": ["x"]}}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-29T12:00:00Z", "metricset": "late"},
+     {"pick": lambda r: (r["_id"], r["result"])}),
+    ("DELETE", "/tsdb-err"),
+])
+
+TS_BAD = {"mode": "time_series", "routing_path": ["dim"], "time_series": dict(TSDB_TS)}
+DIM = {"dim": {"type": "keyword", "time_series_dimension": True}}
+
+
+def tsdb_bad_create(settings=None, mappings=None):
+    body = {"settings": {"index": settings if settings is not None else TS_BAD}}
+    if mappings is not None:
+        body["mappings"] = mappings
+    return [("PUT", "/tsdb-bad", body), ("DELETE", "/tsdb-bad?ignore_unavailable=true")]
+
+
+scenario("tsdb_settings", [("DELETE", "/tsdb-bad?ignore_unavailable=true")]
+         + tsdb_bad_create({**TS_BAD, "sort.field": ["a"]})
+         + tsdb_bad_create({**TS_BAD, "sort.order": ["desc"]})
+         + tsdb_bad_create({**TS_BAD, "routing_partition_size": 2, "number_of_shards": 4})
+         + tsdb_bad_create({"mode": "time_series", "time_series": dict(TSDB_TS)})
+         + tsdb_bad_create({"mode": "time_series", "routing_path": [], "time_series": dict(TSDB_TS)})
+         + tsdb_bad_create({"mode": "time_series", "routing_path": [], "time_series": {"start_time": "", "end_time": ""}})
+         + tsdb_bad_create({"routing_path": ["dim"]})
+         + tsdb_bad_create({"time_series": {"start_time": "2021-04-28T00:00:00Z"}})
+         + tsdb_bad_create({"mode": "bogus"})
+         + tsdb_bad_create(TS_BAD, {"_routing": {"required": True}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"properties": {"dim": {"type": "keyword"}}})
+         + tsdb_bad_create(TS_BAD, {"properties": {"dim": {"properties": {"a": {"type": "keyword", "time_series_dimension": True}}}}})
+         + tsdb_bad_create(TS_BAD, {"properties": {**DIM, "@timestamp": {"type": "long"}}})
+         + tsdb_bad_create(TS_BAD, {"properties": {**DIM, "n": {"type": "nested"}}})
+         + tsdb_bad_create(TS_BAD, {"_source": {"mode": "stored"}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"_source": {"includes": ["a"]}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"_data_stream_timestamp": "x", "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"runtime": {"c": {"type": "long", "time_series_metric": "counter"}}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"runtime": {"@timestamp": {"type": "date"}}, "properties": DIM})
+         + tsdb_bad_create({}, {"properties": {"n": {"type": "nested", "properties": DIM}}})
+         + tsdb_bad_create({}, {"properties": DIM, "runtime": {"dim": {"type": "keyword"}}})
+         + [("PUT", "/tsdb-bad", {"settings": {"index": TS_BAD}, "mappings": {"properties": DIM}}, ACK),
+            ("GET", "/tsdb-bad/_mapping"),
+            ("GET", "/tsdb-bad/_settings", None, {"pick": lambda r: {k: v for k, v in r["tsdb-bad"]["settings"]["index"].items()
+                                                                       if k in ("mode", "routing_path", "time_series")}}),
+            ("GET", "/tsdb-bad/_field_caps?fields=dim,_tsid,_ts_routing_hash,@timestamp"),
+            ("DELETE", "/tsdb-bad")])
+
+scenario("tsdb_dims", tsdb_index("tsdb-dims", {"dynamic_templates": [
+    {"kw": {"match_mapping_type": "string", "mapping": {"type": "keyword", "time_series_dimension": True}}}],
+    "properties": {"@timestamp": {"type": "date"}, "n": {"type": "long", "time_series_dimension": True},
+                   "u": {"type": "unsigned_long", "time_series_dimension": True},
+                   "ip": {"type": "ip", "time_series_dimension": True},
+                   "flat": {"type": "flattened", "time_series_dimensions": ["a.b", "c"]},
+                   "v": {"type": "double", "time_series_metric": "gauge"}}}, routing_path=["k"]) + [
+    ("POST", "/tsdb-dims/_bulk?refresh=true", [
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:00Z", "k": "a", "n": 1, "v": 1.5},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:01Z", "k": "a", "n": "1", "v": 2.5},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:02Z", "k": "a", "n": 1.9, "u": 18446744073709551615},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:03Z", "k": "b", "ip": "2001:0db8:0:0:0:0:0:1", "other": "x"},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:04Z", "k": "b", "flat": {"a": {"b": "x", "z": "y"}, "c": 7}},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:05Z", "k": "c", "n": "abc"},
+    ], {"pick": items}),
+    ("POST", "/tsdb-dims/_search", {"size": 0, "aggs": {"t": {"terms": {"field": "_tsid", "order": {"_key": "asc"}},
+                                                             "aggs": {"v": {"sum": {"field": "v"}}}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("GET", "/tsdb-dims/_mapping"),
+    ("DELETE", "/tsdb-dims"),
+])
+
+scenario("tsdb_nanos", tsdb_index("tsdb-nanos", {"properties": {"@timestamp": {"type": "date_nanos"},
+                                                               "k": {"type": "keyword", "time_series_dimension": True}}},
+                                  routing_path=["k"], time_series={"start_time": "2021-09-26T03:09:42Z",
+                                                                   "end_time": "2021-09-26T03:09:52Z"}) + [
+    ("POST", "/tsdb-nanos/_doc?refresh=true", {"@timestamp": "2021-09-26T03:09:42.123456789Z", "k": "a"},
+     {"pick": lambda r: (r["_id"], r["result"])}),
+    ("POST", "/tsdb-nanos/_doc", {"@timestamp": "2021-09-26T03:09:41.123456789Z", "k": "a"}),
+    ("POST", "/tsdb-nanos/_doc", {"@timestamp": "2021-09-26T03:09:52.000000001Z", "k": "a"}),
+    ("POST", "/tsdb-nanos/_search", {"docvalue_fields": ["@timestamp"], "sort": ["@timestamp"], "_source": False},
+     {"pick": hit_meta}),
+    ("DELETE", "/tsdb-nanos"),
+    ("DELETE", "/rng-nanos?ignore_unavailable=true"),
+    ("PUT", "/rng-nanos", {"mappings": {"properties": {"d": {"type": "date_nanos"}}}}, ACK),
+    ("PUT", "/rng-nanos/_doc/1", {"d": "1969-12-31T23:59:59Z"}),
+    ("PUT", "/rng-nanos/_doc/2", {"d": "2263-01-01T00:00:00Z"}),
+    ("PUT", "/rng-nanos/_doc/3?refresh=true", {"d": "2018-10-29T12:12:12.987654321Z"}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/rng-nanos/_doc/4?refresh=true", {"d": "2018-10-29T12:12:12.123456789Z"}, {"pick": lambda r: r["result"]}),
+    ("POST", "/rng-nanos/_search", {"sort": [{"d": "desc"}], "_source": False}, {"pick": hit_meta}),
+    ("DELETE", "/rng-nanos"),
+])
+
+RNG_MAPPING = {"settings": STATIC, "mappings": {"properties": {
+    t: {"type": t} for t in ["integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range"]}}}
+
+scenario("range_fields", setup("rng-fields", RNG_MAPPING, [
+    {"integer_range": {"gte": 1, "lte": 5}, "long_range": {"gt": None, "lte": 5}, "float_range": {"gte": 1.5, "lt": 3},
+     "double_range": {"gt": 1, "lte": 5}, "date_range": {"gte": "2017-09-01", "lte": "2017-09-05"},
+     "ip_range": "192.168.0.0/24"},
+    {"integer_range": {"gte": 1, "lte": 3}, "long_range": {"gte": 10}, "float_range": {"gte": 3, "lte": 4},
+     "double_range": {"gte": 4, "lte": 5}, "date_range": {"gte": "2017-09-01", "lte": "2017-09-03"},
+     "ip_range": {"gte": "192.168.0.1", "lte": "192.168.0.3"}},
+    {"integer_range": {"gte": 4, "lte": 5}, "long_range": {"gte": None, "lt": None},
+     "date_range": {"gte": "2019-12-15T12:00:00.000Z", "lte": "2019-12-15T13:00:00.000Z"},
+     "ip_range": {"gte": "10.0.0.1", "lte": "10.0.0.5"}},
+    {"integer_range": None},
+]) + [
+    ("POST", "/rng-fields/_search", {"query": {"range": {f: dict(q, relation=rel)}}, "_source": False}, {"pick": ids})
+    for f, q in [("integer_range", {"gte": 3, "lte": 4}), ("long_range", {"gte": 5, "lte": 10}),
+                 ("float_range", {"gt": 3, "lt": 3.5}), ("double_range", {"gte": 1, "lt": 4}),
+                 ("date_range", {"gte": "2017-09-03", "lte": "2017-09-04"}),
+                 ("date_range", {"gt": "2019-12-15||/d"}), ("date_range", {"lte": "2019-12-15||/d"}),
+                 ("ip_range", {"gte": "192.168.0.2", "lte": "192.168.0.3"})]
+    for rel in ["intersects", "contains", "within"]
+] + [
+    ("POST", "/rng-fields/_search", {"query": {"term": {"long_range": -9223372036854775808}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"long_range": 9223372036854775806}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "192.168.0.200"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"terms": {"integer_range": [0, 5]}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"query_string": {"query": "integer_range:[2 TO 3]"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"range": {"integer_range": {"gte": 3, "relation": "disjoint"}}}}),
+    ("POST", "/rng-fields/_search", {"query": {"range": {"integer_range": {"gte": 3, "relation": "foo"}}}}),
+    ("PUT", "/rng-fields/_doc/7?refresh=true", {"ip_range": {"gte": None, "lte": "10.10.10.10"}}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/rng-fields/_doc/8?refresh=true", {"ip_range": {"gt": "2001:db8::", "lt": "200a:100::"}}, {"pick": lambda r: r["result"]}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "10.0.0.0"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "2001:db9::1"}}, "_source": False}, {"pick": ids}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": {"gte": 5, "lte": 1}}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": {"gte": "a"}}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": 5}),
+    ("DELETE", "/rng-fields"),
+])
+
+scenario("date_rounding", setup("rng-dates", {"settings": STATIC, "mappings": {"properties": {"d": {"type": "date"},
+                                                                                         "y": {"type": "date", "format": "uuuu"}}}}, [
+    {"d": "1970-01-01T00:00:01Z"}, {"d": "1500-01-01T12:00:00Z"}, {"d": "2017-09-04T10:00:00Z"},
+    {"d": "2017-09-04T23:59:59.999Z", "y": "2017"}]) + [
+    ("POST", "/rng-dates/_search", {"query": {"range": {"d": q}}, "_source": False, "sort": ["_doc"]}, {"pick": ids})
+    for q in [{"gte": 1000, "lte": 2023}, {"gte": "0", "lte": "1000"}, {"lte": "2017-09-04"}, {"lt": "2017-09-04"},
+              {"gt": "2017-09-04T09"}, {"lte": "2017-09"}, {"gt": "2017-09-04T23:59:59"},
+              {"gte": 1500, "lte": 1500, "format": "uuuu"}, {"gte": 1000, "lte": 2017, "format": "uuuu"}]
+] + [
+    ("POST", "/rng-dates/_search", {"query": {"term": {"d": "2017-09-04T10:00:00Z"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-dates/_search", {"query": {"term": {"d": "2017-09-04"}}, "_source": False, "sort": ["_doc"]}, {"pick": ids}),
+    ("POST", "/rng-dates/_search", {"query": {"match": {"d": "1500-01-01T12:00:00.000Z"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-dates/_search", {"query": {"query_string": {"query": "d:\"2017-09-04T10:00:00Z\""}}, "_source": False}, {"pick": ids}),
+    ("DELETE", "/rng-dates"),
+])
+
+scenario("dynamic_settings", [
+    ("DELETE", "/rng-dyn?ignore_unavailable=true"),
+    ("PUT", "/rng-dyn", {"settings": STATIC, "mappings": {
+        "dynamic_templates": [{"kw": {"match_mapping_type": "string", "mapping": {"type": "keyword"}}},
+                              {"ints": {"match": "i_*", "mapping": {"type": "integer"}}},
+                              {"x": {"match": "x_*", "match_mapping_type": "*",
+                                     "mapping": {"type": "{dynamic_type}", "meta": {"n": "{name}"}}}}],
+        "properties": {"off": {"type": "object", "dynamic": "false"}, "strict": {"type": "object", "dynamic": "strict"},
+                       "rt": {"type": "object", "dynamic": "runtime"}}}}, ACK),
+    ("PUT", "/rng-dyn/_doc/1", {"s": "x", "i_a": 5, "x_b": "2021-01-01", "x_c": 1.5, "x_d": "str", "dd": "2021-01-01",
+                                "off": {"q": 1}, "rt": {"k": "v", "n": 1}, "o": {"p": {"q": True}}},
+     {"pick": lambda r: r["result"]}),
+    ("GET", "/rng-dyn/_mapping"),
+    ("PUT", "/rng-dyn/_doc/2", {"strict": {"new": 1}}),
+    ("DELETE", "/rng-dyn"),
+])
 
 failures = 0
 for name, steps in SCENARIOS.items():

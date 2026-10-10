@@ -322,7 +322,8 @@ pub fn parse_math(s: &str, now: i64, round_up: bool, format: Option<&str>, tz: i
     } else if let Some(pos) = s.find("||") {
         (parse(&s[..pos], format, tz)?, &s[pos + 2..])
     } else {
-        return parse(s, format, tz);
+        let t = parse(s, format, tz)?;
+        return Some(if round_up { t + round_up_fill(s, format, tz) } else { t });
     };
     let b = math.as_bytes();
     let mut i = 0;
@@ -357,6 +358,53 @@ pub fn parse_math(s: &str, now: i64, round_up: bool, format: Option<&str>, tz: i
         t = add(t, if op == b'-' { -n } else { n }, unit, tz);
     }
     Some(t)
+}
+
+/// What rounding up adds to a date parsed without some of its fields:
+/// Elasticsearch's round-up parser fills a missing time of day with its
+/// last millisecond (`2017-09-04` is `2017-09-04T23:59:59.999`), the way a
+/// `lte` or `gt` bound reads it.
+fn round_up_fill(s: &str, format: Option<&str>, tz: i64) -> i64 {
+    let format = format.unwrap_or("strict_date_optional_time||epoch_millis");
+    for f in format.split("||").map(str::trim) {
+        if parse(s, Some(f), tz).is_none() {
+            continue;
+        }
+        let pattern = match f {
+            "epoch_millis" | "epoch_second" => return 0,
+            "basic_date" | "year_month_day" | "year_month" | "year" | "strict_date" | "date" => {
+                return MS_DAY - 1;
+            }
+            "strict_date_optional_time"
+            | "date_optional_time"
+            | "strict_date_time"
+            | "date_time"
+            | "iso8601" => {
+                let Some((_, time)) = s.split_once(['T', 't']) else { return MS_DAY - 1 };
+                let time = time.split(['Z', 'z', '+', '-']).next().unwrap_or("");
+                return match (time.matches(':').count(), time.contains(['.', ','])) {
+                    (0, _) => 3_599_999,
+                    (1, _) => 59_999,
+                    (_, false) => 999,
+                    _ => 0,
+                };
+            }
+            p => p,
+        };
+        let has = |c: &[char]| pattern.contains(c);
+        return if !has(&['H', 'h', 'k', 'K']) {
+            MS_DAY - 1
+        } else if !has(&['m']) {
+            3_599_999
+        } else if !has(&['s']) {
+            59_999
+        } else if !has(&['S']) {
+            999
+        } else {
+            0
+        };
+    }
+    0
 }
 
 /// Formats `ms` with a Java-style pattern, or Elasticsearch's default
