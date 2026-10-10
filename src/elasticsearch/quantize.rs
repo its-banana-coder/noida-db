@@ -380,7 +380,7 @@ pub fn scores(opts: Options, sim: Sim, query: &[f32], vectors: &[&[f32]]) -> Vec
     let query = if owned.is_some() { normalized(query) } else { query.to_vec() };
     let dims = query.len();
     let quantizer = match opts.confidence {
-        Some(c) if c == 0.0 => dynamic(&vectors, sim, opts.bits),
+        Some(0.0) => dynamic(&vectors, sim, opts.bits),
         Some(c) => fixed(&vectors, c, opts.bits),
         None => fixed(&vectors, default_confidence(dims), opts.bits),
     };

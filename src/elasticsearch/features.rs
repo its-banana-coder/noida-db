@@ -1,3 +1,4 @@
+#![allow(clippy::neg_cmp_op_on_partial_ord, clippy::type_complexity)]
 //! Feature fields: `rank_feature`, `rank_features` and `sparse_vector`,
 //! each a Lucene `FeatureField` (a strictly positive float per feature
 //! name, kept to 9 significant bits), with their indexing checks and the
