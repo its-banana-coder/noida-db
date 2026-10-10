@@ -1682,6 +1682,11 @@ const NODE_FEATURES: &[&str] = &[
 /// `GET /_features`: the system features and what they manage.
 pub(super) fn features() -> Value {
     let list = [
+        ("logstash_management", "Enables Logstash Central Management pipeline storage"),
+        ("searchable_snapshots", "Manages caches and configuration for searchable snapshots"),
+        ("security", "Manages configuration for Security features, such as users and roles"),
+        ("tasks", "Manages task results"),
+        ("inference_plugin", "Inference plugin for managing inference services and inference"),
         ("enrich", "Manages data related to Enrich policies"),
         ("fleet", "Manages configuration for Fleet"),
         ("watcher", "Manages Watch definitions and state"),
@@ -1692,11 +1697,6 @@ pub(super) fn features() -> Value {
         ("synonyms", "Manages synonyms"),
         ("kibana", "Manages Kibana configuration and reports"),
         ("transform", "Manages configuration and state for transforms"),
-        ("logstash_management", "Enables Logstash Central Management pipeline storage"),
-        ("searchable_snapshots", "Manages caches and configuration for searchable snapshots"),
-        ("security", "Manages configuration for Security features, such as users and roles"),
-        ("tasks", "Manages task results"),
-        ("inference_plugin", "Inference plugin for managing inference services and inference"),
     ];
     json!({"features": list.iter().map(|(n, d)| json!({"name": n, "description": d})).collect::<Vec<_>>()})
 }
