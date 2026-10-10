@@ -185,7 +185,17 @@ fn parse_pattern(s: &str, pattern: &str, tz: i64) -> Option<i64> {
                 'H' => h = v,
                 'm' => mi = v,
                 's' => sec = v,
-                'S' => ms = v,
+                // A fraction of a second: its first three digits are the
+                // milliseconds (`SSSSSS` reads micros).
+                'S' => {
+                    let digits = ti - start;
+                    ms = match digits {
+                        1 => v * 100,
+                        2 => v * 10,
+                        3 => v,
+                        n => v / 10i64.pow(n as u32 - 3),
+                    };
+                }
                 _ => return None,
             }
             pi += run;

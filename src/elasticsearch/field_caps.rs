@@ -185,7 +185,16 @@ pub fn field_caps(
     let mut fields: BTreeMap<String, BTreeMap<String, Vec<(String, Cap)>>> = BTreeMap::new();
     let include_empty = q.get("include_empty_fields").is_none_or(|v| v != "false");
     for (index, mappings, sources) in indices {
-        let caps = all_caps(mappings);
+        let mut caps = all_caps(mappings);
+        // Runtime fields (the index's, then the request's) are searchable
+        // and aggregatable, and shadow a mapped field of the same name.
+        for runtime in [mappings.get("runtime"), body.get("runtime_mappings")] {
+            for (name, def) in runtime.and_then(Value::as_object).into_iter().flatten() {
+                let ty = def.get("type").and_then(Value::as_str).unwrap_or("keyword");
+                caps.retain(|(n, _)| n != name);
+                caps.push((name.clone(), Cap::new(ty, true, true, false)));
+            }
+        }
         // `include_empty_fields=false`: only fields some document has.
         let has_value = |name: &str, cap: &Cap| {
             if include_empty || cap.metadata {

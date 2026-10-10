@@ -370,7 +370,7 @@ pub fn function_score(
 
 /// The `doc` a scoring script sees: each field's values, `.value` the
 /// first.
-fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
+pub(super) fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
     let mut m = Map::new();
     // Only the fields the script names (`doc['x']`).
     let mut rest = src;
