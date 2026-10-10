@@ -206,6 +206,10 @@ struct Ctx<'a> {
     analyze_wildcard: bool,
     fuzziness_default: Value,
     phrase_slop: i64,
+    /// `analyzer` / `quote_analyzer`: what query text and phrases go
+    /// through instead of the fields' own search analyzers.
+    analyzer: Option<String>,
+    quote_analyzer: Option<String>,
 }
 
 impl Ctx<'_> {
@@ -257,7 +261,13 @@ impl Ctx<'_> {
                 return Some(json!({"wildcard": {f: pattern}}));
             }
             match ty {
-                "text" | "match_only_text" => Some(json!({"match": {f: {"query": text}}})),
+                "text" | "match_only_text" => {
+                    let mut m = json!({"query": text});
+                    if let Some(a) = &self.analyzer {
+                        m["analyzer"] = json!(a);
+                    }
+                    Some(json!({"match": {f: m}}))
+                }
                 "keyword" | "constant_keyword" | "wildcard" => Some(json!({"term": {f: text}})),
                 "boolean" => match text {
                     "true" | "false" => Some(json!({"term": {f: text}})),
@@ -287,7 +297,11 @@ impl Ctx<'_> {
     fn phrase_query(&self, field: Option<&str>, text: &str, slop: i64) -> Value {
         self.leaf(field, &|f, ty| match ty {
             "text" | "match_only_text" => {
-                Some(json!({"match_phrase": {f: {"query": text, "slop": slop}}}))
+                let mut m = json!({"query": text, "slop": slop});
+                if let Some(a) = self.quote_analyzer.as_ref().or(self.analyzer.as_ref()) {
+                    m["analyzer"] = json!(a);
+                }
+                Some(json!({"match_phrase": {f: m}}))
             }
             "keyword" => Some(json!({"term": {f: text}})),
             _ => None,
@@ -593,6 +607,8 @@ pub fn query_string(spec: &Value, mappings: &Value) -> Result<Value, EsError> {
         analyze_wildcard: spec.get("analyze_wildcard").and_then(Value::as_bool).unwrap_or(false),
         fuzziness_default: spec.get("fuzziness").cloned().unwrap_or(json!("AUTO")),
         phrase_slop: spec.get("phrase_slop").and_then(Value::as_i64).unwrap_or(0),
+        analyzer: spec.get("analyzer").and_then(Value::as_str).map(str::to_string),
+        quote_analyzer: spec.get("quote_analyzer").and_then(Value::as_str).map(str::to_string),
     };
     let _ = ctx.analyze_wildcard;
     let fail = |m: String| {
@@ -636,6 +652,8 @@ pub fn simple_query_string(spec: &Value, mappings: &Value) -> Result<Value, EsEr
         analyze_wildcard: false,
         fuzziness_default: json!("AUTO"),
         phrase_slop: 0,
+        analyzer: spec.get("analyzer").and_then(Value::as_str).map(str::to_string),
+        quote_analyzer: spec.get("quote_analyzer").and_then(Value::as_str).map(str::to_string),
     };
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;

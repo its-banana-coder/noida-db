@@ -1445,6 +1445,299 @@ scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
     ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
 ])
 
+
+# --- Text analysis (`an_*`, indices and synonym sets `an-*`) -----------------
+
+AN = "/_analyze"
+AN_T = ("The 2 QUICK Brown-Foxes jumped over the lazy dog's bone. foo_bar U.S.A. 3.14 1,000 "
+        "e-mail@x.com http://www.example.com/a?b=1 don't 🙂 café 東京タワー ひらがな カタカナ 한국어 x123 α-βeta")
+
+
+def an(body, path=AN):
+    return ("POST", path, body)
+
+
+def an_tok(text, tok, filters=None, cf=None):
+    b = {"text": text, "tokenizer": tok}
+    if filters is not None:
+        b["filter"] = filters
+    if cf is not None:
+        b["char_filter"] = cf
+    return an(b)
+
+
+scenario("an_tokenizers", [an_tok(AN_T, t) for t in [
+    "standard", "classic", "uax_url_email", "whitespace", "letter", "lowercase", "keyword", "ngram", "edge_ngram",
+    "pattern", "path_hierarchy",
+]] + [
+    an_tok("Quick Fox-2", {"type": "ngram", "min_gram": 2, "max_gram": 3, "token_chars": ["letter", "digit"]}),
+    an_tok("Quick Fox-2 a_b", {"type": "edge_ngram", "min_gram": 1, "max_gram": 3, "token_chars": ["letter", "custom"],
+                               "custom_token_chars": "_-"}),
+    an_tok("one,two  three", {"type": "pattern", "pattern": ","}),
+    an_tok("\"value\", \"value with embedded \\\" quote\"",
+           {"type": "pattern", "pattern": "\"((?:\\\\\"|[^\"]|\\\\\")+)\"", "group": 1}),
+    an_tok("fd-786-335-514-x", {"type": "simple_pattern", "pattern": "[0123456789]{3}"}),
+    an_tok("an|split|string", {"type": "simple_pattern_split", "pattern": "\\|"}),
+    an_tok("The QUICK brown-fox", {"type": "char_group", "tokenize_on_chars": ["whitespace", "-", "\n"]}),
+    an_tok("one-two-three-four-five", {"type": "path_hierarchy", "delimiter": "-", "replacement": "/", "skip": 2}),
+    an_tok("/one/two/three", {"type": "path_hierarchy", "reverse": True}),
+    an_tok("www.elastic.co", {"type": "path_hierarchy", "delimiter": ".", "reverse": True}),
+    an_tok("The quick brown fox", {"type": "standard", "max_token_length": 3}),
+    an_tok("aaaaaaaaaa bb", {"type": "whitespace", "max_token_length": 4}),
+    an_tok("", "keyword"),
+    an({"text": "", "analyzer": "standard"}),
+    an_tok("wi-fi WiFi 3D x86_64 R2-D2 O'Neil's 1.2.3 a.b.c 1,2 1-2 A1B2 12.ab", "standard"),
+    an_tok("😀👍🏽 🇺🇸 #hash @user $5 50% ½ ภาษาไทย ລາວ Ω≈ç√ ﬁ ẞ İstanbul", "standard"),
+    an({"text": ["Foo Bar", "Baz"], "tokenizer": "standard"}),
+    an({"text": ["Foo Bar", "Baz"], "analyzer": "standard"}),
+])
+
+scenario("an_filters", [an_tok(t, tok, f) for t, f, tok in [
+    ("Ünïcödé CAFÉ Straße ﬁne", ["lowercase", "asciifolding"], "standard"),
+    ("Ünïcödé CAFÉ", [{"type": "asciifolding", "preserve_original": True}], "standard"),
+    ("hello World", ["uppercase"], "standard"),
+    ("The quick and the dead is a fox", ["lowercase", "stop"], "standard"),
+    ("The quick and the Dead", [{"type": "stop", "stopwords": ["the", "dead"], "ignore_case": True}], "standard"),
+    ("the quick an", [{"type": "stop", "stopwords": ["an"], "remove_trailing": False}], "standard"),
+    ("le chat et la souris de Paris", [{"type": "stop", "stopwords": "_french_"}], "standard"),
+    ("caresses ponies ties agreed plastered motoring conflated troubled sized hopping relational conditional "
+     "valenci digitizer conformabli radicalli vietnamization predication feudalism decisiveness formaliti "
+     "triplicate electrical allowance adjustable replacement homologous effective bowdlerize controll "
+     "generalizations oscillators", ["porter_stem"], "whitespace"),
+    ("dancing stars running ran easily generalizations knives", [{"type": "stemmer", "language": "english"}], "whitespace"),
+    ("dancing stars running ran easily fairly generalizations", [{"type": "snowball", "language": "English"}], "whitespace"),
+    ("dogs boxes flies cats queries ladies abilities knives", [{"type": "stemmer", "language": "minimal_english"}], "whitespace"),
+    ("John's dog's toys", [{"type": "stemmer", "language": "possessive_english"}], "standard"),
+    ("the quick brown fox", ["shingle"], "whitespace"),
+    ("the quick brown fox", [{"type": "shingle", "min_shingle_size": 2, "max_shingle_size": 3,
+                              "output_unigrams": False}], "whitespace"),
+    ("quick fox", [{"type": "ngram", "min_gram": 1, "max_gram": 2}], "whitespace"),
+    ("quick fox", [{"type": "edge_ngram", "min_gram": 1, "max_gram": 3}], "whitespace"),
+    ("quick fox", [{"type": "edge_ngram", "min_gram": 2, "max_gram": 3, "preserve_original": True}], "whitespace"),
+    ("quick fox", ["edge_ngram"], "whitespace"),
+    ("Wi-Fi PowerShot500 SD500 O'Neil's j2se wi_fi foo-bar-baz", ["word_delimiter"], "whitespace"),
+    ("Wi-Fi PowerShot500 SD500 O'Neil's j2se wi_fi foo-bar-baz", ["word_delimiter_graph"], "whitespace"),
+    ("Wi-Fi PowerShot500 SD500", [{"type": "word_delimiter_graph", "preserve_original": True,
+                                   "catenate_words": True}], "whitespace"),
+    ("a bb ccc dddd", [{"type": "length", "min": 2, "max": 3}], "whitespace"),
+    ("abcdefghijklmnop xyz", ["truncate"], "whitespace"),
+    ("the fox the dog fox", ["unique"], "whitespace"),
+    (" a b ", ["trim"], "keyword"),
+    ("hello world", ["reverse"], "whitespace"),
+    ("l'avion d'Paris j'aime L'Arbre", ["elision"], "standard"),
+    ("Istanbul'a veya Istanbul'dan", ["apostrophe"], "standard"),
+    ("running jumping", [{"type": "keyword_marker", "keywords_pattern": "^run.*"}, "porter_stem"], "standard"),
+    ("aaa-bbb ccc aXa", [{"type": "pattern_replace", "pattern": "a", "replacement": "X", "all": False}], "whitespace"),
+    ("one two three four", [{"type": "limit", "max_token_count": 2}], "whitespace"),
+    ("١٢٣ ٤٥ abc", ["decimal_digit"], "whitespace"),
+    ("ｼｰｻｲﾄﾞﾗｲﾅｰ ＡＢＣ１２３", ["cjk_width"], "whitespace"),
+    ("東京都に住む", ["cjk_bigram"], "standard"),
+    ("dogs running fox", ["keyword_repeat", "porter_stem", "remove_duplicates"], "whitespace"),
+    ("zebra jumps over resting resting dog", ["fingerprint"], "whitespace"),
+    ("İSTANBUL ISPARTA", [{"type": "lowercase", "language": "turkish"}], "standard"),
+    ("chevaux étudiants rapides", [{"type": "stemmer", "language": "light_french"}], "standard"),
+]])
+
+scenario("an_char_filters", [an_tok(t, tok, [], cf) for t, cf, tok in [
+    ("<p>I&apos;m so <b>happy</b>! &lt;3 &amp; caf&eacute; &#169; &#x41;</p><br/>x<script>bad()</script>y",
+     ["html_strip"], "standard"),
+    ("a<div>b</div>c<p>d</p>e<br>f<li>h</li>i<!-- c -->j<b>k</b>", ["html_strip"], "keyword"),
+    ("<p>keep <b>this</b></p>", [{"type": "html_strip", "escaped_tags": ["b"]}], "keyword"),
+    (":) x ph ab abc", [{"type": "mapping", "mappings": [":) => _happy_", "ph => f", "ab => X", "abc => Y"]}], "standard"),
+    ("xx yy", [{"type": "mapping", "mappings": ["x => "]}], "standard"),
+    ("aXbXc a1b22c", [{"type": "pattern_replace", "pattern": "X", "replacement": "--"}], "standard"),
+    ("My credit card is 123-456-789", [{"type": "pattern_replace", "pattern": "(\\d+)-", "replacement": "$1_"}],
+     "standard"),
+]])
+
+scenario("an_analyzers", [an({"text": "The QUICK brown foxes jumped over the lazy dog's bones; isn't it? Café 42",
+                               "analyzer": a}) for a in [
+    "standard", "simple", "whitespace", "stop", "keyword", "pattern", "fingerprint", "english", "snowball", "classic",
+    "french", "german", "spanish", "italian", "portuguese", "russian", "cjk",
+]] + [
+    an({"text": "The dancing stars were shining brightly; John's cats' toys", "analyzer": "english"}),
+    an({"text": "L'avion des étudiants était très rapide, n'est-ce pas? Les chevaux mangeaient", "analyzer": "french"}),
+    an({"text": "Die Häuser der Straße waren schöner als die Bäume", "analyzer": "german"}),
+    an({"text": "Los niños estaban corriendo rápidamente por las calles", "analyzer": "spanish"}),
+])
+
+scenario("an_explain", [
+    an({"text": "This is troubled", "analyzer": "standard", "explain": True}),
+    an({"text": "foo bar buzz", "tokenizer": "standard", "explain": True,
+        "filter": [{"type": "stop", "stopwords": ["foo", "buzz"]}]}),
+    an({"text": "<b>Hello</b> World", "tokenizer": "standard", "char_filter": ["html_strip"],
+        "filter": ["lowercase", {"type": "keyword_marker", "keywords": ["world"]}, "porter_stem"],
+        "explain": True, "attributes": ["keyword"]}),
+    an({"text": "Hello World", "analyzer": "english", "explain": True, "attributes": ["keyword", "foo"]}),
+    an({"text": "dogs", "tokenizer": "standard", "filter": ["keyword_repeat", "porter_stem"], "explain": True}),
+    an({"text": ["a b", "c"], "tokenizer": "whitespace", "explain": True}),
+])
+
+scenario("an_errors", [
+    an({}),
+    an({"text": "x", "analyzer": "nope"}),
+    an({"text": "x", "tokenizer": "nope"}),
+    an({"text": "x", "tokenizer": "standard", "filter": ["nope"]}),
+    an({"text": "x", "tokenizer": "standard", "filter": [{"type": "nope"}]}),
+    an({"text": "x", "tokenizer": "standard", "char_filter": ["nope"]}),
+    an({"text": "a b", "analyzer": "standard", "tokenizer": "standard"}),
+    an({"text": "x", "normalizer": "lowercase"}),
+    an({"text": "x", "tokenizer": "standard", "filter": [{"type": "synonym"}]}),
+    an({"text": "x", "tokenizer": "standard", "filter": [{"type": "synonym", "synonyms": ["a => b => c"]}]}),
+    an({"text": "x", "tokenizer": {"type": "ngram", "min_gram": 1, "max_gram": 5}}),
+    an({"text": "x", "filter": ["porter_stem"]}),
+    an({"text": "x", "bogus": 1}),
+    ("POST", "/an-nope/_analyze", {"text": "x"}),
+] + [step for body in [
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "custom", "tokenizer": "nope"}}}}},
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "custom"}}}}},
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "custom", "tokenizer": "standard", "filter": ["nope"]}}}}},
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "nope"}}}}},
+    {"settings": {"analysis": {"filter": {"f": {"type": "nope"}}}}},
+    {"mappings": {"properties": {"t": {"type": "text", "analyzer": "nope"}}}},
+    {"mappings": {"properties": {"t": {"type": "text", "search_analyzer": "nope"}}}},
+    {"mappings": {"properties": {"k": {"type": "keyword", "normalizer": "nope"}}}},
+    {"settings": {"analysis": {"normalizer": {"n": {"type": "custom", "filter": ["porter_stem"]}}}}},
+    {"settings": {"analysis": {"tokenizer": {"t": {"type": "ngram", "min_gram": 1, "max_gram": 5}}}}},
+    {"settings": {"analysis": {"filter": {"f": {"type": "synonym", "synonyms": ["a => b => c"]}},
+                               "analyzer": {"a": {"tokenizer": "standard", "filter": ["f"]}}}}},
+] for step in [("PUT", "/an-err", body), ("DELETE", "/an-err?ignore_unavailable=true")]])
+
+AN_IDX = {"settings": {"index": {"refresh_interval": "-1", "number_of_shards": 1}, "analysis": {
+    "char_filter": {"my_cf": {"type": "mapping", "mappings": ["ph => f"]}},
+    "filter": {"my_stop": {"type": "stop", "stopwords": ["foo"]},
+               "my_syn": {"type": "synonym", "synonyms": ["quick, fast", "nyc => new york city"]},
+               "my_edge": {"type": "edge_ngram", "min_gram": 2, "max_gram": 10}},
+    "analyzer": {"my_an": {"type": "custom", "tokenizer": "standard", "char_filter": ["my_cf", "html_strip"],
+                           "filter": ["lowercase", "my_stop", "my_syn"]},
+                 "edge": {"tokenizer": "whitespace", "filter": ["lowercase", "my_edge"]},
+                 "std_stop": {"type": "standard", "stopwords": "_english_", "max_token_length": 5}},
+    "normalizer": {"my_norm": {"type": "custom", "filter": ["lowercase", "asciifolding"]}}}},
+    "mappings": {"properties": {
+        "t": {"type": "text", "analyzer": "my_an"},
+        "e": {"type": "text", "analyzer": "english"},
+        "auto": {"type": "text", "analyzer": "edge", "search_analyzer": "standard"},
+        "k": {"type": "keyword", "normalizer": "my_norm"},
+        "title": {"type": "text", "fields": {"english": {"type": "text", "analyzer": "english"}}}}}}
+AN_DOCS = [
+    {"t": "Phone foo QUICK nyc", "e": "The dancing stars were shining", "auto": "Quick Brown Fox",
+     "k": "Héllo Wörld", "title": "dancing with the stars"},
+    {"t": "a fast car in new york", "e": "dance with star", "auto": "Lazy dog", "k": "HELLO WORLD",
+     "title": "dance with star"},
+    {"t": "slow boat", "e": "stars dancing", "auto": "quickly", "k": "other", "title": "stars of the dance"},
+]
+AS = "/an-idx/_search"
+
+scenario("an_custom_index", setup("an-idx", AN_IDX, AN_DOCS) + [
+    ("GET", "/an-idx/_settings", None, {"pick": lambda r: r["an-idx"]["settings"]["index"]["analysis"]}),
+    an({"text": "Phone foo QUICK nyc", "analyzer": "my_an", "explain": True}, "/an-idx/_analyze"),
+    an({"text": "Phone foo QUICK nyc", "field": "t"}, "/an-idx/_analyze"),
+    an({"text": "Héllo Wörld", "field": "k"}, "/an-idx/_analyze"),
+    an({"text": "Héllo Wörld", "normalizer": "my_norm"}, "/an-idx/_analyze"),
+    an({"text": "The quickest brown", "analyzer": "std_stop"}, "/an-idx/_analyze"),
+    an({"text": ["a b", "c"], "field": "t"}, "/an-idx/_analyze"),
+    an({"text": "Hello World", "field": "nope"}, "/an-idx/_analyze"),
+    ("POST", AS, {"query": {"match": {"t": "fast"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"t": "fone"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"e": "dances"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match_phrase": {"e": "dancing star"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match_phrase": {"e": "dancing the stars"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match_phrase": {"e": {"query": "dancing stars", "slop": 2}}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"auto": "qui"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"auto": "quick"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"term": {"k": "HÉLLO WÖRLD"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"terms": {"k": ["Hello World", "x"]}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"k": "hello world"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"title": {"query": "dances", "analyzer": "english"}}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"title.english": "dances"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"multi_match": {"query": "dances", "fields": ["title", "title.english"]}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"title.english": "dancing"}},
+                  "highlight": {"fields": {"title": {"matched_fields": ["title.english"]}}}},
+     {"pick": lambda r: sorted((h["_id"], h.get("highlight")) for h in r["hits"]["hits"])}),
+    ("POST", AS, {"size": 0, "aggs": {"k": {"terms": {"field": "k"}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("DELETE", "/an-idx"),
+])
+
+AN_SYN_IDX = {"settings": {"index": {"number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "-1"},
+                           "analysis": {
+    "filter": {"syn": {"type": "synonym_graph", "synonyms_set": "an-set1", "updateable": True}},
+    "analyzer": {"syn_an": {"type": "custom", "tokenizer": "standard", "filter": ["lowercase", "syn"]}}}},
+    "mappings": {"properties": {"f": {"type": "text", "search_analyzer": "syn_an"}}}}
+
+scenario("an_synonyms", [
+    ("DELETE", "/an-syn?ignore_unavailable=true"),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set2"),
+    ("GET", "/_synonyms/an-set1"),
+    ("PUT", "/_synonyms/an-set1", {"synonyms_set": [{"synonyms": "hello, hi", "id": "r1"},
+                                                     {"synonyms": "bye => goodbye", "id": "r2"}]}),
+    ("PUT", "/_synonyms/an-set1", {"synonyms_set": [{"synonyms": "hello, hi", "id": "r1"},
+                                                     {"synonyms": "bye => goodbye", "id": "r2"},
+                                                     {"synonyms": "test => check", "id": "r3"}]}),
+    ("GET", "/_synonyms/an-set1"),
+    ("GET", "/_synonyms/an-set1?size=2"),
+    ("GET", "/_synonyms/an-set1?from=1"),
+    ("GET", "/_synonyms/an-set1?size=-1"),
+    ("GET", "/_synonyms/an-set1?from=100001"),
+    ("GET", "/_synonyms/an-set1/r2"),
+    ("GET", "/_synonyms/an-set1/nope"),
+    ("GET", "/_synonyms/an-nope/r2"),
+    ("PUT", "/_synonyms/an-set1/r2", {"synonyms": "bye, goodbye, seeya"}),
+    ("PUT", "/_synonyms/an-set1/r0", {"synonyms": "i-phone, iphone"}),
+    ("PUT", "/_synonyms/an-nope/r0", {"synonyms": "a, b"}),
+    ("PUT", "/_synonyms/an-set1/r9", {"synonyms": ""}),
+    ("PUT", "/_synonyms/an-set1/r9", {"synonyms": "a, b", "id": "x"}),
+    ("GET", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set1/r3"),
+    ("DELETE", "/_synonyms/an-set1/r3"),
+    ("DELETE", "/_synonyms/an-nope/r3"),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": []}),
+    ("GET", "/_synonyms/an-set2"),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": ""}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": "bye => => goodbye"}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": " => goodbye"}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": "bye, goodbye,  "}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"id": "x"}]}),
+    ("PUT", "/_synonyms/an-set2", {}),
+    ("PUT", "/an-syn", AN_SYN_IDX),
+    ("POST", "/_bulk?refresh=true", [{"index": {"_index": "an-syn", "_id": "1"}}, {"f": "hello"},
+                                     {"index": {"_index": "an-syn", "_id": "2"}}, {"f": "goodbye"}],
+     {"pick": lambda r: r["errors"]}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "hi"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "bye"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_analyze", {"text": "hello bye", "analyzer": "syn_an"}),
+    ("PUT", "/_synonyms/an-set1", {"synonyms_set": [{"synonyms": "hello, salute"}, {"synonyms": "ciao => goodbye"}]},
+     {"pick": lambda r: (r["result"], [{k: v for k, v in d.items() if k != "reloaded_node_ids"}
+                                       for d in r["reload_analyzers_details"]["reload_details"]])}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "salute"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "ciao"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "hi"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_reload_search_analyzers", None,
+     {"pick": lambda r: [{k: v for k, v in d.items() if k != "reloaded_node_ids"} for d in r["reload_details"]]}),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/an-syn"),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set2"),
+])
+
+scenario("an_synonym_filters", [an({"text": t, "tokenizer": "standard",
+                                    "filter": ["lowercase", {"type": ty, "synonyms": rules, **extra}]})
+                                 for ty in ["synonym", "synonym_graph"] for t, rules, extra in [
+    ("the quick fox", ["quick, fast, speedy"], {}),
+    ("Fast cars in NYC", ["quick, fast", "nyc => new york city"], {}),
+    ("i love new york and the usa", ["new york, ny", "usa, united states of america"], {}),
+    ("united states of america rocks", ["usa, united states of america"], {}),
+    ("visit the big apple now", ["big apple => nyc"], {}),
+    ("a b c d", ["a b c => x"], {}),
+    ("quick", ["quick, fast"], {"expand": False}),
+    ("fast", ["quick, fast", "fast => rapid"], {}),
+    ("x y", ["x => a b c", "y => d"], {}),
+    ("hello", ["s(100000001,1,'hello',n,1,0).", "s(100000001,2,'hi',n,1,0)."], {"format": "wordnet"}),
+    ("hello", ["hello\\, world, hi"], {}),
+]])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

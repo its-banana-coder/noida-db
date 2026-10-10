@@ -29,10 +29,7 @@ enum Hl {
 }
 
 fn analyze(mappings: &Value, field: &str, text: &str) -> Vec<String> {
-    match resolve_field(mappings, field).1.as_deref() {
-        None | Some("text") | Some("match_only_text") => analysis::standard(text),
-        Some(_) => vec![text.to_string()],
-    }
+    super::search::analyze_for(mappings, field, text)
 }
 
 fn text_of(v: Option<&Value>) -> String {
@@ -281,12 +278,54 @@ fn edit_distance(a: &str, b: &str) -> usize {
 /// A token: its term and byte range in the text.
 type Token = (String, usize, usize);
 
-fn tokenize(text: &str, keyword: bool) -> Vec<Token> {
+/// The tokens of `field`'s value `text` (its index analyzer), with byte
+/// offsets.
+fn tokenize(mappings: &Value, field: &str, text: &str, keyword: bool) -> Vec<Token> {
     if keyword {
         if text.is_empty() { vec![] } else { vec![(text.to_string(), 0, text.len())] }
     } else {
-        analysis::standard_with_offsets(text)
+        let toks = analysis::field_tokens(mappings, field, text, analysis::Mode::Index);
+        analysis::with_byte_offsets(text, toks)
     }
+}
+
+/// Spans of `text` to tag for `field`: its own matches, plus (with
+/// `matched_fields`) each other field's matches in its own analysis of
+/// the same text.
+#[allow(clippy::too_many_arguments)]
+fn field_spans(
+    mappings: &Value,
+    field: &str,
+    text: &str,
+    keyword: bool,
+    terms: &[(String, Hl)],
+    matched_fields: &[String],
+    hls: &[&Hl],
+    weighted: bool,
+    limited: &dyn Fn(&str, Vec<Token>) -> Vec<Token>,
+) -> Vec<(usize, usize)> {
+    if matched_fields.is_empty() {
+        return spans(&limited(text, tokenize(mappings, field, text, keyword)), hls, weighted);
+    }
+    let mut all = Vec::new();
+    let mut sources: Vec<&str> = vec![field];
+    sources.extend(matched_fields.iter().map(String::as_str).filter(|f| *f != field));
+    for f in sources {
+        let these: Vec<&Hl> = terms.iter().filter(|(tf, _)| tf == f).map(|(_, h)| h).collect();
+        if these.is_empty() {
+            continue;
+        }
+        all.extend(spans(&limited(text, tokenize(mappings, f, text, keyword)), &these, weighted));
+    }
+    all.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in all {
+        match merged.last_mut() {
+            Some(last) if s < last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
 }
 
 /// Which tokens a query term matches, and where its phrases occur (as
@@ -1091,7 +1130,7 @@ pub fn highlight(
             if ty == "plain" {
                 let mut all: Vec<(f32, usize, String)> = Vec::new();
                 for text in &values {
-                    let toks = limited(text, tokenize(text, keyword));
+                    let toks = limited(text, tokenize(mappings, &field, text, keyword));
                     let mut fs = plain_fragments(text, &toks, &hls, size, fragmenter, &fmt);
                     fs.sort_by(|a, b| {
                         b.0.partial_cmp(&a.0)
@@ -1112,8 +1151,11 @@ pub fn highlight(
                 frags = all.into_iter().map(|f| f.2).collect();
                 if frags.is_empty()
                     && no_match > 0
-                    && let Some(e) =
-                        plain_no_match(&values[0], &tokenize(&values[0], keyword), no_match)
+                    && let Some(e) = plain_no_match(
+                        &values[0],
+                        &tokenize(mappings, &field, &values[0], keyword),
+                        no_match,
+                    )
                 {
                     let mut s = String::new();
                     push_encoded(&mut s, &e, html);
@@ -1124,7 +1166,17 @@ pub fn highlight(
                 let weighted = ty == "fvh" || (ctx.weighted && weight_setting);
                 if count == 0 || keyword {
                     for text in &values {
-                        let sp = spans(&limited(text, tokenize(text, keyword)), &hls, weighted);
+                        let sp = field_spans(
+                            mappings,
+                            &field,
+                            text,
+                            keyword,
+                            &terms,
+                            &matched_fields,
+                            &hls,
+                            weighted,
+                            &limited,
+                        );
                         if !sp.is_empty() {
                             frags.push(tag(text, &sp, &fmt));
                         }
@@ -1133,7 +1185,17 @@ pub fn highlight(
                     // Values are highlighted as one text, separated so no
                     // passage spans two of them.
                     let content = values.join("\u{2029}");
-                    let sp = spans(&limited(&content, tokenize(&content, false)), &hls, weighted);
+                    let sp = field_spans(
+                        mappings,
+                        &field,
+                        &content,
+                        false,
+                        &terms,
+                        &matched_fields,
+                        &hls,
+                        weighted,
+                        &limited,
+                    );
                     if !sp.is_empty() {
                         frags = fragment_text(&content, &sp, size, count, by_score, scanner, &fmt);
                     }

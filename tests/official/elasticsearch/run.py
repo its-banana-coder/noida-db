@@ -453,6 +453,14 @@ class Runner:
                     calls.append(("DELETE", "/_template/" + urllib.parse.quote(name), {}))
         except Exception:  # noqa: BLE001
             pass
+        # Synonym sets (the Java runner wipes their system index with the
+        # rest; deleted after the indices that might use them).
+        try:
+            status, raw, _ = self.http("GET", "/_synonyms", {"size": "10000"}, None, {}, False)
+            for r in json.loads(raw).get("results", []) if status == 200 else []:
+                calls.append(("DELETE", "/_synonyms/" + urllib.parse.quote(r["synonyms_set"]), {}))
+        except Exception:  # noqa: BLE001
+            pass
         # Cluster settings a test changed go back to their defaults (the
         # Java runner does the same): a leftover
         # `cluster.routing.allocation.enable: none` breaks every later test.
