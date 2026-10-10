@@ -158,6 +158,23 @@ fn parse_pattern(s: &str, pattern: &str, tz: i64) -> Option<i64> {
             run += 1;
         }
         if c.is_ascii_alphabetic() {
+            // Day and month names (`E`, `MMM`): English or French words,
+            // abbreviated with a trailing `.` or not.
+            if c == 'E' || (c == 'M' && run >= 3) {
+                let start = ti;
+                while ti < text.len() && (text[ti].is_alphabetic() || text[ti] == '.') {
+                    ti += 1;
+                }
+                let word: String = text[start..ti].iter().collect::<String>().to_lowercase();
+                if word.trim_end_matches('.').is_empty() {
+                    return None;
+                }
+                if c == 'M' {
+                    mo = month_number(word.trim_end_matches('.'))?;
+                }
+                pi += run;
+                continue;
+            }
             if c == 'X' || c == 'Z' {
                 let start = ti;
                 while ti < text.len() && (text[ti].is_ascii_digit() || "+-:Z".contains(text[ti])) {
@@ -220,6 +237,52 @@ fn parse_pattern(s: &str, pattern: &str, tz: i64) -> Option<i64> {
         return None;
     }
     Some(from_fields(y, mo, d, h, mi, sec, ms) - offset.unwrap_or(tz))
+}
+
+/// A month's number from its English or French name or abbreviation.
+fn month_number(word: &str) -> Option<i64> {
+    const NAMES: [[&str; 12]; 2] = [
+        [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ],
+        [
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ],
+    ];
+    const FRENCH_SHORT: [&str; 12] =
+        ["janv", "févr", "mars", "avr", "mai", "juin", "juil", "août", "sept", "oct", "nov", "déc"];
+    if let Some(i) = FRENCH_SHORT.iter().position(|m| *m == word) {
+        return Some(i as i64 + 1);
+    }
+    if word.chars().count() < 3 {
+        return None;
+    }
+    NAMES
+        .iter()
+        .find_map(|names| names.iter().position(|m| m.starts_with(word)))
+        .map(|i| i as i64 + 1)
 }
 
 /// Parses one date the way a `date` field with `format` does (default

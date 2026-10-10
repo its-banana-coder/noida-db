@@ -446,6 +446,10 @@ pub fn fetch(
                 out.insert("_index".into(), json!([doc.index]));
                 continue;
             }
+            "_seq_no" if kind == Kind::DocValue => {
+                out.insert("_seq_no".into(), json!([doc.seq]));
+                continue;
+            }
             "_version" if kind == Kind::Fields => {
                 out.insert("_version".into(), json!([doc.version]));
                 continue;

@@ -268,12 +268,6 @@ fn describe(q: &Value, mappings: &Value, t: u64, hits: usize) -> Value {
     }
 }
 
-/// How Lucene prints the query a DSL query becomes (`*:*`,
-/// `title:quick`, `+a:x #b:y`), as explanations describe it.
-pub fn lucene_description(q: &Value, mappings: &Value) -> String {
-    describe(q, mappings, 1, 1)["description"].as_str().unwrap_or("").to_string()
-}
-
 /// Fetch phase: the sub-phases this request runs, alphabetically by
 /// their class names, as Elasticsearch lists them.
 fn fetch(req: &Value, hits: usize, t: u64) -> Value {

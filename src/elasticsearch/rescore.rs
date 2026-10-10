@@ -6,8 +6,22 @@
 
 use serde_json::Value;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use super::search::{CommittedDoc, EsError, eval};
+
+/// One rescorer's effect on a hit, for its `_explanation`.
+#[derive(Clone, Debug)]
+pub struct Step {
+    /// The score before this rescorer.
+    pub primary: f32,
+    pub query_weight: f32,
+    /// The rescore query's score, when the hit was in the window and
+    /// matched it.
+    pub secondary: Option<f32>,
+    pub rescore_weight: f32,
+    pub mode: String,
+}
 
 struct Rescorer {
     window: usize,
@@ -69,54 +83,56 @@ fn by_score(a: &(usize, f32), b: &(usize, f32)) -> Ordering {
 /// Rescores `ranked` (doc position, score; best first) in place. `keep`
 /// is how many hits the request returns (`from + size`): a shard hands
 /// over at least that many, or the largest window, to be rescored.
-/// Returns whether anything was rescored.
+/// Returns each handed-over hit's steps (for its `_explanation`), or
+/// `None` when the request has no rescorer.
 pub fn apply(
     body: &Value,
     ranked: &mut Vec<(usize, f32)>,
     mappings: &Value,
     docs: &[CommittedDoc],
     keep: usize,
-) -> Result<bool, EsError> {
+) -> Result<Option<HashMap<usize, Vec<Step>>>, EsError> {
     let rescorers = parse(body)?;
     if rescorers.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
+    let mut steps: HashMap<usize, Vec<Step>> = HashMap::new();
     let n = rescorers.iter().map(|r| r.window).max().unwrap_or(0).max(keep).min(ranked.len());
     let mut top: Vec<(usize, f32)> = ranked[..n].to_vec();
     for r in &rescorers {
         let second = eval(&r.query, mappings, docs)?;
         let w = r.window.min(top.len());
-        let mut window: Vec<(usize, f32)> = top[..w]
-            .iter()
-            .map(|&(i, s)| {
-                let primary = s * r.query_weight;
-                let score = match second.get(&i) {
-                    None => primary,
-                    Some(&s2) => {
-                        let secondary = s2 * r.rescore_weight;
-                        match r.mode.as_str() {
-                            "multiply" => primary * secondary,
-                            "avg" => (primary + secondary) / 2.0,
-                            "max" => primary.max(secondary),
-                            "min" => primary.min(secondary),
-                            _ => primary + secondary,
-                        }
+        for (pos, h) in top.iter_mut().enumerate() {
+            let primary = h.1 * r.query_weight;
+            // Hits below the window are treated as not matching the
+            // rescore query: only the query weight applies.
+            let matched = if pos < w { second.get(&h.0).copied() } else { None };
+            steps.entry(h.0).or_default().push(Step {
+                primary: h.1,
+                query_weight: r.query_weight,
+                secondary: matched,
+                rescore_weight: r.rescore_weight,
+                mode: r.mode.clone(),
+            });
+            h.1 = match matched {
+                None => primary,
+                Some(s2) => {
+                    let secondary = s2 * r.rescore_weight;
+                    match r.mode.as_str() {
+                        "multiply" => primary * secondary,
+                        "avg" => (primary + secondary) / 2.0,
+                        "max" => primary.max(secondary),
+                        "min" => primary.min(secondary),
+                        _ => primary + secondary,
                     }
-                };
-                (i, score)
-            })
-            .collect();
-        window.sort_by(by_score);
-        // Hits below the window are treated as not matching the rescore
-        // query: only the query weight applies, then all are re-sorted.
-        for h in top.iter_mut().skip(w) {
-            h.1 *= r.query_weight;
+                }
+            };
         }
-        top.splice(..w, window);
+        // Then all the handed-over hits are re-sorted, as Elasticsearch does.
         top.sort_by(by_score);
     }
     ranked.splice(..n, top);
-    Ok(true)
+    Ok(Some(steps))
 }
 
 #[cfg(test)]
@@ -142,8 +158,10 @@ mod tests {
         let body = json!({"rescore": {"window_size": 2, "query": {
             "rescore_query": {"match_all": {}}, "query_weight": 5, "rescore_query_weight": 10}}});
         let mut ranked = vec![(0, 1.0), (1, 1.0), (2, 1.0)];
-        assert!(apply(&body, &mut ranked, &json!({}), &docs, 10).unwrap());
+        let steps = apply(&body, &mut ranked, &json!({}), &docs, 10).unwrap().unwrap();
         assert_eq!(ranked, vec![(0, 15.0), (1, 15.0), (2, 5.0)]);
+        assert_eq!(steps[&0][0].secondary, Some(1.0));
+        assert_eq!(steps[&2][0].secondary, None);
         assert!(check_sort(&body, false).is_err());
     }
 }

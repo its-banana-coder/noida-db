@@ -507,6 +507,9 @@ impl Engine {
         if segments.first() == Some(&"_analyze") {
             return self.analyze(body);
         }
+        if segments == ["_validate", "query"] {
+            return self.validate_api(method, "_all", &q, body);
+        }
         if segments.first() == Some(&"_bulk") {
             // The global bulk endpoint -- no index in the URL, each
             // action line names its own `_index` instead. Found missing
@@ -704,7 +707,10 @@ impl Engine {
                 self.mtermvectors(method, segments[0], &q, body)
             }
             "_explain" if segments.len() == 3 => {
-                self.explain(method, segments[0], index_name, segments[2], &q, body)
+                self.explain_api(method, segments[0], index_name, segments[2], &q, body)
+            }
+            "_validate" if segments.get(2) == Some(&"query") && segments.len() == 3 => {
+                self.validate_api(method, segments[0], &q, body)
             }
             "_search_shards" if segments.len() == 2 && matches!(method, "GET" | "POST") => {
                 self.search_shards(segments[0], &q)
@@ -1063,7 +1069,7 @@ impl Engine {
         Ok(names)
     }
 
-    fn search_or_count(
+    pub(super) fn search_or_count(
         &self,
         method: &str,
         action: &str,
@@ -1098,6 +1104,7 @@ impl Engine {
             "track_scores",
             "timeout",
             "min_score",
+            "include_named_queries_score",
         ] {
             if let Some(v) = q.get(key)
                 && req.get(key).is_none()
@@ -1193,6 +1200,11 @@ impl Engine {
         {
             return e;
         }
+        let search = action == "_search";
+        let _dsl = match Self::prepare_query(&s, index_pattern, search, &mut req, body) {
+            Ok(g) => g,
+            Err(e) => return e,
+        };
         let now = std::time::Instant::now();
         s.contexts.retain(|_, c| c.expires > now);
         if let Some(pit) = req.get("pit") {
@@ -1280,13 +1292,6 @@ impl Engine {
             .collect();
         if let Err(e) = tsdb::check_search(&targets, q.contains_key("routing"), &req) {
             return e;
-        }
-        // Terms lookups (`{"terms": {"f": {"index", "id", "path"}}}`) read
-        // the terms from the named document first.
-        for key in ["query", "post_filter"] {
-            if let Some(q) = req.get_mut(key) {
-                terms_lookup(&s, q);
-            }
         }
         for n in &names {
             if let Some(i) = s.indices.get(n) {
@@ -1563,6 +1568,63 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The searchable indices `pattern` names, with their mappings.
+    pub(super) fn index_mappings(&self, pattern: &str) -> Vec<(String, Value)> {
+        let s = self.0.lock().unwrap();
+        Self::resolve_indices(&s, pattern)
+            .into_iter()
+            .filter_map(|n| s.indices.get(&n).map(|i| (n.clone(), i.mappings.clone())))
+            .collect()
+    }
+
+    /// `dsl::prepare` against this node's indices (terms lookups and
+    /// `more_like_this` documents read like a real-time GET), and the
+    /// cluster's `search.allow_expensive_queries` in effect until the
+    /// returned guard drops.
+    fn prepare_query(
+        s: &State,
+        index_pattern: &str,
+        search: bool,
+        req: &mut Value,
+        raw: &[u8],
+    ) -> Result<super::dsl::Guard, (u16, Value)> {
+        let names = Self::resolve_indices(s, index_pattern);
+        let fetch = |index: &str, id: &str, _routing: Option<&str>| {
+            let target = Self::resolve_indices(s, index);
+            let Some(i) = target.first().and_then(|n| s.indices.get(n)) else {
+                return Err(missing_index(index));
+            };
+            Ok(i.docs.get(id).map(|d| d.source.clone()))
+        };
+        let max_terms_count = names
+            .iter()
+            .filter_map(|n| s.indices.get(n))
+            .map(|i| {
+                let v = &i.settings["index"]["max_terms_count"];
+                v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok())).unwrap_or(65_536)
+            })
+            .min()
+            .unwrap_or(65_536) as usize;
+        let env = super::dsl::Env {
+            fetch: &fetch,
+            default_index: names.first().cloned(),
+            max_terms_count,
+            search,
+            raw: std::str::from_utf8(raw).unwrap_or_default(),
+        };
+        super::dsl::prepare(req, &env)?;
+        let allow = ["transient", "persistent"]
+            .iter()
+            .find_map(|k| {
+                s.cluster_settings
+                    .get(*k)
+                    .and_then(|m| m.get("search.allow_expensive_queries"))
+                    .and_then(Value::as_str)
+            })
+            .is_none_or(|v| v != "false");
+        Ok(super::dsl::enter(allow))
     }
 
     /// `/<index>/_knn_search` (deprecated since 8.4 for the search API's
@@ -3386,116 +3448,6 @@ impl Engine {
         (200, json!({"docs": docs}))
     }
 
-    /// `/<index>/_explain/<id>`: whether (and with what score) a query
-    /// matches one document, searched through `target` (an alias's
-    /// filter applies) on its index `index`.
-    fn explain(
-        &self,
-        method: &str,
-        target: &str,
-        index: &str,
-        id: &str,
-        q: &HashMap<String, String>,
-        body: &[u8],
-    ) -> (u16, Value) {
-        if !matches!(method, "GET" | "POST") {
-            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
-        }
-        let req = if body.iter().all(u8::is_ascii_whitespace) {
-            json!({})
-        } else {
-            match parse_json(body) {
-                Some(v) => v,
-                None => return (400, malformed_body()),
-            }
-        };
-        // The body takes only `query`.
-        if let Some(bad) = req.as_object().and_then(|m| m.keys().find(|k| *k != "query")) {
-            let text = String::from_utf8_lossy(body);
-            let all = super::jsonpos::scan(&text);
-            let (line, col) = all
-                .iter()
-                .find(|p| p.path == *bad)
-                .map_or((1, 1), |p| (p.start.0, super::limits::key_col(&text, p, bad)));
-            let reason = format!("request does not support [{bad}]");
-            return (
-                400,
-                json!({"error": {"root_cause": [{"type": "parsing_exception", "reason": reason, "line": line, "col": col}],
-                    "type": "parsing_exception", "reason": reason, "line": line, "col": col}, "status": 400}),
-            );
-        }
-        let query = match (req.get("query"), q.get("q")) {
-            (Some(query), _) => query.clone(),
-            (None, Some(text)) => {
-                let mut qs = json!({"query": text});
-                for (param, key) in [
-                    ("df", "default_field"),
-                    ("default_operator", "default_operator"),
-                    ("analyze_wildcard", "analyze_wildcard"),
-                    ("lenient", "lenient"),
-                ] {
-                    if let Some(v) = q.get(param) {
-                        qs[key] = match v.as_str() {
-                            "true" => json!(true),
-                            "false" => json!(false),
-                            other => json!(other),
-                        };
-                    }
-                }
-                json!({"query_string": qs})
-            }
-            (None, None) => {
-                return (
-                    400,
-                    error(
-                        "action_request_validation_exception",
-                        "Validation Failed: 1: query is missing;",
-                        400,
-                    ),
-                );
-            }
-        };
-        let (doc, mappings) = {
-            let s = self.0.lock().unwrap();
-            let Some(i) = s.indices.get(index) else { return missing_index(index) };
-            (i.docs.get(id).map(|d| (d.source.clone(), d.seq)), i.mappings.clone())
-        };
-        let Some((source, seq)) = doc else {
-            return (200, json!({"_index": index, "_id": id, "matched": false}));
-        };
-        let search = json!({"query": {"bool": {"must": [query.clone()], "filter": [{"ids": {"values": [id]}}]}},
-            "size": 1, "_source": false});
-        let mut sq = HashMap::new();
-        if let Some(r) = q.get("routing") {
-            sq.insert("routing".to_string(), r.clone());
-        }
-        let bytes = serde_json::to_vec(&search).unwrap_or_default();
-        let (status, resp) = self.search_or_count("POST", "_search", target, &sq, &bytes);
-        if status >= 400 {
-            return (status, resp);
-        }
-        let hit = resp["hits"]["hits"].as_array().and_then(|h| h.first()).cloned();
-        let mut out = json!({"_index": index, "_id": id, "matched": hit.is_some()});
-        out["explanation"] = match &hit {
-            Some(h) => json!({"value": h["_score"],
-                "description": super::profile::lucene_description(&query, &mappings), "details": []}),
-            None => json!({"value": 0.0, "description": "no matching term", "details": []}),
-        };
-        // `_source` / `stored_fields` parameters add the document.
-        let source_params = ["_source", "_source_includes", "_source_excludes"];
-        if source_params.iter().any(|k| q.contains_key(*k)) || q.contains_key("stored_fields") {
-            let mut get = json!({"_seq_no": seq, "_primary_term": 1, "found": true});
-            let filter = source_filter_from_params(q);
-            let wants = !q.contains_key("stored_fields")
-                || source_params.iter().any(|k| q.contains_key(*k));
-            if wants && !matches!(filter, Some(Value::Bool(false))) {
-                get["_source"] = search::filter_source(&source, filter.as_ref());
-            }
-            out["get"] = get;
-        }
-        (200, out)
-    }
-
     /// `/<index>/_search_shards`: the shards a search would reach, with
     /// the aliases (and their combined filter) each index was reached
     /// through.
@@ -4180,41 +4132,6 @@ impl Engine {
         } else {
             (200, json!({"acknowledged": true, "errors": false}))
         }
-    }
-}
-
-/// Replaces each terms lookup in query `q` with the terms it reads: the
-/// values at `path` in document `id` of `index` (none when it's missing).
-fn terms_lookup(s: &State, q: &mut Value) {
-    match q {
-        Value::Object(m) => {
-            if let Some(Value::Object(t)) = m.get_mut("terms") {
-                for (_, spec) in t.iter_mut() {
-                    let (Some(index), Some(id), Some(path)) = (
-                        spec.get("index").and_then(Value::as_str),
-                        spec.get("id").map(|v| v.as_str().map_or(v.to_string(), str::to_string)),
-                        spec.get("path").and_then(Value::as_str),
-                    ) else {
-                        continue;
-                    };
-                    let target = Engine::resolve_indices(s, index);
-                    let vals: Vec<Value> = target
-                        .first()
-                        .and_then(|n| s.indices.get(n))
-                        .and_then(|i| i.docs.get(&id))
-                        .map(|d| search::raw_values(&d.source, path).into_iter().cloned().collect())
-                        .unwrap_or_default();
-                    *spec = Value::Array(vals);
-                }
-            }
-            for (k, v) in m.iter_mut() {
-                if k != "terms" {
-                    terms_lookup(s, v);
-                }
-            }
-        }
-        Value::Array(a) => a.iter_mut().for_each(|v| terms_lookup(s, v)),
-        _ => {}
     }
 }
 
