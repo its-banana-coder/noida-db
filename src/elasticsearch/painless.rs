@@ -498,8 +498,9 @@ impl P {
                         let args = if self.eat("(") { self.args(")")? } else { Vec::new() };
                         Ok(Expr::Static(id, m, args))
                     }
-                    // The vector functions of scoring scripts.
-                    _ if super::vectors::SCRIPT_FUNCTIONS.contains(&id.as_str())
+                    // The vector functions of scoring scripts, and `$('field',
+                    // default)` (a document's first value of a field).
+                    _ if (super::vectors::SCRIPT_FUNCTIONS.contains(&id.as_str()) || id == "$")
                         && self.is("(") =>
                     {
                         self.i += 1;
@@ -1052,6 +1053,14 @@ impl Env {
                     }
                 };
                 match (class.as_str(), m.as_str()) {
+                    ("fn", "$") => {
+                        let field = vals.first().map(to_string).unwrap_or_default();
+                        let doc = self.get_var("doc")?;
+                        match doc.get(&field).and_then(|d| d.get("values")) {
+                            Some(Value::Array(a)) if !a.is_empty() => a[0].clone(),
+                            _ => vals.get(1).cloned().unwrap_or(Value::Null),
+                        }
+                    }
                     ("fn", name) => {
                         let field = vals.get(1).cloned().unwrap_or(Value::Null);
                         let doc = match &field {

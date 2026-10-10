@@ -1445,6 +1445,2393 @@ scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
     ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
 ])
 
+
+# --- Index lifecycle and admin (rollover, resize, blocks, resolve,
+# snapshots, ingest, stored scripts, reindex). Names start with `lc-`.
+
+def lc_strip(v):
+    """Drops the volatile parts of lifecycle responses (timestamps,
+    durations, uuids, node ids)."""
+    drop = {"timestamp", "start_time", "start_time_in_millis", "end_time", "end_time_in_millis",
+            "duration_in_millis", "duration", "time_in_millis", "took", "uuid", "creation_date",
+            "creation_date_string", "size_in_bytes", "file_count", "size", "nodes", "ingest_took"}
+    if isinstance(v, dict):
+        return {k: lc_strip(x) for k, x in v.items() if k not in drop}
+    if isinstance(v, list):
+        return [lc_strip(x) for x in v]
+    return v
+
+
+LC_STRIP = {"pick": lc_strip}
+
+
+def lc_clean(names):
+    return [("DELETE", f"/{names}?ignore_unavailable=true")]
+
+
+LC_UNBLOCK = {f"index.blocks.{b}": None for b in ("read_only", "metadata", "write", "read", "read_only_allow_delete")}
+
+
+scenario("lc_rollover", lc_clean("lc-roll-1,lc-roll-000002,lc-roll-explicit,lc-rw-000001,lc-rw-000002,lc-rplain,lc-rtwo-1,lc-rtwo-2") + [
+    ("PUT", "/lc-roll-1", {"aliases": {"lc-roll": {}, "lc-roll-search": {}}}, ACK),
+    ("POST", "/lc-roll/_rollover", {"conditions": {"max_docs": 1}}),
+    ("PUT", "/lc-roll-1/_doc/1?refresh=true", {"foo": "hello world"}, {"pick": lambda r: r["result"]}),
+    ("POST", "/lc-roll/_rollover?dry_run=true", {"conditions": {"max_docs": 1}}),
+    ("POST", "/lc-roll/_rollover", {"conditions": {"max_docs": 1, "min_age": "7d"}}),
+    ("POST", "/lc-roll/_rollover", {"conditions": {"max_docs": 1, "min_docs": 1, "max_size": "1b",
+                                                   "max_primary_shard_docs": 5, "min_size": "0b"}}),
+    ("GET", "/_alias/lc-roll"),
+    ("GET", "/_alias/lc-roll-search"),
+    ("POST", "/lc-roll/_rollover", {"conditions": {"min_docs": 1}}),
+    ("POST", "/lc-roll/_rollover", {"conditions": {"bogus": 1}}),
+    ("POST", "/lc-roll/_rollover", {"conditions": {"max_docs": "x"}}),
+    ("POST", "/lc-roll/_rollover", {"bogus": {}}),
+    ("POST", "/lc-roll/_rollover?lazy=true"),
+    ("POST", "/lc-roll-1/_rollover"),
+    ("POST", "/lc-roll-nosuch/_rollover"),
+    ("POST", "/lc-roll-search/_rollover"),
+    ("POST", "/lc-roll/_rollover/lc-roll-000002"),
+    ("POST", "/lc-roll/_rollover/Bad-Name"),
+    ("POST", "/lc-roll/_rollover/lc-roll-explicit", {"conditions": {"max_age": "0s"},
+                                                    "settings": {"index.number_of_shards": 2},
+                                                    "mappings": {"properties": {"k": {"type": "keyword"}}},
+                                                    "aliases": {"lc-roll-extra": {}}}),
+    ("GET", "/_alias/lc-roll,lc-roll-extra"),
+    ("GET", "/lc-roll-explicit/_mapping"),
+    ("GET", "/lc-roll-explicit/_settings", None, {"pick": lambda r: r["lc-roll-explicit"]["settings"]["index"]["number_of_shards"]}),
+    # An explicit write index stays in the alias, no longer the write index.
+    ("PUT", "/lc-rw-000001", {"aliases": {"lc-rw": {"is_write_index": True}, "lc-rw-other": {}}}, ACK),
+    ("POST", "/lc-rw/_rollover"),
+    ("GET", "/_alias/lc-rw,lc-rw-other"),
+    ("POST", "/lc-rw-other/_rollover"),
+    ("PUT", "/lc-rw/_doc/1?refresh=true", {"a": 1}, {"pick": lambda r: r["_index"]}),
+    # No write index among several; a name without a number.
+    ("PUT", "/lc-rtwo-1", {"aliases": {"lc-rtwo": {}}}, ACK),
+    ("PUT", "/lc-rtwo-2", {"aliases": {"lc-rtwo": {}}}, ACK),
+    ("POST", "/lc-rtwo/_rollover"),
+    ("PUT", "/lc-rplain", {"aliases": {"lc-rplain-a": {}}}, ACK),
+    ("POST", "/lc-rplain-a/_rollover"),
+] + lc_clean("lc-roll-1,lc-roll-000002,lc-roll-explicit,lc-rw-000001,lc-rw-000002,lc-rplain,lc-rtwo-1,lc-rtwo-2"))
+
+scenario("lc_resize", lc_clean("lc-src,lc-tgt,lc-tgt-shrunk,lc-tgt-clone,lc-tgt-x") + [
+    ("PUT", "/lc-src", {"settings": {"number_of_shards": 2, "number_of_replicas": 0},
+                        "mappings": {"properties": {"foo": {"type": "text"}, "n": {"type": "nested"}}},
+                        "aliases": {"lc-src-alias": {}}}, ACK),
+    ("PUT", "/lc-src/_doc/1", {"foo": "hello world", "n": [{"a": 1}]}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-src/_doc/2?routing=r1", {"foo": "hello world 2"}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-src/_doc/3?refresh=true", {"foo": "hello world 3"}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 4}}),
+    ("PUT", "/lc-src/_clone/lc-tgt", {"settings": {"index.number_of_shards": 3}}),
+    ("PUT", "/lc-src/_shrink/lc-tgt", {"settings": {"index.number_of_shards": 3}}),
+    ("PUT", "/lc-src/_settings", {"index.blocks.write": True}, ACK),
+    ("PUT", "/lc-src/_split/lc-tgt", {}),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 1}}),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 3}}),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 4, "index.number_of_routing_shards": 8}}),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 4}, "mappings": {}}),
+    ("PUT", "/lc-src/_split/Lc-Tgt", {"settings": {"index.number_of_shards": 4}}),
+    ("PUT", "/lc-nosuch/_split/lc-tgt", {"settings": {"index.number_of_shards": 4}}),
+    ("PUT", "/lc-src-alias/_clone/lc-tgt"),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 4, "index.number_of_replicas": 0},
+                                     "aliases": {"lc-tgt-alias": {}}}),
+    ("PUT", "/lc-src/_split/lc-tgt", {"settings": {"index.number_of_shards": 4}}),
+    ("GET", "/lc-tgt", None, LC_STRIP),
+    ("GET", "/lc-tgt/_doc/1"),
+    ("GET", "/lc-tgt/_doc/2?routing=r1"),
+    ("POST", "/lc-tgt/_search", {"query": {"match": {"foo": "hello"}}}, {"pick": lambda r: sorted(h["_id"] for h in r["hits"]["hits"])}),
+    ("POST", "/lc-tgt/_search", {"query": {"nested": {"path": "n", "query": {"term": {"n.a": 1}}}}}, {"pick": lambda r: [h["_id"] for h in r["hits"]["hits"]]}),
+    ("PUT", "/lc-src/_shrink/lc-tgt-shrunk", {"settings": {"index.number_of_replicas": 0}}),
+    ("GET", "/lc-tgt-shrunk/_settings", None, {"pick": lambda r: {k: v for k, v in r["lc-tgt-shrunk"]["settings"]["index"].items() if k in ("number_of_shards", "number_of_replicas", "blocks", "routing_partition_size")}}),
+    ("GET", "/lc-tgt-shrunk/_doc/3", None, {"pick": lambda r: r["_source"]}),
+    ("POST", "/lc-src/_clone/lc-tgt-clone"),
+    ("GET", "/lc-tgt-clone/_settings", None, {"pick": lambda r: {k: v for k, v in r["lc-tgt-clone"]["settings"]["index"].items() if k in ("number_of_shards", "number_of_replicas", "blocks")}}),
+    ("GET", "/lc-tgt-clone/_count", None, {"pick": lambda r: r["count"]}),
+    ("PUT", "/lc-tgt-clone/_doc/9", {"a": 1}),
+    ("PUT", "/lc-tgt-clone/_settings", {"index.blocks.write": False}, ACK),
+    ("PUT", "/lc-tgt-clone/_doc/9", {"a": 1}, {"pick": lambda r: (r["result"], r["_version"])}),
+    ("PUT", "/lc-src/_shrink/lc-tgt-x", {"settings": {"index.number_of_shards": 1}, "max_primary_shard_size": "1gb"}),
+    ("PUT", "/lc-src/_shrink/lc-tgt-x", {"max_primary_shard_size": "1b"}),
+    ("GET", "/lc-tgt-x/_settings", None, {"pick": lambda r: r["lc-tgt-x"]["settings"]["index"]["number_of_shards"]}),
+] + lc_clean("lc-src,lc-tgt,lc-tgt-shrunk,lc-tgt-clone,lc-tgt-x"))
+
+scenario("lc_blocks", [("PUT", "/lc-blk/_settings", LC_UNBLOCK), ("PUT", "/lc-blk2/_settings", LC_UNBLOCK)]
+         + lc_clean("lc-blk,lc-blk2") + [
+    ("PUT", "/lc-blk", {"settings": {"number_of_shards": 1}}, ACK),
+    ("PUT", "/lc-blk/_doc/1?refresh=true", {"a": 1}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-blk/_block/write"),
+    ("PUT", "/lc-blk/_doc/2", {"a": 1}),
+    ("POST", "/lc-blk/_doc", {"a": 1}),
+    ("DELETE", "/lc-blk/_doc/1"),
+    ("POST", "/lc-blk/_update/1", {"doc": {"a": 2}}),
+    ("POST", "/_bulk", [{"index": {"_index": "lc-blk", "_id": "3"}}, {"a": 1}, {"delete": {"_index": "lc-blk", "_id": "1"}}],
+     {"pick": lambda r: [(list(i.values())[0]["status"], list(i.values())[0].get("error", {}).get("type")) for i in r["items"]]}),
+    ("GET", "/lc-blk/_doc/1"),
+    ("POST", "/lc-blk/_delete_by_query", {"query": {"match_all": {}}}, LC_STRIP),
+    ("POST", "/lc-blk/_update_by_query", {"query": {"match_all": {}}}, LC_STRIP),
+    ("POST", "/lc-blk/_search", {"size": 0}, {"pick": lambda r: r["hits"]["total"]}),
+    ("PUT", "/lc-blk/_mapping", {"properties": {"b": {"type": "keyword"}}}),
+    ("PUT", "/lc-blk/_settings", {"index.blocks.write": False}, ACK),
+    ("PUT", "/lc-blk/_block/read_only"),
+    ("PUT", "/lc-blk/_doc/2", {"a": 1}),
+    ("PUT", "/lc-blk/_mapping", {"properties": {"c": {"type": "keyword"}}}),
+    ("PUT", "/lc-blk/_settings", {"index.refresh_interval": "2s"}),
+    ("PUT", "/lc-blk/_alias/lc-blk-a"),
+    ("POST", "/lc-blk/_close"),
+    ("DELETE", "/lc-blk"),
+    ("GET", "/lc-blk/_mapping"),
+    ("PUT", "/lc-blk/_settings", {"index.blocks.read_only": False}, ACK),
+    ("PUT", "/lc-blk/_block/read"),
+    ("GET", "/lc-blk/_doc/1"),
+    ("POST", "/lc-blk/_search"),
+    ("POST", "/lc-blk/_count"),
+    ("PUT", "/lc-blk/_doc/5?refresh=true", {"a": 5}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-blk/_settings", {"index.blocks.read": False}, ACK),
+    ("PUT", "/lc-blk/_block/metadata"),
+    ("GET", "/lc-blk/_mapping"),
+    ("GET", "/lc-blk/_settings"),
+    ("GET", "/lc-blk"),
+    ("PUT", "/lc-blk/_doc/6?refresh=true", {"a": 6}, {"pick": lambda r: r["result"]}),
+    ("POST", "/lc-blk/_search", {"size": 0}, {"pick": lambda r: r["hits"]["total"]}),
+    ("DELETE", "/lc-blk"),
+    ("PUT", "/lc-blk/_settings", {"index.blocks.metadata": False}, ACK),
+    ("PUT", "/lc-blk/_settings", {"index.blocks.read_only_allow_delete": True}, ACK),
+    ("PUT", "/lc-blk/_doc/7", {"a": 7}),
+    ("PUT", "/lc-blk/_mapping", {"properties": {"d": {"type": "keyword"}}}, ACK),
+    ("PUT", "/lc-blk/_block/bogus"),
+    ("PUT", "/lc-blk-nosuch/_block/write"),
+    ("PUT", "/lc-blk/_settings", {"index.blocks.read_only_allow_delete": None}, ACK),
+    ("PUT", "/lc-blk2", {"settings": {"index.blocks.write": True, "index.blocks.read_only": True}}, ACK),
+    ("PUT", "/lc-blk2/_doc/1", {"a": 1}),
+    ("PUT", "/lc-blk2/_settings", {"index.blocks.write": None, "index.blocks.read_only": None}, ACK),
+] + lc_clean("lc-blk,lc-blk2"))
+
+scenario("lc_resolve", lc_clean("lc-res1,lc-res2,lc-res3") + [
+    ("PUT", "/lc-res1", {"aliases": {"lc-res-a": {}, "lc-res-b": {"is_write_index": True}}}, ACK),
+    ("PUT", "/lc-res2", {"aliases": {"lc-res-a": {}}, "settings": {"index.hidden": True}}, ACK),
+    ("PUT", "/lc-res3", {"aliases": {"lc-res-c": {}}}, ACK),
+    ("POST", "/lc-res3/_close", None, ACK),
+    ("GET", "/_resolve/index/lc-res*"),
+    ("GET", "/_resolve/index/lc-res*?expand_wildcards=all"),
+    ("GET", "/_resolve/index/lc-res*?expand_wildcards=closed"),
+    ("GET", "/_resolve/index/lc-res*,-lc-res1"),
+    ("GET", "/_resolve/index/lc-res-a"),
+    ("GET", "/_resolve/index/lc-res2"),
+    ("GET", "/_resolve/index/lc-res-nosuch"),
+    ("GET", "/_resolve/index/lc-res-nosuch?ignore_unavailable=true"),
+    ("GET", "/_resolve/index/lc-res-nosuch*"),
+    ("GET", "/_resolve/cluster/lc-res*"),
+    ("GET", "/_resolve/cluster/lc-res3"),
+    ("GET", "/_resolve/cluster/lc-res3*?expand_wildcards=closed"),
+    ("GET", "/_resolve/cluster/lc-res-a"),
+    ("GET", "/_resolve/cluster/lc-res-a,lc-res-nosuch"),
+    ("GET", "/_resolve/cluster/lc-res-a,lc-res-nosuch*"),
+] + lc_clean("lc-res1,lc-res2,lc-res3"))
+
+
+def lc_snap_sorted(s):
+    s = lc_strip(s)
+    if isinstance(s.get("indices"), list):
+        s["indices"] = sorted(s["indices"])
+    return s
+
+
+def lc_snap_info(r):
+    return [lc_snap_sorted(s) for s in r["snapshots"]]
+
+
+scenario("lc_snapshots", lc_clean("lc-sn1,lc-sn2,lc-snr1,lc-snq2") + [
+    ("DELETE", "/_snapshot/lc-repo-a/*"), ("DELETE", "/_snapshot/lc-repo-a"),
+    ("DELETE", "/_snapshot/lc-repo-b"), ("DELETE", "/_snapshot/lc-repo-ro"),
+    ("PUT", "/_snapshot/lc-repo-a", {"type": "fs", "settings": {"location": "lc-repo-a-loc", "compress": True}}),
+    ("GET", "/_snapshot/lc-repo-a"),
+    ("GET", "/_snapshot/lc-repo-nosuch"),
+    ("PUT", "/_snapshot/lc-repo-b", {"type": "fs", "settings": {}}),
+    ("PUT", "/_snapshot/lc-repo-b", {"type": "nope", "settings": {}}),
+    ("PUT", "/_snapshot/lc-repo-b", {"settings": {"location": "x"}}),
+    ("POST", "/_snapshot/lc-repo-a/_verify", None, {"pick": lambda r: sorted(r)}),
+    ("POST", "/_snapshot/lc-repo-a/_cleanup"),
+    ("POST", "/_snapshot/lc-repo-nosuch/_verify"),
+    ("PUT", "/lc-sn1", {"settings": {"number_of_shards": 1, "number_of_replicas": 0}, "aliases": {"lc-sn-alias": {}}}, ACK),
+    ("PUT", "/lc-sn2", {"settings": {"number_of_shards": 2, "number_of_replicas": 0}}, ACK),
+    ("PUT", "/lc-sn1/_doc/1?refresh=true", {"a": 1}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-sn2/_doc/1?refresh=true", {"b": 2}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s1?wait_for_completion=true",
+     {"indices": "lc-sn1,lc-sn2", "include_global_state": False, "metadata": {"by": "me"}},
+     {"pick": lambda r: lc_snap_sorted(r["snapshot"])}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s1", {"indices": "lc-sn1"}),
+    ("PUT", "/_snapshot/lc-repo-a/Lc-Bad", {"indices": "lc-sn1"}),
+    ("PUT", "/_snapshot/lc-repo-a/_bad", {"indices": "lc-sn1"}),
+    ("PUT", "/_snapshot/lc-repo-nosuch/lc-s1", {"indices": "lc-sn1"}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s2?wait_for_completion=true", {"indices": "lc-sn-missing"}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s2?wait_for_completion=true",
+     {"indices": "lc-sn-missing", "ignore_unavailable": True, "include_global_state": False}, LC_STRIP),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s3?wait_for_completion=true", {"indices": ["lc-sn2"], "feature_states": ["none"]}, LC_STRIP),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s4", {"indices": "lc-sn1", "include_global_state": False}),
+    ("sleep", 2),
+    ("GET", "/_snapshot/lc-repo-a/lc-s1", None, {"pick": lc_snap_info}),
+    ("GET", "/_snapshot/lc-repo-a/lc-s1?verbose=false", None, {"pick": lc_snap_info}),
+    ("GET", "/_snapshot/lc-repo-a/lc-s1?index_details=true&human=true&include_repository=false&index_names=false", None, {"pick": lc_snap_info}),
+    ("GET", "/_snapshot/lc-repo-a/lc-nosuch"),
+    ("GET", "/_snapshot/lc-repo-a/lc-nosuch?ignore_unavailable=true"),
+    ("GET", "/_snapshot/lc-repo-a/lc-s1,lc-nosuch"),
+    ("GET", "/_snapshot/lc-repo-a/_all?sort=name", None, {"pick": lambda r: ([s["snapshot"] for s in r["snapshots"]], r["total"], r["remaining"])}),
+    ("GET", "/_snapshot/lc-repo-a/*?sort=name&order=desc&size=2", None, {"pick": lambda r: ([s["snapshot"] for s in r["snapshots"]], r["total"], r["remaining"], r.get("next"))}),
+    ("GET", "/_snapshot/lc-repo-a/*?sort=name&size=1&offset=1", None, {"pick": lambda r: ([s["snapshot"] for s in r["snapshots"]], r["total"], r["remaining"])}),
+    ("GET", "/_snapshot/lc-repo-a/*?sort=index_count", None, {"pick": lambda r: [s["snapshot"] for s in r["snapshots"]]}),
+    ("GET", "/_snapshot/lc-repo-a/*?sort=bogus"),
+    ("GET", "/_snapshot/lc-repo-a/_current"),
+    ("GET", "/_snapshot/lc-repo-a/lc-s1/_status", None, LC_STRIP),
+    ("GET", "/_snapshot/lc-repo-a/lc-nosuch/_status"),
+    ("GET", "/_snapshot/lc-repo-a/lc-nosuch/_status?ignore_unavailable=true"),
+    ("GET", "/_snapshot/lc-repo-a/_status"),
+    ("GET", "/_snapshot/lc-repo-a", None, {"pick": lambda r: sorted(r["lc-repo-a"])}),
+    # Clone.
+    ("PUT", "/_snapshot/lc-repo-a/lc-s1/_clone/lc-s5", {"indices": "lc-sn2"}),
+    ("GET", "/_snapshot/lc-repo-a/lc-s5", None, {"pick": lc_snap_info}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s1/_clone/lc-s5", {"indices": "lc-sn2"}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s1/_clone/lc-s6", {"indices": "nomatch"}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-s1/_clone/lc-s6", {}),
+    ("PUT", "/_snapshot/lc-repo-a/lc-nosuch/_clone/lc-s6", {"indices": "lc-sn1"}),
+    # Restore.
+    ("POST", "/_snapshot/lc-repo-a/lc-s1/_restore", {"indices": "lc-sn1"}),
+    ("POST", "/_snapshot/lc-repo-a/lc-s1/_restore?wait_for_completion=true",
+     {"indices": "lc-sn1", "rename_pattern": "lc-sn(.+)", "rename_replacement": "lc-snr$1"}),
+    ("GET", "/lc-snr1/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("GET", "/_alias/lc-sn-alias"),
+    ("POST", "/_snapshot/lc-repo-a/lc-s1/_restore",
+     {"indices": "lc-sn2", "rename_pattern": "lc-sn(.+)", "rename_replacement": "lc-snq$1", "include_aliases": False,
+      "index_settings": {"index.number_of_replicas": 0}}),
+    ("GET", "/lc-snq2/_settings", None, {"pick": lambda r: r["lc-snq2"]["settings"]["index"]["number_of_replicas"]}),
+    ("DELETE", "/lc-sn1", None, ACK),
+    ("POST", "/_snapshot/lc-repo-a/lc-s1/_restore?wait_for_completion=true", {"indices": "lc-sn1"}),
+    ("GET", "/lc-sn1/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("GET", "/_alias/lc-sn-alias", None, {"pick": lambda r: sorted(r)}),
+    ("POST", "/lc-sn2/_close", None, ACK),
+    ("POST", "/_snapshot/lc-repo-a/lc-s3/_restore?wait_for_completion=true"),
+    ("GET", "/lc-sn2/_count", None, {"pick": lambda r: r["count"]}),
+    ("POST", "/_snapshot/lc-repo-a/lc-nosuch/_restore"),
+    # A read-only repository over the same location sees the snapshots.
+    ("PUT", "/_snapshot/lc-repo-ro", {"type": "fs", "settings": {"location": "lc-repo-a-loc", "readonly": True}}),
+    ("GET", "/_snapshot/lc-repo-ro/*?sort=name", None, {"pick": lambda r: [s["snapshot"] for s in r["snapshots"]]}),
+    ("PUT", "/_snapshot/lc-repo-ro/lc-s9?wait_for_completion=true", {"indices": "lc-sn1"}),
+    ("DELETE", "/_snapshot/lc-repo-ro/lc-s1"),
+    ("GET", "/_snapshot/lc-repo-ro", None, {"pick": lambda r: lc_strip(r)}),
+    ("GET", "/_snapshot/lc-repo-a,lc-repo-ro/lc-s1", None, {"pick": lambda r: [(s["snapshot"], s["repository"]) for s in r["snapshots"]]}),
+    # Delete.
+    ("DELETE", "/_snapshot/lc-repo-a/lc-nosuch"),
+    ("DELETE", "/_snapshot/lc-repo-a/lc-s1,lc-s2"),
+    ("DELETE", "/_snapshot/lc-repo-a/lc-s*"),
+    ("GET", "/_snapshot/lc-repo-a/_all"),
+    ("DELETE", "/_snapshot/lc-repo-nosuch/lc-s1"),
+    ("DELETE", "/_snapshot/lc-repo-ro"),
+    ("DELETE", "/_snapshot/lc-repo-a"),
+    ("DELETE", "/_snapshot/lc-repo-a"),
+] + lc_clean("lc-sn1,lc-sn2,lc-snr1,lc-snq2"))
+
+LC_PIPE = "/_ingest/pipeline/_simulate"
+
+
+def lc_sim(processors, *docs):
+    return ("POST", LC_PIPE, {"pipeline": {"processors": processors}, "docs": [{"_source": d} for d in docs]}, LC_STRIP)
+
+
+scenario("lc_ingest_crud", [
+    ("DELETE", "/_ingest/pipeline/lc-p*"),
+    ("PUT", "/_ingest/pipeline/lc-p1", {"description": "d", "version": 3, "_meta": {"k": 1},
+                                        "processors": [{"set": {"field": "x", "value": "{{a}}-y", "tag": "t"}}]}),
+    ("GET", "/_ingest/pipeline/lc-p1"),
+    ("GET", "/_ingest/pipeline/lc-p1?summary=true"),
+    ("GET", "/_ingest/pipeline/lc-p*"),
+    ("GET", "/_ingest/pipeline/lc-nosuch"),
+    ("DELETE", "/_ingest/pipeline/lc-nosuch"),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"nope": {}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"set": {"value": 1}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"set": {"field": "a"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": {"set": {"field": "a", "value": 1}}}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"set": {"field": "a", "value": 1, "bogus": 2}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"description": "x", "processors": [], "invalid_field": {}}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"description": "x"}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"convert": {"field": "a", "type": "bogus"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"rename": {"field": "a"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"set": {"field": "a", "value": 1}}], "on_failure": []}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"foreach": {"field": "a", "processor": {"nope": {}}}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [{"grok": {"field": "a", "patterns": ["%{NOPE:x}"]}}]}),
+    ("PUT", "/_ingest/pipeline/lc-p2", {"processors": [], "version": "x"}),
+    ("DELETE", "/_ingest/pipeline/lc-p1"),
+    ("GET", "/_ingest/pipeline/lc-p1"),
+])
+
+scenario("lc_ingest_processors", [
+    lc_sim([{"set": {"field": "x", "value": "{{a}}-{{{b.c}}}"}}, {"set": {"field": "o.p", "value": {"k": "{{a}}"}}},
+            {"set": {"field": "a", "value": "new", "override": False}}, {"set": {"field": "e", "value": "", "ignore_empty_value": True}},
+            {"set": {"field": "copy", "copy_from": "b"}}],
+           {"a": "A", "b": {"c": 1}}),
+    lc_sim([{"lowercase": {"field": "s"}}, {"uppercase": {"field": "l"}}, {"trim": {"field": "t", "target_field": "t2"}}],
+           {"s": "AbC", "l": ["x", "y"], "t": "  pad  "}),
+    lc_sim([{"lowercase": {"field": "missing"}}], {"a": 1}),
+    lc_sim([{"lowercase": {"field": "missing", "ignore_missing": True}}], {"a": 1}),
+    lc_sim([{"lowercase": {"field": "n"}}], {"n": 5}),
+    lc_sim([{"lowercase": {"field": "n"}}], {"n": None}),
+    lc_sim([{"remove": {"field": ["a", "b.c"]}}, {"remove": {"field": "zz", "ignore_missing": True}}], {"a": 1, "b": {"c": 2, "d": 3}, "e": 4}),
+    lc_sim([{"remove": {"field": "zz"}}], {"a": 1}),
+    lc_sim([{"remove": {"keep": ["a", "b.c"]}}], {"a": 1, "b": {"c": 2, "d": 3}, "e": 4}),
+    lc_sim([{"rename": {"field": "a", "target_field": "b.x"}}], {"a": 1, "b": {}}),
+    lc_sim([{"rename": {"field": "a", "target_field": "c"}}], {"a": 1, "c": 2}),
+    lc_sim([{"rename": {"field": "a", "target_field": "c", "override": True}}], {"a": 1, "c": 2}),
+    lc_sim([{"rename": {"field": "zz", "target_field": "c"}}], {"a": 1}),
+    lc_sim([{"append": {"field": "t", "value": ["b", "c"]}}, {"append": {"field": "new", "value": "x"}},
+            {"append": {"field": "s", "value": "z"}}, {"append": {"field": "d", "value": ["a"], "allow_duplicates": False}}],
+           {"t": ["a"], "s": "y", "d": ["a"]}),
+    lc_sim([{"convert": {"field": "i", "type": "integer"}}, {"convert": {"field": "f", "type": "float"}},
+            {"convert": {"field": "b", "type": "boolean"}}, {"convert": {"field": "s", "type": "string"}},
+            {"convert": {"field": "l", "type": "long"}}, {"convert": {"field": "au", "type": "auto"}},
+            {"convert": {"field": "lst", "type": "integer"}}, {"convert": {"field": "d", "type": "double", "target_field": "d2"}}],
+           {"i": "42", "f": "1.5", "b": "TRUE", "s": 7, "l": "123456789012", "au": "3.25", "lst": ["1", "2"], "d": "2"}),
+    lc_sim([{"convert": {"field": "i", "type": "integer"}}], {"i": "x1"}),
+    lc_sim([{"convert": {"field": "i", "type": "boolean"}}], {"i": "yes"}),
+    lc_sim([{"date": {"field": "d", "formats": ["ISO8601"]}}, {"date": {"field": "u", "formats": ["UNIX"], "target_field": "u2"}},
+            {"date": {"field": "m", "formats": ["UNIX_MS"], "target_field": "m2"}},
+            {"date": {"field": "p", "formats": ["dd/MM/yyyy"], "target_field": "p2", "output_format": "yyyy-MM-dd"}}],
+           {"d": "2024-01-15T10:00:00Z", "u": "1700000000", "m": "1700000000123", "p": "15/01/2024"}),
+    lc_sim([{"date": {"field": "d", "formats": ["ISO8601"]}}], {"d": "not a date"}),
+    lc_sim([{"split": {"field": "s", "separator": ","}}, {"split": {"field": "w", "separator": "\\s+"}},
+            {"split": {"field": "p", "separator": ",", "preserve_trailing": True}}],
+           {"s": "a,b,,", "w": "one  two three", "p": "a,b,,"}),
+    lc_sim([{"join": {"field": "l", "separator": "-"}}], {"l": ["a", 1, True]}),
+    lc_sim([{"join": {"field": "l", "separator": "-"}}], {"l": "abc"}),
+    lc_sim([{"gsub": {"field": "g", "pattern": "(\\d+)", "replacement": "<$1>"}}, {"gsub": {"field": "h", "pattern": "\\.", "replacement": "-"}}],
+           {"g": "a12b3", "h": "1.2.3"}),
+    lc_sim([{"grok": {"field": "m", "patterns": ["%{IP:client.ip} %{WORD:verb} %{URIPATHPARAM:req} %{NUMBER:bytes:int} %{NUMBER:dur:float}"]}}],
+           {"m": "55.3.244.1 GET /index.html?a=1 15824 0.043"}),
+    lc_sim([{"grok": {"field": "m", "patterns": ["%{FOO:x}-%{WORD:y}", "%{TIMESTAMP_ISO8601:ts} %{LOGLEVEL:level} %{GREEDYDATA:msg}"],
+                      "pattern_definitions": {"FOO": "[a-z]+"}, "trace_match": True}}],
+           {"m": "2024-01-15T10:00:00Z ERROR something broke"}),
+    lc_sim([{"grok": {"field": "m", "patterns": ["%{INT:n}"]}}], {"m": "abc"}),
+    lc_sim([{"dissect": {"field": "m", "pattern": "%{a} %{b} [%{c}] %{+a}"}}], {"m": "x y [z] w"}),
+    lc_sim([{"dissect": {"field": "m", "pattern": "%{a}|%{b}"}}], {"m": "nope"}),
+    lc_sim([{"json": {"field": "j"}}, {"json": {"field": "k", "target_field": "kk"}}, {"json": {"field": "r", "add_to_root": True}}],
+           {"j": "{\"a\": [1, 2]}", "k": "3", "r": "{\"top\": true}"}),
+    lc_sim([{"kv": {"field": "q", "field_split": "&", "value_split": "="}},
+            {"kv": {"field": "q", "field_split": "&", "value_split": "=", "target_field": "p", "prefix": "x_", "exclude_keys": ["b"]}}],
+           {"q": "a=1&b=2&a=3"}),
+    lc_sim([{"dot_expander": {"field": "a.b"}}, {"dot_expander": {"field": "*", "path": "o"}}],
+           {"a.b": 1, "o": {"x.y": 2, "z": 3}}),
+    lc_sim([{"sort": {"field": "n"}}, {"sort": {"field": "s", "order": "desc", "target_field": "s2"}}], {"n": [3, 1, 2], "s": ["b", "c", "a"]}),
+    lc_sim([{"urldecode": {"field": "u"}}, {"html_strip": {"field": "h"}}, {"bytes": {"field": "b"}}],
+           {"u": "a%20b%2Bc+d", "h": "<p>Hi <b>there</b></p>", "b": "1kb"}),
+    lc_sim([{"csv": {"field": "c", "target_fields": ["x", "y", "z"]}}], {"c": "1,\"a,b\",3"}),
+    lc_sim([{"foreach": {"field": "l", "processor": {"uppercase": {"field": "_ingest._value"}}}}], {"l": ["a", "b"]}),
+    lc_sim([{"foreach": {"field": "l", "processor": {"uppercase": {"field": "_ingest._value"}}}}], {"l": "x"}),
+    lc_sim([{"script": {"source": "ctx.b = ctx.a * params.f; ctx.remove('a')", "params": {"f": 3}}}], {"a": 2}),
+    lc_sim([{"set": {"field": "y", "value": 1, "if": "ctx.a == 2"}}, {"set": {"field": "z", "value": 1, "if": "ctx.a == 1"}}], {"a": 1}),
+    lc_sim([{"fail": {"message": "bad {{a}}"}}], {"a": "Q"}),
+    lc_sim([{"drop": {}}], {"a": 1}),
+    lc_sim([{"rename": {"field": "nope", "target_field": "y", "tag": "rt",
+                        "on_failure": [{"set": {"field": "err", "value": "{{_ingest.on_failure_message}}|{{_ingest.on_failure_processor_type}}|{{_ingest.on_failure_processor_tag}}"}}]}}],
+           {"a": 1}),
+    lc_sim([{"rename": {"field": "nope", "target_field": "y", "ignore_failure": True}}, {"set": {"field": "ok", "value": True}}], {"a": 1}),
+    lc_sim([{"set": {"field": "_index", "value": "other"}}, {"set": {"field": "_id", "value": "new-id"}}], {"a": 1}),
+    ("POST", LC_PIPE + "?verbose=true", {"pipeline": {"processors": [{"set": {"field": "a", "value": 1}}, {"lowercase": {"field": "zz", "tag": "t1"}}]},
+                                         "docs": [{"_source": {"b": 1}}]}, LC_STRIP),
+    ("POST", LC_PIPE, {"docs": [{"_source": {"a": 1}}]}),
+    ("POST", "/_ingest/pipeline/lc-nosuch/_simulate", {"docs": [{"_source": {"a": 1}}]}),
+    ("POST", LC_PIPE, {"pipeline": {"processors": [{"set": {"field": "x", "value": "{{_index}}/{{_id}}"}}]},
+                       "docs": [{"_index": "i", "_id": "7", "_routing": "r", "_source": {"a": 1}}]}, LC_STRIP),
+])
+
+scenario("lc_ingest_writes", lc_clean("lc-ing,lc-ing-plain,lc-ing-routed,lc-ing-b") + [
+    ("DELETE", "/_ingest/pipeline/lc-*"),
+    ("PUT", "/_ingest/pipeline/lc-up", {"processors": [{"uppercase": {"field": "a"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-final", {"processors": [{"set": {"field": "final", "value": True}}]}),
+    ("PUT", "/_ingest/pipeline/lc-drop", {"processors": [{"drop": {"if": "ctx.d == true"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-fail", {"processors": [{"fail": {"message": "bad {{a}}"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-route", {"processors": [{"set": {"field": "_index", "value": "lc-ing-routed"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-nested", {"processors": [{"pipeline": {"name": "lc-up"}}, {"set": {"field": "n", "value": 1}}]}),
+    ("PUT", "/_ingest/pipeline/lc-onf", {"processors": [{"rename": {"field": "nope", "target_field": "y"}}],
+                                         "on_failure": [{"set": {"field": "err", "value": "{{_ingest.on_failure_message}}|{{_ingest.on_failure_processor_type}}|{{_ingest.on_failure_pipeline}}"}}]}),
+    ("PUT", "/lc-ing", {"settings": {"default_pipeline": "lc-up", "final_pipeline": "lc-final"}}, ACK),
+    ("PUT", "/lc-ing/_doc/1?refresh=true", {"a": "x"}, {"pick": lambda r: (r["result"], r["_index"])}),
+    ("GET", "/lc-ing/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("PUT", "/lc-ing/_doc/2?pipeline=_none", {"a": "x"}, {"pick": lambda r: r["result"]}),
+    ("GET", "/lc-ing/_doc/2", None, {"pick": lambda r: r["_source"]}),
+    ("PUT", "/lc-ing/_doc/3?pipeline=lc-drop", {"d": True}),
+    ("GET", "/lc-ing/_doc/3", None, {"pick": lambda r: r["found"]}),
+    ("PUT", "/lc-ing/_doc/4?pipeline=lc-fail", {"a": "Q"}),
+    ("PUT", "/lc-ing/_doc/5?pipeline=lc-nosuch", {"a": "Q"}),
+    ("PUT", "/lc-ing/_doc/6?pipeline=lc-onf", {"a": "Q"}, {"pick": lambda r: r["result"]}),
+    ("GET", "/lc-ing/_doc/6", None, {"pick": lambda r: r["_source"]}),
+    ("PUT", "/lc-ing/_doc/7?pipeline=lc-nested", {"a": "q"}, {"pick": lambda r: r["result"]}),
+    ("GET", "/lc-ing/_doc/7", None, {"pick": lambda r: r["_source"]}),
+    ("POST", "/lc-ing/_doc?pipeline=lc-up", {"a": "auto"}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-ing-plain/_doc/1?pipeline=lc-route", {"a": "r"}, {"pick": lambda r: (r["result"], r["_index"])}),
+    ("GET", "/lc-ing-routed/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("POST", "/_bulk?pipeline=lc-drop", [{"index": {"_index": "lc-ing-b", "_id": "1"}}, {"d": True},
+                                          {"index": {"_index": "lc-ing-b", "_id": "2", "pipeline": "lc-fail"}}, {"a": 1},
+                                          {"index": {"_index": "lc-ing-b", "_id": "3", "pipeline": "lc-nosuch"}}, {"a": 1},
+                                          {"create": {"_index": "lc-ing-b", "_id": "4", "pipeline": "lc-up"}}, {"a": "c"}],
+     {"pick": lambda r: (r["errors"], "ingest_took" in r, [lc_strip(list(i.values())[0]) for i in r["items"]])}),
+    ("POST", "/_bulk", [{"index": {"_index": "lc-ing-b", "_id": "9"}}, {"a": 1}], {"pick": lambda r: (r["errors"], "ingest_took" in r)}),
+    ("GET", "/lc-ing-b/_doc/4", None, {"pick": lambda r: r["_source"]}),
+    ("DELETE", "/_ingest/pipeline/lc-up"),
+    ("POST", "/_ingest/_simulate", {"docs": [{"_index": "lc-ing", "_id": "1", "_source": {"a": "y"}},
+                                             {"_index": "lc-ing-other", "_id": "2", "_source": {"a": "y"}}]}),
+    ("PUT", "/_ingest/pipeline/lc-up", {"processors": [{"uppercase": {"field": "a"}}]}),
+    ("POST", "/_ingest/_simulate", {"docs": [{"_index": "lc-ing", "_id": "1", "_source": {"a": "y"}},
+                                             {"_index": "lc-ing-other", "_id": "2", "_source": {"a": "y"}}]}),
+    ("POST", "/_ingest/_simulate?pipeline=lc-onf", {"docs": [{"_index": "lc-ing-other", "_id": "1", "_source": {"a": "x"}}]}),
+    ("POST", "/_ingest/_simulate?pipeline=lc-fail", {"docs": [{"_index": "lc-ing-other", "_id": "1", "_source": {"a": "x"}}]}),
+    ("POST", "/_ingest/_simulate?pipeline=lc-drop", {"docs": [{"_index": "lc-ing-other", "_id": "1", "_source": {"d": True}}]}),
+    ("POST", "/_ingest/_simulate?pipeline=lc-nosuch", {"docs": [{"_index": "lc-ing-other", "_id": "1", "_source": {"d": True}}]}),
+    ("POST", "/_ingest/lc-ing/_simulate", {"docs": [{"_id": "1", "_source": {"a": "x"}}],
+                                           "pipeline_substitutions": {"lc-up": {"processors": [{"lowercase": {"field": "a"}}]}}}),
+    ("POST", "/_ingest/lc-ing/_simulate", {"docs": [{"_id": "1", "_source": {"a": "x"}}],
+                                           "pipeline_substitutions": {"lc-up": {"processors": [{"nope": {}}]}}}),
+    ("POST", "/_ingest/lc-ing/_simulate", {"docs": [{"_id": "1", "_source": {"a": "x"}}],
+                                           "pipeline_substitutions": {"lc-unused": {"processors": [{"nope": {}}]}}}),
+] + lc_clean("lc-ing,lc-ing-plain,lc-ing-routed,lc-ing-b") + [("DELETE", "/_ingest/pipeline/lc-*")])
+
+scenario("lc_scripts", lc_clean("lc-sc") + [
+    ("DELETE", "/_scripts/lc-s1"), ("DELETE", "/_scripts/lc-s2"),
+    ("PUT", "/_scripts/lc-s1", {"script": {"lang": "painless", "source": "ctx._source.n += params.k"}}),
+    ("PUT", "/_scripts/lc-s2", {"script": {"lang": "painless", "source": "doc['n'].value * params.f"}}),
+    ("GET", "/_scripts/lc-s1"),
+    ("GET", "/_scripts/lc-nosuch"),
+    ("DELETE", "/_scripts/lc-nosuch"),
+    ("PUT", "/_scripts/lc-s3", {"script": {"lang": "painless"}}),
+    ("PUT", "/_scripts/lc-s3", {"script": {"source": "1"}}),
+    ("PUT", "/_scripts/lc-s3", {"bogus": {"lang": "painless"}}),
+    ("PUT", "/_scripts/lc-s3", {"script": {"lang": "python", "source": "1"}}),
+    ("PUT", "/_scripts/lc-s3", {"script": {"lang": "mustache", "source": {"query": {"match": {"a": "{{q}}"}}}}}),
+    ("GET", "/_scripts/lc-s3"),
+    ("DELETE", "/_scripts/lc-s3"),
+    ("PUT", "/lc-sc/_doc/1?refresh=true", {"n": 1}, {"pick": lambda r: r["result"]}),
+    ("POST", "/lc-sc/_update/1", {"script": {"id": "lc-s1", "params": {"k": 5}}}, {"pick": lambda r: r["result"]}),
+    ("GET", "/lc-sc/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("POST", "/lc-sc/_update/1", {"script": {"id": "lc-nosuch"}}),
+    ("POST", "/lc-sc/_refresh", None, {"pick": lambda r: 1}),
+    ("POST", "/lc-sc/_search", {"query": {"script_score": {"query": {"match_all": {}}, "script": {"id": "lc-s2", "params": {"f": 3}}}}},
+     {"pick": lambda r: [h["_score"] for h in r["hits"]["hits"]]}),
+    ("POST", "/lc-sc/_search", {"query": {"script_score": {"query": {"match_all": {}}, "script": {"id": "lc-nosuch"}}}}),
+    ("POST", "/lc-sc/_update_by_query?refresh=true", {"script": {"id": "lc-s1", "params": {"k": 1}}}, {"pick": lambda r: r["updated"]}),
+    ("GET", "/lc-sc/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("GET", "/_script_language"),
+    ("GET", "/_script_context", None, {"pick": lambda r: [c["name"] for c in r["contexts"]][:5]}),
+    ("DELETE", "/_scripts/lc-s1"), ("DELETE", "/_scripts/lc-s2"),
+] + lc_clean("lc-sc"))
+
+scenario("lc_reindex", lc_clean("lc-ri-src,lc-ri-dst,lc-ri-q,lc-ri-s,lc-ri-b,lc-ri-p,lc-ri-w,lc-ri-x") + [
+    ("PUT", "/lc-ri-src/_doc/1", {"a": 1, "o": {"x": 1, "y": 2}}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-ri-src/_doc/2?routing=r", {"a": 2}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/lc-ri-src/_doc/3?refresh=true", {"a": 3}, {"pick": lambda r: r["result"]}),
+    ("POST", "/_reindex?refresh=true", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-dst"}}, LC_STRIP),
+    ("GET", "/lc-ri-dst/_doc/2?routing=r", None, {"pick": lambda r: (r["_source"], r.get("_routing"))}),
+    ("POST", "/_reindex", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-dst", "op_type": "create"}},
+     {"pick": lambda r: lc_strip({k: v for k, v in r.items() if k != "failures"})}),
+    ("POST", "/_reindex", {"conflicts": "proceed", "source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-dst", "op_type": "create"}}, LC_STRIP),
+    ("POST", "/_reindex?refresh=true", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-dst"}}, LC_STRIP),
+    ("GET", "/lc-ri-dst/_doc/1", None, {"pick": lambda r: r["_version"]}),
+    ("POST", "/_reindex", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-src"}}),
+    ("POST", "/_reindex", {"source": {"index": "lc-ri-nosuch"}, "dest": {"index": "lc-ri-x"}}),
+    ("POST", "/_reindex", {"source": {"index": "lc-ri-src"}}),
+    ("POST", "/_reindex", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-x"}, "bogus": 1}),
+    ("POST", "/_reindex?refresh=true", {"source": {"index": "lc-ri-src", "query": {"range": {"a": {"gte": 2}}}, "_source": ["a"]},
+                                        "dest": {"index": "lc-ri-q"}, "max_docs": 1}, LC_STRIP),
+    ("POST", "/lc-ri-q/_search", {"sort": ["a"]}, {"pick": lambda r: [(h["_id"], h["_source"]) for h in r["hits"]["hits"]]}),
+    ("POST", "/_reindex?refresh=true", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-s"},
+                                        "script": {"source": "ctx._source.b = ctx._source.a + 10; if (ctx._id == '2') { ctx.op = 'noop' }"}}, LC_STRIP),
+    ("POST", "/lc-ri-s/_search", {"sort": ["a"]}, {"pick": lambda r: [(h["_id"], h["_source"]) for h in r["hits"]["hits"]]}),
+    ("POST", "/_reindex?refresh=true", {"source": {"index": "lc-ri-src", "size": 1}, "dest": {"index": "lc-ri-b"}}, LC_STRIP),
+    ("PUT", "/_ingest/pipeline/lc-ri-p", {"processors": [{"set": {"field": "piped", "value": True}}]}),
+    ("POST", "/_reindex?refresh=true", {"source": {"index": "lc-ri-src", "query": {"term": {"a": 1}}}, "dest": {"index": "lc-ri-p", "pipeline": "lc-ri-p"}}, LC_STRIP),
+    ("GET", "/lc-ri-p/_doc/1", None, {"pick": lambda r: r["_source"]}),
+    ("DELETE", "/_ingest/pipeline/lc-ri-p"),
+    ("POST", "/_reindex?wait_for_completion=false", {"source": {"index": "lc-ri-src"}, "dest": {"index": "lc-ri-w"}}, {"pick": lambda r: sorted(r)}),
+    ("sleep", 2),
+] + lc_clean("lc-ri-src,lc-ri-dst,lc-ri-q,lc-ri-s,lc-ri-b,lc-ri-p,lc-ri-w,lc-ri-x"))
+
+scenario("lc_misc", lc_clean("lc-misc") + [
+    ("PUT", "/lc-misc", None, ACK),
+    ("POST", "/lc-misc/_forcemerge?max_num_segments=10&only_expunge_deletes=true"),
+    ("POST", "/lc-misc/_forcemerge?max_num_segments=1"),
+    ("POST", "/lc-misc/_forcemerge?wait_for_completion=false", None, {"pick": lambda r: sorted(r)}),
+    ("POST", "/lc-misc/_flush?force=true&wait_if_ongoing=false"),
+    ("POST", "/lc-misc/_flush?force=true"),
+    ("GET", "/_migration/system_features", None, {"pick": lambda r: (r["migration_status"], [f["feature_name"] for f in r["features"]])}),
+    ("POST", "/_migration/system_features"),
+] + lc_clean("lc-misc"))
+# --- search response features and document parsing (resp_*) ----------
+
+RESULT = {"pick": lambda r: r.get("result")}
+
+
+def resp_hits(r):
+    return [(h["_id"], h.get("_score"), h.get("sort"), h.get("fields"), h.get("_ignored"),
+             h.get("ignored_field_values")) for h in r["hits"]["hits"]] + [r["hits"].get("total")]
+
+
+def resp_inner(r):
+    return [(h["_id"], h.get("fields"), {n: ([x["_id"] for x in ih["hits"]["hits"]], ih["hits"]["total"])
+                                         for n, ih in h.get("inner_hits", {}).items()})
+            for h in r["hits"]["hits"]]
+
+
+scenario("resp_docparse", [
+    ("DELETE", "/resp-dp?ignore_unavailable=true"),
+    ("PUT", "/resp-dp", {"settings": STATIC, "mappings": {"dynamic": "strict", "properties": {
+        "ip": {"type": "ip", "ignore_malformed": True}, "n": {"type": "integer"},
+        "d": {"type": "date", "ignore_malformed": True}, "k": {"type": "keyword", "ignore_above": 3},
+        "b": {"type": "boolean"}, "o": {"type": "object", "dynamic": True},
+        "f": {"type": "object", "dynamic": False}}}}, ACK),
+    ("PUT", "/resp-dp/_doc/1", {"ip": "10.0.0.1", "n": 5, "k": "ab"}, RESULT),
+    ("PUT", "/resp-dp/_doc/2", {"ip": "garbage", "d": "nope", "k": "abcdef"}, RESULT),
+    ("PUT", "/resp-dp/_doc/3", {"ip": ["1.1.1.1", "bad", 7], "n": "12", "o": {"new": "x"}}, RESULT),
+    ("PUT", "/resp-dp/_doc/4", {"f": {"anything": [1, "a"]}, "b": "false"}, RESULT),
+    ("PUT", "/resp-dp/_doc/5", {"zz": 1}),
+    ("PUT", "/resp-dp/_doc/5", {"n": "abc"}),
+    ("PUT", "/resp-dp/_doc/5", {"n": 3000000000}),
+    ("PUT", "/resp-dp/_doc/5", {"n": True}),
+    ("PUT", "/resp-dp/_doc/5", {"b": "yes"}),
+    ("PUT", "/resp-dp/_doc/5", {"ip": {"object": "wow"}}),
+    ("PUT", "/resp-dp/_doc/5", {"k": {"a": 1}}),
+    ("PUT", "/resp-dp/_doc/5", {"o": "concrete"}),
+    ("PUT", "/resp-dp/_doc/5", {"o": {"p": {"q": 1}}, "n": "1e3"}, RESULT),
+    ("POST", "/resp-dp/_refresh"),
+    ("GET", "/resp-dp/_mapping"),
+    ("GET", "/resp-dp/_doc/2?stored_fields=_ignored"),
+    ("GET", "/resp-dp/_doc/1?stored_fields=_ignored"),
+    ("POST", "/resp-dp/_search", {"query": {"exists": {"field": "_ignored"}}, "sort": ["_doc"]}, {"pick": resp_hits}),
+    ("POST", "/resp-dp/_search", {"query": {"term": {"_ignored": "k"}}}, {"pick": ids}),
+    ("POST", "/resp-dp/_search", {"query": {"ids": {"values": ["2", "3"]}}, "_source": False, "fields": ["ip", "k", "d"],
+                                  "sort": ["_doc"]}, {"pick": resp_hits}),
+    ("DELETE", "/resp-dt?ignore_unavailable=true"),
+    ("PUT", "/resp-dt", {"settings": STATIC, "mappings": {"dynamic_templates": [
+        {"strs": {"match_mapping_type": "string", "match": "k_*", "mapping": {"type": "keyword"}}},
+        {"longs": {"match_mapping_type": "long", "mapping": {"type": "integer"}}},
+        {"named": {"mapping": {"type": "keyword"}}},
+        {"rt": {"match": "r_*", "runtime": {}}}]}}, ACK),
+    ("PUT", "/resp-dt/_doc/1", {"k_a": "x", "n": 5, "f": 1.5, "s": "text", "d": "2020-01-01", "d2": "2015/09/02",
+                                "dotted.name": "y", "r_x": "v", "e": [], "nul": None}, RESULT),
+    ("GET", "/resp-dt/_mapping"),
+    ("POST", "/_bulk", [{"index": {"_index": "resp-dt", "_id": "2", "dynamic_templates": {"t": "named"}}},
+                        {"t": "abc"},
+                        {"index": {"_index": "resp-dt", "_id": "3", "dynamic_templates": {"u": "missing"}}},
+                        {"u": "abc"},
+                        {"index": {"_index": "resp-dt", "_id": "4", "bogus": 1}}, {"x": 1}],
+     ),
+    ("POST", "/_bulk", [{"index": {"_index": "resp-dt", "_id": "2", "dynamic_templates": {"t": "named"}}},
+                        {"t": "abc"},
+                        {"index": {"_index": "resp-dt", "_id": "3", "dynamic_templates": {"u": "missing"}}},
+                        {"u": "abc"}],
+     {"pick": lambda r: [(list(i)[0], i[list(i)[0]]["status"], i[list(i)[0]].get("error", {}).get("type"))
+                         for i in r["items"]]}),
+    ("GET", "/resp-dt/_mapping/field/t,u"),
+    ("GET", "/resp-dt/_mapping/field/k_a?include_defaults=true"),
+    ("DELETE", "/resp-dp"), ("DELETE", "/resp-dt"),
+])
+
+scenario("resp_termvectors", [
+    ("DELETE", "/resp-tvx?ignore_unavailable=true"),
+    ("PUT", "/resp-tvx", {"settings": STATIC, "mappings": {"properties": {
+        "text": {"type": "text", "term_vector": "with_positions_offsets"}, "kw": {"type": "keyword"},
+        "plain": {"type": "text"}}}}, ACK),
+    ("PUT", "/resp-tvx/_doc/1?refresh=true", {"text": "The quick brown fox is brown.", "kw": "Hello World",
+                                              "plain": "some text here"}, RESULT),
+    ("PUT", "/resp-tvx/_doc/2?refresh=true", {"text": "brown cows", "plain": "more text"}, RESULT),
+    ("GET", "/resp-tvx/_termvectors/1?term_statistics=true"),
+    ("GET", "/resp-tvx/_termvectors/1?fields=kw,plain&positions=false"),
+    ("GET", "/resp-tvx/_termvectors/1?fields=plain&offsets=false&field_statistics=false"),
+    ("GET", "/resp-tvx/_termvectors/9"),
+    ("GET", "/resp-nope/_termvectors/1"),
+    ("POST", "/resp-tvx/_termvectors", {"doc": {"text": "brown cow", "x": "y"}, "term_statistics": True}),
+    ("POST", "/resp-tvx/_termvectors/1?bogus=1"),
+    ("POST", "/resp-tvx/_termvectors/1", {"versionType": "x"}),
+    ("POST", "/_mtermvectors", {"docs": [{"_index": "resp-tvx", "_id": "1", "fields": ["plain"]},
+                                         {"_index": "resp-tvx", "_id": "9"},
+                                         {"_index": "resp-nope", "_id": "1"}]}),
+    ("POST", "/resp-tvx/_mtermvectors?fields=plain", {"ids": ["1", "2"]}),
+    ("POST", "/resp-tvx/_mtermvectors", {"docs": [{"_id": "1", "_routing": "x"}]}),
+    ("POST", "/resp-tvx/_mtermvectors", {}),
+    ("DELETE", "/resp-tvx"),
+])
+
+COLLAPSE_DOCS = [
+    {"g": 1, "tag": "A", "sort": 10, "t": "red fox"}, {"g": 1, "tag": "B", "sort": 6, "t": "red red fox"},
+    {"g": 1, "tag": "A", "sort": 24, "t": "blue fox"}, {"g": 25, "tag": "B", "sort": 10, "t": "red dog"},
+    {"g": 25, "tag": "A", "sort": 5, "t": "red"}, {"g": 3, "tag": "B", "sort": 36, "t": "fox"},
+]
+
+scenario("resp_collapse", setup("resp-col", {"settings": STATIC, "mappings": {"properties": {
+    "g": {"type": "integer"}, "tag": {"type": "keyword"}, "sort": {"type": "long"}, "t": {"type": "text"}}}},
+    COLLAPSE_DOCS) + [
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g", "inner_hits": {"name": "s", "size": 2, "sort": [{"sort": "asc"}]}},
+                                   "sort": [{"sort": "desc"}]}, {"pick": resp_inner}),
+    ("POST", "/resp-col/_search", {"query": {"match": {"t": "red"}},
+                                   "collapse": {"field": "g", "inner_hits": [{"name": "a", "size": 1},
+                                                                             {"name": "b", "collapse": {"field": "tag"}}]}},
+     {"pick": resp_inner}),
+    ("POST", "/resp-col/_search?rest_total_hits_as_int=true",
+     {"collapse": {"field": "g", "inner_hits": {"name": "s", "version": True, "_source": False, "fields": ["tag"]}},
+      "sort": [{"sort": "desc"}]}, {"pick": resp_inner}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g", "inner_hits": {"size": 1}}}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g", "inner_hits": {"name": "x", "collapse": {"field": "tag", "inner_hits": {}}}}}),
+    ("POST", "/resp-col/_search?scroll=1m", {"collapse": {"field": "g"}}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "t"}}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g"}, "search_after": [6], "sort": [{"sort": "desc"}]}),
+    ("POST", "/resp-col/_search", {"query": {"match": {"t": "red"}}, "collapse": {"field": "g"},
+                                   "rescore": {"window_size": 2, "query": {"rescore_query": {"match": {"t": "fox"}},
+                                                                           "query_weight": 0.5, "rescore_query_weight": 2}}},
+     {"pick": resp_hits}),
+    ("POST", "/resp-col/_search", {"rescore": {"query": {"rescore_query": {"match_all": {}}}}, "sort": ["sort"]}),
+    ("DELETE", "/resp-col"),
+])
+
+scenario("resp_limits", setup("resp-lim", {"settings": {"index": {"refresh_interval": "-1", "max_docvalue_fields_search": 2,
+                                                                     "max_script_fields": 1, "max_result_window": 5,
+                                                                     "max_terms_count": 2, "number_of_shards": 3}},
+                                           "mappings": {"properties": {"k": {"type": "keyword"}, "n": {"type": "long"}}}},
+                                [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]) + [
+    ("POST", "/resp-lim/_search", {"match": {"k": "a"}}),
+    ("POST", "/resp-lim/_search", {"query": {"match_all": {}}, "bogus": [1]}),
+    ("POST", "/resp-lim/_search", {"query": {"term": {"k": "a"}, "preference": "_local"}}),
+    ("POST", "/resp-lim/_search", {"from": -1}),
+    ("POST", "/resp-lim/_search?from=-1"),
+    ("POST", "/resp-lim/_search", {"size": 6}),
+    ("POST", "/resp-lim/_search?scroll=1m", {"size": 6}),
+    ("POST", "/resp-lim/_search", {"docvalue_fields": ["k", "n", "x"]}),
+    ("POST", "/resp-lim/_search", {"script_fields": {"a": {"script": "1"}, "b": {"script": "2"}}}),
+    ("POST", "/resp-lim/_search", {"query": {"terms": {"k": ["a", "b", "c"]}}}),
+    ("POST", "/resp-lim/_search", {"query": {"regexp": {"k": "a" * 1001}}}),
+    ("POST", "/resp-lim/_search", {"query": {"prefix": {"k": "a" * 1001}}}),
+    ("POST", "/resp-lim/_search", {"rescore": [{"window_size": 10001, "query": {"rescore_query": {"match_all": {}}}}]}),
+    ("POST", "/resp-lim/_search?batched_reduce_size=1"),
+    ("POST", "/resp-lim/_search?pre_filter_shard_size=0"),
+    ("POST", "/resp-lim/_search?batched_reduce_size=2", {"size": 0, "aggs": {"k": {"terms": {"field": "k"}}}},
+     {"pick": lambda r: (r.get("num_reduce_phases"), r["hits"]["total"])}),
+    ("POST", "/resp-lim/_search", {"track_total_hits": -2}),
+    ("POST", "/resp-lim/_search?terminate_after=-1"),
+    ("POST", "/resp-lim/_count?terminate_after=-1"),
+    ("POST", "/resp-lim/_search", {"indices_boost": {"resp-lim": 2}}),
+    ("POST", "/resp-lim/_search", {"indices_boost": [{"resp-nope": 2}]}),
+    ("POST", "/resp-nomatch*/_search"),
+    ("POST", "/resp-nomatch*/_count"),
+    ("POST", "/resp-nomatch*/_search?allow_no_indices=false"),
+    ("POST", "/resp-lim,resp-nope/_search"),
+    ("POST", "/<resp-nope-{now/d}>/_search"),
+    ("GET", "/resp-lim/_search_shards?routing=x", None, {"pick": lambda r: (r["indices"], [[(c["index"], c["shard"], c["primary"]) for c in g] for g in r["shards"]])}),
+    ("GET", "/resp-lim/_search_shards", None, {"pick": lambda r: (r["indices"], [[(c["index"], c["shard"]) for c in g] for g in r["shards"]])}),
+    ("DELETE", "/resp-lim"),
+])
+
+scenario("resp_fields", [
+    ("DELETE", "/resp-fl?ignore_unavailable=true"),
+    ("PUT", "/resp-fl", {"settings": STATIC, "mappings": {"properties": {
+        "id": {"type": "keyword"}, "idAlias": {"type": "alias", "path": "_id"},
+        "num": {"type": "integer"}, "numAlias": {"type": "alias", "path": "num"},
+        "user": {"type": "nested", "properties": {"first": {"type": "keyword"},
+                                                  "address": {"type": "nested"}}},
+        "owner": {"type": "text", "fields": {"length": {"type": "token_count", "analyzer": "standard"}}},
+        "ts": {"type": "date", "format": "yyyy-MM-dd HH:mm:ss.SSS"},
+        "flat": {"type": "flattened"}, "geo": {"type": "geo_point"},
+        "off": {"type": "object", "enabled": False}}}}, ACK),
+    ("PUT", "/resp-fl/_doc/1?refresh=true", {"id": "x", "num": 7, "owner": "Anna Ott", "ts": "2021-02-11 08:30:04.828",
+                                             "user": [{"first": "John", "address": {"city": "Berlin"}, "acct": {"size": 1}},
+                                                      {"first": "Alice", "address": [{"city": "Paris"}, {"zip": "1"}]},
+                                                      {"last": "Snow"}],
+                                             "flat": {"a": "b", "c": ["d", "e"]}, "geo": {"lat": 41.12, "lon": -71.34},
+                                             "off": {"z": "q"}}, RESULT),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": ["*"]}, {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": ["user.address*"]}, {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": [{"field": "*", "include_unmapped": True}]}, {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": ["_id", "_index", "_version", "_*", "flat.c", "flat.*"]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": [{"field": "geo", "format": "wkt"}, {"field": "ts", "format": "yyyy"}]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"fields": ["_seq_no"]}),
+    ("POST", "/resp-fl/_search", {"fields": [{"field": "id", "format": "yyyy"}]}),
+    ("POST", "/resp-fl/_search", {"fields": [{"field": "i*", "format": "yyyy"}]}),
+    ("POST", "/resp-fl/_search", {"script_fields": {"a": {"script": "doc['num'].value * 2"},
+                                                    "b": {"script": {"source": "params._source.id + params.x", "params": {"x": "!"}}},
+                                                    "c": {"script": "return null"}}},
+     {"pick": lambda r: [(h.get("_source"), h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("POST", "/resp-fl/_search", {"sort": [{"ts": {"order": "asc", "format": "strict_date_optional_time_nanos"}}]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"sort": [{"ts": {"order": "asc"}}], "search_after": ["2021-02-11 08:30:04.827"]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"sort": [{"ts": {"order": "asc", "format": "epoch_millis"}}], "search_after": ["2021-02-11T08:30:04.828Z"]}),
+    ("POST", "/resp-fl/_search", {"sort": ["_shard_doc"]}),
+    ("DELETE", "/resp-fl"),
+])
+
+
+def resp_profile(r):
+    out = []
+    for sh in r["profile"]["shards"]:
+        f = sh.get("fetch")
+        out.append((sh["shard_id"], sh["index"], sh.get("cluster"), sorted(sh), len(sh["node_id"]),
+                    f and (f["type"], f["debug"], [c["type"] for c in f.get("children", [])]),
+                    sh.get("dfs") and sorted(sh["dfs"]),
+                    [(s["query"][0]["type"], [c["name"] for c in s["collector"]]) for s in sh.get("searches", [])]))
+    return out
+
+
+scenario("resp_profile", setup("resp-prof", {"settings": {"index": {"refresh_interval": "-1", "number_of_shards": 2}},
+                                             "mappings": {"properties": {"k": {"type": "keyword"}, "t": {"type": "text"}}}},
+                               [{"k": "a", "t": "quick fox"}, {"k": "b", "t": "lazy dog"}]) + [
+    ("POST", "/resp-prof/_search", {"profile": True, "query": {"term": {"k": "a"}}}, {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search", {"profile": True, "_source": False, "fields": ["k"], "query": {"term": {"k": "a"}}},
+     {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search", {"profile": True, "stored_fields": "_none_", "query": {"term": {"k": "a"}}},
+     {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search?search_type=dfs_query_then_fetch", {"profile": True, "query": {"term": {"k": "zz"}}},
+     {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search", {"profile": True, "query": {"bool": {"must": [{"match": {"t": "quick fox"}}],
+                                                                        "filter": [{"term": {"k": "a"}}]}}},
+     {"pick": lambda r: [s["searches"][0]["query"][0]["description"] for s in r["profile"]["shards"]]}),
+    ("DELETE", "/resp-prof"),
+])
+
+scenario("resp_misc", setup("resp-misc", {"settings": STATIC, "mappings": {"properties": {
+    "k": {"type": "keyword"}, "n": {"type": "long"}, "f": {"type": "double"}, "d": {"type": "date"}}}},
+    [{"k": "a", "n": 1, "f": 1.5, "d": "2020-01-01"}, {"k": "b", "n": 2, "f": 2.5, "d": "2021-01-01"}]) + [
+    ("POST", "/resp-misc/_search?typed_keys=true", {"size": 0, "aggs": {
+        "t": {"terms": {"field": "k"}, "aggs": {"m": {"max": {"field": "n"}}}}, "l": {"terms": {"field": "n"}},
+        "dt": {"terms": {"field": "f"}}, "a": {"avg": {"field": "n"}}, "c": {"cardinality": {"field": "k"}},
+        "r": {"range": {"field": "d", "ranges": [{"to": "2020-06-01"}]}}, "f": {"filter": {"term": {"k": "a"}}},
+        "h": {"histogram": {"field": "n", "interval": 1}}, "m": {"missing": {"field": "k"}}}},
+     {"pick": lambda r: sorted(r["aggregations"])}),
+    ("POST", "/_msearch?typed_keys=true", [{"index": "resp-misc"}, {"size": 0, "aggs": {"f": {"filter": {"term": {"k": "a"}}}}}],
+     {"pick": lambda r: [sorted(x.get("aggregations", {})) for x in r["responses"]]}),
+    ("POST", "/resp-misc/_pit?keep_alive=1m", None, {"save": {"pit": "id"}, "pick": lambda r: "id" in r}),
+    ("POST", "/_msearch", [{"index": "resp-misc"}, {"pit": {"id": "{pit}"}}]),
+    ("POST", "/_msearch", [{}, {"pit": {"id": "{pit}"}, "query": {"match": {"_index": "resp-misc"}}}],
+     {"pick": lambda r: [x["hits"]["total"] for x in r["responses"]]}),
+    ("DELETE", "/_pit", {"id": "{pit}"}, {"pick": lambda r: r}),
+    ("POST", "/resp-misc/_search?include_named_queries_score=true",
+     {"query": {"bool": {"should": [{"term": {"k": {"value": "a", "_name": "ka"}}}, {"match_all": {"_name": "all"}}]}}},
+     {"pick": lambda r: [(h["_id"], sorted(h.get("matched_queries"))) for h in r["hits"]["hits"]]}),
+    ("PUT", "/%3Cresp-dm-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E", None, ACK),
+    ("GET", "/resp-dm-2022-12-31", None, {"pick": lambda r: sorted(r)}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "<resp-dm-{2022-12-31||/d{yyyy-MM-dd}}>",
+                                                "alias": "<resp-dma-{2022-12-31||/d{yyyy-MM-dd}}>"}}]}, ACK),
+    ("GET", "/_alias/resp-dma-2022-12-31"),
+    ("GET", "/resp-misc/_mget", {"docs": [{"_id": "1", "_routing": "x"}]}),
+    ("POST", "/_bulk", [{"index": {"_index": "resp-misc", "_id": "9", "_type": "x"}}, {"k": "z"}]),
+    ("POST", "/resp-misc/_search", {"runtime_mappings": {"loc": {"type": "lookup", "target_index": "resp-misc",
+                                                                 "input_field": "k", "target_field": "k",
+                                                                 "fetch_fields": ["n"]}},
+                                    "fields": ["loc"], "_source": False, "sort": ["n"]}, {"pick": resp_hits}),
+    ("POST", "/resp-misc/_search", {"runtime_mappings": {"loc": {"type": "lookup", "target_index": "resp-misc",
+                                                                 "input_field": "k", "target_field": "k",
+                                                                 "fetch_fields": ["n"]}},
+                                    "query": {"match": {"loc": "x"}}}),
+    ("DELETE", "/resp-misc"), ("DELETE", "/resp-dm-2022-12-31"),
+])
+# --- time-series indices (index.mode: time_series) and range fields -------
+
+TSDB_TS = {"start_time": "2021-04-28T00:00:00Z", "end_time": "2021-04-29T00:00:00Z"}
+
+
+def tsdb_index(name, mappings, routing_path=("metricset", "k8s.pod.uid"), **settings):
+    index = {"mode": "time_series", "routing_path": list(routing_path),
+             "time_series": dict(TSDB_TS), "refresh_interval": "-1"}
+    index.update(settings)
+    return [("DELETE", f"/{name}?ignore_unavailable=true"),
+            ("PUT", f"/{name}", {"settings": {"index": index}, "mappings": mappings}, ACK)]
+
+
+TSDB_MAPPING = {"properties": {
+    "@timestamp": {"type": "date"},
+    "metricset": {"type": "keyword", "time_series_dimension": True},
+    "k8s": {"properties": {"pod": {"properties": {
+        "uid": {"type": "keyword", "time_series_dimension": True},
+        "name": {"type": "keyword"},
+        "ip": {"type": "ip", "time_series_dimension": True},
+        "network": {"properties": {"tx": {"type": "long", "time_series_metric": "counter"},
+                                   "rx": {"type": "long", "time_series_metric": "gauge"}}}}}}}}}
+
+TSDB_DOCS = []
+for _ts, _name, _uid, _ip, _tx in [
+        ("2021-04-28T18:50:04.467Z", "cat", "947e4ced-1786-4e53-9e0c-5c447e959507", "10.10.55.1", 2001818691),
+        ("2021-04-28T18:50:24.467Z", "cat", "947e4ced-1786-4e53-9e0c-5c447e959507", "10.10.55.1", 2005177954),
+        ("2021-04-28T18:51:04.467Z", "cat", "947e4ced-1786-4e53-9e0c-5c447e959507", "10.10.55.2", 2012916202),
+        ("2021-04-28T18:50:03.142Z", "dog", "df3145b3-0563-4d3b-a0f7-897eb2876ea9", "10.10.55.3", 1434521831),
+        ("2021-04-28T18:50:53.142Z", "dog", "df3145b3-0563-4d3b-a0f7-897eb2876ea9", "::ffff:10.10.55.3", 1434587694)]:
+    TSDB_DOCS += [{"index": {}}, {"@timestamp": _ts, "metricset": "pod", "k8s": {"pod": {
+        "name": _name, "uid": _uid, "ip": _ip, "network": {"tx": _tx, "rx": 802133794}}}}]
+
+
+def items(r):
+    return [(k, v["status"], v.get("_id"), v.get("result"), v.get("error", {}).get("type"))
+            for i in r["items"] for k, v in i.items()]
+
+
+def hit_meta(r):
+    return [(h["_id"], h.get("sort"), h.get("fields")) for h in r["hits"]["hits"]]
+
+
+scenario("tsdb_ids", tsdb_index("tsdb-ids", TSDB_MAPPING) + [
+    ("POST", "/tsdb-ids/_bulk?refresh=true", TSDB_DOCS, {"pick": items}),
+    # The same series and timestamp again: the same _id, overwritten.
+    ("POST", "/tsdb-ids/_bulk?refresh=true", TSDB_DOCS[:2], {"pick": items}),
+    ("POST", "/tsdb-ids/_search", {"sort": ["_tsid", "@timestamp"], "fields": ["_tsid", "_ts_routing_hash"],
+                                   "_source": False}, {"pick": hit_meta}),
+    ("POST", "/tsdb-ids/_search", {"size": 0, "aggs": {"t": {"terms": {"field": "_tsid", "order": {"_key": "desc"}}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("POST", "/tsdb-ids/_search", {"size": 0, "aggs": {"t": {"terms": {"field": "k8s.pod.ip", "order": {"_key": "asc"}}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("POST", "/tsdb-ids/_search", {"query": {"ids": {"values": ["cZZNs7B9sSWsyrL5AAABeRnRGTM"]}}, "_source": False},
+     {"pick": hit_meta}),
+    ("GET", "/tsdb-ids/_doc/cZZNs7B9sSWsyrL5AAABeRnRGTM", None, {"pick": lambda r: (r["_id"], r["found"])}),
+    ("GET", "/tsdb-ids/_doc/cZZNs7B9sSWsyrL5AAABeRnRGTM?routing=x"),
+    ("GET", "/tsdb-ids/_doc/nope"),
+    ("DELETE", "/tsdb-ids/_doc/nope"),
+    ("POST", "/tsdb-ids/_mget", {"ids": ["cZZNs7B9sSWsyrL5AAABeRnRGTM", "nope"]},
+     {"pick": lambda r: [(d["_id"], d.get("found"), d.get("error", {}).get("type")) for d in r["docs"]]}),
+    # The index API without an id creates: the same document again conflicts.
+    ("POST", "/tsdb-ids/_doc", TSDB_DOCS[1]),
+    ("POST", "/tsdb-ids/_doc?op_type=index", TSDB_DOCS[1], {"pick": lambda r: (r["_id"], r["result"], r["_version"])}),
+    ("PUT", "/tsdb-ids/_doc/abc", TSDB_DOCS[1]),
+    ("PUT", "/tsdb-ids/_doc/cZZNs7B9sSWsyrL5AAABeRnRGTM", TSDB_DOCS[1], {"pick": lambda r: (r["_id"], r["result"])}),
+    ("POST", "/tsdb-ids/_bulk", [{"create": {}}, TSDB_DOCS[1], {"delete": {"_id": "cZZNs7B9sSWsyrL5AAABeRnRGTM"}},
+                                 {"delete": {"_id": "bad id"}}], {"pick": items}),
+    ("DELETE", "/tsdb-ids"),
+])
+
+scenario("tsdb_errors", tsdb_index("tsdb-err", TSDB_MAPPING) + [
+    ("POST", "/tsdb-err/_doc", {"metricset": "pod", "k8s": {"pod": {"uid": "u"}}}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-28T01:00:00Z"}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-27T23:59:59.999Z", "metricset": "pod"}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-29T00:00:00Z", "metricset": "pod"}),
+    ("POST", "/tsdb-err/_doc?routing=r", {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "pod"}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-28T01:00:00Z", "metricset": ["a", "b"]}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-28T01:00:00Z", "metricset": True}),
+    ("POST", "/tsdb-err/_bulk", [{"index": {}}, {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "a", "k8s": {"pod": {"ip": ["1.1.1.1", "2.2.2.2"]}}},
+                                 {"index": {"routing": "r"}}, {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "a"},
+                                 {"update": {"_id": "x"}}, {"doc": {}},
+                                 {"index": {}}, {"@timestamp": "2021-04-28T01:00:00Z", "metricset": "a", "unmapped": "x"}],
+     {"pick": items}),
+    ("POST", "/tsdb-err/_update/x", {"doc": {}}),
+    ("POST", "/tsdb-err/_search?routing=x"),
+    ("POST", "/tsdb-err/_search", {"sort": ["_id"]}),
+    ("POST", "/tsdb-err/_search", {"aggs": {"i": {"terms": {"field": "_id"}}}}),
+    ("POST", "/tsdb-err/_search", {"query": {"term": {"_tsid": "x"}}}),
+    ("POST", "/tsdb-err/_search", {"size": 0, "aggs": {"f": {"filter": {"term": {"_tsid": "x"}}}}}),
+    ("POST", "/tsdb-err/_search", {"runtime_mappings": {"metricset": {"type": "keyword"}}}),
+    ("POST", "/tsdb-err/_alias/tsdb-err-a", {"routing": "x"}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "tsdb-err", "alias": "tsdb-err-b", "search_routing": "x"}}]}),
+    ("PUT", "/tsdb-err/_mapping", {"properties": {"k8s": {"properties": {"pod": {"properties": {"uid": {"type": "keyword"}}}}}}}),
+    ("PUT", "/tsdb-err/_mapping", {"properties": {"metricset2": {"type": "keyword"}}}, ACK),
+    ("PUT", "/tsdb-err/_mapping", {"properties": {"n": {"type": "nested"}}}),
+    ("PUT", "/tsdb-err/_settings", {"index": {"time_series": {"end_time": "2021-04-28T12:00:00Z"}}}),
+    ("PUT", "/tsdb-err/_settings", {"index": {"time_series": {"end_time": "2021-04-30T00:00:00Z"}}}, ACK),
+    ("PUT", "/tsdb-err/_settings", {"index": {"time_series": {"start_time": "2021-04-27T00:00:00Z"}}}),
+    ("PUT", "/tsdb-err/_settings", {"index": {"routing_path": ["x"]}}),
+    ("POST", "/tsdb-err/_doc", {"@timestamp": "2021-04-29T12:00:00Z", "metricset": "late"},
+     {"pick": lambda r: (r["_id"], r["result"])}),
+    ("DELETE", "/tsdb-err"),
+])
+
+TS_BAD = {"mode": "time_series", "routing_path": ["dim"], "time_series": dict(TSDB_TS)}
+DIM = {"dim": {"type": "keyword", "time_series_dimension": True}}
+
+
+def tsdb_bad_create(settings=None, mappings=None):
+    body = {"settings": {"index": settings if settings is not None else TS_BAD}}
+    if mappings is not None:
+        body["mappings"] = mappings
+    return [("PUT", "/tsdb-bad", body), ("DELETE", "/tsdb-bad?ignore_unavailable=true")]
+
+
+scenario("tsdb_settings", [("DELETE", "/tsdb-bad?ignore_unavailable=true")]
+         + tsdb_bad_create({**TS_BAD, "sort.field": ["a"]})
+         + tsdb_bad_create({**TS_BAD, "sort.order": ["desc"]})
+         + tsdb_bad_create({**TS_BAD, "routing_partition_size": 2, "number_of_shards": 4})
+         + tsdb_bad_create({"mode": "time_series", "time_series": dict(TSDB_TS)})
+         + tsdb_bad_create({"mode": "time_series", "routing_path": [], "time_series": dict(TSDB_TS)})
+         + tsdb_bad_create({"mode": "time_series", "routing_path": [], "time_series": {"start_time": "", "end_time": ""}})
+         + tsdb_bad_create({"routing_path": ["dim"]})
+         + tsdb_bad_create({"time_series": {"start_time": "2021-04-28T00:00:00Z"}})
+         + tsdb_bad_create({"mode": "bogus"})
+         + tsdb_bad_create(TS_BAD, {"_routing": {"required": True}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"properties": {"dim": {"type": "keyword"}}})
+         + tsdb_bad_create(TS_BAD, {"properties": {"dim": {"properties": {"a": {"type": "keyword", "time_series_dimension": True}}}}})
+         + tsdb_bad_create(TS_BAD, {"properties": {**DIM, "@timestamp": {"type": "long"}}})
+         + tsdb_bad_create(TS_BAD, {"properties": {**DIM, "n": {"type": "nested"}}})
+         + tsdb_bad_create(TS_BAD, {"_source": {"mode": "stored"}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"_source": {"includes": ["a"]}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"_data_stream_timestamp": "x", "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"runtime": {"c": {"type": "long", "time_series_metric": "counter"}}, "properties": DIM})
+         + tsdb_bad_create(TS_BAD, {"runtime": {"@timestamp": {"type": "date"}}, "properties": DIM})
+         + tsdb_bad_create({}, {"properties": {"n": {"type": "nested", "properties": DIM}}})
+         + tsdb_bad_create({}, {"properties": DIM, "runtime": {"dim": {"type": "keyword"}}})
+         + [("PUT", "/tsdb-bad", {"settings": {"index": TS_BAD}, "mappings": {"properties": DIM}}, ACK),
+            ("GET", "/tsdb-bad/_mapping"),
+            ("GET", "/tsdb-bad/_settings", None, {"pick": lambda r: {k: v for k, v in r["tsdb-bad"]["settings"]["index"].items()
+                                                                       if k in ("mode", "routing_path", "time_series")}}),
+            ("GET", "/tsdb-bad/_field_caps?fields=dim,_tsid,_ts_routing_hash,@timestamp"),
+            ("DELETE", "/tsdb-bad")])
+
+scenario("tsdb_dims", tsdb_index("tsdb-dims", {"dynamic_templates": [
+    {"kw": {"match_mapping_type": "string", "mapping": {"type": "keyword", "time_series_dimension": True}}}],
+    "properties": {"@timestamp": {"type": "date"}, "n": {"type": "long", "time_series_dimension": True},
+                   "u": {"type": "unsigned_long", "time_series_dimension": True},
+                   "ip": {"type": "ip", "time_series_dimension": True},
+                   "flat": {"type": "flattened", "time_series_dimensions": ["a.b", "c"]},
+                   "v": {"type": "double", "time_series_metric": "gauge"}}}, routing_path=["k"]) + [
+    ("POST", "/tsdb-dims/_bulk?refresh=true", [
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:00Z", "k": "a", "n": 1, "v": 1.5},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:01Z", "k": "a", "n": "1", "v": 2.5},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:02Z", "k": "a", "n": 1.9, "u": 18446744073709551615},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:03Z", "k": "b", "ip": "2001:0db8:0:0:0:0:0:1", "other": "x"},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:04Z", "k": "b", "flat": {"a": {"b": "x", "z": "y"}, "c": 7}},
+        {"index": {}}, {"@timestamp": "2021-04-28T01:00:05Z", "k": "c", "n": "abc"},
+    ], {"pick": items}),
+    ("POST", "/tsdb-dims/_search", {"size": 0, "aggs": {"t": {"terms": {"field": "_tsid", "order": {"_key": "asc"}},
+                                                             "aggs": {"v": {"sum": {"field": "v"}}}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("GET", "/tsdb-dims/_mapping"),
+    ("DELETE", "/tsdb-dims"),
+])
+
+scenario("tsdb_nanos", tsdb_index("tsdb-nanos", {"properties": {"@timestamp": {"type": "date_nanos"},
+                                                               "k": {"type": "keyword", "time_series_dimension": True}}},
+                                  routing_path=["k"], time_series={"start_time": "2021-09-26T03:09:42Z",
+                                                                   "end_time": "2021-09-26T03:09:52Z"}) + [
+    ("POST", "/tsdb-nanos/_doc?refresh=true", {"@timestamp": "2021-09-26T03:09:42.123456789Z", "k": "a"},
+     {"pick": lambda r: (r["_id"], r["result"])}),
+    ("POST", "/tsdb-nanos/_doc", {"@timestamp": "2021-09-26T03:09:41.123456789Z", "k": "a"}),
+    ("POST", "/tsdb-nanos/_doc", {"@timestamp": "2021-09-26T03:09:52.000000001Z", "k": "a"}),
+    ("POST", "/tsdb-nanos/_search", {"docvalue_fields": ["@timestamp"], "sort": ["@timestamp"], "_source": False},
+     {"pick": hit_meta}),
+    ("DELETE", "/tsdb-nanos"),
+    ("DELETE", "/rng-nanos?ignore_unavailable=true"),
+    ("PUT", "/rng-nanos", {"mappings": {"properties": {"d": {"type": "date_nanos"}}}}, ACK),
+    ("PUT", "/rng-nanos/_doc/1", {"d": "1969-12-31T23:59:59Z"}),
+    ("PUT", "/rng-nanos/_doc/2", {"d": "2263-01-01T00:00:00Z"}),
+    ("PUT", "/rng-nanos/_doc/3?refresh=true", {"d": "2018-10-29T12:12:12.987654321Z"}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/rng-nanos/_doc/4?refresh=true", {"d": "2018-10-29T12:12:12.123456789Z"}, {"pick": lambda r: r["result"]}),
+    ("POST", "/rng-nanos/_search", {"sort": [{"d": "desc"}], "_source": False}, {"pick": hit_meta}),
+    ("DELETE", "/rng-nanos"),
+])
+
+RNG_MAPPING = {"settings": STATIC, "mappings": {"properties": {
+    t: {"type": t} for t in ["integer_range", "long_range", "float_range", "double_range", "date_range", "ip_range"]}}}
+
+scenario("range_fields", setup("rng-fields", RNG_MAPPING, [
+    {"integer_range": {"gte": 1, "lte": 5}, "long_range": {"gt": None, "lte": 5}, "float_range": {"gte": 1.5, "lt": 3},
+     "double_range": {"gt": 1, "lte": 5}, "date_range": {"gte": "2017-09-01", "lte": "2017-09-05"},
+     "ip_range": "192.168.0.0/24"},
+    {"integer_range": {"gte": 1, "lte": 3}, "long_range": {"gte": 10}, "float_range": {"gte": 3, "lte": 4},
+     "double_range": {"gte": 4, "lte": 5}, "date_range": {"gte": "2017-09-01", "lte": "2017-09-03"},
+     "ip_range": {"gte": "192.168.0.1", "lte": "192.168.0.3"}},
+    {"integer_range": {"gte": 4, "lte": 5}, "long_range": {"gte": None, "lt": None},
+     "date_range": {"gte": "2019-12-15T12:00:00.000Z", "lte": "2019-12-15T13:00:00.000Z"},
+     "ip_range": {"gte": "10.0.0.1", "lte": "10.0.0.5"}},
+    {"integer_range": None},
+]) + [
+    ("POST", "/rng-fields/_search", {"query": {"range": {f: dict(q, relation=rel)}}, "_source": False}, {"pick": ids})
+    for f, q in [("integer_range", {"gte": 3, "lte": 4}), ("long_range", {"gte": 5, "lte": 10}),
+                 ("float_range", {"gt": 3, "lt": 3.5}), ("double_range", {"gte": 1, "lt": 4}),
+                 ("date_range", {"gte": "2017-09-03", "lte": "2017-09-04"}),
+                 ("date_range", {"gt": "2019-12-15||/d"}), ("date_range", {"lte": "2019-12-15||/d"}),
+                 ("ip_range", {"gte": "192.168.0.2", "lte": "192.168.0.3"})]
+    for rel in ["intersects", "contains", "within"]
+] + [
+    ("POST", "/rng-fields/_search", {"query": {"term": {"long_range": -9223372036854775808}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"long_range": 9223372036854775806}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "192.168.0.200"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"terms": {"integer_range": [0, 5]}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"query_string": {"query": "integer_range:[2 TO 3]"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"range": {"integer_range": {"gte": 3, "relation": "disjoint"}}}}),
+    ("POST", "/rng-fields/_search", {"query": {"range": {"integer_range": {"gte": 3, "relation": "foo"}}}}),
+    ("PUT", "/rng-fields/_doc/7?refresh=true", {"ip_range": {"gte": None, "lte": "10.10.10.10"}}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/rng-fields/_doc/8?refresh=true", {"ip_range": {"gt": "2001:db8::", "lt": "200a:100::"}}, {"pick": lambda r: r["result"]}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "10.0.0.0"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "2001:db9::1"}}, "_source": False}, {"pick": ids}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": {"gte": 5, "lte": 1}}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": {"gte": "a"}}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": 5}),
+    ("DELETE", "/rng-fields"),
+])
+
+scenario("date_rounding", setup("rng-dates", {"settings": STATIC, "mappings": {"properties": {"d": {"type": "date"},
+                                                                                         "y": {"type": "date", "format": "uuuu"}}}}, [
+    {"d": "1970-01-01T00:00:01Z"}, {"d": "1500-01-01T12:00:00Z"}, {"d": "2017-09-04T10:00:00Z"},
+    {"d": "2017-09-04T23:59:59.999Z", "y": "2017"}]) + [
+    ("POST", "/rng-dates/_search", {"query": {"range": {"d": q}}, "_source": False, "sort": ["_doc"]}, {"pick": ids})
+    for q in [{"gte": 1000, "lte": 2023}, {"gte": "0", "lte": "1000"}, {"lte": "2017-09-04"}, {"lt": "2017-09-04"},
+              {"gt": "2017-09-04T09"}, {"lte": "2017-09"}, {"gt": "2017-09-04T23:59:59"},
+              {"gte": 1500, "lte": 1500, "format": "uuuu"}, {"gte": 1000, "lte": 2017, "format": "uuuu"}]
+] + [
+    ("POST", "/rng-dates/_search", {"query": {"term": {"d": "2017-09-04T10:00:00Z"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-dates/_search", {"query": {"term": {"d": "2017-09-04"}}, "_source": False, "sort": ["_doc"]}, {"pick": ids}),
+    ("POST", "/rng-dates/_search", {"query": {"match": {"d": "1500-01-01T12:00:00.000Z"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-dates/_search", {"query": {"query_string": {"query": "d:\"2017-09-04T10:00:00Z\""}}, "_source": False}, {"pick": ids}),
+    ("DELETE", "/rng-dates"),
+])
+
+scenario("dynamic_settings", [
+    ("DELETE", "/rng-dyn?ignore_unavailable=true"),
+    ("PUT", "/rng-dyn", {"settings": STATIC, "mappings": {
+        "dynamic_templates": [{"kw": {"match_mapping_type": "string", "mapping": {"type": "keyword"}}},
+                              {"ints": {"match": "i_*", "mapping": {"type": "integer"}}},
+                              {"x": {"match": "x_*", "match_mapping_type": "*",
+                                     "mapping": {"type": "{dynamic_type}", "meta": {"n": "{name}"}}}}],
+        "properties": {"off": {"type": "object", "dynamic": "false"}, "strict": {"type": "object", "dynamic": "strict"},
+                       "rt": {"type": "object", "dynamic": "runtime"}}}}, ACK),
+    ("PUT", "/rng-dyn/_doc/1", {"s": "x", "i_a": 5, "x_b": "2021-01-01", "x_c": 1.5, "x_d": "str", "dd": "2021-01-01",
+                                "off": {"q": 1}, "rt": {"k": "v", "n": 1}, "o": {"p": {"q": True}}},
+     {"pick": lambda r: r["result"]}),
+    ("GET", "/rng-dyn/_mapping"),
+    ("PUT", "/rng-dyn/_doc/2", {"strict": {"new": 1}}),
+    ("DELETE", "/rng-dyn"),
+])
+# --- stats / cluster / node / cat APIs (indices prefixed `st-`) -----------
+
+ST_SETTINGS = {"settings": {"index": {"number_of_shards": 2, "number_of_replicas": 0, "refresh_interval": "-1"}},
+               "mappings": {"properties": {"name": {"type": "keyword"}, "body": {"type": "text", "fielddata": True},
+                                           "sug": {"type": "completion"}, "n": {"type": "long"}}}}
+ST_DOCS = [{"index": {"_index": "st-a", "_id": str(i)}} if j == 0 else
+           {"name": f"n{i}", "body": f"word{i} common", "sug": f"sug{i}", "n": i}
+           for i in range(1, 6) for j in range(2)]
+
+
+def section_keys(r):
+    return {k: sorted(v) if isinstance(v, dict) else v for k, v in r["_all"]["total"].items()}
+
+
+def st_counts(r):
+    t = r["indices"]["st-a"]["total"]
+    return {"docs": t["docs"]["count"], "index_total": t["indexing"]["index_total"],
+            "delete_total": t["indexing"]["delete_total"], "noop": t["indexing"]["noop_update_total"],
+            "get": [t["get"]["total"], t["get"]["exists_total"], t["get"]["missing_total"]],
+            "query_total": t["search"]["query_total"], "suggest_total": t["search"]["suggest_total"],
+            "segments": t["segments"]["count"], "translog_ops": t["translog"]["operations"],
+            "shard_stats": t["shard_stats"], "health": r["indices"]["st-a"]["health"],
+            "status": r["indices"]["st-a"]["status"]}
+
+
+def keys_of(path):
+    def pick(r):
+        for k in path:
+            r = r[k]
+        return sorted(r) if isinstance(r, dict) else r
+    return pick
+
+
+def node_entry(r):
+    return next(iter(r["nodes"].values()))
+
+
+def shape(v):
+    """A response's structure: keys kept, values reduced to their type."""
+    if isinstance(v, dict):
+        return {k: shape(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [shape(v[0])] if v else []
+    return type(v).__name__
+
+
+scenario("stats_indices", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/st-a/_stats", None, {"pick": st_counts}),
+    ("POST", "/_bulk?refresh=true", ST_DOCS, {"pick": lambda r: r["errors"]}),
+    ("GET", "/st-a/_doc/1", None, {"pick": lambda r: r["found"]}),
+    ("GET", "/st-a/_doc/nope"),
+    ("POST", "/st-a/_update/2", {"doc": {"n": 2}}, {"pick": lambda r: r["result"]}),
+    ("POST", "/st-a/_update/2", {"doc": {"n": 3}}, {"pick": lambda r: r["result"]}),
+    ("DELETE", "/st-a/_doc/5", None, {"pick": lambda r: r["result"]}),
+    ("POST", "/st-a/_search", {"query": {"match_all": {}}}, {"pick": lambda r: r["hits"]["total"]}),
+    ("POST", "/st-a/_search", {"suggest": {"s": {"prefix": "sug", "completion": {"field": "sug"}}}},
+     {"pick": lambda r: len(r["suggest"]["s"][0]["options"])}),
+    ("GET", "/st-a/_stats", None, {"pick": st_counts}),
+    ("GET", "/st-a/_stats", None, {"pick": section_keys}),
+    ("GET", "/st-a/_stats?level=shards", None, {"pick": lambda r: shape(r["indices"]["st-a"]["shards"]["0"][0])}),
+    ("GET", "/st-a/_stats?human", None, {"pick": lambda r: shape(r["_all"])}),
+    ("GET", "/st-a/_stats/docs,store,merge", None, {"pick": section_keys}),
+    ("GET", "/st-a/_stats?level=shards", None, {"pick": lambda r: sorted(r["indices"]["st-a"]["shards"]["0"][0])}),
+    ("GET", "/st-a/_stats?level=cluster", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/st-a/_stats/fieldata"),
+    ("GET", "/st-a/_stats?level=bad"),
+    ("GET", "/st-zz/_stats"),
+    ("GET", "/st-zz*/_stats", None, {"pick": lambda r: r["_all"]}),
+    ("POST", "/st-a/_search", {"sort": ["body"], "size": 1}, {"pick": lambda r: r["hits"]["hits"][0]["sort"]}),
+    ("GET", "/st-a/_stats/fielddata?fielddata_fields=body", None,
+     {"pick": lambda r: sorted(r["_all"]["total"]["fielddata"]["fields"])}),
+    ("GET", "/st-a/_stats/completion?completion_fields=*", None,
+     {"pick": lambda r: sorted(r["_all"]["total"]["completion"]["fields"])}),
+    ("POST", "/st-a/_search", {"stats": ["g1"], "size": 0}, {"pick": lambda r: r["hits"]["total"]}),
+    ("GET", "/st-a/_stats/search?groups=g*", None,
+     {"pick": lambda r: r["_all"]["total"]["search"]["groups"]["g1"]["query_total"]}),
+    ("POST", "/st-a/_flush", None, {"pick": lambda r: r["_shards"]["failed"]}),
+    ("GET", "/st-a/_stats/translog", None, {"pick": lambda r: r["_all"]["total"]["translog"]["operations"]}),
+    ("PUT", "/st-b", {"settings": {"index.translog.retention.size": "1mb"}}),
+    ("DELETE", "/st-a"),
+])
+
+scenario("stats_cat", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("POST", "/_bulk?refresh=true", ST_DOCS, {"pick": lambda r: r["errors"]}),
+    ("GET", "/_cat/indices/st-a?h=health,status,index,pri,rep,docs.count,docs.deleted&v"),
+    ("GET", "/_cat/indices/st-a?h=i,dc,p&format=json"),
+    ("GET", "/_cat/indices/st-a?health=bogus"),
+    ("GET", "/_cat/indices/st-zz"),
+    ("GET", "/_cat/count/st-a?h=count"),
+    ("GET", "/_cat/shards/st-a?h=index,shard,prirep,state,docs&s=shard&v"),
+    ("GET", "/_cat/segments/st-a?h=index,shard,prirep,segment,generation,docs.count,docs.deleted&s=shard&format=json"),
+    ("GET", "/_cat/recovery/st-a?h=index,shard,type,stage,files,translog_ops_percent&v"),
+    ("GET", "/_cat/thread_pool/write,generic?h=name,type,queue_size,core,max,keep_alive&v"),
+    ("GET", "/_cat/nodes?h=node.role,master&v"),
+    ("GET", "/_cat/indices/st-a?help"),
+    ("GET", "/_cat/shards?help"),
+    ("GET", "/_cat/nodes?help"),
+    ("GET", "/_cat/segments?help"),
+    ("GET", "/_cat/recovery?help"),
+    ("GET", "/_cat/allocation?help"),
+    ("GET", "/_cat/health?help"),
+    ("GET", "/_cat/thread_pool?help"),
+    ("GET", "/_cat/tasks?help"),
+    ("GET", "/_cat/fielddata?help"),
+    ("GET", "/_cat/nodeattrs?help"),
+    ("GET", "/_cat/plugins?v"),
+    ("POST", "/st-a/_close", None, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/_cat/indices/st-a?h=health,status,index,pri,rep,docs.count&format=json"),
+    ("GET", "/_cat/segments/st-a"),
+    ("GET", "/_cat/recovery/st-a?h=index,shard,type,stage&format=json"),
+    ("DELETE", "/st-a"),
+])
+
+scenario("stats_cluster", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/_cluster/health/st-a?level=shards", None,
+     {"pick": lambda r: {k: v for k, v in r.items()
+                         if k not in ("cluster_name", "number_of_pending_tasks", "task_max_waiting_in_queue_millis")}}),
+    ("GET", "/_cluster/health/st-a?wait_for_status=green&timeout=1s", None, {"pick": lambda r: r["status"]}),
+    ("GET", "/_cluster/health/st-a?level=bogus"),
+    ("GET", "/_cluster/state/metadata,routing_table/st-a", None,
+     {"pick": lambda r: [sorted(r), sorted(r["metadata"]["indices"]["st-a"]),
+                         r["metadata"]["indices"]["st-a"]["state"],
+                         sorted(r["routing_table"]["indices"]["st-a"]["shards"])]}),
+    ("GET", "/_cluster/state/master_node,version", None, {"pick": sorted}),
+    ("GET", "/_cluster/state/bogus", None, {"pick": sorted}),
+    ("GET", "/_cluster/state/metadata/st-nothere*?allow_no_indices=false"),
+    ("GET", "/_cluster/state/metadata/st-foobla?ignore_unavailable=false"),
+    ("GET", "/_cluster/allocation/explain", {"index": "st-a", "shard": 0, "primary": True},
+     {"pick": lambda r: [sorted(r), r["current_state"], sorted(r["current_node"])]}),
+    ("GET", "/_cluster/stats", None, {"pick": lambda r: [sorted(r), sorted(r["indices"]), sorted(r["nodes"]),
+                                                         sorted(r["nodes"]["count"])]}),
+    ("GET", "/_nodes/_all/_none", None, {"pick": lambda r: sorted(node_entry(r))}),
+    ("GET", "/_nodes/stats/indices/docs", None, {"pick": lambda r: sorted(node_entry(r)["indices"])}),
+    ("GET", "/_nodes/stats/os,jvm", None, {"pick": lambda r: sorted(node_entry(r))}),
+    ("GET", "/_nodes/stats/indices", None, {"pick": lambda r: shape(node_entry(r)["indices"])}),
+    ("GET", "/_nodes/stats/discovery,indexing_pressure,transport,thread_pool,script,script_cache,breaker", None,
+     {"pick": lambda r: {k: sorted(v) if isinstance(v, dict) else v for k, v in node_entry(r).items()
+                         if k in ("discovery", "indexing_pressure", "transport", "script", "script_cache")}}),
+    ("GET", "/_nodes/stats/indices/mappings?level=indices", None,
+     {"pick": lambda r: node_entry(r)["indices"]["indices"]["st-a"]}),
+    ("GET", "/_nodes/stats/transprot"),
+    ("GET", "/_nodes/stats/os/docs"),
+    ("GET", "/_nodes/hot_threads?type=bogus"),
+    ("GET", "/_nodes/settings", None, {"pick": lambda r: sorted(node_entry(r))}),
+    ("GET", "/_info/_all,ingest"),
+    ("GET", "/_info/ingest,bogus"),
+    ("GET", "/_info/script", None, {"pick": lambda r: sorted(r["script"])}),
+    ("GET", "/_health_report/master_is_stable?verbose=false", None,
+     {"pick": lambda r: [sorted(r), r["indicators"]["master_is_stable"]["status"]]}),
+    ("GET", "/_health_report/bogus"),
+    ("GET", "/_tasks/foo:1"),
+    ("GET", "/_tasks/bogus"),
+    ("POST", "/_tasks/_cancel?actions=unknown_action"),
+    ("GET", "/_tasks?actions=cluster:monitor/tasks/lists&group_by=none", None,
+     {"pick": lambda r: [t["action"] for t in r["tasks"]]}),
+    ("GET", "/_capabilities?method=GET&path=/_capabilities&parameters=method,path", None, {"pick": lambda r: r["supported"]}),
+    ("GET", "/_capabilities?method=GET&path=/_capabilities&parameters=bogus", None, {"pick": lambda r: r["supported"]}),
+    ("GET", "/_capabilities?method=PUT&path=/%7Bindex%7D&capabilities=logsdb_index_mode", None, {"pick": lambda r: r["supported"]}),
+    ("GET", "/_features"),
+    ("GET", "/_remote/info"),
+    ("POST", "/_cluster/voting_config_exclusions"),
+    ("POST", "/_internal/prevalidate_node_removal"),
+    ("POST", "/_internal/prevalidate_node_removal?names=st-nonode"),
+    ("PUT", "/_internal/desired_nodes/st-h/1?dry_run=true",
+     {"nodes": [{"settings": {"node.name": "x"}, "processors": 8, "memory": "1gb", "storage": "1gb"}]}),
+    ("PUT", "/_internal/desired_nodes/st-h/1?dry_run=true",
+     {"nodes": [{"settings": {}, "processors": 8, "memory": "1gb", "storage": "1gb"}]}),
+    ("PUT", "/_internal/desired_nodes/st-h/1?dry_run=true", {"nodes": []}),
+    ("PUT", "/_internal/desired_nodes/st-h/asa?dry_run=true",
+     {"nodes": [{"settings": {"node.name": "x"}, "processors": 8, "memory": "1gb", "storage": "1gb"}]}),
+    ("DELETE", "/st-a"),
+])
+
+scenario("stats_shards", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("POST", "/_bulk?refresh=true", ST_DOCS, {"pick": lambda r: r["errors"]}),
+    ("GET", "/st-a/_segments", None,
+     {"pick": lambda r: {s: [c["segments"]["_0"]["num_docs"] for c in copies]
+                         for s, copies in r["indices"]["st-a"]["shards"].items()}}),
+    ("GET", "/st-a/_recovery", None,
+     {"pick": lambda r: [(s["id"], s["type"], s["stage"], s["primary"]) for s in r["st-a"]["shards"]]}),
+    ("GET", "/st-a/_recovery?human&detailed=true", None,
+     {"pick": lambda r: sorted(r["st-a"]["shards"][0]["index"]["files"])}),
+    ("GET", "/st-zz*/_recovery"),
+    ("GET", "/st-zz/_recovery"),
+    ("GET", "/st-a/_shard_stores?status=green", None,
+     {"pick": lambda r: {s: [x["allocation"] for x in v["stores"]]
+                         for s, v in r["indices"]["st-a"]["shards"].items()}}),
+    ("GET", "/st-a/_shard_stores"),
+    ("POST", "/st-a/_disk_usage"),
+    ("POST", "/st-a/_disk_usage?run_expensive_tasks=true", None,
+     {"pick": lambda r: [sorted(r["st-a"]), sorted(r["st-a"]["fields"])]}),
+    ("POST", "/st-a/_close", None, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/st-a/_segments"),
+    ("GET", "/st-a/_recovery", None,
+     {"pick": lambda r: [(s["id"], s["type"], s["stage"]) for s in r["st-a"]["shards"]]}),
+    ("GET", "/st-a/_stats"),
+    ("DELETE", "/st-a"),
+])
+# --- Retrievers, quantized kNN scores, feature fields (vec-*) ---------
+
+VEC_RET = "/vec-ret/_search"
+
+
+def vec_hits(r):
+    out = [(h["_id"], h.get("_score"), h.get("fields"), h.get("sort")) for h in r["hits"]["hits"]]
+    return out + [r["hits"].get("total"), r["hits"].get("max_score"), r.get("terminated_early"),
+                  r.get("aggregations")]
+
+
+VEC_RET_DOCS = [
+    {"t": "a b", "k": "x", "n": 1, "v": [1, 1]},
+    {"t": "a", "k": "y", "n": 2, "v": [2, 2]},
+    {"t": "b", "k": "x", "n": 3, "v": [3, 3]},
+    {"t": "a c", "k": "x", "n": 4, "v": [4, 4]},
+    {"t": "c", "k": "y", "n": 5, "v": [5, 5]},
+]
+
+VEC_KNN = {"field": "v", "query_vector": [2, 2], "k": 3, "num_candidates": 5}
+
+scenario("vec_retrievers", setup("vec-ret", {"settings": {"number_of_shards": 1}, "mappings": {"properties": {
+    "t": {"type": "text"}, "k": {"type": "keyword"}, "n": {"type": "integer"},
+    "v": {"type": "dense_vector", "dims": 2, "similarity": "l2_norm"}}}}, VEC_RET_DOCS) + [
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a"}}, "filter": {"term": {"k": "x"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"filter": [{"term": {"k": "x"}}, {"range": {"n": {"gt": 1}}}]}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match_all": {}}, "sort": [{"n": "desc"}], "search_after": [4]}}, "size": 2}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match_all": {}}, "sort": [{"n": "asc"}], "collapse": {"field": "k"}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a"}}, "min_score": 0.5}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a c"}}, "_name": "q"}}, "size": 1, "from": 1, "fields": ["k"]}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match_all": {}}}}, "size": 0, "aggs": {"a": {"terms": {"field": "k"}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"filter": {"bool": {"must_not": {"term": {"k": "y"}}}}, "sort": ["n"], "terminate_after": 2}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": VEC_KNN}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, filter={"term": {"k": "x"}})}, "fields": ["n"]}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, similarity=1.5, _name="kn")}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, filter=[{"term": {"k": "x"}}])}, "size": 1, "from": 1}, {"pick": vec_hits}),
+    # Errors.
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "query_vector": [1, 1]}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "query_vector": [1, 1], "k": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"query_vector": [1, 1], "k": 2, "num_candidates": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "k": 2, "num_candidates": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, k=0)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, num_candidates=1)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, num_candidates=20000)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, boost=2)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, query_vector=[1, 2, 3])}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "query_vector_builder": {"text_embedding": {"model_id": "m", "model_text": "x"}}, "k": 1, "num_candidates": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}}, "query": {"match_all": {}}, "knn": VEC_KNN, "sort": ["n"], "min_score": 1, "search_after": [1], "terminate_after": 2}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}}, "sub_searches": [{"query": {"match_all": {}}}]}),
+    ("POST", VEC_RET, {"retriever": {}}),
+    ("POST", VEC_RET, {"retriever": []}),
+    ("POST", VEC_RET, {"retriever": "x"}),
+    ("POST", VEC_RET, {"retriever": {"standard": 1}}),
+    ("POST", VEC_RET, {"retriever": {"foo": {}}}),
+    ("POST", VEC_RET, {"retriever": {"standar": {}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}, "knn": VEC_KNN}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"bad": 1}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"bogus": {}}}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"filter": [{"bogus": {}}]}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"sort": "n"}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"terminate_after": -1}}}),
+    ("POST", VEC_RET, {"retriever": {"rrf": 1}}),
+    # sub_searches and rank without a license.
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}, {"query": {"match": {"t": "b"}}}]}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}]}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}], "knn": VEC_KNN}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}], "query": {"match_all": {}}}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}, "x": 1}]}),
+    ("POST", VEC_RET, {"sub_searches": {}}),
+    ("POST", VEC_RET, {"rank": {"foo": {}}}),
+    ("POST", VEC_RET, {"rank": {}}),
+    ("POST", VEC_RET, {"rank": 1}),
+    # terminate_after on a plain search.
+    ("POST", VEC_RET, {"terminate_after": 2, "query": {"match": {"t": "a"}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"terminate_after": 1, "query": {"constant_score": {"filter": {"term": {"k": "x"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"terminate_after": 10, "query": {"constant_score": {"filter": {"term": {"k": "x"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"terminate_after": 2, "query": {"bool": {"must_not": {"term": {"k": "y"}}}}, "sort": [{"n": "desc"}]}, {"pick": vec_hits}),
+    ("DELETE", "/vec-ret"),
+])
+
+
+def vec_vectors(seed, n, dims, unit=False):
+    import random
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        v = [round(rnd.uniform(-50, 50), 3) for _ in range(dims)]
+        if unit:
+            m = sum(x * x for x in v) ** 0.5
+            v = [x / m for x in v]
+        out.append(v)
+    return out
+
+
+def vec_scores(r):
+    return [(h["_id"], h["_score"]) for h in r["hits"]["hits"]]
+
+
+def vec_quantized(name, opts, sim, vectors, queries):
+    props = {"v": {"type": "dense_vector", "dims": len(vectors[0]), "similarity": sim, "index_options": opts}}
+    steps = [("DELETE", f"/{name}?ignore_unavailable=true"),
+             ("PUT", f"/{name}", {"settings": {"number_of_shards": 1}, "mappings": {"properties": props}}, ACK)]
+    bulk = []
+    for i, v in enumerate(vectors, 1):
+        bulk += [{"index": {"_index": name, "_id": str(i)}}, {"v": v}]
+    steps.append(("POST", "/_bulk?refresh=true", bulk, {"pick": lambda r: r["errors"]}))
+    for q in queries:
+        steps.append(("POST", f"/{name}/_search", {"knn": {"field": "v", "query_vector": q, "k": 8, "num_candidates": 100}, "size": 8, "_source": False}, {"pick": vec_scores}))
+    steps.append(("DELETE", f"/{name}"))
+    return steps
+
+
+VEC_Q = vec_vectors(1, 30, 6)
+VEC_QU = vec_vectors(2, 30, 6, unit=True)
+VEC_QS = vec_vectors(3, 7, 4)
+vec_quant_steps = []
+for vec_t in ["int8_hnsw", "int4_hnsw", "int8_flat", "int4_flat"]:
+    for vec_sim, vec_docs in [("l2_norm", VEC_Q), ("cosine", VEC_Q), ("dot_product", VEC_QU), ("max_inner_product", VEC_Q)]:
+        vec_quant_steps += vec_quantized(f"vec-q-{vec_t.replace('_', '-')}-{vec_sim.replace('_', '-')}", {"type": vec_t}, vec_sim, vec_docs, [vec_docs[3], vec_vectors(9, 1, 6, unit=vec_sim == "dot_product")[0]])
+    vec_quant_steps += vec_quantized(f"vec-q-{vec_t.replace('_', '-')}-small", {"type": vec_t}, "l2_norm", VEC_QS, [VEC_QS[0], [1, 2, 3, 4]])
+vec_quant_steps += vec_quantized("vec-q-ci", {"type": "int8_hnsw", "confidence_interval": 0.95}, "l2_norm", VEC_Q, [VEC_Q[0]])
+vec_quant_steps += vec_quantized("vec-q-ci1", {"type": "int8_flat", "confidence_interval": 1.0}, "cosine", VEC_Q, [VEC_Q[0]])
+vec_quant_steps += vec_quantized("vec-q-int4-ci", {"type": "int4_hnsw", "confidence_interval": 0.9}, "l2_norm", VEC_Q, [VEC_Q[0]])
+scenario("vec_quantized", vec_quant_steps + [
+    ("DELETE", "/vec-q-sim?ignore_unavailable=true"),
+    ("PUT", "/vec-q-sim", {"settings": {"number_of_shards": 1}, "mappings": {"properties": {"v": {"type": "dense_vector", "dims": 5, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw"}}, "n": {"type": "keyword"}}}}, ACK),
+    ("POST", "/_bulk?refresh=true", [{"index": {"_index": "vec-q-sim", "_id": "1"}}, {"n": "a", "v": [230.0, 300.33, -34.8988, 15.555, -200.0]},
+                                     {"index": {"_index": "vec-q-sim", "_id": "2"}}, {"n": "b", "v": [-0.5, 100.0, -13, 14.8, -156.0]},
+                                     {"index": {"_index": "vec-q-sim", "_id": "3"}}, {"n": "c", "v": [0.5, 111.3, -13.0, 14.8, -156.0]}], {"pick": lambda r: r["errors"]}),
+    ("POST", "/vec-q-sim/_search", {"knn": {"field": "v", "query_vector": [-0.5, 90.0, -10, 14.8, -156.0], "k": 3, "num_candidates": 3, "similarity": 10.3}}, {"pick": vec_scores}),
+    ("POST", "/vec-q-sim/_search", {"query": {"knn": {"field": "v", "query_vector": [-0.5, 90.0, -10, 14.8, -156.0], "similarity": 11, "filter": {"term": {"n": "b"}}}}}, {"pick": vec_scores}),
+    ("POST", "/vec-q-sim/_search", {"query": {"script_score": {"query": {"match_all": {}}, "script": {"source": "1 / (1 + l2norm(params.q, 'v'))", "params": {"q": [-0.5, 90.0, -10, 14.8, -156.0]}}}}}, {"pick": vec_scores}),
+    ("DELETE", "/vec-q-sim"),
+])
+
+VEC_FEAT = "/vec-feat/_search"
+VEC_FEAT_DOCS = [
+    {"t": {"a": 1.5, "b": 0.33333}, "rf": 10, "rfs": {"x": 2.5, "y": 7}, "neg": 3},
+    {"t": [{"a": 0.2, "c": 3.1}, {"a": 2.7}], "rf": 0.5, "rfs": {"x": 11}, "neg": 0.25},
+    {"t": {"d": 1}, "rf": 100},
+    {"t": {}, "rf": "7.5", "rfs": {"y": 0.001}},
+    {"t": [], "o": {"s": "z"}},
+]
+
+
+def vec_feat(q):
+    return ("POST", VEC_FEAT, {"query": q}, {"pick": lambda r: [(h["_id"], h["_score"], h.get("matched_queries")) for h in r["hits"]["hits"]]})
+
+
+def vec_doc(body):
+    return ("PUT", "/vec-feat/_doc/x", body, {"pick": lambda r: r.get("result")})
+
+
+scenario("vec_features", setup("vec-feat", {"settings": {"number_of_shards": 1}, "mappings": {"properties": {
+    "t": {"type": "sparse_vector"}, "rf": {"type": "rank_feature"}, "rfs": {"type": "rank_features"},
+    "neg": {"type": "rank_feature", "positive_score_impact": False}, "txt": {"type": "text"},
+    "o": {"properties": {"s": {"type": "keyword"}}}}}}, VEC_FEAT_DOCS) + [
+    ("GET", "/vec-feat/_mapping"),
+    vec_feat({"rank_feature": {"field": "rf"}}),
+    vec_feat({"rank_feature": {"field": "rf", "boost": 2, "_name": "f"}}),
+    vec_feat({"rank_feature": {"field": "rf", "saturation": {"pivot": 5}}}),
+    vec_feat({"rank_feature": {"field": "rf", "saturation": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {"scaling_factor": 4}}}),
+    vec_feat({"rank_feature": {"field": "rf", "sigmoid": {"pivot": 7, "exponent": 0.6}}}),
+    vec_feat({"rank_feature": {"field": "rf", "linear": {}}}),
+    vec_feat({"rank_feature": {"field": "rfs.x"}}),
+    vec_feat({"rank_feature": {"field": "rfs.y", "log": {"scaling_factor": 2}}}),
+    vec_feat({"rank_feature": {"field": "rfs.zzz"}}),
+    vec_feat({"rank_feature": {"field": "neg"}}),
+    vec_feat({"rank_feature": {"field": "neg", "linear": {}}}),
+    vec_feat({"rank_feature": {"field": "nope"}}),
+    vec_feat({"rank_feature": {"field": "t.a"}}),
+    vec_feat({"rank_feature": {"field": "o"}}),
+    vec_feat({"rank_feature": {}}),
+    vec_feat({"rank_feature": "rf"}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {"scaling_factor": 2}, "saturation": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "foo": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "sigmoid": {"pivot": 5}}}),
+    vec_feat({"rank_feature": {"field": "neg", "log": {"scaling_factor": 2}}}),
+    vec_feat({"rank_feature": {"field": "rf", "saturation": {"pivot": -1}}}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {"scaling_factor": 0.5}}}),
+    vec_feat({"rank_feature": {"field": "t"}}),
+    vec_feat({"rank_feature": {"field": "rfs"}}),
+    vec_feat({"rank_feature": {"field": "txt"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "b": 2, "c": 0.5}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "boost": 3, "_name": "n"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "zz": 5}, "prune": True}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "c": 0.1}, "prune": True, "pruning_config": {"tokens_freq_ratio_threshold": 1, "tokens_weight_threshold": 0.5}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "c": 0.1}, "prune": True, "pruning_config": {"tokens_freq_ratio_threshold": 1, "tokens_weight_threshold": 0.5, "only_score_pruned_tokens": True}}}),
+    vec_feat({"sparse_vector": {"field": "nope", "query_vector": {"a": 1}}}),
+    vec_feat({"sparse_vector": {}}),
+    vec_feat({"sparse_vector": {"field": "t"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "inference_id": "m"}}),
+    vec_feat({"sparse_vector": {"field": "t", "inference_id": "m"}}),
+    vec_feat({"sparse_vector": {"field": "t", "inference_id": "m", "query": "hi"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": -1}}}),
+    vec_feat({"sparse_vector": {"field": "rfs", "query_vector": {"x": 1}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": "x"}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "foo": 1}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "pruning_config": {"tokens_freq_ratio_threshold": 200}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "prune": True, "pruning_config": {"tokens_weight_threshold": 2}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": [{"a": 1}, {"c": 2}], "boost": 2, "_name": "w"}}}),
+    vec_feat({"weighted_tokens": {"rfs": {"tokens": {"x": 1, "y": 0.5}}}}),
+    vec_feat({"weighted_tokens": {"t": {}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}, "pruning_config": {"tokens_freq_ratio_threshold": 200}}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}, "pruning_config": {"bad": 1}}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}, "foo": 1}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": "x"}}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "pruning_config": {"bad": 2}}}),
+    vec_feat({"weighted_tokens": {}}),
+    vec_feat({"weighted_tokens": {"nope": {"tokens": {"a": 1}}}}),
+    vec_feat({"weighted_tokens": {"txt": {"tokens": {"a": 1}}}}),
+    vec_feat({"text_expansion": {"t": {"model_id": "m", "model_text": "x"}}}),
+    vec_feat({"text_expansion": {"t": {"model_text": "x"}}}),
+    vec_feat({"text_expansion": {"t": {"model_id": "m"}}}),
+    vec_feat({"term": {"t": "a"}}),
+    vec_feat({"term": {"t": {"value": "a", "boost": 2}}}),
+    vec_feat({"term": {"rfs": "x"}}),
+    vec_feat({"terms": {"t": ["a", "c"]}}),
+    vec_feat({"terms": {"rfs": ["x", "y"], "boost": 3}}),
+    vec_feat({"match": {"t": "a"}}),
+    vec_feat({"match": {"t": "a c"}}),
+    vec_feat({"match": {"t": {"query": "c", "boost": 2}}}),
+    vec_feat({"bool": {"should": [{"term": {"t": "a"}}, {"term": {"t": "c"}}]}}),
+    vec_feat({"exists": {"field": "t"}}),
+    vec_feat({"exists": {"field": "rf"}}),
+    vec_feat({"exists": {"field": "rfs"}}),
+    vec_feat({"term": {"rf": 10}}),
+    vec_feat({"match": {"rf": "1"}}),
+    vec_feat({"range": {"rf": {"gte": 1}}}),
+    vec_feat({"range": {"t": {"gte": 1}}}),
+    vec_feat({"prefix": {"t": "a"}}),
+    vec_feat({"wildcard": {"t": "a*"}}),
+    vec_feat({"regexp": {"t": "a.*"}}),
+    vec_feat({"fuzzy": {"t": "a"}}),
+    ("POST", VEC_FEAT, {"fields": ["t", "rf", "rfs", "neg"], "_source": False, "sort": ["_doc"]}, {"pick": lambda r: [h.get("fields") for h in r["hits"]["hits"]]}),
+    ("POST", VEC_FEAT, {"docvalue_fields": ["rf"]}),
+    ("POST", VEC_FEAT, {"docvalue_fields": ["t"]}),
+    ("POST", VEC_FEAT, {"aggs": {"a": {"terms": {"field": "t"}}}, "size": 0}),
+    ("POST", VEC_FEAT, {"aggs": {"a": {"avg": {"field": "rf"}}}, "size": 0}),
+    ("POST", VEC_FEAT, {"aggs": {"a": {"terms": {"field": "rfs"}}}, "size": 0}),
+    ("POST", VEC_FEAT, {"sort": ["rf"]}),
+    ("POST", VEC_FEAT, {"sort": [{"t": "desc"}]}),
+    # Indexing checks.
+    vec_doc({"rf": -1}), vec_doc({"rf": "abc"}), vec_doc({"rf": [1, 2]}), vec_doc({"rf": True}),
+    vec_doc({"rf": {"a": 1}}), vec_doc({"rf": 0}), vec_doc({"rf": 1e-40}), vec_doc({"rf": None}), vec_doc({"rf": "5"}),
+    vec_doc({"rfs": {"x": -1}}), vec_doc({"rfs": {"x": "a"}}), vec_doc({"rfs": 5}), vec_doc({"rfs": {"x": [1, 2]}}),
+    vec_doc({"rfs": {"x": 0}}), vec_doc({"rfs": {"x.y": 1}}), vec_doc({"rfs": [{"x": 1}, {"x": 2}]}),
+    vec_doc({"rfs": [{"x": 1}, {"y": 2}]}), vec_doc({"rfs": {"x": True}}),
+    vec_doc({"t": {"a": -1}}), vec_doc({"t": {"a": "2"}}), vec_doc({"t": {"a": 0}}), vec_doc({"t": {"a.b": 1}}),
+    vec_doc({"t": 5}), vec_doc({"t": "x"}), vec_doc({"t": {"a": [1, 2]}}), vec_doc({"t": {"a": {"b": 1}}}),
+    vec_doc({"t": [[{"a": 1}]]}), vec_doc({"t": {"a": 1e-40}}), vec_doc({"t": {"a": None}}), vec_doc({"t": {"a": True}}),
+    ("DELETE", "/vec-feat"),
+])
+
+scenario("vec_semantic", [
+    ("DELETE", "/vec-sem?ignore_unavailable=true"),
+    ("DELETE", "/vec-sem2?ignore_unavailable=true"),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"s": {"type": "semantic_text"}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"o": {"properties": {"s": {"type": "semantic_text"}}}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"s": {"type": "semantic_text", "inference_id": "x", "foo": 1}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"rf": {"type": "rank_feature", "positive_score_impact": "maybe"}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"rf": {"type": "rank_feature", "foo": 1}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"t": {"type": "sparse_vector", "store": True}}}}),
+    ("PUT", "/vec-sem", {"mappings": {"properties": {"s": {"type": "semantic_text", "inference_id": "nope"}, "t": {"type": "text"}}}}, ACK),
+    ("GET", "/vec-sem/_mapping"),
+    ("PUT", "/vec-sem/_doc/1?refresh=true", {"s": "hello", "t": "x"}),
+    ("PUT", "/vec-sem/_doc/2?refresh=true", {"t": "x"}, {"pick": lambda r: r.get("result")}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "s", "query": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "t", "query": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "nope", "query": "hi"}}}, {"pick": vec_scores}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"query": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "s", "query": "hi", "x": 1}}}),
+    ("POST", "/vec-sem/_search", {"query": {"match": {"s": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"retriever": {"text_similarity_reranker": 1}}),
+    ("DELETE", "/vec-sem"),
+])
+
+
+def vec_bit_score(f, q):
+    return ("POST", "/vec-bit/_search", {"query": {"script_score": {"query": {"match_all": {}}, "script": {"source": f"{f}(params.q, 'b') + 100", "params": {"q": q}}}}}, {"pick": vec_scores})
+
+
+scenario("vec_bits", [
+    ("DELETE", "/vec-bit?ignore_unavailable=true"),
+    ("PUT", "/vec-bit", {"mappings": {"properties": {"b": {"type": "dense_vector", "dims": 16, "element_type": "bit"}}}}, ACK),
+    ("PUT", "/vec-bit/_doc/1?refresh=true", {"b": [5, -3]}, {"pick": lambda r: r.get("result")}),
+] + [vec_bit_score(f, q) for f in ["hamming", "l1norm", "l2norm", "dotProduct", "cosineSimilarity"]
+     for q in [[1, 2], "0a0b", [0.5, 1.5, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]] + [
+    ("DELETE", "/vec-bit"),
+])
+
+
+# --- Synthetic `_source` (`"_source": {"mode": "synthetic"}`) -------------
+
+SYN = {"mode": "synthetic"}
+
+
+def syn_docs(index, docs):
+    """Index each doc (id = position) and GET it back."""
+    steps = []
+    for i, d in enumerate(docs):
+        steps.append(("PUT", f"/{index}/_doc/{i}?refresh=true", d, {"pick": lambda r: r.get("result")}))
+        steps.append(("GET", f"/{index}/_doc/{i}", None, {"pick": lambda r: r.get("_source")}))
+    return steps
+
+
+def src_hits(r):
+    return [(h["_id"], h.get("_source")) for h in r["hits"]["hits"]]
+
+
+scenario("synth_leaf_types", [
+    ("DELETE", "/syn-leaf?ignore_unavailable=true"),
+    ("PUT", "/syn-leaf", {"mappings": {"_source": SYN, "properties": {
+        "k": {"type": "keyword"}, "kia": {"type": "keyword", "ignore_above": 3},
+        "ks": {"type": "keyword", "store": True, "doc_values": False, "ignore_above": 3},
+        "kn": {"type": "keyword", "doc_values": False},
+        "knv": {"type": "keyword", "null_value": "NULL"},
+        "l": {"type": "long"}, "i": {"type": "integer"}, "sh": {"type": "short"},
+        "f": {"type": "float"}, "h": {"type": "half_float"}, "d": {"type": "double"},
+        "sf": {"type": "scaled_float", "scaling_factor": 100}, "ul": {"type": "unsigned_long"},
+        "ln": {"type": "long", "doc_values": False},
+        "b": {"type": "boolean"}, "ip": {"type": "ip"},
+        "ipm": {"type": "ip", "ignore_malformed": True},
+        "im": {"type": "integer", "ignore_malformed": True},
+        "dt": {"type": "date"}, "dtf": {"type": "date", "format": "yyyy/MM/dd||epoch_millis"},
+        "dte": {"type": "date", "format": "epoch_millis"}, "dn": {"type": "date_nanos"},
+        "t": {"type": "text", "store": True},
+        "tk": {"type": "text", "fields": {"raw": {"type": "keyword", "ignore_above": 4}}},
+        "w": {"type": "wildcard"}, "v": {"type": "version"}, "mot": {"type": "match_only_text"},
+        "gp": {"type": "geo_point"}, "dv": {"type": "dense_vector", "dims": 3},
+        "fl": {"type": "flattened"}, "flia": {"type": "flattened", "ignore_above": 3},
+        "am": {"type": "aggregate_metric_double", "metrics": ["min", "max"], "default_metric": "max"},
+        "cp": {"type": "completion"},
+    }}}),
+] + syn_docs("syn-leaf", [
+    {"k": ["b", "a", "b", "c"], "kia": ["long", "b", "a", "long"], "ks": ["zz", "longer", "aa", "zz"]},
+    {"kn": ["b", "a", "b"], "knv": [None, "a"], "k": None},
+    {"l": [3, 1, 2, 1, "5", 1.7], "i": [2.9, -2.9], "sh": "7", "ln": ["3", 1.7, 1]},
+    {"f": [1.1, 2.5, 1.1], "h": [1.1, 3, 0.1], "d": [1.1, "2.5", 1e300], "sf": [1.234, 5, 1.005]},
+    {"ul": [18446744073709551615, 1, "5"], "b": ["true", False, True, "false"]},
+    {"ip": ["10.0.0.2", "10.0.0.1", "::ffff:10.0.0.1", "2001:db8::1", "::1", "fe80::1"]},
+    {"ipm": ["10.0.0.1", "garbage", "1.1.1.1", 7], "im": [5, "x", False, 1]},
+    {"dt": ["2017-09-01", 1504224000000, "2017-09-01T10:20:30.123+01:00", "2017"],
+     "dtf": ["2017/09/01", 1504224000000], "dte": ["1504224000123", 5]},
+    {"dn": ["2017-09-01T00:00:00.123456789Z", "2017-09-01T00:00:00.1Z", "2017-09-01T00:00:00Z", 1504224000000]},
+    {"t": ["b c", "a", "b c"], "tk": ["b c", "a", "b c", "longer text", "a"]},
+    {"w": ["b", "a", "b"], "v": ["1.10.0", "1.2.0", "1.2.0", "1.2.0-beta"], "mot": ["b", "a"]},
+    {"gp": [{"lat": 1.5, "lon": 2.5}, "41.12,-71.34", [-71.34, 41.12], "POINT (2 1)"]},
+    {"gp": {"lat": 41.12, "lon": -71.34}, "dv": [1, 2.5, 300.33]},
+    {"fl": {"b": [3, True, None, "x", 1.5], "a": {"c": None}, "e": [], "d": {}, "z": {"y": ["2", "10", "2"]}}},
+    {"fl": [{"x": 1}, {"x": 2, "y": 0}], "flia": {"a": "abcd", "b": ["x", "abcd", "y"]}},
+    {"am": {"min": 1, "max": 5}, "cp": ["b", "a"]},
+    {"k": ["a"], "l": [7], "f": [], "x_unmapped": [3, 1], "_doc_count": 2},
+]) + [
+    ("POST", "/syn-leaf/_search", {"query": {"ids": {"values": [0, 2]}}, "_source": ["k", "l", "i"]}, {"pick": src_hits}),
+    ("POST", "/syn-leaf/_search", {"query": {"ids": {"values": ["0", "3"]}}, "fields": ["k", "f", "h"], "_source": False},
+     {"pick": lambda r: [(h["_id"], h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("DELETE", "/syn-leaf"),
+])
+
+scenario("synth_objects", [
+    ("DELETE", "/syn-obj?ignore_unavailable=true"),
+    ("PUT", "/syn-obj", {"mappings": {"_source": SYN, "properties": {
+        "o": {"properties": {"a": {"type": "long"}, "b": {"type": "keyword"},
+                             "in": {"properties": {"x": {"type": "long"}}},
+                             "dis": {"enabled": False}, "kn": {"type": "keyword", "doc_values": False}}},
+        "n": {"type": "nested", "properties": {"a": {"type": "long"}, "nn": {"type": "nested"}}},
+        "dis": {"type": "object", "enabled": False},
+        "df": {"dynamic": False, "properties": {"m": {"type": "keyword"}}},
+        "dr": {"dynamic": "runtime", "properties": {"m": {"type": "keyword"}}},
+        "sas": {"store_array_source": True, "properties": {"a": {"type": "long"}, "b": {"type": "keyword"}}},
+        "so": {"type": "object", "subobjects": False, "properties": {"a.b": {"type": "keyword"}}},
+        "z": {"type": "keyword"},
+    }}}),
+] + syn_docs("syn-obj", [
+    {"o": [{"a": 2, "b": "y"}, {"a": 1, "b": "x", "in": [{"x": 5}, {"x": 4}]}]},
+    {"o": [{"a": 1}], "o.b": "q", "o.in.x": 3},
+    {"o": [{"dis": {"b": 2}}, {"dis": {"a": 1}}, {"a": 5}]},
+    {"o": [{"kn": "b"}, {"kn": "a"}], "z": "1"},
+    {"n": [{"a": [3, 1]}, {}, {"a": 2, "nn": [{"q": [3, 2]}, {"q": 1}]}]},
+    {"n": {"a": 1}}, {"n": []}, {"n": [None, {"a": 1}]},
+    {"dis": {"b": 2, "a": [3, 1, {"c": None}], "x.y": 1}, "z": "x"},
+    {"dis": [{"b": 2}, {"a": 1}]}, {"dis": 5},
+    {"df": {"m": ["b", "a"], "zz": [3, 1, {"q": 1}], "y": {"w": 2}, "y.x": 1}},
+    {"df": [{"m": "x", "u": 1}, {"m": "y", "u": 2}]},
+    {"dr": {"m": ["b", "a"], "zz": [3, 1]}}, {"dr": [{"m": "b"}, {"m": "a"}]}, {"dr": {"m": "b", "x": 1}},
+    {"sas": [{"b": "z", "a": 2}, {"a": 1}]}, {"sas": {"b": "z", "a": [2, 1]}},
+    {"so": {"a.b": ["y", "x"], "c.d": 5, "e": {"f": 1}}}, {"so.a.b": "q"},
+    {"o": {"a": None, "b": None}, "z": []}, {"o": [{}, {}]},
+    {"a.b.c": 1, "a": {"b": {"d": [2, 1]}}, "new_obj": [{"p": 2}, {"p": 1}]},
+]) + [
+    ("GET", "/syn-obj/_mapping"),
+    ("POST", "/syn-obj/_search", {"query": {"ids": {"values": ["0", "4", "11"]}}}, {"pick": lambda r: sorted(src_hits(r), key=lambda h: h[0])}),
+    ("DELETE", "/syn-obj"),
+    # A disabled root keeps everything as sent.
+    ("DELETE", "/syn-root?ignore_unavailable=true"),
+    ("PUT", "/syn-root", {"mappings": {"_source": SYN, "enabled": False}}),
+] + syn_docs("syn-root", [{"name": "aaaa", "b": [3, 1], "a.very.deeply": "AAAA", "n": None}]) + [
+    ("GET", "/syn-root/_mapping"),
+    ("DELETE", "/syn-root"),
+    # Beyond the total fields limit, dynamic fields are kept unmapped.
+    ("DELETE", "/syn-limit?ignore_unavailable=true"),
+    ("PUT", "/syn-limit", {"settings": {"index.mapping.total_fields.limit": 3,
+                                        "index.mapping.total_fields.ignore_dynamic_beyond_limit": True},
+                           "mappings": {"_source": SYN, "properties": {"name": {"type": "keyword"}}}}),
+] + syn_docs("syn-limit", [
+    {"name": "x", "p_int": 1000, "q_double": 123.456789, "r_str": "AaAa", "s.very.deep": "A"},
+    {"name": "y", "arr": [3, 1, 2], "objs": [{"v": 2}, {"v": 1}]},
+]) + [
+    ("GET", "/syn-limit/_mapping"),
+    ("DELETE", "/syn-limit"),
+])
+
+scenario("synth_ranges", [
+    ("DELETE", "/syn-range?ignore_unavailable=true"),
+    ("PUT", "/syn-range", {"mappings": {"_source": SYN, "properties": {
+        "ir": {"type": "integer_range"}, "lr": {"type": "long_range"}, "fr": {"type": "float_range"},
+        "dr": {"type": "double_range"}, "dtr": {"type": "date_range"},
+        "dtf": {"type": "date_range", "format": "yyyy-MM-dd"}, "ipr": {"type": "ip_range"}}}}),
+] + syn_docs("syn-range", [
+    {"ir": [{"gte": 1, "lte": 2}, {"gte": 1, "lte": 2}, {"lte": 0}, {"gte": None}]},
+    {"ir": {"gt": 1.5, "lt": 3.7}, "lr": {"gte": "5", "lte": "10"}},
+    {"fr": {"gt": 1.0, "lt": 2.0}, "dr": [{"gte": 4, "lte": 8}, {"gte": 4, "lte": 7}]},
+    {"fr": {"gte": 1.1}, "dr": {"gt": 1.5}},
+    {"dtr": {"gt": "2017-09-01", "lt": "2017-09-05"}, "dtf": {"gte": "2017-09-01", "lt": "2017-09-03"}},
+    {"dtr": {"gte": 1504224000000, "lte": "2017-09-05T03:04:05.789Z"}},
+    {"ipr": "74.125.227.0/25"}, {"ipr": {"gt": "2001:db8::", "lt": "200a:100::"}},
+    {"ipr": {"gte": "::ffff:1.2.3.4", "lte": "1.2.3.5"}}, {"ir": None},
+]) + [("DELETE", "/syn-range")])
+
+
+def syn_create(fields, index="syn-bad", mode=SYN, settings=None):
+    body = {"mappings": {"_source": mode, "properties": fields}}
+    if settings:
+        body["settings"] = settings
+    return [("PUT", f"/{index}", body, {"pick": lambda r: r.get("acknowledged")}),
+            ("DELETE", f"/{index}?ignore_unavailable=true")]
+
+
+scenario("synth_mapping_errors", [("DELETE", "/syn-bad?ignore_unavailable=true")]
+  + syn_create({"t": {"type": "text"}})
+  + syn_create({"t": {"type": "text", "store": True}})
+  + syn_create({"t": {"type": "text", "fields": {"raw": {"type": "keyword"}}}})
+  + syn_create({"t": {"type": "text", "fields": {"raw": {"type": "keyword", "normalizer": "lowercase"}}}})
+  + syn_create({"t": {"type": "text", "fields": {"raw": {"type": "keyword", "doc_values": False}}}})
+  + syn_create({"b": {"type": "binary"}})
+  + syn_create({"b": {"type": "binary", "doc_values": True}})
+  + syn_create({"k": {"type": "keyword", "normalizer": "lowercase"}})
+  + syn_create({"k": {"type": "keyword", "copy_to": "other"}, "other": {"type": "keyword"}})
+  + syn_create({"k": {"type": "boolean", "doc_values": False}})
+  + syn_create({"k": {"type": "ip", "doc_values": False}})
+  + syn_create({"k": {"type": "date", "doc_values": False}})
+  + syn_create({"k": {"type": "geo_point", "doc_values": False}})
+  + syn_create({"k": {"type": "flattened", "doc_values": False}})
+  + syn_create({"k": {"type": "integer_range", "doc_values": False}})
+  + syn_create({"k": {"type": "keyword", "doc_values": False}})
+  + syn_create({"k": {"type": "long", "doc_values": False}})
+  + syn_create({"o": {"properties": {"z": {"type": "text"}, "b": {"type": "binary"}}}})
+  + syn_create({"n": {"type": "nested", "properties": {"t": {"type": "text"}}}})
+  + syn_create({"t": {"type": "text"}}, settings={"index.mode": "logsdb"})
+  + syn_create({"t": {"type": "text"}}, mode={"mode": "stored"})
+  + syn_create({}, mode={"mode": "synthetic", "includes": ["a"]})
+  + syn_create({}, mode={"mode": "synthetic", "enabled": False})
+  + syn_create({}, mode={"mode": "bogus"})
+  + [
+    ("PUT", "/syn-bad", {"mappings": {"_source": SYN}}),
+    ("PUT", "/syn-bad/_mapping", {"properties": {"t": {"type": "text"}}}),
+    ("PUT", "/syn-bad/_mapping", {"properties": {"t": {"type": "keyword", "normalizer": "lowercase"}}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"mode": "stored"}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"enabled": True}}),
+    ("GET", "/syn-bad/_mapping"),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"excludes": ["a"]}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"mode": "synthetic"}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {}}),
+    ("GET", "/syn-bad/_mapping"),
+    ("DELETE", "/syn-bad"),
+    ("PUT", "/syn-bad", {"mappings": {"_source": {"mode": "stored"}}}),
+    ("GET", "/syn-bad/_mapping"),
+    ("PUT", "/syn-bad/_mapping", {"_source": SYN}),
+    ("PUT", "/syn-bad/_doc/1?refresh=true", {"a.b": [3, 1]}, {"pick": lambda r: r.get("result")}),
+    ("GET", "/syn-bad/_doc/1", None, {"pick": lambda r: r.get("_source")}),
+    ("DELETE", "/syn-bad"),
+])
+
+scenario("synth_force", [
+    ("DELETE", "/syn-f1?ignore_unavailable=true"), ("DELETE", "/syn-f2?ignore_unavailable=true"),
+    ("PUT", "/syn-f1", {"mappings": {"properties": {"text": {"type": "text"}, "o": {"properties": {"k": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-f1/_doc/1?refresh=true", {"text": "foo", "o.k": ["b", "a"]}),
+    ("GET", "/syn-f1/_doc/1?force_synthetic_source=true"),
+    ("GET", "/syn-f1/_doc/1"),
+    ("POST", "/syn-f1/_mget?force_synthetic_source=true", {"ids": ["1", "2"]}),
+    ("POST", "/syn-f1/_search?force_synthetic_source=true", {}),
+    ("PUT", "/syn-f2", {"mappings": {"properties": {"o": {"properties": {"k": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-f2/_doc/1?refresh=true", {"o.k": ["b", "a"], "x": 1.5, "s": "str", "n": [3, 1]}),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=true"),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=false"),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=bogus"),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=true&realtime=false"),
+    ("POST", "/syn-f2/_mget?force_synthetic_source=true", {"ids": ["1"]}),
+    ("POST", "/syn-f2/_search?force_synthetic_source=true", {}, {"pick": src_hits}),
+    ("POST", "/syn-f2/_search", {}, {"pick": src_hits}),
+    ("DELETE", "/syn-f1"), ("DELETE", "/syn-f2"),
+])
+
+scenario("synth_update", [
+    ("DELETE", "/syn-up?ignore_unavailable=true"),
+    ("PUT", "/syn-up", {"settings": {"index": {"refresh_interval": "-1"}},
+                        "mappings": {"_source": SYN, "properties": {"k": {"type": "keyword"}, "n": {"type": "long"}}}}),
+    ("PUT", "/syn-up/_doc/1", {"k": ["b", "a"], "n": "3", "o.p": 1}),
+    ("GET", "/syn-up/_doc/1"),
+    ("GET", "/syn-up/_doc/1?realtime=false"),
+    ("POST", "/syn-up/_update/1", {"doc": {"x": 1}, "_source": True}),
+    ("GET", "/syn-up/_doc/1"),
+    ("POST", "/syn-up/_update/1", {"doc": {"k": ["a", "b"]}}),
+    ("POST", "/syn-up/_update/1", {"script": {"source": "ctx._source.n += 1"}}),
+    ("GET", "/syn-up/_doc/1"),
+    ("GET", "/syn-up/_source/1"),
+    ("GET", "/syn-up/_doc/1?_source_includes=k"),
+    ("POST", "/syn-up/_refresh"),
+    ("POST", "/syn-up/_search", {"query": {"ids": {"values": ["1"]}}, "fields": ["k", "n", "o.p"]}),
+    ("DELETE", "/syn-up"),
+])
+
+scenario("synth_index_misc", [
+    ("DELETE", "/syn-misc?ignore_unavailable=true"),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {"": {"type": "keyword"}}}}),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {"a": {"properties": {"": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {" ": {"type": "keyword"}}}}),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {"a..b": {"type": "keyword"}}}}),
+    ("PUT", "/syn-misc", {"settings": {"soft_deletes.enabled": False}}),
+    ("PUT", "/syn-misc", {"settings": {"index.soft_deletes.enabled": "false"}}),
+    ("PUT", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E",
+     {"aliases": {"<syn-misc-alias-{2022-12-31||/M{yyyy.MM}}>": {}}}),
+    ("PUT", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7D%3E"),
+    ("PUT", "/%3Csyn-misc-%7Bnow%2Fd%7Byyyy%7D%3E"),
+    ("PUT", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E",
+     {"aliases": {"<syn-misc-alias-{2022-12-31||/M{yyyy-MM-dd}}>": {}}}),
+    ("GET", "/syn-misc-2022-12-31/_alias"),
+    ("HEAD", "/_alias/syn-misc-alias-2022-12-01"),
+    ("GET", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E/_count"),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "<syn-misc-{2022-12-31||/d{yyyy-MM-dd}}>",
+                                                "alias": "<syn-misc-al2-{2022-12-31||+1d{yyyy-MM-dd}}>"}}]}),
+    ("GET", "/syn-misc-2022-12-31/_alias"),
+    ("DELETE", "/syn-misc-2022-12-31"),
+    # Index sorting.
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": "nested_field.foo"},
+                          "mappings": {"properties": {"nested_field": {"type": "nested", "properties": {"foo": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": "nope"}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": "t"}, "mappings": {"properties": {"t": {"type": "text"}}}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": ["a", "b"], "index.sort.order": ["desc"]},
+                          "mappings": {"properties": {"a": {"type": "long"}, "b": {"type": "long"}}}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": ["a", "b"], "index.sort.order": ["desc", "asc"],
+                                       "index.sort.missing": ["_first", "_last"], "index.refresh_interval": "-1"},
+                          "mappings": {"properties": {"a": {"type": "long"}, "b": {"type": "keyword"}}}}),
+    ("POST", "/_bulk?refresh=true", [
+        {"index": {"_index": "syn-misc", "_id": "1"}}, {"a": 1, "b": "x"},
+        {"index": {"_index": "syn-misc", "_id": "2"}}, {"a": 3, "b": "y"},
+        {"index": {"_index": "syn-misc", "_id": "3"}}, {"b": "z"},
+        {"index": {"_index": "syn-misc", "_id": "4"}}, {"a": 3, "b": "a"},
+        {"index": {"_index": "syn-misc", "_id": "5"}}, {"a": [1, 5]}], {"pick": lambda r: r["errors"]}),
+    ("POST", "/syn-misc/_search", {"sort": ["_doc"]}, {"pick": ids}),
+    ("POST", "/syn-misc/_search?scroll=1m", {"track_total_hits": False}),
+    ("POST", "/syn-misc/_search?scroll=1m", {"track_total_hits": 5}),
+    ("DELETE", "/syn-misc"),
+    # Values a field can't take.
+    ("PUT", "/syn-misc", {"mappings": {"properties": {
+        "l": {"type": "long"}, "i": {"type": "integer"}, "b": {"type": "boolean"}, "ip": {"type": "ip"},
+        "k": {"type": "keyword"}, "t": {"type": "text"}, "f": {"type": "float"},
+        "lim": {"type": "long", "ignore_malformed": True}, "o": {"properties": {"s": {"type": "short"}}}}}}),
+] + [("PUT", "/syn-misc/_doc/1", d, {"pick": lambda r: r.get("result")}) for d in [
+    {"l": "abc"}, {"l": True}, {"l": {"a": 1}}, {"l": [1, "x"]}, {"i": 3000000000}, {"l": 1.5e30},
+    {"b": "yes"}, {"b": 1}, {"ip": "x"}, {"ip": 7}, {"k": {"a": 1}}, {"t": {"a": 1}}, {"f": "NaN"},
+    {"lim": {"a": 1}}, {"lim": [{"a": 1}]}, {"lim": "x"}, {"k": [{"a": 1}]}, {"l": ""}, {"ip": ""}, {"b": ""},
+    {"l": []}, {"l": [[1, 2]]}, {"k": [["a"]]}, {"o.s": 40000}, {"o": [{"s": 1}, {"s": "x"}]},
+    {"l": "1.5", "i": 2.9, "b": "true", "ip": "::1", "k": 5, "f": "2.5"}, {"new": [1, "x"]},
+]] + [
+    ("POST", "/_bulk", [{"index": {"_index": "syn-misc", "_id": "2"}}, {"l": "abc"},
+                        {"index": {"_index": "syn-misc", "_id": "3"}}, {"l": 3}],
+     {"pick": lambda r: [(list(i.values())[0]["status"], list(i.values())[0].get("error", {}).get("type")) for i in r["items"]]}),
+    ("DELETE", "/syn-misc"),
+])
+
+
+# --- Query DSL: fuzziness, minimum_should_match, intervals, spans,
+# more_like_this, distance_feature, terms lookup, explain/validate,
+# rescore, named queries, post_filter, request parsing.
+
+DSL_DOCS = [
+    {"t": "quick brown fox", "k": "quick", "n": 1, "d": "2018-02-01T10:00:00Z", "g": [-71.34, 41.13]},
+    {"t": "quack brown box", "k": "quack", "n": 2, "d": "2018-02-01T11:00:00Z", "g": [-71.34, 41.14]},
+    {"t": "the lazy dog quick quick", "k": "lazy", "n": 3, "d": "2018-02-01T09:00:00Z", "g": [-71.34, 41.12]},
+    {"t": "qiuck foxes", "k": "qiuck", "n": 4},
+    {"t": "Some like it hot, some like it cold", "k": "hot", "n": 5},
+    {"t": "Its cold outside, theres no kind of atmosphere", "k": "cold", "n": 6},
+    {"t": "Baby its cold there outside", "k": "baby", "n": 7},
+    {"t": "Outside it is cold and wet", "k": "wet", "n": 8},
+    {"t": "the big bad wolf", "k": "wolf", "n": 9},
+    {"t": "the big wolf", "k": "wolf", "n": 10},
+    {"t": "cold cold cold", "k": "cold", "n": 11},
+]
+DSL_MAPPING = {
+    "settings": {"index": {"refresh_interval": "-1", "number_of_shards": 1}},
+    "mappings": {"properties": {
+        "t": {"type": "text", "fields": {"raw": {"type": "keyword"}}},
+        "k": {"type": "keyword"}, "n": {"type": "integer"}, "d": {"type": "date"},
+        "g": {"type": "geo_point"},
+    }},
+}
+DS = "/dsl-edge/_search"
+
+
+def dsl_hits(r):
+    return [(h["_id"], h.get("_score")) for h in r["hits"]["hits"]]
+
+
+def dsl_total(r):
+    return r["hits"]["total"]["value"]
+
+
+def q(query, **kw):
+    body = {"query": query, "size": 20}
+    body.update(kw)
+    return body
+
+
+HITS = {"pick": dsl_hits}
+TOTAL = {"pick": dsl_total}
+
+scenario("dsl_fuzzy", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"match": {"t": {"query": "quikc", "fuzziness": "AUTO"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quikc", "fuzziness": "AUTO", "fuzzy_transpositions": False}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 2}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": "AUTO:2,4"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 1, "prefix_length": 2}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 2, "max_expansions": 1}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quikc brwn", "fuzziness": 1, "operator": "and"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 1.5}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 3}}})),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": "abc"}}})),
+    ("POST", DS, q({"match": {"n": {"query": "3", "fuzziness": 1}}})),
+    ("POST", DS, q({"match": {"k": {"query": "quikc", "fuzziness": "AUTO"}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": {"value": "quick", "fuzziness": 2}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": "quikc"}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": {"value": "quikc", "transpositions": False}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": {"value": "quick", "rewrite": "constant_score"}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"n": {"value": "3"}}})),
+    ("POST", DS, q({"multi_match": {"query": "quikc", "fields": ["t", "k"], "fuzziness": "AUTO"}}), HITS),
+    ("POST", DS, q({"multi_match": {"query": "brwn fxo", "fields": ["t"], "fuzziness": 1, "type": "most_fields"}}), HITS),
+    ("POST", DS, q({"multi_match": {"query": "brown", "fields": ["t"], "fuzziness": 1, "type": "cross_fields"}})),
+    ("POST", DS, q({"multi_match": {"query": "brown", "fields": ["t"], "type": "bool_prefix", "slop": 1}})),
+    ("POST", DS, q({"match_bool_prefix": {"t": {"query": "quikc bro", "fuzziness": 1}}}), HITS),
+    ("POST", DS, q({"query_string": {"query": "quikc~", "default_field": "t"}}), HITS),
+    ("POST", DS, q({"query_string": {"query": "t:quikc~1"}}), HITS),
+    ("POST", DS, q({"match": {"n": 3}}), HITS),
+    ("POST", DS, q({"match": {"n": {"query": "x"}}})),
+    ("POST", DS, q({"match": {"n": {"query": "x", "lenient": True}}}), HITS),
+])
+
+scenario("dsl_msm", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": 3}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "75%"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "-1"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "-25%"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "2<75%"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": 9}}}), HITS),
+    ("POST", DS, q({"bool": {"should": [{"term": {"k": "wolf"}}, {"term": {"t": "big"}}, {"term": {"t": "bad"}}], "minimum_should_match": "2"}}), HITS),
+    ("POST", DS, q({"bool": {"should": [{"term": {"k": "wolf"}}, {"term": {"t": "big"}}, {"term": {"t": "bad"}}], "minimum_should_match": "60%"}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "", "zero_terms_query": "all"}}}), TOTAL),
+])
+
+scenario("dsl_intervals", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside"}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "ordered": True}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "max_gaps": 1}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "ordered": True, "max_gaps": 0}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold cold"}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "boost": 2}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "the"}}, {"any_of": {"intervals": [{"match": {"query": "big"}}, {"match": {"query": "big bad"}}]}}, {"match": {"query": "wolf"}}], "max_gaps": 0, "ordered": True}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "the"}}, {"match": {"query": "wolf"}}], "ordered": True}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"any_of": {"intervals": [{"match": {"query": "big"}}, {"match": {"query": "bad"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "filter": {"before": {"match": {"query": "outside"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "filter": {"after": {"match": {"query": "outside"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"match": {"query": "outside"}}], "filter": {"containing": {"match": {"query": "is"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"match": {"query": "outside"}}], "filter": {"not_containing": {"match": {"query": "is"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "it", "filter": {"not_contained_by": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"match": {"query": "outside"}}]}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "ordered": True, "filter": {"overlapping": {"match": {"query": "baby there"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"prefix": {"prefix": "out"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"wildcard": {"pattern": "OUT?IDE"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"fuzzy": {"term": "cald"}}, {"prefix": {"prefix": "out"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "use_field": "t.raw"}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"foo": {"query": "x"}}}})),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "x"}, "any_of": {"intervals": []}}}})),
+    ("POST", DS, q({"intervals": {"k": {"match": {"query": "cold"}}}})),
+    ("POST", DS, q({"intervals": {"missing": {"match": {"query": "cold"}}}}), HITS),
+])
+
+scenario("dsl_spans", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"span_term": {"t": "quick"}}), HITS),
+    ("POST", DS, q({"span_term": {"t": {"value": "quick", "boost": 2}}}), HITS),
+    ("POST", DS, q({"span_or": {"clauses": [{"span_term": {"t": "quick"}}, {"span_term": {"t": "brown"}}]}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "quick"}}, {"span_term": {"t": "brown"}}], "slop": 0}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "cold"}}, {"span_term": {"t": "outside"}}], "slop": 2, "in_order": False}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "cold"}}, {"span_term": {"t": "outside"}}], "slop": 1, "in_order": True}}), HITS),
+    ("POST", DS, q({"span_first": {"match": {"span_term": {"t": "cold"}}, "end": 3}}), HITS),
+    ("POST", DS, q({"span_not": {"include": {"span_term": {"t": "cold"}}, "exclude": {"span_term": {"t": "outside"}}}}), HITS),
+    ("POST", DS, q({"span_not": {"include": {"span_term": {"t": "cold"}}, "exclude": {"span_term": {"t": "outside"}}, "post": 1}}), HITS),
+    ("POST", DS, q({"span_containing": {"big": {"span_near": {"clauses": [{"span_term": {"t": "the"}}, {"span_term": {"t": "wolf"}}], "slop": 3}}, "little": {"span_term": {"t": "bad"}}}}), HITS),
+    ("POST", DS, q({"span_within": {"big": {"span_near": {"clauses": [{"span_term": {"t": "the"}}, {"span_term": {"t": "wolf"}}], "slop": 3}}, "little": {"span_term": {"t": "big"}}}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "cold"}}, {"span_multi": {"match": {"prefix": {"t": "out"}}}}], "slop": 2}}), TOTAL),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "quick"}}, {"span_term": {"k": "brown"}}]}})),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "quick"}}, {"field_masking_span": {"query": {"span_term": {"t.raw": "x"}}, "field": "t"}}], "slop": 5}}), TOTAL),
+])
+
+MLT_DOCS = [{"foo": "bar baz selected", "body": "apple apple banana"}, {"foo": "bar", "body": "apple cherry"},
+            {"foo": "bar baz", "body": "banana banana cherry"}, {"foo": "qux", "body": "durian"}]
+scenario("dsl_mlt", setup("dsl-mlt", {"settings": STATIC}, MLT_DOCS) + [
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "apple apple banana", "fields": ["body"], "min_doc_freq": 1}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "apple apple banana", "min_doc_freq": 1}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"_id": "1"}], "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"_id": "1"}], "min_doc_freq": 0, "min_term_freq": 0, "include": True}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": {"_index": "dsl-mlt", "_id": "1"}, "unlike": {"_index": "dsl-mlt", "_id": "3"}, "include": True, "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"doc": {"foo": "bar"}}], "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "bar baz qux", "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0, "minimum_should_match": "100%"}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "bar baz qux", "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0, "max_query_terms": 1}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "bar baz qux", "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0, "stop_words": ["bar"]}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"_id": "nope"}], "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("DELETE", "/dsl-mlt"),
+])
+
+scenario("dsl_distance_feature", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"distance_feature": {"field": "d", "pivot": "1h", "origin": "2018-02-01T08:00:30Z"}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "d", "pivot": "7d", "origin": "2018-02-01", "boost": 3}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "g", "pivot": "1km", "origin": [-71.35, 41.12]}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "g", "pivot": "1000m", "origin": "41.12,-71.35"}}), HITS),
+    ("POST", DS, q({"bool": {"must": {"match": {"t": "quick"}}, "should": {"distance_feature": {"field": "d", "pivot": "1h", "origin": "2018-02-01T08:00:00Z"}}}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "missing", "pivot": "1h", "origin": "2018-02-01"}}), HITS),
+])
+
+LOOKUP_DOCS = [{"user": "u1", "followers": ["u2", "u3"]}, {"user": "u2", "followers": ["u1", "u3", "u4"]},
+               {"user": "u3", "followers": ["u1"]}, {"user": "u4", "followers": ["u3"]}]
+LOOKUP_MAPPING = {"settings": {"index": {"refresh_interval": "-1", "max_terms_count": 2}},
+                  "mappings": {"properties": {"user": {"type": "keyword"}, "followers": {"type": "keyword"}}}}
+scenario("dsl_terms_lookup", setup("dsl-tl", LOOKUP_MAPPING, LOOKUP_DOCS) + [
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": ["u1", "u2"]}}), HITS),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": ["u1", "u2", "u3"]}})),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "1", "path": "followers"}}}), HITS),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "2", "path": "followers"}}})),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "zz", "path": "followers"}}}), HITS),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-nope", "id": "1", "path": "followers"}}})),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "path": "followers"}}})),
+    ("POST", "/dsl-tl/_count", {"query": {"terms": {"user": {"index": "dsl-tl", "id": "1", "path": "followers"}}}}, {"pick": lambda r: r["count"]}),
+    # Real-time: an unrefreshed lookup document is read.
+    ("PUT", "/dsl-tl/_doc/5", {"user": "u5", "followers": ["u4"]}, {"pick": lambda r: r.get("result")}),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "5", "path": "followers"}}}), HITS),
+    ("DELETE", "/dsl-tl"),
+])
+
+scenario("dsl_explain_validate", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", "/dsl-edge/_explain/9", {"query": {"match_all": {}}}),
+    ("POST", "/dsl-edge/_explain/9", {"query": {"match": {"t": "wolf"}}}),
+    ("POST", "/dsl-edge/_explain/9", {"query": {"match": {"t": "xyz"}}}),
+    ("POST", "/dsl-edge/_explain/nope", {"query": {"match_all": {}}}),
+    ("POST", "/dsl-edge/_explain/9?_source=true", {"query": {"term": {"k": "wolf"}}}, {"pick": lambda r: (r["matched"], r.get("get"))}),
+    ("POST", "/dsl-edge/_explain/9?_source_includes=k", {"query": {"term": {"k": "wolf"}}}, {"pick": lambda r: (r["matched"], r.get("get"))}),
+    ("POST", "/dsl-edge/_explain/9", {"match_all": {}}),
+    ("POST", "/dsl-edge/_explain/9", {}),
+    ("POST", "/dsl-nope/_explain/9", {"query": {"match_all": {}}}),
+    ("GET", "/dsl-edge/_explain/9?q=wolf", None, {"pick": lambda r: r["matched"]}),
+    ("GET", "/dsl-edge/_explain/9?q=t:wolf%20t:xyz&default_operator=AND", None, {"pick": lambda r: r["matched"]}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"query": {"boool": {}}}),
+    ("POST", "/dsl-edge/_validate/query", {"query": {"boool": {}}}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"match_all": {}}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", None),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"query": {"match": {"t": "Big wolf"}}}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"query": {"bool": {"must": {"term": {"k": "a"}}, "filter": {"term": {"k": "b"}}}}}),
+    ("GET", "/dsl-edge/_validate/query?q=t:BA*", None),
+    ("GET", "/dsl-edge/_validate/query?explain=true&q=t:BA*", None),
+    ("GET", "/dsl-edge/_validate/query?q=n:foo&lenient=true", None),
+    ("GET", "/dsl-nope/_validate/query?q=x", None),
+    ("POST", DS, {"explain": True, "size": 1, "query": {"match": {"t": "wolf"}}},
+     {"pick": lambda r: [(h["_shard"], h["_explanation"]) for h in r["hits"]["hits"]]}),
+])
+
+scenario("dsl_rescore", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"match": {"t": "cold"}}, rescore={"window_size": 2, "query": {"rescore_query": {"match": {"t": "outside"}}, "query_weight": 0.5, "rescore_query_weight": 2}}), HITS),
+    ("POST", DS, q({"match": {"t": "quick"}}, rescore=[{"window_size": 10, "query": {"rescore_query": {"match": {"t": "brown"}}, "score_mode": "multiply"}}, {"query": {"rescore_query": {"match": {"t": "fox"}}, "score_mode": "max", "rescore_query_weight": 3}}]), HITS),
+    ("POST", DS, q({"match": {"t": "cold"}}, rescore={"query": {"rescore_query": {"match": {"t": "outside"}}, "score_mode": "avg"}}), HITS),
+    ("POST", DS, q({"match": {"t": "cold"}}, rescore={"query": {"rescore_query": {"match": {"t": "outside"}}, "score_mode": "min"}}), HITS),
+    ("POST", DS, q({"match": {"t": "quick"}}, sort=["k"], rescore={"window_size": 1, "query": {"rescore_query": {"match": {"t": "brown"}}}})),
+    ("POST", DS, q({"match_all": {}}, size=3, explain=True, rescore={"window_size": 2, "query": {"rescore_query": {"match_all": {}}, "query_weight": 5, "rescore_query_weight": 10}}),
+     {"pick": lambda r: (r["hits"]["max_score"], [(h["_score"], h["_explanation"]["value"]) for h in r["hits"]["hits"]])}),
+])
+
+scenario("dsl_named_post_filter", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS + "?include_named_queries_score=true", q({"bool": {"should": [{"match": {"n": {"query": 1, "_name": "one"}}}, {"match": {"t": {"query": "quick", "_name": "quick", "boost": 2}}}]}}),
+     {"pick": lambda r: [(h["_id"], h.get("matched_queries")) for h in r["hits"]["hits"]]}),
+    ("POST", DS, q({"bool": {"should": [{"match": {"n": {"query": 1, "_name": "one"}}}, {"match": {"t": {"query": "quick", "_name": "quick"}}}]}}),
+     {"pick": lambda r: [(h["_id"], h.get("matched_queries")) for h in r["hits"]["hits"]]}),
+    ("POST", DS, {"size": 20, "query": {"match": {"t": "cold"}}, "post_filter": {"term": {"k": "cold"}}, "aggs": {"ks": {"terms": {"field": "k"}}}},
+     {"pick": lambda r: (dsl_hits(r), r["hits"]["total"], r["aggregations"])}),
+])
+
+scenario("dsl_parse_errors", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, {"query": {"boool": {}}}),
+    ("POST", DS, {"query": {"matchall": {}}}),
+    ("POST", DS, {"query": {"bool": {"must": [{"xyzzy": {}}]}}}),
+    ("POST", DS, {"query": {"term": {"k": "x"}, "preference": "_local"}}),
+    ("POST", DS, {"match": {"t": "x"}}),
+    ("POST", DS, {"foo": 1}),
+    ("POST", DS, {"foo": [1]}),
+    ("POST", DS, {"query": {"exists": {"field": "_source"}}}),
+    ("POST", DS, q({"range": {"n": {"gte": "1e+1", "lt": "11"}}}), HITS),
+    ("POST", DS, q({"range": {"n": {"from": 2, "to": 4, "include_lower": False}}}), HITS),
+    ("POST", DS, q({"range": {"n": {"gte": "abc"}}})),
+])
+
+
+TERM_DOCS = [{"b": True, "k": ["a", "b"], "t": "a b c", "d": "2017/01/01", "p": "x"},
+             {"b": False, "k": "a", "t": "a", "d": "2017/01/02", "p": "y"},
+             {"b": True, "k": "Key1", "t": "c", "d": "2017/01/01", "p": "x"}]
+TERM_MAPPING = {"settings": {"index": {"refresh_interval": "-1", "number_of_shards": 1}},
+                "mappings": {"properties": {"b": {"type": "boolean"}, "k": {"type": "keyword"}, "t": {"type": "text"},
+                                            "d": {"type": "date", "format": "yyyy/MM/dd"}, "p": {"type": "keyword"}}}}
+TS = "/dsl-term/_search"
+scenario("dsl_term_scoring", setup("dsl-term", TERM_MAPPING, TERM_DOCS) + [
+    ("POST", TS, q({"term": {"b": True}}), HITS),
+    ("POST", TS, q({"term": {"k": "a"}}), HITS),
+    ("POST", TS, q({"term": {"k": {"value": "a", "boost": 3}}}), HITS),
+    ("POST", TS, q({"term": {"t": "a"}}), HITS),
+    ("POST", TS, q({"term": {"k": {"value": "KEY1", "case_insensitive": True}}}), HITS),
+    ("POST", TS, q({"prefix": {"k": {"value": "KE", "case_insensitive": True}}}), HITS),
+    ("POST", TS, q({"wildcard": {"k": {"value": "K?Y*", "case_insensitive": True}}}), HITS),
+    ("POST", TS, q({"match": {"d": {"query": "2017/01/01"}}}), HITS),
+    ("POST", TS, q({"term": {"d": "2017/01/02"}}), HITS),
+    ("POST", TS, q({"match": {"d": "not a date"}})),
+    ("POST", TS, q({"bool": {"filter": {"match": {"t": "a"}}, "should": {"term": {"k": "a"}}}}, collapse={"field": "p"},
+                   rescore={"query": {"rescore_query": {"term": {"b": False}}, "query_weight": 0, "rescore_query_weight": 1}}),
+     {"pick": lambda r: [(h["_id"], h["_score"], h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("DELETE", "/dsl-term"),
+])
+
+
+# --- Text analysis (`an_*`, indices and synonym sets `an-*`) -----------------
+
+AN = "/_analyze"
+AN_T = ("The 2 QUICK Brown-Foxes jumped over the lazy dog's bone. foo_bar U.S.A. 3.14 1,000 "
+        "e-mail@x.com http://www.example.com/a?b=1 don't 🙂 café 東京タワー ひらがな カタカナ 한국어 x123 α-βeta")
+
+
+def an(body, path=AN):
+    return ("POST", path, body)
+
+
+def an_tok(text, tok, filters=None, cf=None):
+    b = {"text": text, "tokenizer": tok}
+    if filters is not None:
+        b["filter"] = filters
+    if cf is not None:
+        b["char_filter"] = cf
+    return an(b)
+
+
+scenario("an_tokenizers", [an_tok(AN_T, t) for t in [
+    "standard", "classic", "uax_url_email", "whitespace", "letter", "lowercase", "keyword", "ngram", "edge_ngram",
+    "pattern", "path_hierarchy",
+]] + [
+    an_tok("Quick Fox-2", {"type": "ngram", "min_gram": 2, "max_gram": 3, "token_chars": ["letter", "digit"]}),
+    an_tok("Quick Fox-2 a_b", {"type": "edge_ngram", "min_gram": 1, "max_gram": 3, "token_chars": ["letter", "custom"],
+                               "custom_token_chars": "_-"}),
+    an_tok("one,two  three", {"type": "pattern", "pattern": ","}),
+    an_tok("\"value\", \"value with embedded \\\" quote\"",
+           {"type": "pattern", "pattern": "\"((?:\\\\\"|[^\"]|\\\\\")+)\"", "group": 1}),
+    an_tok("fd-786-335-514-x", {"type": "simple_pattern", "pattern": "[0123456789]{3}"}),
+    an_tok("an|split|string", {"type": "simple_pattern_split", "pattern": "\\|"}),
+    an_tok("The QUICK brown-fox", {"type": "char_group", "tokenize_on_chars": ["whitespace", "-", "\n"]}),
+    an_tok("one-two-three-four-five", {"type": "path_hierarchy", "delimiter": "-", "replacement": "/", "skip": 2}),
+    an_tok("/one/two/three", {"type": "path_hierarchy", "reverse": True}),
+    an_tok("www.elastic.co", {"type": "path_hierarchy", "delimiter": ".", "reverse": True}),
+    an_tok("The quick brown fox", {"type": "standard", "max_token_length": 3}),
+    an_tok("aaaaaaaaaa bb", {"type": "whitespace", "max_token_length": 4}),
+    an_tok("", "keyword"),
+    an({"text": "", "analyzer": "standard"}),
+    an_tok("wi-fi WiFi 3D x86_64 R2-D2 O'Neil's 1.2.3 a.b.c 1,2 1-2 A1B2 12.ab", "standard"),
+    an_tok("😀👍🏽 🇺🇸 #hash @user $5 50% ½ ภาษาไทย ລາວ Ω≈ç√ ﬁ ẞ İstanbul", "standard"),
+    an({"text": ["Foo Bar", "Baz"], "tokenizer": "standard"}),
+    an({"text": ["Foo Bar", "Baz"], "analyzer": "standard"}),
+])
+
+scenario("an_filters", [an_tok(t, tok, f) for t, f, tok in [
+    ("Ünïcödé CAFÉ Straße ﬁne", ["lowercase", "asciifolding"], "standard"),
+    ("Ünïcödé CAFÉ", [{"type": "asciifolding", "preserve_original": True}], "standard"),
+    ("hello World", ["uppercase"], "standard"),
+    ("The quick and the dead is a fox", ["lowercase", "stop"], "standard"),
+    ("The quick and the Dead", [{"type": "stop", "stopwords": ["the", "dead"], "ignore_case": True}], "standard"),
+    ("the quick an", [{"type": "stop", "stopwords": ["an"], "remove_trailing": False}], "standard"),
+    ("le chat et la souris de Paris", [{"type": "stop", "stopwords": "_french_"}], "standard"),
+    ("caresses ponies ties agreed plastered motoring conflated troubled sized hopping relational conditional "
+     "valenci digitizer conformabli radicalli vietnamization predication feudalism decisiveness formaliti "
+     "triplicate electrical allowance adjustable replacement homologous effective bowdlerize controll "
+     "generalizations oscillators", ["porter_stem"], "whitespace"),
+    ("dancing stars running ran easily generalizations knives", [{"type": "stemmer", "language": "english"}], "whitespace"),
+    ("dancing stars running ran easily fairly generalizations", [{"type": "snowball", "language": "English"}], "whitespace"),
+    ("dogs boxes flies cats queries ladies abilities knives", [{"type": "stemmer", "language": "minimal_english"}], "whitespace"),
+    ("John's dog's toys", [{"type": "stemmer", "language": "possessive_english"}], "standard"),
+    ("the quick brown fox", ["shingle"], "whitespace"),
+    ("the quick brown fox", [{"type": "shingle", "min_shingle_size": 2, "max_shingle_size": 3,
+                              "output_unigrams": False}], "whitespace"),
+    ("quick fox", [{"type": "ngram", "min_gram": 1, "max_gram": 2}], "whitespace"),
+    ("quick fox", [{"type": "edge_ngram", "min_gram": 1, "max_gram": 3}], "whitespace"),
+    ("quick fox", [{"type": "edge_ngram", "min_gram": 2, "max_gram": 3, "preserve_original": True}], "whitespace"),
+    ("quick fox", ["edge_ngram"], "whitespace"),
+    ("Wi-Fi PowerShot500 SD500 O'Neil's j2se wi_fi foo-bar-baz", ["word_delimiter"], "whitespace"),
+    ("Wi-Fi PowerShot500 SD500 O'Neil's j2se wi_fi foo-bar-baz", ["word_delimiter_graph"], "whitespace"),
+    ("Wi-Fi PowerShot500 SD500", [{"type": "word_delimiter_graph", "preserve_original": True,
+                                   "catenate_words": True}], "whitespace"),
+    ("a bb ccc dddd", [{"type": "length", "min": 2, "max": 3}], "whitespace"),
+    ("abcdefghijklmnop xyz", ["truncate"], "whitespace"),
+    ("the fox the dog fox", ["unique"], "whitespace"),
+    (" a b ", ["trim"], "keyword"),
+    ("hello world", ["reverse"], "whitespace"),
+    ("l'avion d'Paris j'aime L'Arbre", ["elision"], "standard"),
+    ("Istanbul'a veya Istanbul'dan", ["apostrophe"], "standard"),
+    ("running jumping", [{"type": "keyword_marker", "keywords_pattern": "^run.*"}, "porter_stem"], "standard"),
+    ("aaa-bbb ccc aXa", [{"type": "pattern_replace", "pattern": "a", "replacement": "X", "all": False}], "whitespace"),
+    ("one two three four", [{"type": "limit", "max_token_count": 2}], "whitespace"),
+    ("١٢٣ ٤٥ abc", ["decimal_digit"], "whitespace"),
+    ("ｼｰｻｲﾄﾞﾗｲﾅｰ ＡＢＣ１２３", ["cjk_width"], "whitespace"),
+    ("東京都に住む", ["cjk_bigram"], "standard"),
+    ("dogs running fox", ["keyword_repeat", "porter_stem", "remove_duplicates"], "whitespace"),
+    ("zebra jumps over resting resting dog", ["fingerprint"], "whitespace"),
+    ("İSTANBUL ISPARTA", [{"type": "lowercase", "language": "turkish"}], "standard"),
+    ("chevaux étudiants rapides", [{"type": "stemmer", "language": "light_french"}], "standard"),
+]])
+
+scenario("an_char_filters", [an_tok(t, tok, [], cf) for t, cf, tok in [
+    ("<p>I&apos;m so <b>happy</b>! &lt;3 &amp; caf&eacute; &#169; &#x41;</p><br/>x<script>bad()</script>y",
+     ["html_strip"], "standard"),
+    ("a<div>b</div>c<p>d</p>e<br>f<li>h</li>i<!-- c -->j<b>k</b>", ["html_strip"], "keyword"),
+    ("<p>keep <b>this</b></p>", [{"type": "html_strip", "escaped_tags": ["b"]}], "keyword"),
+    (":) x ph ab abc", [{"type": "mapping", "mappings": [":) => _happy_", "ph => f", "ab => X", "abc => Y"]}], "standard"),
+    ("xx yy", [{"type": "mapping", "mappings": ["x => "]}], "standard"),
+    ("aXbXc a1b22c", [{"type": "pattern_replace", "pattern": "X", "replacement": "--"}], "standard"),
+    ("My credit card is 123-456-789", [{"type": "pattern_replace", "pattern": "(\\d+)-", "replacement": "$1_"}],
+     "standard"),
+]])
+
+scenario("an_analyzers", [an({"text": "The QUICK brown foxes jumped over the lazy dog's bones; isn't it? Café 42",
+                               "analyzer": a}) for a in [
+    "standard", "simple", "whitespace", "stop", "keyword", "pattern", "fingerprint", "english", "snowball", "classic",
+    "french", "german", "spanish", "italian", "portuguese", "russian", "cjk",
+]] + [
+    an({"text": "The dancing stars were shining brightly; John's cats' toys", "analyzer": "english"}),
+    an({"text": "L'avion des étudiants était très rapide, n'est-ce pas? Les chevaux mangeaient", "analyzer": "french"}),
+    an({"text": "Die Häuser der Straße waren schöner als die Bäume", "analyzer": "german"}),
+    an({"text": "Los niños estaban corriendo rápidamente por las calles", "analyzer": "spanish"}),
+])
+
+scenario("an_explain", [
+    an({"text": "This is troubled", "analyzer": "standard", "explain": True}),
+    an({"text": "foo bar buzz", "tokenizer": "standard", "explain": True,
+        "filter": [{"type": "stop", "stopwords": ["foo", "buzz"]}]}),
+    an({"text": "<b>Hello</b> World", "tokenizer": "standard", "char_filter": ["html_strip"],
+        "filter": ["lowercase", {"type": "keyword_marker", "keywords": ["world"]}, "porter_stem"],
+        "explain": True, "attributes": ["keyword"]}),
+    an({"text": "Hello World", "analyzer": "english", "explain": True, "attributes": ["keyword", "foo"]}),
+    an({"text": "dogs", "tokenizer": "standard", "filter": ["keyword_repeat", "porter_stem"], "explain": True}),
+    an({"text": ["a b", "c"], "tokenizer": "whitespace", "explain": True}),
+])
+
+scenario("an_errors", [
+    an({}),
+    an({"text": "x", "analyzer": "nope"}),
+    an({"text": "x", "tokenizer": "nope"}),
+    an({"text": "x", "tokenizer": "standard", "filter": ["nope"]}),
+    an({"text": "x", "tokenizer": "standard", "filter": [{"type": "nope"}]}),
+    an({"text": "x", "tokenizer": "standard", "char_filter": ["nope"]}),
+    an({"text": "a b", "analyzer": "standard", "tokenizer": "standard"}),
+    an({"text": "x", "normalizer": "lowercase"}),
+    an({"text": "x", "tokenizer": "standard", "filter": [{"type": "synonym"}]}),
+    an({"text": "x", "tokenizer": "standard", "filter": [{"type": "synonym", "synonyms": ["a => b => c"]}]}),
+    an({"text": "x", "tokenizer": {"type": "ngram", "min_gram": 1, "max_gram": 5}}),
+    an({"text": "x", "filter": ["porter_stem"]}),
+    an({"text": "x", "bogus": 1}),
+    ("POST", "/an-nope/_analyze", {"text": "x"}),
+] + [step for body in [
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "custom", "tokenizer": "nope"}}}}},
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "custom"}}}}},
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "custom", "tokenizer": "standard", "filter": ["nope"]}}}}},
+    {"settings": {"analysis": {"analyzer": {"a": {"type": "nope"}}}}},
+    {"settings": {"analysis": {"filter": {"f": {"type": "nope"}}}}},
+    {"mappings": {"properties": {"t": {"type": "text", "analyzer": "nope"}}}},
+    {"mappings": {"properties": {"t": {"type": "text", "search_analyzer": "nope"}}}},
+    {"mappings": {"properties": {"k": {"type": "keyword", "normalizer": "nope"}}}},
+    {"settings": {"analysis": {"normalizer": {"n": {"type": "custom", "filter": ["porter_stem"]}}}}},
+    {"settings": {"analysis": {"tokenizer": {"t": {"type": "ngram", "min_gram": 1, "max_gram": 5}}}}},
+    {"settings": {"analysis": {"filter": {"f": {"type": "synonym", "synonyms": ["a => b => c"]}},
+                               "analyzer": {"a": {"tokenizer": "standard", "filter": ["f"]}}}}},
+] for step in [("PUT", "/an-err", body), ("DELETE", "/an-err?ignore_unavailable=true")]])
+
+AN_IDX = {"settings": {"index": {"refresh_interval": "-1", "number_of_shards": 1}, "analysis": {
+    "char_filter": {"my_cf": {"type": "mapping", "mappings": ["ph => f"]}},
+    "filter": {"my_stop": {"type": "stop", "stopwords": ["foo"]},
+               "my_syn": {"type": "synonym", "synonyms": ["quick, fast", "nyc => new york city"]},
+               "my_edge": {"type": "edge_ngram", "min_gram": 2, "max_gram": 10}},
+    "analyzer": {"my_an": {"type": "custom", "tokenizer": "standard", "char_filter": ["my_cf", "html_strip"],
+                           "filter": ["lowercase", "my_stop", "my_syn"]},
+                 "edge": {"tokenizer": "whitespace", "filter": ["lowercase", "my_edge"]},
+                 "std_stop": {"type": "standard", "stopwords": "_english_", "max_token_length": 5}},
+    "normalizer": {"my_norm": {"type": "custom", "filter": ["lowercase", "asciifolding"]}}}},
+    "mappings": {"properties": {
+        "t": {"type": "text", "analyzer": "my_an"},
+        "e": {"type": "text", "analyzer": "english"},
+        "auto": {"type": "text", "analyzer": "edge", "search_analyzer": "standard"},
+        "k": {"type": "keyword", "normalizer": "my_norm"},
+        "title": {"type": "text", "fields": {"english": {"type": "text", "analyzer": "english"}}}}}}
+AN_DOCS = [
+    {"t": "Phone foo QUICK nyc", "e": "The dancing stars were shining", "auto": "Quick Brown Fox",
+     "k": "Héllo Wörld", "title": "dancing with the stars"},
+    {"t": "a fast car in new york", "e": "dance with star", "auto": "Lazy dog", "k": "HELLO WORLD",
+     "title": "dance with star"},
+    {"t": "slow boat", "e": "stars dancing", "auto": "quickly", "k": "other", "title": "stars of the dance"},
+]
+AS = "/an-idx/_search"
+
+scenario("an_custom_index", setup("an-idx", AN_IDX, AN_DOCS) + [
+    ("GET", "/an-idx/_settings", None, {"pick": lambda r: r["an-idx"]["settings"]["index"]["analysis"]}),
+    an({"text": "Phone foo QUICK nyc", "analyzer": "my_an", "explain": True}, "/an-idx/_analyze"),
+    an({"text": "Phone foo QUICK nyc", "field": "t"}, "/an-idx/_analyze"),
+    an({"text": "Héllo Wörld", "field": "k"}, "/an-idx/_analyze"),
+    an({"text": "Héllo Wörld", "normalizer": "my_norm"}, "/an-idx/_analyze"),
+    an({"text": "The quickest brown", "analyzer": "std_stop"}, "/an-idx/_analyze"),
+    an({"text": ["a b", "c"], "field": "t"}, "/an-idx/_analyze"),
+    an({"text": "Hello World", "field": "nope"}, "/an-idx/_analyze"),
+    ("POST", AS, {"query": {"match": {"t": "fast"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"t": "fone"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"e": "dances"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match_phrase": {"e": "dancing star"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match_phrase": {"e": "dancing the stars"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match_phrase": {"e": {"query": "dancing stars", "slop": 2}}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"auto": "qui"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"auto": "quick"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"term": {"k": "HÉLLO WÖRLD"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"terms": {"k": ["Hello World", "x"]}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"k": "hello world"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"title": {"query": "dances", "analyzer": "english"}}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"title.english": "dances"}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"multi_match": {"query": "dances", "fields": ["title", "title.english"]}}}, {"pick": ids}),
+    ("POST", AS, {"query": {"match": {"title.english": "dancing"}},
+                  "highlight": {"fields": {"title": {"matched_fields": ["title.english"]}}}},
+     {"pick": lambda r: sorted((h["_id"], h.get("highlight")) for h in r["hits"]["hits"])}),
+    ("POST", AS, {"size": 0, "aggs": {"k": {"terms": {"field": "k"}}}},
+     {"pick": lambda r: r["aggregations"]}),
+    ("DELETE", "/an-idx"),
+])
+
+AN_SYN_IDX = {"settings": {"index": {"number_of_shards": 1, "number_of_replicas": 0, "refresh_interval": "-1"},
+                           "analysis": {
+    "filter": {"syn": {"type": "synonym_graph", "synonyms_set": "an-set1", "updateable": True}},
+    "analyzer": {"syn_an": {"type": "custom", "tokenizer": "standard", "filter": ["lowercase", "syn"]}}}},
+    "mappings": {"properties": {"f": {"type": "text", "search_analyzer": "syn_an"}}}}
+
+scenario("an_synonyms", [
+    ("DELETE", "/an-syn?ignore_unavailable=true"),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set2"),
+    ("GET", "/_synonyms/an-set1"),
+    ("PUT", "/_synonyms/an-set1", {"synonyms_set": [{"synonyms": "hello, hi", "id": "r1"},
+                                                     {"synonyms": "bye => goodbye", "id": "r2"}]}),
+    ("PUT", "/_synonyms/an-set1", {"synonyms_set": [{"synonyms": "hello, hi", "id": "r1"},
+                                                     {"synonyms": "bye => goodbye", "id": "r2"},
+                                                     {"synonyms": "test => check", "id": "r3"}]}),
+    ("GET", "/_synonyms/an-set1"),
+    ("GET", "/_synonyms/an-set1?size=2"),
+    ("GET", "/_synonyms/an-set1?from=1"),
+    ("GET", "/_synonyms/an-set1?size=-1"),
+    ("GET", "/_synonyms/an-set1?from=100001"),
+    ("GET", "/_synonyms/an-set1/r2"),
+    ("GET", "/_synonyms/an-set1/nope"),
+    ("GET", "/_synonyms/an-nope/r2"),
+    ("PUT", "/_synonyms/an-set1/r2", {"synonyms": "bye, goodbye, seeya"}),
+    ("PUT", "/_synonyms/an-set1/r0", {"synonyms": "i-phone, iphone"}),
+    ("PUT", "/_synonyms/an-nope/r0", {"synonyms": "a, b"}),
+    ("PUT", "/_synonyms/an-set1/r9", {"synonyms": ""}),
+    ("PUT", "/_synonyms/an-set1/r9", {"synonyms": "a, b", "id": "x"}),
+    ("GET", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set1/r3"),
+    ("DELETE", "/_synonyms/an-set1/r3"),
+    ("DELETE", "/_synonyms/an-nope/r3"),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": []}),
+    ("GET", "/_synonyms/an-set2"),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": ""}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": "bye => => goodbye"}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": " => goodbye"}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"synonyms": "bye, goodbye,  "}]}),
+    ("PUT", "/_synonyms/an-set2", {"synonyms_set": [{"id": "x"}]}),
+    ("PUT", "/_synonyms/an-set2", {}),
+    ("PUT", "/an-syn", AN_SYN_IDX),
+    ("POST", "/_bulk?refresh=true", [{"index": {"_index": "an-syn", "_id": "1"}}, {"f": "hello"},
+                                     {"index": {"_index": "an-syn", "_id": "2"}}, {"f": "goodbye"}],
+     {"pick": lambda r: r["errors"]}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "hi"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "bye"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_analyze", {"text": "hello bye", "analyzer": "syn_an"}),
+    ("PUT", "/_synonyms/an-set1", {"synonyms_set": [{"synonyms": "hello, salute"}, {"synonyms": "ciao => goodbye"}]},
+     {"pick": lambda r: (r["result"], [{k: v for k, v in d.items() if k != "reloaded_node_ids"}
+                                       for d in r["reload_analyzers_details"]["reload_details"]])}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "salute"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "ciao"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_search", {"query": {"match": {"f": "hi"}}}, {"pick": ids}),
+    ("POST", "/an-syn/_reload_search_analyzers", None,
+     {"pick": lambda r: [{k: v for k, v in d.items() if k != "reloaded_node_ids"} for d in r["reload_details"]]}),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/an-syn"),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set1"),
+    ("DELETE", "/_synonyms/an-set2"),
+])
+
+scenario("an_synonym_filters", [an({"text": t, "tokenizer": "standard",
+                                    "filter": ["lowercase", {"type": ty, "synonyms": rules, **extra}]})
+                                 for ty in ["synonym", "synonym_graph"] for t, rules, extra in [
+    ("the quick fox", ["quick, fast, speedy"], {}),
+    ("Fast cars in NYC", ["quick, fast", "nyc => new york city"], {}),
+    ("i love new york and the usa", ["new york, ny", "usa, united states of america"], {}),
+    ("united states of america rocks", ["usa, united states of america"], {}),
+    ("visit the big apple now", ["big apple => nyc"], {}),
+    ("a b c d", ["a b c => x"], {}),
+    ("quick", ["quick, fast"], {"expand": False}),
+    ("fast", ["quick, fast", "fast => rapid"], {}),
+    ("x y", ["x => a b c", "y => d"], {}),
+    ("hello", ["s(100000001,1,'hello',n,1,0).", "s(100000001,2,'hi',n,1,0)."], {"format": "wordnet"}),
+    ("hello", ["hello\\, world, hi"], {}),
+]])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

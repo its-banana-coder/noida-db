@@ -5,19 +5,19 @@
 //! Painless scoring scripts call (`cosineSimilarity`, `dotProduct`, ...).
 //!
 //! Every search here is exact (a linear scan): real Elasticsearch searches
-//! an approximate HNSW graph, by default over int8-quantized vectors whose
-//! scores are close to, but not exactly, the true ones. For the document
-//! counts a local dev database holds, exact search returns what the
-//! approximate one aims for and is far simpler (see
-//! `docs/SERVICE_GUIDE.md`: "small and simple, performance is not a goal").
-//! `index_options` (`hnsw`, `int8_hnsw`, `flat`, ...) are validated and
-//! echoed but change nothing.
+//! an approximate HNSW graph. For the document counts a local dev database
+//! holds, exact search returns what the approximate one aims for and is
+//! far simpler (see `docs/SERVICE_GUIDE.md`: "small and simple,
+//! performance is not a goal"). The scores of a quantized field
+//! (`int8_hnsw`, `int4_flat`, ...) are computed on the quantized vectors,
+//! as Elasticsearch computes them (see `quantize`).
 
 use serde_json::{Map, Value, json};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use super::engine::error;
+use super::quantize;
 use super::search::{CommittedDoc, EsError, InnerMatches, eval};
 
 /// The most dimensions a `dense_vector` may have, and the most
@@ -49,6 +49,9 @@ pub struct Field {
     /// Unset until the first document gives it, for a field mapped
     /// without `dims`. For `bit` vectors, the number of bits.
     pub dims: Option<usize>,
+    /// How an `int8_*`/`int4_*` index quantizes the vectors its kNN
+    /// search scores (see `quantize`).
+    pub quant: Option<quantize::Options>,
 }
 
 impl Field {
@@ -72,7 +75,20 @@ impl Field {
             _ => Sim::Cosine,
         });
         let dims = def.get("dims").and_then(Value::as_u64).map(|d| d as usize);
-        Some(Field { elem, sim, dims })
+        let options = def.get("index_options");
+        let bits = match options.and_then(|o| o.get("type")).and_then(Value::as_str) {
+            Some(t) if t.starts_with("int8") => Some(7),
+            Some(t) if t.starts_with("int4") => Some(4),
+            _ => None,
+        };
+        let quant = bits.filter(|_| sim.is_some() && elem == Elem::Float).map(|bits| {
+            let confidence = options
+                .and_then(|o| o.get("confidence_interval"))
+                .and_then(Value::as_f64)
+                .map(|c| c as f32);
+            quantize::Options { bits, confidence }
+        });
+        Some(Field { elem, sim, dims, quant })
     }
 
     /// The dimensions a parsed vector of `len` values has (a `bit` vector
@@ -105,7 +121,7 @@ fn source_value<'a>(source: &'a Value, field: &str) -> Option<&'a Value> {
 
 /// A float as Java's `Float.toString` prints it (`3.0`, `0.6`, `1.0E-5`),
 /// as Elasticsearch's messages show vector values.
-fn java_float(f: f32) -> String {
+pub(crate) fn java_float(f: f32) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
     }
@@ -150,7 +166,7 @@ fn decode_hex(s: &str) -> Result<Vec<f32>, String> {
         .collect()
 }
 
-fn token_name(v: &Value) -> &'static str {
+pub(crate) fn token_name(v: &Value) -> &'static str {
     match v {
         Value::String(_) => "VALUE_STRING",
         Value::Number(_) => "VALUE_NUMBER",
@@ -350,10 +366,10 @@ pub fn check_source(mappings: &mut Value, src: &Value, id: &str) -> Result<(), (
         }
         Ok(())
     }
-    match mappings.get_mut("properties") {
-        Some(props) => walk(props, src, "", id).map_err(refusal_error),
-        None => Ok(()),
+    if let Some(props) = mappings.get_mut("properties") {
+        walk(props, src, "", id).map_err(refusal_error)?;
     }
+    super::features::check_source(mappings, src, id)
 }
 
 /// The mapping dynamic mapping gives an array: an array of 128 to 4096
@@ -637,6 +653,7 @@ fn update_conflicts(old: &Value, new: &Value) -> Vec<String> {
 /// Validates the `dense_vector` fields of an incoming mapping (and, against
 /// `current`, their updates), filling in the defaults Elasticsearch shows.
 pub fn prepare_mapping(current: &Value, incoming: &mut Value) -> Result<(), (u16, Value)> {
+    super::features::check_mapping(incoming)?;
     fn walk(cur: Option<&Value>, inc: &mut Value, prefix: &str) -> Result<(), (u16, Value)> {
         let Some(props) = inc.get_mut("properties").and_then(Value::as_object_mut) else {
             return Ok(());
@@ -885,7 +902,7 @@ fn parse_query(v: &Value) -> Result<Knn, EsError> {
 
 /// A `query_vector_builder` needs an inference model, which noida doesn't
 /// have (neither does a real node without machine learning).
-fn no_inference() -> EsError {
+pub(crate) fn no_inference() -> EsError {
     EsError::new(
         500,
         "illegal_state_exception",
@@ -955,23 +972,41 @@ fn allowed(
 }
 
 /// Each scored document's (index, score), filtered by the `similarity`
-/// threshold; documents without a vector don't match.
+/// threshold; documents without a vector don't match. A quantized field
+/// scores the quantized vectors, each index's as one segment.
 fn scored(knn: &Knn, f: &Field, docs: &[CommittedDoc]) -> Vec<(usize, f32)> {
     let threshold = knn.similarity.map(|s| min_score(f, s, f.dims.unwrap_or(0)));
-    docs.iter()
+    let vectors: Vec<(usize, Vec<f32>)> = docs
+        .iter()
         .enumerate()
         .filter_map(|(i, d)| {
             let v = source_value(&d.source, &knn.field)?;
             let v = doc_vector(f, &knn.field, &d.id, v).ok()?;
-            if v.len() != knn.query.len() {
-                return None;
-            }
-            let s = score(f, &knn.query, &v);
-            if threshold.is_some_and(|t| s < t) {
-                return None;
-            }
-            Some((i, s * knn.boost))
+            (v.len() == knn.query.len()).then_some((i, v))
         })
+        .collect();
+    let mut scores: Vec<f32> = vectors.iter().map(|(_, v)| score(f, &knn.query, v)).collect();
+    if let (Some(opts), Some(sim)) = (f.quant, f.sim) {
+        let mut segments: Vec<(&str, Vec<usize>)> = Vec::new();
+        for (n, (i, _)) in vectors.iter().enumerate() {
+            let index = docs[*i].index.as_str();
+            match segments.iter_mut().find(|(name, _)| *name == index) {
+                Some((_, members)) => members.push(n),
+                None => segments.push((index, vec![n])),
+            }
+        }
+        for (_, members) in segments {
+            let vs: Vec<&[f32]> = members.iter().map(|n| vectors[*n].1.as_slice()).collect();
+            for (n, s) in members.iter().zip(quantize::scores(opts, sim, &knn.query, &vs)) {
+                scores[*n] = s;
+            }
+        }
+    }
+    vectors
+        .iter()
+        .zip(scores)
+        .filter(|(_, s)| threshold.is_none_or(|t| *s >= t))
+        .map(|((i, _), s)| (*i, s * knn.boost))
         .collect()
 }
 
@@ -1242,6 +1277,30 @@ pub fn unsupported_doc_values(body: &Value, mappings: &Value) -> Option<EsError>
         Some(Value::String(s)) => names.push(s),
         _ => {}
     }
+    // Feature fields refuse sorting too.
+    let mut sorted: Vec<&str> = Vec::new();
+    let sorts = match body.get("sort") {
+        Some(Value::Array(a)) => a.iter().collect(),
+        Some(s) => vec![s],
+        None => Vec::new(),
+    };
+    for s in sorts {
+        match s {
+            Value::String(f) => sorted.push(f),
+            Value::Object(o) => sorted.extend(o.keys().map(String::as_str)),
+            _ => {}
+        }
+    }
+    let feature = names.iter().chain(&sorted).find_map(|f| {
+        let ty = field_def(mappings, f)?.get("type")?.as_str()?;
+        matches!(ty, "rank_feature" | "rank_features" | "sparse_vector").then_some(ty)
+    });
+    if let Some(ty) = feature {
+        return Some(EsError::shard_failure(
+            "illegal_argument_exception",
+            &format!("[{ty}] fields do not support sorting, scripting or aggregating"),
+        ));
+    }
     let f = names.into_iter().find(|f| field_def(mappings, f).and_then(Field::of).is_some())?;
     Some(EsError::shard_failure(
         "illegal_argument_exception",
@@ -1288,15 +1347,27 @@ pub fn script_function(name: &str, query: &Value, doc: &Value) -> Result<f64, St
         _ => return Err("query vector must be a list of numbers or a hex string".into()),
     };
     let element = doc.get("__vector").and_then(Value::as_str).unwrap_or("float");
-    if element == "bit" && name != "hamming" {
-        return Err(format!("[{name}] is not supported on [bit] vectors by noida"));
-    }
     if q.len() != v.len() {
         let (qd, vd) =
             if element == "bit" { (q.len() * 8, v.len() * 8) } else { (q.len(), v.len()) };
         return Err(format!(
             "The query vector has a different number of dimensions [{qd}] than the document vectors [{vd}]."
         ));
+    }
+    // A bit vector's L1 distance is its Hamming distance (L2: the root of
+    // it); dot product and cosine aren't defined for bits.
+    let bits = || -> f64 {
+        q.iter()
+            .zip(&v)
+            .map(|(a, b)| ((*a as i8 as u8) ^ (*b as i8 as u8)).count_ones() as f64)
+            .sum()
+    };
+    if element == "bit" {
+        return match name {
+            "hamming" | "l1norm" => Ok(bits()),
+            "l2norm" => Ok(bits().sqrt() as f32 as f64),
+            _ => Err(format!("{name} is not supported for bit vectors.")),
+        };
     }
     let dot: f64 = q.iter().zip(&v).map(|(a, b)| a * b).sum();
     Ok(match name {

@@ -158,6 +158,23 @@ fn parse_pattern(s: &str, pattern: &str, tz: i64) -> Option<i64> {
             run += 1;
         }
         if c.is_ascii_alphabetic() {
+            // Day and month names (`E`, `MMM`): English or French words,
+            // abbreviated with a trailing `.` or not.
+            if c == 'E' || (c == 'M' && run >= 3) {
+                let start = ti;
+                while ti < text.len() && (text[ti].is_alphabetic() || text[ti] == '.') {
+                    ti += 1;
+                }
+                let word: String = text[start..ti].iter().collect::<String>().to_lowercase();
+                if word.trim_end_matches('.').is_empty() {
+                    return None;
+                }
+                if c == 'M' {
+                    mo = month_number(word.trim_end_matches('.'))?;
+                }
+                pi += run;
+                continue;
+            }
             if c == 'X' || c == 'Z' {
                 let start = ti;
                 while ti < text.len() && (text[ti].is_ascii_digit() || "+-:Z".contains(text[ti])) {
@@ -185,7 +202,17 @@ fn parse_pattern(s: &str, pattern: &str, tz: i64) -> Option<i64> {
                 'H' => h = v,
                 'm' => mi = v,
                 's' => sec = v,
-                'S' => ms = v,
+                // A fraction of a second: its first three digits are the
+                // milliseconds (`SSSSSS` reads micros).
+                'S' => {
+                    let digits = ti - start;
+                    ms = match digits {
+                        1 => v * 100,
+                        2 => v * 10,
+                        3 => v,
+                        n => v / 10i64.pow(n as u32 - 3),
+                    };
+                }
                 _ => return None,
             }
             pi += run;
@@ -210,6 +237,52 @@ fn parse_pattern(s: &str, pattern: &str, tz: i64) -> Option<i64> {
         return None;
     }
     Some(from_fields(y, mo, d, h, mi, sec, ms) - offset.unwrap_or(tz))
+}
+
+/// A month's number from its English or French name or abbreviation.
+fn month_number(word: &str) -> Option<i64> {
+    const NAMES: [[&str; 12]; 2] = [
+        [
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ],
+        [
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ],
+    ];
+    const FRENCH_SHORT: [&str; 12] =
+        ["janv", "févr", "mars", "avr", "mai", "juin", "juil", "août", "sept", "oct", "nov", "déc"];
+    if let Some(i) = FRENCH_SHORT.iter().position(|m| *m == word) {
+        return Some(i as i64 + 1);
+    }
+    if word.chars().count() < 3 {
+        return None;
+    }
+    NAMES
+        .iter()
+        .find_map(|names| names.iter().position(|m| m.starts_with(word)))
+        .map(|i| i as i64 + 1)
 }
 
 /// Parses one date the way a `date` field with `format` does (default
@@ -312,7 +385,8 @@ pub fn parse_math(s: &str, now: i64, round_up: bool, format: Option<&str>, tz: i
     } else if let Some(pos) = s.find("||") {
         (parse(&s[..pos], format, tz)?, &s[pos + 2..])
     } else {
-        return parse(s, format, tz);
+        let t = parse(s, format, tz)?;
+        return Some(if round_up { t + round_up_fill(s, format, tz) } else { t });
     };
     let b = math.as_bytes();
     let mut i = 0;
@@ -347,6 +421,53 @@ pub fn parse_math(s: &str, now: i64, round_up: bool, format: Option<&str>, tz: i
         t = add(t, if op == b'-' { -n } else { n }, unit, tz);
     }
     Some(t)
+}
+
+/// What rounding up adds to a date parsed without some of its fields:
+/// Elasticsearch's round-up parser fills a missing time of day with its
+/// last millisecond (`2017-09-04` is `2017-09-04T23:59:59.999`), the way a
+/// `lte` or `gt` bound reads it.
+fn round_up_fill(s: &str, format: Option<&str>, tz: i64) -> i64 {
+    let format = format.unwrap_or("strict_date_optional_time||epoch_millis");
+    for f in format.split("||").map(str::trim) {
+        if parse(s, Some(f), tz).is_none() {
+            continue;
+        }
+        let pattern = match f {
+            "epoch_millis" | "epoch_second" => return 0,
+            "basic_date" | "year_month_day" | "year_month" | "year" | "strict_date" | "date" => {
+                return MS_DAY - 1;
+            }
+            "strict_date_optional_time"
+            | "date_optional_time"
+            | "strict_date_time"
+            | "date_time"
+            | "iso8601" => {
+                let Some((_, time)) = s.split_once(['T', 't']) else { return MS_DAY - 1 };
+                let time = time.split(['Z', 'z', '+', '-']).next().unwrap_or("");
+                return match (time.matches(':').count(), time.contains(['.', ','])) {
+                    (0, _) => 3_599_999,
+                    (1, _) => 59_999,
+                    (_, false) => 999,
+                    _ => 0,
+                };
+            }
+            p => p,
+        };
+        let has = |c: &[char]| pattern.contains(c);
+        return if !has(&['H', 'h', 'k', 'K']) {
+            MS_DAY - 1
+        } else if !has(&['m']) {
+            3_599_999
+        } else if !has(&['s']) {
+            59_999
+        } else if !has(&['S']) {
+            999
+        } else {
+            0
+        };
+    }
+    0
 }
 
 /// Formats `ms` with a Java-style pattern, or Elasticsearch's default

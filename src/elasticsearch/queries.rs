@@ -1,5 +1,5 @@
 //! Query types beyond the core set in `search.rs`: autocomplete
-//! (`match_phrase_prefix`, `match_bool_prefix`), relevance tuning
+//! (`match_phrase_prefix`), relevance tuning
 //! (`boosting`, `function_score`, `script_score`), `combined_fields`, and
 //! geo (`geo_distance`, `geo_bounding_box`). Scores follow
 //! Elasticsearch's formulas so ordering and `_score` match.
@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 
 use super::search::EsError;
 use super::search::{
-    CommittedDoc, analyze_for, bm25_scores, doc_tokens, eval, field_and_spec, query_text,
-    raw_values, resolve_field, sloppy_phrase_matches,
+    CommittedDoc, analyze_for, analyze_phrase, bm25_scores, doc_positions, doc_tokens, eval,
+    field_and_spec, query_text, raw_values, resolve_field,
 };
 use super::{dates, painless, vectors};
 
@@ -45,59 +45,22 @@ pub fn match_phrase_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -
     let slop = o.and_then(|o| o.get("slop")).and_then(Value::as_u64).unwrap_or(0) as usize;
     let max =
         o.and_then(|o| o.get("max_expansions")).and_then(Value::as_u64).unwrap_or(50) as usize;
-    let terms = analyze_for(mappings, field, &text);
-    let Some((last, head)) = terms.split_last() else { return Scores::new() };
+    let analyzer = o.and_then(|o| o.get("analyzer")).and_then(Value::as_str);
+    let positioned = analyze_phrase(mappings, field, &text, analyzer);
+    let Some(((last, last_pos), head)) = positioned.split_last() else { return Scores::new() };
     let per_doc = doc_tokens(mappings, docs, field);
+    let doc_pos = doc_positions(mappings, docs, field);
     let mut out = Scores::new();
     for exp in expansions(&per_doc, last, max) {
-        let mut phrase = head.to_vec();
-        phrase.push(exp);
+        let mut query = head.to_vec();
+        query.push((exp, *last_pos));
+        let phrase: Vec<String> = query.iter().map(|t| t.0.clone()).collect();
         let mut sc = bm25_scores(mappings, docs, field, &phrase, true);
-        sc.retain(|i, _| sloppy_phrase_matches(&per_doc[*i], &phrase, slop));
+        sc.retain(|i, _| super::analysis::phrase_matches(&doc_pos[*i], &query, slop));
         for (i, s) in sc {
             let e = out.entry(i).or_insert(0.0);
             *e = e.max(s);
         }
-    }
-    let b = boost_of(o);
-    out.values_mut().for_each(|s| *s *= b);
-    out
-}
-
-/// `match_bool_prefix`: every term a should/must `term` clause, the last
-/// one a constant-score `prefix`.
-pub fn match_bool_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Scores {
-    let Some((field, spec)) = field_and_spec(v) else { return Scores::new() };
-    let (text, o) = obj_spec(spec);
-    let and = o
-        .and_then(|o| o.get("operator"))
-        .and_then(Value::as_str)
-        .is_some_and(|op| op.eq_ignore_ascii_case("and"));
-    let terms = analyze_for(mappings, field, &text);
-    let Some((last, head)) = terms.split_last() else { return Scores::new() };
-    let per_doc = doc_tokens(mappings, docs, field);
-    let mut clauses: Vec<Scores> = head
-        .iter()
-        .map(|t| bm25_scores(mappings, docs, field, std::slice::from_ref(t), false))
-        .collect();
-    clauses.push(
-        per_doc
-            .iter()
-            .enumerate()
-            .filter(|(_, toks)| toks.iter().any(|t| t.starts_with(last.as_str())))
-            .map(|(i, _)| (i, 1.0))
-            .collect(),
-    );
-    let mut out = Scores::new();
-    let mut hits: HashMap<usize, usize> = HashMap::new();
-    for c in &clauses {
-        for (i, s) in c {
-            *out.entry(*i).or_insert(0.0) += s;
-            *hits.entry(*i).or_insert(0) += 1;
-        }
-    }
-    if and {
-        out.retain(|i, _| hits.get(i) == Some(&clauses.len()));
     }
     let b = boost_of(o);
     out.values_mut().for_each(|s| *s *= b);
@@ -370,12 +333,16 @@ pub fn function_score(
 
 /// The `doc` a scoring script sees: each field's values, `.value` the
 /// first.
-fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
+pub(super) fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
     let mut m = Map::new();
     // Only the fields the script names (`doc['x']`).
     let mut rest = src;
-    while let Some(i) = rest.find("doc[") {
-        rest = &rest[i + 4..];
+    // `doc['x']`, or `$('x', default)`.
+    let next = |s: &str| {
+        [s.find("doc[").map(|i| i + 4), s.find("$(").map(|i| i + 2)].into_iter().flatten().min()
+    };
+    while let Some(i) = next(rest) {
+        rest = &rest[i..];
         let q = rest.chars().next().unwrap_or('\'');
         let name: String = rest[1..].chars().take_while(|c| *c != q).collect();
         if let Some(v) = vectors::field_def(mappings, &name)
@@ -584,7 +551,7 @@ fn at_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
 }
 
 /// A document's points for `field` (a single point or an array of them).
-fn points(d: &CommittedDoc, field: &str) -> Vec<(f64, f64)> {
+pub(crate) fn points(d: &CommittedDoc, field: &str) -> Vec<(f64, f64)> {
     let Some(v) = at_path(&d.source, field) else { return vec![] };
     match v {
         // `[lon, lat]` is one point; an array of points is several.
