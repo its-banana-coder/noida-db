@@ -20,11 +20,17 @@ use super::templates::Templates;
 use super::tsdb;
 use super::vectors;
 
+mod cat_tables;
+mod cluster;
 mod ingest;
 mod lifecycle;
+mod monitor;
+pub(super) mod node;
+mod nodes;
 mod reindex;
 mod scripts;
 mod snapshots;
+mod stats;
 
 #[derive(Default, Serialize, Deserialize)]
 struct State {
@@ -38,6 +44,9 @@ struct State {
     /// scripts (see `lifecycle.rs`).
     #[serde(default)]
     admin: lifecycle::Admin,
+    /// Voting exclusions and desired nodes.
+    #[serde(default)]
+    cluster_meta: cluster::ClusterMeta,
     /// Open scrolls and points in time (in memory only, like a node's).
     #[serde(skip)]
     contexts: HashMap<String, SearchContext>,
@@ -111,6 +120,9 @@ struct Index {
     segments: HashMap<String, (u64, i64)>,
     #[serde(skip)]
     refreshes: u64,
+    /// Operation counters for `_stats` (a node's, so not persisted).
+    #[serde(skip)]
+    counters: stats::Counters,
 }
 
 /// `index.refresh_interval` (default 1s; `-1` turns periodic refresh off).
@@ -235,6 +247,7 @@ impl Engine {
         for name in names {
             if let Some(index) = state.indices.get_mut(&name) {
                 index.refresh(&name);
+                index.counters.existing_store = true;
             }
         }
         Self(Arc::new(Mutex::new(state)))
@@ -249,6 +262,7 @@ impl Engine {
 impl Engine {
     pub fn dispatch(&self, method: &str, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
         let (status, mut resp) = self.route(method, path, query, body);
+        self.observe(method, path, query, body, status, &resp);
         // `?local` on the alias reads is deprecated (it has no effect).
         if query.split('&').any(|p| p == "local" || p.starts_with("local="))
             && method == "GET"
@@ -403,6 +417,9 @@ impl Engine {
         if let Some(r) = self.lifecycle_route(method, &segments, &q, body) {
             return r;
         }
+        if let Some(r) = self.monitoring_route(method, &segments, &q, body, path) {
+            return r;
+        }
         if path == "/" || path.is_empty() {
             return (
                 200,
@@ -436,8 +453,6 @@ impl Engine {
         match segments.first() {
             Some(&"_cluster") => return self.cluster_api(method, &segments, &q, body),
             Some(&"_cat") => return self.cat_api(&segments, &q),
-            Some(&"_nodes") => return self.nodes_api(),
-            Some(&"_stats") => return self.stats_api("*"),
             _ => {}
         }
         if segments.first() == Some(&"_search") || segments.first() == Some(&"_count") {
@@ -638,7 +653,6 @@ impl Engine {
             }
             "_knn_search" if segments.len() == 2 => self.knn_search(method, segments[0], &q, body),
             "_pit" if method == "POST" => self.open_pit(index_name, &q, body),
-            "_stats" if method == "GET" => self.stats_api(index_name),
             "_delete_by_query" | "_update_by_query" => {
                 self.by_query(method, segments[1], index_name, &q, body)
             }
@@ -1545,68 +1559,22 @@ impl Engine {
         self.search_or_count(method, "_search", index, q, &body)
     }
 
-    /// Health of `indices` (all when `None`): green when no index wants
-    /// replicas, yellow otherwise (a single node can't place them).
+    /// Cluster health numbers over `names` (see `cluster::health_body`).
     fn health_of(s: &State, names: &[String]) -> Value {
-        let counts: Vec<(u64, u64)> =
-            names.iter().filter_map(|n| s.indices.get(n)).map(shard_counts).collect();
-        let pri = counts.iter().map(|(p, _)| *p as usize).sum::<usize>();
-        let replicas = counts.iter().map(|(p, r)| (p * r) as usize).sum::<usize>();
-        let status = if replicas > 0 { "yellow" } else { "green" };
-        let pct =
-            if pri + replicas == 0 { 100.0 } else { pri as f64 * 100.0 / (pri + replicas) as f64 };
-        json!({
-            "cluster_name": "docker-cluster", "status": status, "timed_out": false,
-            "number_of_nodes": 1, "number_of_data_nodes": 1,
-            "active_primary_shards": pri, "active_shards": pri, "relocating_shards": 0,
-            "initializing_shards": 0, "unassigned_shards": replicas,
-            "delayed_unassigned_shards": 0, "number_of_pending_tasks": 0,
-            "number_of_in_flight_fetch": 0, "task_max_waiting_in_queue_millis": 0,
-            "active_shards_percent_as_number": pct,
-        })
+        cluster::health_body(s, names)
     }
 
-    /// `_cluster/health[/<indices>]`, `_cluster/settings`, `_cluster/state`
-    /// (minimal), `_cluster/stats` (minimal).
+    /// `_cluster/settings` (the other `_cluster` APIs are in
+    /// `cluster.rs`).
     fn cluster_api(
         &self,
         method: &str,
         segments: &[&str],
-        q: &HashMap<String, String>,
+        _q: &HashMap<String, String>,
         body: &[u8],
     ) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
         match segments.get(1).copied() {
-            Some("health") => {
-                let names: Vec<String> = match segments.get(2) {
-                    Some(p) => {
-                        let names = Self::resolve_indices(&s, p);
-                        if names.is_empty() {
-                            // Elasticsearch waits for the index to appear,
-                            // then gives up red.
-                            let mut h = Self::health_of(&s, &[]);
-                            h["status"] = json!("red");
-                            h["timed_out"] = json!(true);
-                            return (408, h);
-                        }
-                        names
-                    }
-                    None => s.indices.keys().cloned().collect(),
-                };
-                let mut h = Self::health_of(&s, &names);
-                if let Some(want) = q.get("wait_for_status") {
-                    let rank = |st: &str| match st {
-                        "green" => 0,
-                        "yellow" => 1,
-                        _ => 2,
-                    };
-                    if rank(h["status"].as_str().unwrap_or("red")) > rank(want) {
-                        h["timed_out"] = json!(true);
-                        return (408, h);
-                    }
-                }
-                (200, h)
-            }
             Some("settings") => {
                 if method == "PUT" {
                     let Some(req) = parse_json(body) else { return (400, malformed_body()) };
@@ -1662,23 +1630,6 @@ impl Engine {
                     }),
                 )
             }
-            Some("state") => (
-                200,
-                json!({"cluster_name": "docker-cluster", "cluster_uuid": "noida-local",
-                       "master_node": "noida", "metadata": {"indices": s.indices.keys().map(|k| (k.clone(), json!({"state": "open"}))).collect::<Map<String, Value>>()}}),
-            ),
-            Some("stats") => {
-                let docs: usize = s.indices.values().map(|i| i.committed.len()).sum();
-                (
-                    200,
-                    json!({"cluster_name": "docker-cluster", "cluster_uuid": "noida-local",
-                           "status": Self::health_of(&s, &s.indices.keys().cloned().collect::<Vec<_>>())["status"],
-                           "indices": {"count": s.indices.len(), "docs": {"count": docs, "deleted": 0},
-                                       "mappings": {"field_types": field_type_stats(&s),
-                                                    "runtime_field_types": []}},
-                           "nodes": {"count": {"total": 1, "data": 1, "master": 1}}}),
-                )
-            }
             _ => no_handler(method, &format!("/{}", segments.join("/"))),
         }
     }
@@ -1703,138 +1654,7 @@ impl Engine {
                 i.auto_refresh(n);
             }
         }
-        let size_of = |i: &Index| -> u64 {
-            i.docs.values().map(|d| d.source.to_string().len() as u64 + 120).sum()
-        };
         match segments.get(1).copied() {
-            Some("indices") => {
-                let rows = names
-                    .iter()
-                    .map(|n| {
-                        let i = &s.indices[n];
-                        let health = Self::health_of(&s, std::slice::from_ref(n))["status"]
-                            .as_str()
-                            .unwrap_or("green")
-                            .to_string();
-                        let rep = if health == "yellow" { "1" } else { "0" };
-                        let size = cat::human_bytes(size_of(i));
-                        vec![
-                            health,
-                            if i.opened { "open" } else { "close" }.to_string(),
-                            n.clone(),
-                            format!("noida-{n}"),
-                            "1".into(),
-                            rep.into(),
-                            i.committed.len().to_string(),
-                            "0".into(),
-                            size.clone(),
-                            size.clone(),
-                            size,
-                        ]
-                    })
-                    .collect();
-                (
-                    200,
-                    cat::render(
-                        &[
-                            "health",
-                            "status",
-                            "index",
-                            "uuid",
-                            "pri",
-                            "rep",
-                            "docs.count",
-                            "docs.deleted",
-                            "store.size",
-                            "pri.store.size",
-                            "dataset.size",
-                        ],
-                        &[
-                            "pri",
-                            "rep",
-                            "docs.count",
-                            "docs.deleted",
-                            "store.size",
-                            "pri.store.size",
-                            "dataset.size",
-                        ],
-                        rows,
-                        q,
-                    ),
-                )
-            }
-            Some("count") => {
-                let (epoch, ts) = cat::now_columns();
-                let count: usize = names.iter().map(|n| s.indices[n].committed.len()).sum();
-                (
-                    200,
-                    cat::render(
-                        &["epoch", "timestamp", "count"],
-                        &["epoch", "count"],
-                        vec![vec![epoch, ts, count.to_string()]],
-                        q,
-                    ),
-                )
-            }
-            Some("health") => {
-                let (epoch, ts) = cat::now_columns();
-                let all: Vec<String> = s.indices.keys().cloned().collect();
-                let h = Self::health_of(&s, &all);
-                let row = vec![
-                    epoch,
-                    ts,
-                    "docker-cluster".into(),
-                    h["status"].as_str().unwrap_or("green").to_string(),
-                    "1".into(),
-                    "1".into(),
-                    h["active_shards"].to_string(),
-                    h["active_primary_shards"].to_string(),
-                    "0".into(),
-                    "0".into(),
-                    h["unassigned_shards"].to_string(),
-                    "0".into(),
-                    "-".into(),
-                    format!(
-                        "{:.1}%",
-                        h["active_shards_percent_as_number"].as_f64().unwrap_or(100.0)
-                    ),
-                ];
-                (
-                    200,
-                    cat::render(
-                        &[
-                            "epoch",
-                            "timestamp",
-                            "cluster",
-                            "status",
-                            "node.total",
-                            "node.data",
-                            "shards",
-                            "pri",
-                            "relo",
-                            "init",
-                            "unassign",
-                            "pending_tasks",
-                            "max_task_wait_time",
-                            "active_shards_percent",
-                        ],
-                        &[
-                            "node.total",
-                            "node.data",
-                            "shards",
-                            "pri",
-                            "relo",
-                            "init",
-                            "unassign",
-                            "pending_tasks",
-                            "max_task_wait_time",
-                            "active_shards_percent",
-                        ],
-                        vec![row],
-                        q,
-                    ),
-                )
-            }
             Some("aliases") => {
                 let mut rows = Vec::new();
                 let mut idx: Vec<&String> = s.indices.keys().collect();
@@ -1910,94 +1730,8 @@ impl Engine {
                     ),
                 )
             }
-            Some("nodes") => (
-                200,
-                cat::render(
-                    &[
-                        "ip",
-                        "heap.percent",
-                        "ram.percent",
-                        "cpu",
-                        "load_1m",
-                        "load_5m",
-                        "load_15m",
-                        "node.role",
-                        "master",
-                        "name",
-                    ],
-                    &["heap.percent", "ram.percent", "cpu", "load_1m", "load_5m", "load_15m"],
-                    vec![vec![
-                        "127.0.0.1".into(),
-                        "10".into(),
-                        "50".into(),
-                        "1".into(),
-                        "0.00".into(),
-                        "0.00".into(),
-                        "0.00".into(),
-                        "cdfhilmrstw".into(),
-                        "*".into(),
-                        "noida".into(),
-                    ]],
-                    q,
-                ),
-            ),
             _ => no_handler("GET", &format!("/{}", segments.join("/"))),
         }
-    }
-
-    fn nodes_api(&self) -> (u16, Value) {
-        (
-            200,
-            json!({
-                "_nodes": {"total": 1, "successful": 1, "failed": 0},
-                "cluster_name": "docker-cluster",
-                "nodes": {"noida": {
-                    "name": "noida", "transport_address": "127.0.0.1:9300", "host": "127.0.0.1",
-                    "ip": "127.0.0.1", "version": "8.15.3", "build_flavor": "default",
-                    "build_type": "docker", "roles": ["data", "ingest", "master"],
-                    "http": {"publish_address": "127.0.0.1:9200", "bound_address": ["127.0.0.1:9200"]},
-                }},
-            }),
-        )
-    }
-
-    /// `/_stats`, `/<index>/_stats`: document counts (of the refreshed view,
-    /// as Elasticsearch reports them) and an approximate store size.
-    fn stats_api(&self, pattern: &str) -> (u16, Value) {
-        let s = self.0.lock().unwrap();
-        let names = Self::resolve_indices(&s, pattern);
-        if names.is_empty() && pattern != "*" && pattern != "_all" {
-            return missing_index(pattern);
-        }
-        let section = |count: usize, size: u64| {
-            json!({"docs": {"count": count, "deleted": 0, "total_size_in_bytes": size},
-                   "store": {"size_in_bytes": size, "total_data_set_size_in_bytes": size, "reserved_in_bytes": 0},
-                   "indexing": {"index_total": count, "index_current": 0, "delete_total": 0},
-                   "search": {"query_total": 0, "query_current": 0}})
-        };
-        let mut indices = Map::new();
-        let (mut all_count, mut all_size) = (0, 0);
-        for n in &names {
-            let i = &s.indices[n];
-            let size: u64 = i.docs.values().map(|d| d.source.to_string().len() as u64 + 120).sum();
-            let count = i.committed.len();
-            all_count += count;
-            all_size += size;
-            indices.insert(
-                n.clone(),
-                json!({"uuid": format!("noida-{n}"), "health": Self::health_of(&s, std::slice::from_ref(n))["status"],
-                       "status": "open", "primaries": section(count, size), "total": section(count, size)}),
-            );
-        }
-        let shards = names.len();
-        (
-            200,
-            json!({
-                "_shards": {"total": shards * 2, "successful": shards, "failed": 0},
-                "_all": {"primaries": section(all_count, all_size), "total": section(all_count, all_size)},
-                "indices": indices,
-            }),
-        )
     }
 
     /// `POST/GET /_search/scroll` (next page) and `DELETE /_search/scroll`
@@ -2226,6 +1960,9 @@ impl Engine {
                     super::docparse::normalize(&mut index.mappings);
                 }
                 if let Some(st) = req.get("settings") {
+                    if let Err(e) = translog_retention_check(st) {
+                        return e;
+                    }
                     apply_settings(&mut index.settings, st);
                 }
                 if let Err(e) = tsdb::validate_new_settings(&index.settings)
@@ -6136,6 +5873,25 @@ const STATIC_SETTINGS: &[&str] = &[
 
 /// A settings update: unknown settings and (on an open index) static
 /// ones are refused, as Elasticsearch does.
+/// Soft deletes replaced translog retention in 8.0: its settings are
+/// refused.
+fn translog_retention_check(settings: &Value) -> Result<(), (u16, Value)> {
+    if flat_settings(settings).iter().any(|(k, v)| {
+        let k = k.trim_start_matches("index.");
+        (k == "translog.retention.size" || k == "translog.retention.age") && !v.is_null()
+    }) {
+        return Err((
+            400,
+            error(
+                "illegal_argument_exception",
+                "Translog retention settings [index.translog.retention.age] and [index.translog.retention.size] are no longer supported. Please do not specify values for these settings",
+                400,
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_settings(req: &Value, update: bool) -> Result<(), (u16, Value)> {
     let flat = flat_settings(req);
     for (k, _) in &flat {
@@ -6153,6 +5909,7 @@ fn validate_settings(req: &Value, update: bool) -> Result<(), (u16, Value)> {
             ));
         }
     }
+    translog_retention_check(req)?;
     if update {
         let statics: Vec<&String> = flat
             .iter()

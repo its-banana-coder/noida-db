@@ -6,13 +6,15 @@ client runs) against a server, and reports how much of it passes.
 
 Implements the runner contract in the suite's README: `do` (by API name,
 resolved through the JSON API specs), `catch`, `headers`, `warnings`,
-`match` (regexes included), `length`, `is_true`/`is_false`, `gt`/`gte`/
-`lt`/`lte`, `contains`, `close_to`, `set` and stash substitution,
-`setup`/`teardown`, and `requires`/`skip`. A test needing something a
-runner may decline (the capabilities API, a runner feature not listed in
-FEATURES, `awaits_fix`, another distribution) is skipped, never counted
-as a failure; the same skips apply to any server, so a run against real
-Elasticsearch calibrates the runner.
+`match` (regexes included), `length`, `is_true`/`is_false`, `exists`,
+`gt`/`gte`/`lt`/`lte`, `contains`, `close_to`, `set` and stash
+substitution, `setup`/`teardown`, and `requires`/`skip` (capabilities are
+asked of the server's `_capabilities` API, `gte_vX` cluster features are
+read off the 8.15.3 version). A test needing something a runner may
+decline (a runner feature not listed in FEATURES, `awaits_fix`, another
+distribution) is skipped, never counted as a failure; the same skips
+apply to any server, so a run against real Elasticsearch calibrates the
+runner.
 
 Prints a per-directory table and writes a JSON report (`--json PATH`).
 """
@@ -55,8 +57,9 @@ VERSION = (8, 15, 3)
 FEATURES = {
     "headers", "stash_in_path", "stash_in_key", "embedded_stash_key", "warnings",
     "warnings_regex", "allowed_warnings", "allowed_warnings_regex", "contains",
-    "close_to", "arbitrary_key", "default_shards", "xpack",
+    "close_to", "arbitrary_key", "default_shards", "xpack", "capabilities",
 }
+COMMON_PARAMS = set()
 
 
 class Skip(Exception):
@@ -70,7 +73,7 @@ class Fail(Exception):
 def load_apis():
     apis = {}
     for f in os.listdir(API_DIR):
-        if f.endswith(".json") and not f.startswith("_"):
+        if f.endswith(".json") and f != "_common.json":
             with open(os.path.join(API_DIR, f)) as fh:
                 apis.update(json.load(fh))
     return apis
@@ -101,7 +104,27 @@ def in_range(spec):
     return False
 
 
-def check_prereqs(section):
+def capabilities_supported(runner, checks):
+    """Asks the server's `_capabilities` API about each check, as the Java
+    runner does: true only when every one is reported as supported."""
+    for c in checks if isinstance(checks, list) else [checks]:
+        q = {"method": c.get("method", "GET"), "path": c.get("path", "/")}
+        for k in ("parameters", "capabilities"):
+            v = c.get(k) or []
+            v = [v] if isinstance(v, str) else v
+            if v:
+                q[k] = ",".join(v)
+        status, raw, _ = runner.http("GET", "/_capabilities", q, None, {}, False)
+        try:
+            supported = json.loads(raw).get("supported") if status == 200 else None
+        except ValueError:
+            supported = None
+        if supported is not True:
+            return False
+    return True
+
+
+def check_prereqs(section, runner=None):
     for step in section:
         if not isinstance(step, dict):
             continue
@@ -113,7 +136,8 @@ def check_prereqs(section):
                 if f not in FEATURES:
                     raise Skip(f"runner feature {f}")
             if req.get("capabilities"):
-                raise Skip("capabilities API")
+                if runner is None or not capabilities_supported(runner, req["capabilities"]):
+                    raise Skip("capabilities not supported")
             cf = req.get("cluster_features") or []
             cf = [cf] if isinstance(cf, str) else cf
             for f in cf:
@@ -130,7 +154,8 @@ def check_prereqs(section):
             if sk.get("awaits_fix"):
                 raise Skip("awaits_fix")
             if sk.get("capabilities"):
-                raise Skip("capabilities API")
+                if runner is None or capabilities_supported(runner, sk["capabilities"]):
+                    raise Skip("capabilities supported")
             if "version" in sk and in_range(sk["version"]):
                 raise Skip(f"version {sk['version']}")
             cf = sk.get("cluster_features") or []
@@ -176,11 +201,16 @@ class Runner:
         except urllib.error.HTTPError as e:
             return e.code, e.read(), dict(e.headers)
 
-    def call(self, api, params, headers):
+    def call(self, api, params, headers, catch=None):
         spec = APIS.get(api)
         if spec is None:
             raise Skip(f"unknown api {api}")
         params = dict(params or {})
+        if catch == "param":
+            parts = {k for p in spec["url"]["paths"] for k in (p.get("parts") or {})}
+            known = set(spec.get("params") or {}) | parts | COMMON_PARAMS | {"body", "ignore"}
+            if any(k not in known for k in params):
+                return ("param", None)
         body = params.pop("body", None)
         ignore = params.pop("ignore", None)
         parts_given = {k for k in params}
@@ -215,8 +245,11 @@ class Runner:
             headers = dict(headers, Accept="application/json")
         status, raw, rh = self.http(method, path, query, body, headers, ndjson)
         text = raw.decode("utf-8", "replace")
+        ctype = next((v for k, v in rh.items() if k.lower() == "content-type"), "")
         if method == "HEAD":
             parsed = status == 200
+        elif ctype and "json" not in ctype.lower():
+            parsed = text
         else:
             try:
                 parsed = json.loads(text) if text.strip() else ""
@@ -327,7 +360,7 @@ class Runner:
             arg.pop("node_selector", None)
             (api, params), = arg.items()
             params = self.subst(params or {})
-            res = self.call(api, params, headers)
+            res = self.call(api, params, headers, catch)
             if res[0] == "param":
                 if catch == "param":
                     return
@@ -417,6 +450,11 @@ class Runner:
                     ok = False
                 if not ok:
                     raise Fail(f"contains {path}: {json.dumps(expected)[:120]} not in {json.dumps(v)[:200]}")
+            return
+        if kind == "exists":
+            v = self.lookup(self.subst(arg))
+            if v is None:
+                raise Fail(f"exists {arg}: missing")
             return
         if kind == "close_to":
             for path, spec in arg.items():
@@ -514,15 +552,15 @@ class Runner:
                     tests.append((name, steps or []))
         results = []
         try:
-            check_prereqs(setup)
-            check_prereqs(teardown)
+            check_prereqs(setup, self)
+            check_prereqs(teardown, self)
         except Skip as s:
             return [(n, "skip", str(s)) for n, _ in tests]
         for name, steps in tests:
             self.stash = {}
             self.response = None
             try:
-                check_prereqs(steps)
+                check_prereqs(steps, self)
                 self.cleanup()
                 for st in setup:
                     self.step(st)
@@ -554,6 +592,11 @@ def main():
         args = [a for a in args if a != json_out]
     base, targets = args[0], args[1:]
     APIS = load_apis()
+    try:
+        with open(os.path.join(API_DIR, "_common.json")) as fh:
+            COMMON_PARAMS.update(json.load(fh).get("params", {}))
+    except OSError:
+        pass
     files = []
     for t in targets or sorted(os.listdir(TEST_DIR)):
         p = t if os.path.isabs(t) else os.path.join(TEST_DIR, t)

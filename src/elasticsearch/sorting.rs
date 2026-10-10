@@ -138,7 +138,7 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
                         &format!("Field [{f}] of type [dense_vector] doesn't support sort"),
                     ));
                 }
-                if ty.as_deref() == Some("text") {
+                if ty.as_deref() == Some("text") && !fielddata_enabled(mappings, f) {
                     return Err(EsError::shard_failure(
                         "illegal_argument_exception",
                         &format!(
@@ -217,6 +217,27 @@ fn date_key(v: &Value, d: &DateSort) -> Option<Value> {
         dates::value_millis(v, d.parse.as_deref())
     }
     .map(|n| json!(n))
+}
+
+/// Whether a text field (multi-fields included) has `fielddata: true`.
+fn fielddata_enabled(mappings: &Value, field: &str) -> bool {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut props = mappings.get("properties");
+    for (i, seg) in segs.iter().enumerate() {
+        let Some(node) = props.and_then(|p| p.get(*seg)) else { return false };
+        let def = if i + 1 == segs.len() {
+            Some(node)
+        } else if i + 2 == segs.len() {
+            node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        } else {
+            None
+        };
+        if let Some(d) = def {
+            return d.get("fielddata").and_then(Value::as_bool) == Some(true);
+        }
+        props = node.get("properties");
+    }
+    false
 }
 
 /// One field value as a sort key of the field's type.
@@ -302,13 +323,23 @@ pub fn keys(specs: &[SortSpec], doc: &CommittedDoc, doc_idx: usize, score: f32) 
             }
             Key::Field { path, ty, date } => {
                 let ty = ty.as_deref();
-                let mut vals: Vec<Value> = raw_values(&doc.source, path)
-                    .into_iter()
-                    .filter_map(|v| match date {
-                        Some(d) => date_key(v, d),
-                        None => typed_value(v, ty),
-                    })
-                    .collect();
+                let mut vals: Vec<Value> = if ty == Some("text") {
+                    // Field data of a text field: its analyzed terms.
+                    raw_values(&doc.source, path)
+                        .into_iter()
+                        .filter_map(Value::as_str)
+                        .flat_map(super::analysis::standard)
+                        .map(Value::String)
+                        .collect()
+                } else {
+                    raw_values(&doc.source, path)
+                        .into_iter()
+                        .filter_map(|v| match date {
+                            Some(d) => date_key(v, d),
+                            None => typed_value(v, ty),
+                        })
+                        .collect()
+                };
                 if vals.is_empty() {
                     return missing_value(s, ty);
                 }
