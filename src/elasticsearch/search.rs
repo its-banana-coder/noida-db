@@ -2410,6 +2410,13 @@ pub fn search_with(
     // `rescore` re-ranks the top of a score-ordered result (a field sort
     // refuses it).
     let field_sort = specs.iter().any(|s| !s.is_score());
+    // With `collapse`, the group heads (by the query's score) are rescored.
+    let mut uncollapsed = None;
+    if let (Some(c), Some(_)) = (&collapse, body.get("rescore")) {
+        uncollapsed = Some(ranked.clone());
+        let mut seen = HashSet::new();
+        ranked.retain(|h| seen.insert(collapse_key(&docs[h.0], c).to_string()));
+    }
     let rescored = if specs.is_empty() || field_sort {
         rescore::apply(body, field_sort, &mut ranked, mappings, docs)?
     } else {
@@ -2431,7 +2438,7 @@ pub fn search_with(
         ranked.retain(|h| sorting::compare_keys(&specs, &h.2, &after) == Ordering::Greater);
     }
     // Field collapsing: the top hit of each value; inner hits per group.
-    let all_ranked = ranked.clone();
+    let all_ranked = uncollapsed.unwrap_or_else(|| ranked.clone());
     if let Some(c) = &collapse {
         let mut seen = HashSet::new();
         ranked.retain(|h| seen.insert(collapse_key(&docs[h.0], c).to_string()));

@@ -1679,6 +1679,31 @@ scenario("dsl_parse_errors", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
     ("POST", DS, q({"range": {"n": {"gte": "abc"}}})),
 ])
 
+
+TERM_DOCS = [{"b": True, "k": ["a", "b"], "t": "a b c", "d": "2017/01/01", "p": "x"},
+             {"b": False, "k": "a", "t": "a", "d": "2017/01/02", "p": "y"},
+             {"b": True, "k": "Key1", "t": "c", "d": "2017/01/01", "p": "x"}]
+TERM_MAPPING = {"settings": {"index": {"refresh_interval": "-1", "number_of_shards": 1}},
+                "mappings": {"properties": {"b": {"type": "boolean"}, "k": {"type": "keyword"}, "t": {"type": "text"},
+                                            "d": {"type": "date", "format": "yyyy/MM/dd"}, "p": {"type": "keyword"}}}}
+TS = "/dsl-term/_search"
+scenario("dsl_term_scoring", setup("dsl-term", TERM_MAPPING, TERM_DOCS) + [
+    ("POST", TS, q({"term": {"b": True}}), HITS),
+    ("POST", TS, q({"term": {"k": "a"}}), HITS),
+    ("POST", TS, q({"term": {"k": {"value": "a", "boost": 3}}}), HITS),
+    ("POST", TS, q({"term": {"t": "a"}}), HITS),
+    ("POST", TS, q({"term": {"k": {"value": "KEY1", "case_insensitive": True}}}), HITS),
+    ("POST", TS, q({"prefix": {"k": {"value": "KE", "case_insensitive": True}}}), HITS),
+    ("POST", TS, q({"wildcard": {"k": {"value": "K?Y*", "case_insensitive": True}}}), HITS),
+    ("POST", TS, q({"match": {"d": {"query": "2017/01/01"}}}), HITS),
+    ("POST", TS, q({"term": {"d": "2017/01/02"}}), HITS),
+    ("POST", TS, q({"match": {"d": "not a date"}})),
+    ("POST", TS, q({"bool": {"filter": {"match": {"t": "a"}}, "should": {"term": {"k": "a"}}}}, collapse={"field": "p"},
+                   rescore={"query": {"rescore_query": {"term": {"b": False}}, "query_weight": 0, "rescore_query_weight": 1}}),
+     {"pick": lambda r: [(h["_id"], h["_score"], h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("DELETE", "/dsl-term"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

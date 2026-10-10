@@ -574,6 +574,13 @@ pub fn eval_extra(
             {
                 return Some(numeric_match(field, &ty, spec, docs));
             }
+            if matches!(resolve_field(mappings, field).1.as_deref(), Some("date" | "date_nanos")) {
+                let text = match spec {
+                    Value::Object(o) => o.get("query").cloned().unwrap_or(Value::Null),
+                    other => other.clone(),
+                };
+                return Some(date_term(field, &text, spec, mappings, docs));
+            }
             let extra = ["fuzziness", "minimum_should_match", "zero_terms_query"]
                 .iter()
                 .any(|k| spec.get(*k).is_some());
@@ -581,6 +588,20 @@ pub fn eval_extra(
                 return None;
             }
             fuzzy::eval_match(v, mappings, docs)
+        }
+        "term" | "prefix" | "wildcard" | "regexp" if case_insensitive(v) => {
+            Ok(case_insensitive_query(name, v, mappings, docs))
+        }
+        "term" => {
+            let (field, spec) = v.as_object().and_then(|o| o.iter().next())?;
+            if !matches!(resolve_field(mappings, field).1.as_deref(), Some("date" | "date_nanos")) {
+                return None;
+            }
+            let value = match spec {
+                Value::Object(o) => o.get("value").cloned().unwrap_or(Value::Null),
+                other => other.clone(),
+            };
+            date_term(field, &value, spec, mappings, docs)
         }
         "exists" if v.get("field").and_then(Value::as_str) == Some("_source") => Err(
             EsError::shard_failure("query_shard_exception", "The _source field is not searchable"),
@@ -768,6 +789,101 @@ pub fn java_hash_order(names: &mut [&String]) {
         cap *= 2;
     }
     names.sort_by_key(|n| hash(n) as usize & (cap - 1));
+}
+
+fn case_insensitive(v: &Value) -> bool {
+    v.as_object()
+        .and_then(|o| o.values().next())
+        .and_then(|s| s.get("case_insensitive"))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// `term`/`prefix`/`wildcard`/`regexp` with `case_insensitive: true`: the
+/// pattern matched against lowercased index terms, constant score.
+fn case_insensitive_query(
+    kind: &str,
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Scores {
+    let Some((field, spec)) = v.as_object().and_then(|o| o.iter().next()) else {
+        return Scores::new();
+    };
+    let value = spec.get("value").or_else(|| spec.get(kind)).cloned().unwrap_or(Value::Null);
+    let text = match &value {
+        Value::String(s) => s.to_lowercase(),
+        other => other.to_string(),
+    };
+    let boost = spec.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    let pattern = match kind {
+        "term" => format!("^{}$", regex_lite::escape(&text)),
+        "prefix" => format!("^{}", regex_lite::escape(&text)),
+        "wildcard" => {
+            let mut re = String::from("^");
+            for c in text.chars() {
+                match c {
+                    '*' => re.push_str(".*"),
+                    '?' => re.push('.'),
+                    c => re.push_str(&regex_lite::escape(&c.to_string())),
+                }
+            }
+            re.push('$');
+            re
+        }
+        _ => format!("^(?:{text})$"),
+    };
+    let Ok(re) = regex_lite::Regex::new(&pattern) else { return Scores::new() };
+    docs.iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            super::search::tokens_for(mappings, &d.source, field)
+                .iter()
+                .any(|t| re.is_match(&t.to_lowercase()))
+        })
+        .map(|(i, _)| (i, boost))
+        .collect()
+}
+
+/// `term`/`match` on a date field: documents whose value is that instant
+/// (parsed with the field's format), constant score.
+fn date_term(
+    field: &str,
+    value: &Value,
+    spec: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<Scores, EsError> {
+    let format = field_def(mappings, field)
+        .and_then(|d| d.get("format"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let boost = spec.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+    let target = match value {
+        Value::String(s) => dates::parse_math(s, dates::now_ms(), false, format.as_deref(), 0),
+        other => dates::value_millis(other, format.as_deref()),
+    };
+    let Some(target) = target else {
+        let shown = value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string());
+        let f = format.unwrap_or_else(|| "strict_date_optional_time||epoch_millis".into());
+        return Err(EsError::shard_failure(
+            "parse_exception",
+            &format!(
+                "failed to parse date field [{shown}] with format [{f}]: [failed to parse date \
+                 field [{shown}] with format [{f}]]"
+            ),
+        ));
+    };
+    Ok(docs
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            raw_values(&d.source, field)
+                .into_iter()
+                .any(|x| dates::value_millis(x, format.as_deref()) == Some(target))
+        })
+        .map(|(i, _)| (i, boost))
+        .collect())
 }
 
 /// A duration with its unit (`1h`, `100000000nanos`) in nanoseconds.
