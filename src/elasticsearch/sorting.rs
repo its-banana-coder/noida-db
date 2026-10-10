@@ -20,6 +20,8 @@ enum Key {
         /// sort values are shown (the sort's `format`), and the
         /// resolution they compare at (`numeric_type`).
         date: Option<DateSort>,
+        /// A `text` field's index analyzer (its field data are the terms).
+        analyzer: Option<String>,
     },
     /// A time-series document's `_tsid` (ordered by its bytes).
     Tsid,
@@ -166,7 +168,10 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
                             .map_or(ty.as_deref() == Some("date_nanos"), |n| n == "date_nanos"),
                     }
                 });
-                Key::Field { path, ty, date }
+                let analyzer = (ty.as_deref() == Some("text")).then(|| {
+                    super::analysis::field_analyzer_name(mappings, f, super::analysis::Mode::Index)
+                });
+                Key::Field { path, ty, date, analyzer }
             }
         };
         let desc = match order.as_deref() {
@@ -321,14 +326,17 @@ pub fn keys(specs: &[SortSpec], doc: &CommittedDoc, doc_idx: usize, score: f32) 
                     None => Value::Null,
                 }
             }
-            Key::Field { path, ty, date } => {
+            Key::Field { path, ty, date, analyzer } => {
                 let ty = ty.as_deref();
                 let mut vals: Vec<Value> = if ty == Some("text") {
                     // Field data of a text field: its analyzed terms.
                     raw_values(&doc.source, path)
                         .into_iter()
                         .filter_map(Value::as_str)
-                        .flat_map(super::analysis::standard)
+                        .flat_map(|s| {
+                            super::analysis::analyzer(analyzer.as_deref().unwrap_or("standard"))
+                                .terms(s)
+                        })
                         .map(Value::String)
                         .collect()
                 } else {

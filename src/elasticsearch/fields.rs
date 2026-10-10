@@ -148,7 +148,18 @@ fn format_value(leaf: &Leaf, v: &Value, format: Option<&str>) -> Option<Value> {
             Some(json!(f))
         }
         "token_count" => match v {
-            Value::String(s) => Some(json!(super::analysis::standard(s).len())),
+            Value::String(s) => {
+                let name = leaf.node.get("analyzer").and_then(Value::as_str).unwrap_or("standard");
+                let tokens = super::analysis::analyzer(name).tokens(s);
+                // Position increments count, unless switched off.
+                let count: u64 =
+                    if leaf.node.get("enable_position_increments") == Some(&json!(false)) {
+                        tokens.len() as u64
+                    } else {
+                        tokens.iter().map(|t| u64::from(t.pos_inc)).sum()
+                    };
+                Some(json!(count))
+            }
             _ => None,
         },
         "boolean" => match v {

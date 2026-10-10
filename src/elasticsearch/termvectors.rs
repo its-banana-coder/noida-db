@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, HashMap};
 
 use super::analysis;
-use super::search::{analyze_for, raw_values};
+use super::search::raw_values;
 
 /// A term vectors request's options (URL parameters, body fields, or an
 /// `_mtermvectors` item's fields over the request-wide `parameters`).
@@ -213,9 +213,10 @@ fn is_text(ty: &str) -> bool {
 /// One analyzed token: term, position, character offsets.
 type Token = (String, usize, usize, usize);
 
-/// `text`'s tokens for `field`, with positions and offsets. The
-/// analyzer gives the terms; their offsets are found in the text in
-/// order (falling back to the matching word's).
+/// `text`'s tokens for `field`, with positions and offsets, as the
+/// analysis engine produces them (the field's index analyzer, or
+/// `analyzer`); a non-text field's value is one token (after a keyword
+/// field's normalizer).
 fn tokens(
     mappings: &Value,
     field: &str,
@@ -223,35 +224,18 @@ fn tokens(
     text: &str,
     analyzer: Option<&str>,
 ) -> Vec<Token> {
-    let terms = match analyzer {
-        Some(a) => analysis::analyze(a, text),
-        None if is_text(ty) => analyze_for(mappings, field, text),
-        None => vec![text.to_string()],
+    let toks = match analyzer {
+        Some(a) => analysis::analyzer(a).tokens(text),
+        None if is_text(ty) => analysis::field_tokens(mappings, field, text, analysis::Mode::Index),
+        None => {
+            let term = analysis::normalize(mappings, field, text);
+            return vec![(term, 0, 0, text.chars().count())];
+        }
     };
-    if !is_text(ty) && analyzer.is_none() {
-        return terms.into_iter().map(|t| (t, 0, 0, text.chars().count())).collect();
-    }
-    let lower: Vec<char> = text.to_lowercase().chars().collect();
-    let char_at = |byte: usize| text[..byte.min(text.len())].chars().count();
-    let words: Vec<(usize, usize)> = analysis::standard_with_offsets(text)
-        .into_iter()
-        .map(|(_, s, e)| (char_at(s), char_at(e)))
-        .collect();
-    let mut cursor = 0;
-    terms
-        .into_iter()
-        .enumerate()
-        .map(|(pos, t)| {
-            let tc: Vec<char> = t.to_lowercase().chars().collect();
-            let found = (cursor..lower.len().saturating_sub(tc.len()) + 1)
-                .find(|&i| !tc.is_empty() && lower[i..].starts_with(&tc));
-            let (s, e) = match found {
-                Some(i) => (i, i + tc.len()),
-                None => words.get(pos).copied().unwrap_or((cursor, cursor)),
-            };
-            cursor = e;
-            (t, pos, s, e)
-        })
+    let positions = analysis::positions(&toks);
+    toks.into_iter()
+        .zip(positions)
+        .map(|(t, pos)| (t.term, pos.max(0) as usize, t.start, t.end))
         .collect()
 }
 

@@ -113,9 +113,31 @@ struct Positions<'a> {
 impl Positions<'_> {
     fn field(&mut self, field: &str) -> &(HashMap<String, Vec<i64>>, i64) {
         if !self.by_field.contains_key(field) {
-            let (path, _) = resolve_field(self.mappings, field);
+            let (path, ty) = resolve_field(self.mappings, field);
             let mut map: HashMap<String, Vec<i64>> = HashMap::new();
             let mut pos: i64 = 0;
+            // Text fields: the analysis engine's positions (stopword and
+            // synonym gaps, `position_increment_gap` between values).
+            if matches!(ty.as_deref(), None | Some("text" | "match_only_text")) {
+                let texts: Vec<String> = raw_values(self.source, &path)
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Number(n) => Some(n.to_string()),
+                        Value::Bool(b) => Some(b.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+                for (t, p) in
+                    analysis::field_positions(self.mappings, field, &refs, analysis::Mode::Index)
+                {
+                    pos = pos.max(p + 1);
+                    map.entry(t).or_default().push(p);
+                }
+                self.by_field.insert(field.to_string(), (map, pos));
+                return &self.by_field[field];
+            }
             for (k, v) in raw_values(self.source, &path).into_iter().enumerate() {
                 let mut wrapped = v.clone();
                 for seg in path.split('.').rev() {
@@ -511,7 +533,7 @@ fn parse_rule(name: &str, body: &Value, field: &str, cx: &mut Ctx) -> Result<Src
         "match" => {
             let text = query_text(o.get("query"));
             let toks = match o.get("analyzer").and_then(Value::as_str) {
-                Some(a) => analysis::analyze(a, &text),
+                Some(a) => analysis::analyzer(a).terms(&text),
                 None => analyze_for(cx.mappings, &use_field, &text),
             };
             let subs: Vec<Src> = toks

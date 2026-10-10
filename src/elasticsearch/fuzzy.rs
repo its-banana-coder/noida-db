@@ -373,7 +373,7 @@ fn boost_of(o: &Map<String, Value>) -> f32 {
 /// The query text analyzed with the request's `analyzer`, or the field's.
 fn analyzed(o: &Map<String, Value>, mappings: &Value, field: &str, text: &str) -> Vec<String> {
     match o.get("analyzer").and_then(Value::as_str) {
-        Some(a) => analysis::analyze(a, text),
+        Some(a) => analysis::analyzer(a).terms(text),
         None => analyze_for(mappings, field, text),
     }
 }

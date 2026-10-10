@@ -60,52 +60,27 @@ fn analyze_offsets(analyzer: &str, text: &str) -> Vec<(String, usize, usize)> {
                 vec![(text.to_string(), 0, text.len())]
             }
         }
-        "simple" | "stop" | "whitespace" => {
-            let split = |c: char| {
-                if analyzer == "whitespace" { c.is_whitespace() } else { !c.is_alphabetic() }
-            };
-            let mut out = Vec::new();
-            let mut start = None;
-            for (i, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
-                let boundary = i == text.len() || split(c);
-                match (start, boundary) {
-                    (None, false) => start = Some(i),
-                    (Some(s), true) => {
-                        let t = &text[s..i];
-                        let t =
-                            if analyzer == "whitespace" { t.to_string() } else { t.to_lowercase() };
-                        if analyzer != "stop" || !analysis::ENGLISH_STOPWORDS.contains(&t.as_str())
-                        {
-                            out.push((t, s, i));
-                        }
-                        start = None;
-                    }
-                    _ => {}
-                }
-            }
-            out
-        }
-        _ => analysis::standard_with_offsets(text),
+        name => analysis::with_byte_offsets(text, analysis::analyzer(name).tokens(text)),
     };
     spans.into_iter().map(|(t, s, e)| (t, utf16_len(&text[..s]), utf16_len(&text[s..e]))).collect()
 }
 
-const ANALYZERS: &[&str] = &["standard", "simple", "whitespace", "keyword", "stop"];
-
 fn check_analyzer(name: &str) -> Result<(), EsError> {
-    if ANALYZERS.contains(&name) {
+    if analysis::analyzer_exists(name) {
         Ok(())
     } else {
         Err(bad(&format!("analyzer [{name}] doesn't exist")))
     }
 }
 
-/// The analyzer a field's query text goes through: `standard` for text
-/// fields, the whole text for everything else.
-fn field_analyzer(mappings: &Value, field: &str) -> &'static str {
+/// The analyzer a field's query text goes through: the field's search
+/// analyzer for text fields, the whole text for everything else.
+fn field_analyzer(mappings: &Value, field: &str) -> String {
     match resolve_field(mappings, field).1.as_deref() {
-        None | Some("text") | Some("match_only_text") => "standard",
-        Some(_) => "keyword",
+        None | Some("text") | Some("match_only_text") => {
+            analysis::field_analyzer_name(mappings, field, analysis::Mode::Search)
+        }
+        Some(_) => "keyword".to_string(),
     }
 }
 
@@ -514,7 +489,7 @@ fn query_analyzer(
             check_analyzer(a)?;
             Ok(a.to_string())
         }
-        None => Ok(field_analyzer(mappings, field).to_string()),
+        None => Ok(field_analyzer(mappings, field)),
     }
 }
 

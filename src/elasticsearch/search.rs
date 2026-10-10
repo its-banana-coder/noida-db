@@ -579,7 +579,7 @@ pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> 
             .into_iter()
             .filter_map(Value::as_str)
             .filter(|s| s.chars().count() <= 256)
-            .map(str::to_string)
+            .map(|s| analysis::normalize(mappings, field, s))
             .collect();
     }
     let mut out = Vec::new();
@@ -590,10 +590,10 @@ pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> 
                 if ty == Some("keyword") {
                     // Values over `ignore_above` aren't indexed.
                     if ignore_above.is_none_or(|n| s.chars().count() <= n) {
-                        out.push(s.clone());
+                        out.push(analysis::normalize(mappings, field, s));
                     }
                 } else {
-                    out.extend(analysis::standard(s));
+                    out.extend(analysis::field_terms(mappings, field, s, analysis::Mode::Index));
                 }
             }
             Value::Number(n) => out.push(n.to_string()),
@@ -616,6 +616,39 @@ fn meta_tokens(mappings: &Value, d: &CommittedDoc, field: &str) -> Vec<String> {
 
 pub(super) fn doc_tokens(mappings: &Value, docs: &[CommittedDoc], field: &str) -> Vec<Vec<String>> {
     docs.iter().map(|d| tokens_for(mappings, &d.source, field)).collect()
+}
+
+/// Each document's terms of `field` with their positions (phrase
+/// matching): analyzed for text fields, whole values otherwise.
+pub(super) fn doc_positions(
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    field: &str,
+) -> Vec<Vec<(String, i64)>> {
+    let (path, ty) = resolve_field(mappings, field);
+    let text = matches!(ty.as_deref(), None | Some("text") | Some("match_only_text"));
+    docs.iter()
+        .map(|d| {
+            if !text {
+                return tokens_for(mappings, &d.source, field)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, t)| (t, i as i64 * 101))
+                    .collect();
+            }
+            let vals: Vec<String> = raw_values(&d.source, &path)
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+            analysis::field_positions(mappings, field, &refs, analysis::Mode::Index)
+        })
+        .collect()
 }
 
 /// BM25 (Lucene/Elasticsearch defaults k1=1.2, b=0.75) over the given field
@@ -680,7 +713,7 @@ fn eval_term(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
         Some(t) => (t.clone(), spec.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32),
         None => value_and_boost(spec),
     };
-    let target = value_to_term(&value);
+    let target = analysis::normalize(mappings, field, &value_to_term(&value));
     if let Some(scores) = dsl::term_scores(mappings, docs, field, spec, &target, boost) {
         return scores;
     }
@@ -699,8 +732,12 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
     else {
         return HashMap::new();
     };
-    let targets: Vec<String> =
-        arr.as_array().map(|a| a.iter().map(value_to_term).collect()).unwrap_or_default();
+    let targets: Vec<String> = arr
+        .as_array()
+        .map(|a| {
+            a.iter().map(|v| analysis::normalize(mappings, field, &value_to_term(v))).collect()
+        })
+        .unwrap_or_default();
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
         let toks = meta_tokens(mappings, d, field);
@@ -715,9 +752,40 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
 /// boolean, date) fields take it whole, text fields through `standard`.
 pub(super) fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
     match resolve_field(mappings, field).1.as_deref() {
-        None | Some("text") | Some("match_only_text") => analysis::standard(text),
+        None | Some("text") | Some("match_only_text") => {
+            analysis::field_terms(mappings, field, text, analysis::Mode::Search)
+        }
+        Some("keyword") => vec![analysis::normalize(mappings, field, text)],
         Some(_) => vec![text.to_string()],
     }
+}
+
+/// A query string analyzed with an explicit `analyzer` parameter, or the
+/// way `field` analyzes it.
+fn analyze_with(mappings: &Value, field: &str, text: &str, analyzer: Option<&str>) -> Vec<String> {
+    match analyzer {
+        Some(a) => analysis::analyzer(a).terms(text),
+        None => analyze_for(mappings, field, text),
+    }
+}
+
+/// A phrase query's terms with their positions: the field's search quote
+/// analyzer (or `analyzer`) for text fields, the whole value otherwise.
+pub(super) fn analyze_phrase(
+    mappings: &Value,
+    field: &str,
+    text: &str,
+    analyzer: Option<&str>,
+) -> Vec<(String, i64)> {
+    let toks = match (analyzer, resolve_field(mappings, field).1.as_deref()) {
+        (Some(a), _) => analysis::analyzer(a).tokens(text),
+        (None, None | Some("text") | Some("match_only_text")) => {
+            analysis::field_tokens(mappings, field, text, analysis::Mode::Quote)
+        }
+        _ => return analyze_for(mappings, field, text).into_iter().map(|t| (t, 0)).collect(),
+    };
+    let pos = analysis::positions(&toks);
+    toks.into_iter().zip(pos).map(|(t, p)| (t.term, p)).collect()
 }
 
 /// A query value as text: `"quick"`, `10`, `true`.
@@ -745,7 +813,8 @@ pub(super) fn eval_match(
     } else {
         (query_text(Some(spec)), "or".to_string(), 1.0)
     };
-    let query_terms = analyze_for(mappings, field, &text);
+    let analyzer = spec.get("analyzer").and_then(Value::as_str);
+    let query_terms = analyze_with(mappings, field, &text, analyzer);
     if query_terms.is_empty() {
         return HashMap::new();
     }
@@ -782,63 +851,8 @@ fn eval_dis_max(
         .collect())
 }
 
-/// Whether `query_terms` occurs in `doc_tokens` as a contiguous run at
-/// consecutive positions — Lucene's default `slop=0` phrase match. Document
-/// term vectors here are already position-ordered with no gaps (nothing
-/// filters tokens out of `tokens_for`), so the vector index *is* the term
-/// position, exactly like a real positional inverted index at slop 0.
-fn phrase_matches(doc_tokens: &[String], query_terms: &[String]) -> bool {
-    let n = query_terms.len();
-    if n == 0 || doc_tokens.len() < n {
-        return false;
-    }
-    (0..=doc_tokens.len() - n).any(|start| doc_tokens[start..start + n] == query_terms[..])
-}
-
-/// A sloppy phrase match: some choice of positions for the query terms
-/// whose total displacement from consecutive order is at most `slop`
-/// (Lucene's edit-distance notion of phrase slop, reordering included).
-pub(super) fn sloppy_phrase_matches(
-    doc_tokens: &[String],
-    query_terms: &[String],
-    slop: usize,
-) -> bool {
-    if slop == 0 {
-        return phrase_matches(doc_tokens, query_terms);
-    }
-    let positions: Vec<Vec<usize>> = query_terms
-        .iter()
-        .map(|t| doc_tokens.iter().enumerate().filter(|(_, d)| *d == t).map(|(i, _)| i).collect())
-        .collect();
-    if positions.iter().any(Vec::is_empty) {
-        return false;
-    }
-    fn search(positions: &[Vec<usize>], k: usize, chosen: &mut Vec<usize>, slop: usize) -> bool {
-        if k == positions.len() {
-            let offsets: Vec<i64> =
-                chosen.iter().enumerate().map(|(i, &p)| p as i64 - i as i64).collect();
-            let (lo, hi) = (offsets.iter().min().unwrap(), offsets.iter().max().unwrap());
-            return (hi - lo) as usize <= slop;
-        }
-        for &p in &positions[k] {
-            if chosen.contains(&p) {
-                continue;
-            }
-            chosen.push(p);
-            if search(positions, k + 1, chosen, slop) {
-                return true;
-            }
-            chosen.pop();
-        }
-        false
-    }
-    search(&positions, 0, &mut Vec::new(), slop)
-}
-
 /// `match_phrase`: like `match`, but the query's analyzed terms must appear
-/// in the document at consecutive positions, in order (slop 0 — the only
-/// slop value implemented; a non-zero `slop` option is accepted but
-/// currently treated as 0).
+/// in the document at the same relative positions (within `slop`).
 fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
     let (text, slop) = if let Some(o) = spec.as_object() {
@@ -846,22 +860,38 @@ fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Hash
     } else {
         (query_text(Some(spec)), 0)
     };
-    let query_terms = analyze_for(mappings, field, &text);
-    if query_terms.is_empty() {
+    let analyzer = spec.get("analyzer").and_then(Value::as_str);
+    let phrase = analyze_phrase(mappings, field, &text, analyzer);
+    if phrase.is_empty() {
         return HashMap::new();
     }
-    let per_doc = doc_tokens(mappings, docs, field);
-    let matched: HashSet<usize> = per_doc
+    let per_doc = doc_positions(mappings, docs, field);
+    // BM25 over the phrase frequency (exact matches, or Lucene's sloppy
+    // frequency 1/(1+distance) per match), with the terms' idfs summed.
+    let lens = doc_tokens(mappings, docs, field);
+    let doc_count = lens.iter().filter(|t| !t.is_empty()).count() as u64;
+    let total: u64 = lens.iter().map(|t| t.len() as u64).sum();
+    let avg = if doc_count > 0 { total as f32 / doc_count as f32 } else { 1.0 };
+    let mut terms: Vec<&String> = phrase.iter().map(|t| &t.0).collect();
+    terms.sort();
+    terms.dedup();
+    let idf: f32 = terms
         .iter()
-        .enumerate()
-        .filter(|(_, toks)| sloppy_phrase_matches(toks, &query_terms, slop))
-        .map(|(idx, _)| idx)
-        .collect();
-    // Score the same as an AND `match` (every term must be present, which a
-    // phrase match already implies) restricted to documents where the
-    // phrase actually occurs at consecutive positions.
-    let mut scores = bm25_scores(mappings, docs, field, &query_terms, true);
-    scores.retain(|idx, _| matched.contains(idx));
+        .map(|t| {
+            let df = lens.iter().filter(|toks| toks.contains(t)).count() as u64;
+            scoring::idf(df, doc_count.max(1))
+        })
+        .sum();
+    let mut scores = HashMap::new();
+    for (idx, toks) in per_doc.iter().enumerate() {
+        let freq = analysis::phrase_freq(toks, &phrase, slop);
+        if freq <= 0.0 {
+            continue;
+        }
+        let dl = scoring::norm_doc_len(lens[idx].len() as u32).max(1) as f32;
+        let norm = scoring::K1 * ((1.0 - scoring::B) + scoring::B * dl / avg);
+        scores.insert(idx, idf * (freq * (scoring::K1 + 1.0)) / (freq + norm));
+    }
     scores
 }
 
@@ -884,10 +914,7 @@ fn parse_field_boost(spec: &str) -> (&str, f32) {
 fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some(obj) = v.as_object() else { return HashMap::new() };
     let text = obj.get("query").and_then(Value::as_str).unwrap_or("");
-    let query_terms = analysis::standard(text);
-    if query_terms.is_empty() {
-        return HashMap::new();
-    }
+    let analyzer = obj.get("analyzer").and_then(Value::as_str);
     let fields: Vec<(String, f32)> = obj
         .get("fields")
         .and_then(Value::as_array)
@@ -912,6 +939,9 @@ fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashM
             if let Some(slop) = obj.get("slop") {
                 spec["slop"] = slop.clone();
             }
+            if let Some(a) = analyzer {
+                spec["analyzer"] = json!(a);
+            }
             let q = json!({ field.as_str(): spec });
             let scores = if kind == Some("phrase") {
                 eval_match_phrase(&q, mappings, docs)
@@ -928,6 +958,10 @@ fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashM
 
     let mut best: HashMap<usize, f32> = HashMap::new();
     for (field, boost) in &fields {
+        let query_terms = analyze_with(mappings, field, text, analyzer);
+        if query_terms.is_empty() {
+            continue;
+        }
         for (idx, score) in bm25_scores(mappings, docs, field, &query_terms, require_all) {
             let scaled = score * boost;
             let entry = best.entry(idx).or_insert(scaled);
@@ -1583,11 +1617,15 @@ fn agg_values(mappings: &Value, source: &Value, field: &str) -> Vec<Value> {
         match v {
             Value::String(s) => {
                 if ty == Some("keyword") {
-                    out.push(Value::String(s.clone()));
+                    out.push(Value::String(analysis::normalize(mappings, field, s)));
                 } else if ty == Some("ip") {
                     out.push(json!(tsdb::format_ip(s).unwrap_or_else(|| s.clone())));
                 } else {
-                    out.extend(analysis::standard(s).into_iter().map(Value::String));
+                    out.extend(
+                        analysis::field_terms(mappings, field, s, analysis::Mode::Index)
+                            .into_iter()
+                            .map(Value::String),
+                    );
                 }
             }
             Value::Number(_) | Value::Bool(_) => out.push(v.clone()),

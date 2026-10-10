@@ -10,8 +10,8 @@ use serde_json::{Map, Value, json};
 
 use super::search::EsError;
 use super::search::{
-    CommittedDoc, analyze_for, bm25_scores, doc_tokens, eval, field_and_spec, query_text,
-    raw_values, resolve_field, sloppy_phrase_matches,
+    CommittedDoc, analyze_for, analyze_phrase, bm25_scores, doc_positions, doc_tokens, eval,
+    field_and_spec, query_text, raw_values, resolve_field,
 };
 use super::{dates, painless, vectors};
 
@@ -45,15 +45,18 @@ pub fn match_phrase_prefix(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -
     let slop = o.and_then(|o| o.get("slop")).and_then(Value::as_u64).unwrap_or(0) as usize;
     let max =
         o.and_then(|o| o.get("max_expansions")).and_then(Value::as_u64).unwrap_or(50) as usize;
-    let terms = analyze_for(mappings, field, &text);
-    let Some((last, head)) = terms.split_last() else { return Scores::new() };
+    let analyzer = o.and_then(|o| o.get("analyzer")).and_then(Value::as_str);
+    let positioned = analyze_phrase(mappings, field, &text, analyzer);
+    let Some(((last, last_pos), head)) = positioned.split_last() else { return Scores::new() };
     let per_doc = doc_tokens(mappings, docs, field);
+    let doc_pos = doc_positions(mappings, docs, field);
     let mut out = Scores::new();
     for exp in expansions(&per_doc, last, max) {
-        let mut phrase = head.to_vec();
-        phrase.push(exp);
+        let mut query = head.to_vec();
+        query.push((exp, *last_pos));
+        let phrase: Vec<String> = query.iter().map(|t| t.0.clone()).collect();
         let mut sc = bm25_scores(mappings, docs, field, &phrase, true);
-        sc.retain(|i, _| sloppy_phrase_matches(&per_doc[*i], &phrase, slop));
+        sc.retain(|i, _| super::analysis::phrase_matches(&doc_pos[*i], &query, slop));
         for (i, s) in sc {
             let e = out.entry(i).or_insert(0.0);
             *e = e.max(s);

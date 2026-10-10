@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use super::analysis;
 use super::cat;
+
+#[path = "analysis_engine.rs"]
+mod analysis_engine;
 use super::dates;
 use super::index_sort;
 use super::names;
@@ -50,6 +53,9 @@ struct State {
     /// Voting exclusions and desired nodes.
     #[serde(default)]
     cluster_meta: cluster::ClusterMeta,
+    /// Synonym sets (`_synonyms`).
+    #[serde(default)]
+    synonyms: analysis_engine::SynonymStore,
     /// Open scrolls and points in time (in memory only, like a node's).
     #[serde(skip)]
     contexts: HashMap<String, SearchContext>,
@@ -413,6 +419,11 @@ impl Engine {
         }
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let q = query_params(query);
+        // The target indices' analysis settings, for everything below.
+        let _analysis = self.analysis_scope(&segments);
+        if segments.first() == Some(&"_synonyms") {
+            return self.synonyms_api(method, &segments, &q, body);
+        }
         if let Some(v) = q.get("force_synthetic_source")
             && !matches!(v.as_str(), "true" | "false" | "")
         {
@@ -505,7 +516,7 @@ impl Engine {
             return self.mget(method, "", &q, body);
         }
         if segments.first() == Some(&"_analyze") {
-            return self.analyze(body);
+            return self.analyze_request(None, &q, body);
         }
         if segments == ["_validate", "query"] {
             return self.validate_api(method, "_all", &q, body);
@@ -684,7 +695,10 @@ impl Engine {
             "_alias" | "_aliases" => {
                 self.alias_api(method, segments[0], segments.get(2).copied(), &q, body, false)
             }
-            "_analyze" => self.analyze(body),
+            "_analyze" => self.analyze_request(Some(segments[0]), &q, body),
+            "_reload_search_analyzers" if matches!(method, "POST" | "GET") => {
+                self.reload_search_analyzers(segments[0])
+            }
             "_doc" | "_create" | "_source" if segments.len() == 3 => {
                 self.index_with_pipelines(method, index_name, segments[2], segments[1], &q, body)
             }
@@ -1984,33 +1998,6 @@ impl Engine {
         (if freed == 0 { 404 } else { 200 }, json!({"succeeded": true, "num_freed": freed}))
     }
 
-    fn analyze(&self, body: &[u8]) -> (u16, Value) {
-        let req = parse_json(body).unwrap_or_else(|| json!({}));
-        let Some(text) = req.get("text").and_then(|t| {
-            t.as_str().map(str::to_string).or_else(|| {
-                t.as_array()
-                    .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "))
-            })
-        }) else {
-            return (400, error("x_content_parse_exception", "text is required", 400));
-        };
-        let analyzer = req.get("analyzer").and_then(Value::as_str).unwrap_or("standard");
-        let tokens = analysis::analyze(analyzer, &text);
-        let mut position = 0i64;
-        let mut offset = 0usize;
-        let out: Vec<Value> = tokens
-            .into_iter()
-            .map(|t| {
-                let start = offset;
-                offset += t.chars().count();
-                let v = json!({"token": t, "start_offset": start, "end_offset": offset, "type": "<ALPHANUM>", "position": position});
-                position += 1;
-                v
-            })
-            .collect();
-        (200, json!({"tokens": out}))
-    }
-
     fn index_api(&self, method: &str, name: &str, body: &[u8]) -> (u16, Value) {
         let mut s = self.0.lock().unwrap();
         match method {
@@ -2092,8 +2079,13 @@ impl Engine {
                     return e;
                 }
                 index.sort_on_timestamp = index.timestamp_mapped();
+                if let Err(e) = analysis_engine::check_index(&s, &index.settings, &index.mappings) {
+                    return e;
+                }
+                // Shards whose analyzers need a missing synonym set don't start.
+                let started = analysis_engine::synonym_sets_present(&s, &index.settings);
                 s.indices.insert(name.to_string(), index);
-                (200, json!({"acknowledged":true,"shards_acknowledged":true,"index":name}))
+                (200, json!({"acknowledged":true,"shards_acknowledged":started,"index":name}))
             }
             "GET" => {
                 let Some(i) = s.indices.get(name) else {
@@ -2181,6 +2173,9 @@ impl Engine {
                             .and_then(|_| tsdb::validate_mapping(&merged))
                             .and_then(|_| tsdb::validate_tsdb_mapping(&i.settings, &merged))
                         {
+                            return e;
+                        }
+                        if let Err(e) = analysis_engine::check_index(&s, &i.settings, &next) {
                             return e;
                         }
                     }

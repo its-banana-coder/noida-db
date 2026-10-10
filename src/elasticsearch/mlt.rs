@@ -120,7 +120,7 @@ fn term_freqs(
         for f in item_fields(item, query_fields, all) {
             let toks: Vec<String> = match item {
                 Item::Text(t) => match analyzer {
-                    Some(a) => analysis::analyze(a, t),
+                    Some(a) => analysis::analyzer(a).terms(t),
                     None => analyze_for(mappings, f, t),
                 },
                 Item::Doc { source, .. } => tokens_for(mappings, source, f),
