@@ -1617,12 +1617,12 @@ fn note_search(
     for f in &loaded {
         usage.push((f.0.clone(), "doc_values"));
     }
-    if body.get("highlight").is_some() {
-        if let Some(query) = body.get("query") {
-            let mut hl = Vec::new();
-            query_usage(query, false, &mut hl);
-            usage.extend(hl.into_iter().map(|(f, _)| (f, "offsets")));
-        }
+    if body.get("highlight").is_some()
+        && let Some(query) = body.get("query")
+    {
+        let mut hl = Vec::new();
+        query_usage(query, false, &mut hl);
+        usage.extend(hl.into_iter().map(|(f, _)| (f, "offsets")));
     }
     let hits: Vec<(String, String)> = resp["hits"]["hits"]
         .as_array()

@@ -437,7 +437,7 @@ impl Engine {
                         let mut r = Row::new();
                         node_cells(&mut r, false);
                         let st = node::thread_pool_stats(&info);
-                        let num = |v: &Value| v.as_i64().map(|n| t(n)).unwrap_or(Cell::Null);
+                        let num = |v: &Value| v.as_i64().map(t).unwrap_or(Cell::Null);
                         r.insert("name", t(&name));
                         r.insert("type", t(info["type"].as_str().unwrap_or("fixed")));
                         r.insert("active", t(0));

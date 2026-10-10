@@ -223,7 +223,7 @@ impl Engine {
                     "number_of_replicas": r, "active_primary_shards": a, "active_shards": a,
                     "relocating_shards": 0, "initializing_shards": 0, "unassigned_shards": u});
                 if level == "shards" {
-                    let per = if p == 0 { 0 } else { u / p };
+                    let per = u.checked_div(p).unwrap_or(0);
                     let shards: Map<String, Value> = (0..p)
                         .map(|sh| {
                             let active = u64::from(a > 0);
@@ -1732,6 +1732,7 @@ pub(super) fn capabilities(q: &HashMap<String, String>) -> (u16, Value) {
     let params = list("parameters");
     let caps = list("capabilities");
     // (method, path, declared parameters, declared capabilities)
+    #[allow(clippy::type_complexity)]
     let declared: &[(&str, &str, Option<&[&str]>, &[&str])] = &[
         ("GET", "/_capabilities", Some(&["method", "path", "parameters", "capabilities"]), &[]),
         (

@@ -118,23 +118,6 @@ pub fn render(
 /// The key a response body uses to say "send this string as text/plain".
 pub const RAW_TEXT: &str = "\u{0}noida_raw_text";
 
-/// Bytes the way `_cat` prints them (`7.6kb`, `1mb`, `512b`).
-pub fn human_bytes(n: u64) -> String {
-    let units = ["b", "kb", "mb", "gb", "tb"];
-    let mut v = n as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u + 1 < units.len() {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{n}b")
-    } else {
-        let s = format!("{v:.1}");
-        format!("{}{}", s.trim_end_matches(".0"), units[u])
-    }
-}
-
 /// `epoch` and `timestamp` (HH:MM:SS, UTC) columns.
 pub fn now_columns() -> (String, String) {
     let ms = super::dates::now_ms();
