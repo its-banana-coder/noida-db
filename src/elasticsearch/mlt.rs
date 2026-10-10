@@ -94,21 +94,35 @@ fn default_fields(mappings: &Value) -> Vec<String> {
 }
 
 /// Term frequencies per (field, term) of a set of items.
+/// Which fields an item contributes terms from: texts the query's
+/// `fields`; a stored document its own `fields`, else the query's (all
+/// text/keyword fields by default); an artificial document all of its
+/// fields, whatever the query names (Elasticsearch fetches its term
+/// vectors unrestricted).
+fn item_fields<'a>(item: &'a Item, query: &'a [String], all: &'a [String]) -> &'a [String] {
+    match item {
+        Item::Doc { fields: Some(f), .. } => f,
+        Item::Doc { id: None, .. } => all,
+        _ => query,
+    }
+}
+
+/// Term frequencies per (field, term) of a set of items.
 fn term_freqs(
     items: &[Item],
-    fields: &[String],
+    query_fields: &[String],
+    all: &[String],
     mappings: &Value,
     analyzer: Option<&str>,
 ) -> HashMap<(String, String), u32> {
     let mut out: HashMap<(String, String), u32> = HashMap::new();
     for item in items {
-        for f in fields {
+        for f in item_fields(item, query_fields, all) {
             let toks: Vec<String> = match item {
                 Item::Text(t) => match analyzer {
                     Some(a) => analysis::analyze(a, t),
                     None => analyze_for(mappings, f, t),
                 },
-                Item::Doc { fields: Some(only), .. } if !only.contains(f) => continue,
                 Item::Doc { source, .. } => tokens_for(mappings, source, f),
                 Item::Missing => continue,
             };
@@ -129,9 +143,11 @@ fn num(v: &Value, key: &str) -> Option<f64> {
 }
 
 pub fn eval(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<Scores, EsError> {
-    let fields: Vec<String> = match v.get("fields").and_then(Value::as_array) {
+    let all = default_fields(mappings);
+    let explicit = v.get("fields").and_then(Value::as_array);
+    let fields: Vec<String> = match explicit {
         Some(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
-        None => default_fields(mappings),
+        None => all.clone(),
     };
     let fail_unsupported =
         v.get("fail_on_unsupported_field").and_then(Value::as_bool).unwrap_or(true);
@@ -154,6 +170,16 @@ pub fn eval(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<Scores
         return Err(EsError::parsing("more_like_this requires 'like' to be specified"));
     }
     let unlike = items(v.get("unlike"), docs);
+    if explicit.is_none() && like.iter().chain(&unlike).any(|i| matches!(i, Item::Text(_))) {
+        let reason = "[more_like_this] query cannot infer the field to analyze the free text, you \
+                      should update the [index.query.default_field] index setting to a field that \
+                      exists in the mapping or set the [fields] option in the query.";
+        return Err(EsError::shard_failure(
+            "query_shard_exception",
+            &format!("failed to create query: {reason}"),
+        )
+        .caused_by("illegal_argument_exception", reason));
+    }
     let analyzer = v.get("analyzer").and_then(Value::as_str);
     let min_tf = num(v, "min_term_freq").unwrap_or(2.0) as u32;
     let min_df = num(v, "min_doc_freq").unwrap_or(5.0) as u64;
@@ -169,15 +195,18 @@ pub fn eval(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<Scores
         .unwrap_or_default();
 
     let skip: HashSet<(String, String)> =
-        term_freqs(&unlike, &used, mappings, analyzer).into_keys().collect();
+        term_freqs(&unlike, &used, &all, mappings, analyzer).into_keys().collect();
+    let like_terms = term_freqs(&like, &used, &all, mappings, analyzer);
     let mut stats: HashMap<String, FieldTerms> = HashMap::new();
-    for f in &used {
-        stats.insert(f.clone(), FieldTerms::new(mappings, docs, f));
+    for (f, _) in like_terms.keys() {
+        if !stats.contains_key(f) {
+            stats.insert(f.clone(), FieldTerms::new(mappings, docs, f));
+        }
     }
     let num_docs = docs.len() as f64;
     // (score, field, term), best first.
     let mut queue: Vec<(f32, String, String)> = Vec::new();
-    for ((field, term), tf) in term_freqs(&like, &used, mappings, analyzer) {
+    for ((field, term), tf) in like_terms {
         let len = term.chars().count();
         if (min_len > 0 && len < min_len)
             || (max_len > 0 && len > max_len)

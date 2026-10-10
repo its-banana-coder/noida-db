@@ -202,6 +202,23 @@ impl FieldTerms {
         out
     }
 
+    /// BM25 of `term` on a field without norms (keyword, boolean): every
+    /// document's length counts as 1 against the average number of values.
+    pub(crate) fn term_scores_no_norms(&self, term: &str, boost: f32) -> Scores {
+        let total: u64 = self.toks.iter().map(|t| t.len() as u64).sum();
+        let avg = if self.doc_count > 0 { total as f32 / self.doc_count as f32 } else { 1.0 };
+        let idf = scoring::idf(self.doc_freq(term), self.doc_count.max(1));
+        let norm = scoring::K1 * ((1.0 - scoring::B) + scoring::B / avg);
+        let mut out = Scores::new();
+        for (i, toks) in self.toks.iter().enumerate() {
+            let tf = toks.iter().filter(|t| *t == term).count() as f32;
+            if tf > 0.0 {
+                out.insert(i, boost * idf * tf * (scoring::K1 + 1.0) / (tf + norm));
+            }
+        }
+        out
+    }
+
     /// Every distinct index term of the field, sorted.
     pub(crate) fn terms(&self) -> Vec<&String> {
         let mut all: Vec<&String> = self.toks.iter().flatten().collect();
@@ -362,14 +379,20 @@ fn analyzed(o: &Map<String, Value>, mappings: &Value, field: &str, text: &str) -
 }
 
 /// Fuzzy queries only apply to keyword and text fields.
-fn check_fuzzy_field(mappings: &Value, field: &str) -> Result<(), EsError> {
-    let ty = resolve_field(mappings, field).1;
-    match ty.as_deref() {
-        None | Some("text" | "keyword" | "match_only_text" | "constant_keyword" | "wildcard") => {
+fn check_fuzzy_mapping(mappings: &Value, field: &str) -> Result<(), EsError> {
+    match resolve_field(mappings, field).1 {
+        Some(t) => check_fuzzy_field(&t, field),
+        None => Ok(()),
+    }
+}
+
+/// The error for a fuzzy query on a field of type `ty`, if not allowed.
+pub(crate) fn check_fuzzy_field(ty: &str, field: &str) -> Result<(), EsError> {
+    match ty {
+        "text" | "keyword" | "match_only_text" | "constant_keyword" | "wildcard" | "flattened" => {
             Ok(())
         }
-        Some("flattened") => Ok(()),
-        Some(t) => {
+        t => {
             let reason = format!(
                 "Can only use fuzzy queries on keyword and text fields - not on [{field}] which \
                  is of type [{t}]"
@@ -391,7 +414,7 @@ pub fn eval_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<
     let text = query_text(o.get("query"));
     let fuzzy = FuzzyOpts::of_match(o)?;
     if fuzzy.is_some() {
-        check_fuzzy_field(mappings, field)?;
+        check_fuzzy_mapping(mappings, field)?;
     }
     let terms = analyzed(o, mappings, field, &text);
     if terms.is_empty() {
@@ -418,7 +441,7 @@ pub fn eval_fuzzy(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<
         Value::Object(o) => (query_text(o.get("value")), o),
         other => (query_text(Some(other)), &empty),
     };
-    check_fuzzy_field(mappings, field)?;
+    check_fuzzy_mapping(mappings, field)?;
     let opts = FuzzyOpts {
         fuzziness: match o.get("fuzziness") {
             Some(f) => parse_fuzziness(f)?,

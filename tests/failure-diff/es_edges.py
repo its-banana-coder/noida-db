@@ -1445,6 +1445,240 @@ scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
     ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
 ])
 
+
+# --- Query DSL: fuzziness, minimum_should_match, intervals, spans,
+# more_like_this, distance_feature, terms lookup, explain/validate,
+# rescore, named queries, post_filter, request parsing.
+
+DSL_DOCS = [
+    {"t": "quick brown fox", "k": "quick", "n": 1, "d": "2018-02-01T10:00:00Z", "g": [-71.34, 41.13]},
+    {"t": "quack brown box", "k": "quack", "n": 2, "d": "2018-02-01T11:00:00Z", "g": [-71.34, 41.14]},
+    {"t": "the lazy dog quick quick", "k": "lazy", "n": 3, "d": "2018-02-01T09:00:00Z", "g": [-71.34, 41.12]},
+    {"t": "qiuck foxes", "k": "qiuck", "n": 4},
+    {"t": "Some like it hot, some like it cold", "k": "hot", "n": 5},
+    {"t": "Its cold outside, theres no kind of atmosphere", "k": "cold", "n": 6},
+    {"t": "Baby its cold there outside", "k": "baby", "n": 7},
+    {"t": "Outside it is cold and wet", "k": "wet", "n": 8},
+    {"t": "the big bad wolf", "k": "wolf", "n": 9},
+    {"t": "the big wolf", "k": "wolf", "n": 10},
+    {"t": "cold cold cold", "k": "cold", "n": 11},
+]
+DSL_MAPPING = {
+    "settings": {"index": {"refresh_interval": "-1", "number_of_shards": 1}},
+    "mappings": {"properties": {
+        "t": {"type": "text", "fields": {"raw": {"type": "keyword"}}},
+        "k": {"type": "keyword"}, "n": {"type": "integer"}, "d": {"type": "date"},
+        "g": {"type": "geo_point"},
+    }},
+}
+DS = "/dsl-edge/_search"
+
+
+def dsl_hits(r):
+    return [(h["_id"], h.get("_score")) for h in r["hits"]["hits"]]
+
+
+def dsl_total(r):
+    return r["hits"]["total"]["value"]
+
+
+def q(query, **kw):
+    body = {"query": query, "size": 20}
+    body.update(kw)
+    return body
+
+
+HITS = {"pick": dsl_hits}
+TOTAL = {"pick": dsl_total}
+
+scenario("dsl_fuzzy", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"match": {"t": {"query": "quikc", "fuzziness": "AUTO"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quikc", "fuzziness": "AUTO", "fuzzy_transpositions": False}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 2}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": "AUTO:2,4"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 1, "prefix_length": 2}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 2, "max_expansions": 1}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quikc brwn", "fuzziness": 1, "operator": "and"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 1.5}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": 3}}})),
+    ("POST", DS, q({"match": {"t": {"query": "quick", "fuzziness": "abc"}}})),
+    ("POST", DS, q({"match": {"n": {"query": "3", "fuzziness": 1}}})),
+    ("POST", DS, q({"match": {"k": {"query": "quikc", "fuzziness": "AUTO"}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": {"value": "quick", "fuzziness": 2}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": "quikc"}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": {"value": "quikc", "transpositions": False}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"t": {"value": "quick", "rewrite": "constant_score"}}}), HITS),
+    ("POST", DS, q({"fuzzy": {"n": {"value": "3"}}})),
+    ("POST", DS, q({"multi_match": {"query": "quikc", "fields": ["t", "k"], "fuzziness": "AUTO"}}), HITS),
+    ("POST", DS, q({"multi_match": {"query": "brwn fxo", "fields": ["t"], "fuzziness": 1, "type": "most_fields"}}), HITS),
+    ("POST", DS, q({"multi_match": {"query": "brown", "fields": ["t"], "fuzziness": 1, "type": "cross_fields"}})),
+    ("POST", DS, q({"multi_match": {"query": "brown", "fields": ["t"], "type": "bool_prefix", "slop": 1}})),
+    ("POST", DS, q({"match_bool_prefix": {"t": {"query": "quikc bro", "fuzziness": 1}}}), HITS),
+    ("POST", DS, q({"query_string": {"query": "quikc~", "default_field": "t"}}), HITS),
+    ("POST", DS, q({"query_string": {"query": "t:quikc~1"}}), HITS),
+    ("POST", DS, q({"match": {"n": 3}}), HITS),
+    ("POST", DS, q({"match": {"n": {"query": "x"}}})),
+    ("POST", DS, q({"match": {"n": {"query": "x", "lenient": True}}}), HITS),
+])
+
+scenario("dsl_msm", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": 3}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "75%"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "-1"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "-25%"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": "2<75%"}}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "the big bad wolf", "minimum_should_match": 9}}}), HITS),
+    ("POST", DS, q({"bool": {"should": [{"term": {"k": "wolf"}}, {"term": {"t": "big"}}, {"term": {"t": "bad"}}], "minimum_should_match": "2"}}), HITS),
+    ("POST", DS, q({"bool": {"should": [{"term": {"k": "wolf"}}, {"term": {"t": "big"}}, {"term": {"t": "bad"}}], "minimum_should_match": "60%"}}), HITS),
+    ("POST", DS, q({"match": {"t": {"query": "", "zero_terms_query": "all"}}}), TOTAL),
+])
+
+scenario("dsl_intervals", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside"}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "ordered": True}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "max_gaps": 1}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "ordered": True, "max_gaps": 0}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold cold"}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "boost": 2}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "the"}}, {"any_of": {"intervals": [{"match": {"query": "big"}}, {"match": {"query": "big bad"}}]}}, {"match": {"query": "wolf"}}], "max_gaps": 0, "ordered": True}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "the"}}, {"match": {"query": "wolf"}}], "ordered": True}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"any_of": {"intervals": [{"match": {"query": "big"}}, {"match": {"query": "bad"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "filter": {"before": {"match": {"query": "outside"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "filter": {"after": {"match": {"query": "outside"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"match": {"query": "outside"}}], "filter": {"containing": {"match": {"query": "is"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"match": {"query": "outside"}}], "filter": {"not_containing": {"match": {"query": "is"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "it", "filter": {"not_contained_by": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"match": {"query": "outside"}}]}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold outside", "ordered": True, "filter": {"overlapping": {"match": {"query": "baby there"}}}}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"prefix": {"prefix": "out"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"match": {"query": "cold"}}, {"wildcard": {"pattern": "OUT?IDE"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"all_of": {"intervals": [{"fuzzy": {"term": "cald"}}, {"prefix": {"prefix": "out"}}]}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "cold", "use_field": "t.raw"}}}}), HITS),
+    ("POST", DS, q({"intervals": {"t": {"foo": {"query": "x"}}}})),
+    ("POST", DS, q({"intervals": {"t": {"match": {"query": "x"}, "any_of": {"intervals": []}}}})),
+    ("POST", DS, q({"intervals": {"k": {"match": {"query": "cold"}}}})),
+    ("POST", DS, q({"intervals": {"missing": {"match": {"query": "cold"}}}}), HITS),
+])
+
+scenario("dsl_spans", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"span_term": {"t": "quick"}}), HITS),
+    ("POST", DS, q({"span_term": {"t": {"value": "quick", "boost": 2}}}), HITS),
+    ("POST", DS, q({"span_or": {"clauses": [{"span_term": {"t": "quick"}}, {"span_term": {"t": "brown"}}]}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "quick"}}, {"span_term": {"t": "brown"}}], "slop": 0}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "cold"}}, {"span_term": {"t": "outside"}}], "slop": 2, "in_order": False}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "cold"}}, {"span_term": {"t": "outside"}}], "slop": 1, "in_order": True}}), HITS),
+    ("POST", DS, q({"span_first": {"match": {"span_term": {"t": "cold"}}, "end": 3}}), HITS),
+    ("POST", DS, q({"span_not": {"include": {"span_term": {"t": "cold"}}, "exclude": {"span_term": {"t": "outside"}}}}), HITS),
+    ("POST", DS, q({"span_not": {"include": {"span_term": {"t": "cold"}}, "exclude": {"span_term": {"t": "outside"}}, "post": 1}}), HITS),
+    ("POST", DS, q({"span_containing": {"big": {"span_near": {"clauses": [{"span_term": {"t": "the"}}, {"span_term": {"t": "wolf"}}], "slop": 3}}, "little": {"span_term": {"t": "bad"}}}}), HITS),
+    ("POST", DS, q({"span_within": {"big": {"span_near": {"clauses": [{"span_term": {"t": "the"}}, {"span_term": {"t": "wolf"}}], "slop": 3}}, "little": {"span_term": {"t": "big"}}}}), HITS),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "cold"}}, {"span_multi": {"match": {"prefix": {"t": "out"}}}}], "slop": 2}}), TOTAL),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "quick"}}, {"span_term": {"k": "brown"}}]}})),
+    ("POST", DS, q({"span_near": {"clauses": [{"span_term": {"t": "quick"}}, {"field_masking_span": {"query": {"span_term": {"t.raw": "x"}}, "field": "t"}}], "slop": 5}}), TOTAL),
+])
+
+MLT_DOCS = [{"foo": "bar baz selected", "body": "apple apple banana"}, {"foo": "bar", "body": "apple cherry"},
+            {"foo": "bar baz", "body": "banana banana cherry"}, {"foo": "qux", "body": "durian"}]
+scenario("dsl_mlt", setup("dsl-mlt", {"settings": STATIC}, MLT_DOCS) + [
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "apple apple banana", "fields": ["body"], "min_doc_freq": 1}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "apple apple banana", "min_doc_freq": 1}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"_id": "1"}], "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"_id": "1"}], "min_doc_freq": 0, "min_term_freq": 0, "include": True}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": {"_index": "dsl-mlt", "_id": "1"}, "unlike": {"_index": "dsl-mlt", "_id": "3"}, "include": True, "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"doc": {"foo": "bar"}}], "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "bar baz qux", "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0, "minimum_should_match": "100%"}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "bar baz qux", "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0, "max_query_terms": 1}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": "bar baz qux", "fields": ["foo"], "min_doc_freq": 0, "min_term_freq": 0, "stop_words": ["bar"]}}), HITS),
+    ("POST", "/dsl-mlt/_search", q({"more_like_this": {"like": [{"_id": "nope"}], "min_doc_freq": 0, "min_term_freq": 0}}), HITS),
+    ("DELETE", "/dsl-mlt"),
+])
+
+scenario("dsl_distance_feature", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"distance_feature": {"field": "d", "pivot": "1h", "origin": "2018-02-01T08:00:30Z"}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "d", "pivot": "7d", "origin": "2018-02-01", "boost": 3}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "g", "pivot": "1km", "origin": [-71.35, 41.12]}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "g", "pivot": "1000m", "origin": "41.12,-71.35"}}), HITS),
+    ("POST", DS, q({"bool": {"must": {"match": {"t": "quick"}}, "should": {"distance_feature": {"field": "d", "pivot": "1h", "origin": "2018-02-01T08:00:00Z"}}}}), HITS),
+    ("POST", DS, q({"distance_feature": {"field": "missing", "pivot": "1h", "origin": "2018-02-01"}}), HITS),
+])
+
+LOOKUP_DOCS = [{"user": "u1", "followers": ["u2", "u3"]}, {"user": "u2", "followers": ["u1", "u3", "u4"]},
+               {"user": "u3", "followers": ["u1"]}, {"user": "u4", "followers": ["u3"]}]
+LOOKUP_MAPPING = {"settings": {"index": {"refresh_interval": "-1", "max_terms_count": 2}},
+                  "mappings": {"properties": {"user": {"type": "keyword"}, "followers": {"type": "keyword"}}}}
+scenario("dsl_terms_lookup", setup("dsl-tl", LOOKUP_MAPPING, LOOKUP_DOCS) + [
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": ["u1", "u2"]}}), HITS),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": ["u1", "u2", "u3"]}})),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "1", "path": "followers"}}}), HITS),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "2", "path": "followers"}}})),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "zz", "path": "followers"}}}), HITS),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-nope", "id": "1", "path": "followers"}}})),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "path": "followers"}}})),
+    ("POST", "/dsl-tl/_count", {"query": {"terms": {"user": {"index": "dsl-tl", "id": "1", "path": "followers"}}}}, {"pick": lambda r: r["count"]}),
+    # Real-time: an unrefreshed lookup document is read.
+    ("PUT", "/dsl-tl/_doc/5", {"user": "u5", "followers": ["u4"]}, {"pick": lambda r: r.get("result")}),
+    ("POST", "/dsl-tl/_search", q({"terms": {"user": {"index": "dsl-tl", "id": "5", "path": "followers"}}}), HITS),
+    ("DELETE", "/dsl-tl"),
+])
+
+scenario("dsl_explain_validate", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", "/dsl-edge/_explain/9", {"query": {"match_all": {}}}),
+    ("POST", "/dsl-edge/_explain/9", {"query": {"match": {"t": "wolf"}}}),
+    ("POST", "/dsl-edge/_explain/9", {"query": {"match": {"t": "xyz"}}}),
+    ("POST", "/dsl-edge/_explain/nope", {"query": {"match_all": {}}}),
+    ("POST", "/dsl-edge/_explain/9?_source=true", {"query": {"term": {"k": "wolf"}}}, {"pick": lambda r: (r["matched"], r.get("get"))}),
+    ("POST", "/dsl-edge/_explain/9?_source_includes=k", {"query": {"term": {"k": "wolf"}}}, {"pick": lambda r: (r["matched"], r.get("get"))}),
+    ("POST", "/dsl-edge/_explain/9", {"match_all": {}}),
+    ("POST", "/dsl-edge/_explain/9", {}),
+    ("POST", "/dsl-nope/_explain/9", {"query": {"match_all": {}}}),
+    ("GET", "/dsl-edge/_explain/9?q=wolf", None, {"pick": lambda r: r["matched"]}),
+    ("GET", "/dsl-edge/_explain/9?q=t:wolf%20t:xyz&default_operator=AND", None, {"pick": lambda r: r["matched"]}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"query": {"boool": {}}}),
+    ("POST", "/dsl-edge/_validate/query", {"query": {"boool": {}}}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"match_all": {}}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", None),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"query": {"match": {"t": "Big wolf"}}}),
+    ("POST", "/dsl-edge/_validate/query?explain=true", {"query": {"bool": {"must": {"term": {"k": "a"}}, "filter": {"term": {"k": "b"}}}}}),
+    ("GET", "/dsl-edge/_validate/query?q=t:BA*", None),
+    ("GET", "/dsl-edge/_validate/query?explain=true&q=t:BA*", None),
+    ("GET", "/dsl-edge/_validate/query?q=n:foo&lenient=true", None),
+    ("GET", "/dsl-nope/_validate/query?q=x", None),
+    ("POST", DS, {"explain": True, "size": 1, "query": {"match": {"t": "wolf"}}},
+     {"pick": lambda r: [(h["_shard"], h["_explanation"]) for h in r["hits"]["hits"]]}),
+])
+
+scenario("dsl_rescore", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, q({"match": {"t": "cold"}}, rescore={"window_size": 2, "query": {"rescore_query": {"match": {"t": "outside"}}, "query_weight": 0.5, "rescore_query_weight": 2}}), HITS),
+    ("POST", DS, q({"match": {"t": "quick"}}, rescore=[{"window_size": 10, "query": {"rescore_query": {"match": {"t": "brown"}}, "score_mode": "multiply"}}, {"query": {"rescore_query": {"match": {"t": "fox"}}, "score_mode": "max", "rescore_query_weight": 3}}]), HITS),
+    ("POST", DS, q({"match": {"t": "cold"}}, rescore={"query": {"rescore_query": {"match": {"t": "outside"}}, "score_mode": "avg"}}), HITS),
+    ("POST", DS, q({"match": {"t": "cold"}}, rescore={"query": {"rescore_query": {"match": {"t": "outside"}}, "score_mode": "min"}}), HITS),
+    ("POST", DS, q({"match": {"t": "quick"}}, sort=["k"], rescore={"window_size": 1, "query": {"rescore_query": {"match": {"t": "brown"}}}})),
+    ("POST", DS, q({"match_all": {}}, size=3, explain=True, rescore={"window_size": 2, "query": {"rescore_query": {"match_all": {}}, "query_weight": 5, "rescore_query_weight": 10}}),
+     {"pick": lambda r: (r["hits"]["max_score"], [(h["_score"], h["_explanation"]["value"]) for h in r["hits"]["hits"]])}),
+])
+
+scenario("dsl_named_post_filter", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS + "?include_named_queries_score=true", q({"bool": {"should": [{"match": {"n": {"query": 1, "_name": "one"}}}, {"match": {"t": {"query": "quick", "_name": "quick", "boost": 2}}}]}}),
+     {"pick": lambda r: [(h["_id"], h.get("matched_queries")) for h in r["hits"]["hits"]]}),
+    ("POST", DS, q({"bool": {"should": [{"match": {"n": {"query": 1, "_name": "one"}}}, {"match": {"t": {"query": "quick", "_name": "quick"}}}]}}),
+     {"pick": lambda r: [(h["_id"], h.get("matched_queries")) for h in r["hits"]["hits"]]}),
+    ("POST", DS, {"size": 20, "query": {"match": {"t": "cold"}}, "post_filter": {"term": {"k": "cold"}}, "aggs": {"ks": {"terms": {"field": "k"}}}},
+     {"pick": lambda r: (dsl_hits(r), r["hits"]["total"], r["aggregations"])}),
+])
+
+scenario("dsl_parse_errors", setup("dsl-edge", DSL_MAPPING, DSL_DOCS) + [
+    ("POST", DS, {"query": {"boool": {}}}),
+    ("POST", DS, {"query": {"matchall": {}}}),
+    ("POST", DS, {"query": {"bool": {"must": [{"xyzzy": {}}]}}}),
+    ("POST", DS, {"query": {"term": {"k": "x"}, "preference": "_local"}}),
+    ("POST", DS, {"match": {"t": "x"}}),
+    ("POST", DS, {"foo": 1}),
+    ("POST", DS, {"foo": [1]}),
+    ("POST", DS, {"query": {"exists": {"field": "_source"}}}),
+    ("POST", DS, q({"range": {"n": {"gte": "1e+1", "lt": "11"}}}), HITS),
+    ("POST", DS, q({"range": {"n": {"from": 2, "to": 4, "include_lower": False}}}), HITS),
+    ("POST", DS, q({"range": {"n": {"gte": "abc"}}})),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

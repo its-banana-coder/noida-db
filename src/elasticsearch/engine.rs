@@ -1021,7 +1021,8 @@ impl Engine {
         {
             return e;
         }
-        let _dsl = match Self::prepare_query(&s, index_pattern, action == "_search", &mut req) {
+        let search = action == "_search";
+        let _dsl = match Self::prepare_query(&s, index_pattern, search, &mut req, body) {
             Ok(g) => g,
             Err(e) => return e,
         };
@@ -1212,6 +1213,7 @@ impl Engine {
         index_pattern: &str,
         search: bool,
         req: &mut Value,
+        raw: &[u8],
     ) -> Result<super::dsl::Guard, (u16, Value)> {
         let names = Self::resolve_indices(s, index_pattern);
         let fetch = |index: &str, id: &str, _routing: Option<&str>| {
@@ -1235,6 +1237,7 @@ impl Engine {
             default_index: names.first().cloned(),
             max_terms_count,
             search,
+            raw: std::str::from_utf8(raw).unwrap_or_default(),
         };
         super::dsl::prepare(req, &env)?;
         let allow = ["transient", "persistent"]

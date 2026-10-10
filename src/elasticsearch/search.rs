@@ -333,8 +333,18 @@ fn inner_hits(
             {
                 let path = n.get("path").and_then(Value::as_str).unwrap_or("").to_string();
                 let name = ih.get("name").and_then(Value::as_str).unwrap_or(&path).to_string();
+                let source_enabled = mappings
+                    .get("_source")
+                    .and_then(|s| s.get("enabled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 let size = ih.get("size").and_then(Value::as_u64).unwrap_or(3) as usize;
                 let from = ih.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
+                // A nested query inside reports its inner hits per child.
+                let mut sub = Vec::new();
+                if let Some(q) = n.get("query") {
+                    inner_hits(q, mappings, &children, &mut sub)?;
+                }
                 let mut by_parent = HashMap::new();
                 for (parent, mut ms) in per {
                     ms.sort_by(|a, b| {
@@ -355,7 +365,15 @@ fn inner_hits(
                             "_nested": {"field": path, "offset": offset},
                             "_score": score,
                         });
-                        if !matches!(ih.get("_source"), Some(Value::Bool(false))) {
+                        if ih.get("version").and_then(Value::as_bool) == Some(true) {
+                            hit["_version"] = json!(c.version);
+                        }
+                        if ih.get("seq_no_primary_term").and_then(Value::as_bool) == Some(true) {
+                            hit["_seq_no"] = json!(c.seq);
+                            hit["_primary_term"] = json!(1);
+                        }
+                        if !matches!(ih.get("_source"), Some(Value::Bool(false))) && source_enabled
+                        {
                             hit["_source"] = apply_source_filter(src, ih.get("_source"));
                         }
                         if let Some(hl) = ih.get("highlight") {
@@ -366,8 +384,14 @@ fn inner_hits(
                                 settings: &settings,
                                 weighted: true,
                             };
+                            // Without `_source`, only stored fields have text.
+                            let shown = if source_enabled {
+                                c.source.clone()
+                            } else {
+                                dsl::stored_only(mappings, &c.source)
+                            };
                             if let Some(h) =
-                                highlight::highlight(hl, &inner_query, mappings, &c.source, &ctx)?
+                                highlight::highlight(hl, &inner_query, mappings, &shown, &ctx)?
                             {
                                 hit["highlight"] = h;
                             }
@@ -384,6 +408,17 @@ fn inner_hits(
                             }
                             if !grouped.is_empty() {
                                 hit["fields"] = json!({ (path.as_str()): [grouped] });
+                            }
+                        }
+                        if let Some(spec) = ih.get("docvalue_fields") {
+                            for (k, v) in fields::fetch(mappings, c, spec, fields::Kind::DocValue)?
+                            {
+                                hit["fields"][k.as_str()] = v;
+                            }
+                        }
+                        for (sub_name, per_child) in &sub {
+                            if let Some(h) = per_child.get(&ci) {
+                                hit["inner_hits"][sub_name.as_str()] = h.clone();
                             }
                         }
                         hits.push(hit);
@@ -430,6 +465,10 @@ pub(crate) fn resolve_field(mappings: &Value, field: &str) -> (String, Option<St
         if i + 1 == segs.len() {
             let ty = node.get("type").and_then(Value::as_str).unwrap_or("object");
             return (field.to_string(), Some(ty.to_string()));
+        }
+        // A key inside a `flattened` field is a keyword.
+        if node.get("type").and_then(Value::as_str) == Some("flattened") {
+            return (field.to_string(), Some("keyword".to_string()));
         }
         if i + 2 == segs.len()
             && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[i + 1]))
@@ -508,6 +547,9 @@ fn value_to_term(v: &Value) -> String {
 pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> {
     let (path, ty) = resolve_field(mappings, field);
     let ty = ty.as_deref();
+    if ty == Some("flattened") {
+        return dsl::flattened_values(source, &path);
+    }
     if ty == Some("keyword") && path != field && field.ends_with(".keyword") {
         return raw_values(source, &path)
             .into_iter()
@@ -614,6 +656,9 @@ fn eval_term(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
         None => value_and_boost(spec),
     };
     let target = value_to_term(&value);
+    if let Some(scores) = dsl::term_scores(mappings, docs, field, spec, &target, boost) {
+        return scores;
+    }
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
         if meta_tokens(mappings, d, field).contains(&target) {
@@ -999,6 +1044,8 @@ fn eval_range(
         }
         return Ok(out);
     }
+    let numeric = dsl::numeric_range_bounds(cond, ty.as_deref())?;
+    let cond = numeric.as_ref().unwrap_or(cond);
     for (idx, d) in docs.iter().enumerate() {
         if raw_values(&d.source, &path).into_iter().any(|val| in_range(val, cond)) {
             out.insert(idx, boost);
@@ -2502,8 +2549,11 @@ pub fn search_with(
                         collapse_inner_hits(ih, &group, mappings, docs, originals)?;
                 }
             }
-            let names: Vec<(&String, f32)> =
+            let mut names: Vec<(&String, f32)> =
                 named.iter().filter_map(|(n, m)| m.get(idx).map(|s| (n, *s))).collect();
+            let mut order: Vec<&String> = names.iter().map(|(n, _)| *n).collect();
+            dsl::java_hash_order(&mut order);
+            names.sort_by_key(|(n, _)| order.iter().position(|o| o == n));
             if !names.is_empty() {
                 hit["matched_queries"] = if named_scores {
                     Value::Object(names.iter().map(|(n, s)| ((*n).clone(), json!(s))).collect())

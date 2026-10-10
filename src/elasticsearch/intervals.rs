@@ -213,9 +213,32 @@ impl Src {
                 subs.iter().for_each(|s| s.leaf_terms(out))
             }
             Src::Repeat(s, _) | Src::First(s, _) => s.leaf_terms(out),
-            Src::Filtered { src, .. } => src.leaf_terms(out),
+            // `span_containing`/`span_within` weigh both sides' terms.
+            Src::Filtered { src, reference, .. } => {
+                src.leaf_terms(out);
+                reference.leaf_terms(out);
+            }
             Src::Not { include, .. } => include.leaf_terms(out),
             Src::Gap(_) | Src::Nothing => {}
+        }
+    }
+
+    /// Lucene's span `width()` of a match: 0 for a term, the gaps of an
+    /// ordered near, the whole length of an unordered one.
+    fn span_width(&self, iv: &Iv) -> i64 {
+        match self {
+            Src::Terms { .. } | Src::Gap(_) | Src::Nothing => 0,
+            Src::Combine { kind: Kind::Unordered, .. } => iv.width(),
+            Src::Combine { .. } | Src::Repeat(..) => iv.gaps,
+            Src::Or(subs) => {
+                if subs.iter().all(|s| matches!(s, Src::Terms { .. })) {
+                    0
+                } else {
+                    iv.gaps
+                }
+            }
+            Src::Filtered { src, .. } | Src::First(src, _) => src.span_width(iv),
+            Src::Not { include, .. } => include.span_width(iv),
         }
     }
 
@@ -458,10 +481,32 @@ fn too_many(pattern: &str) -> EsError {
     )
 }
 
+/// The parameters each interval rule takes.
+const RULE_PARAMS: &[(&str, &[&str])] = &[
+    ("match", &["query", "max_gaps", "ordered", "analyzer", "filter", "use_field"]),
+    ("any_of", &["intervals", "filter"]),
+    ("all_of", &["intervals", "max_gaps", "ordered", "filter"]),
+    ("prefix", &["prefix", "analyzer", "use_field"]),
+    ("wildcard", &["pattern", "analyzer", "use_field"]),
+    ("fuzzy", &["term", "prefix_length", "transpositions", "fuzziness", "analyzer", "use_field"]),
+];
+
 fn parse_rule(name: &str, body: &Value, field: &str, cx: &mut Ctx) -> Result<Src, EsError> {
     let empty = Map::new();
     let o = body.as_object().unwrap_or(&empty);
+    if let Some((_, params)) = RULE_PARAMS.iter().find(|(r, _)| *r == name)
+        && let Some(bad) = o.keys().find(|k| !params.contains(&k.as_str()))
+    {
+        return Err(EsError::new(
+            400,
+            "x_content_parse_exception",
+            &format!("[{name}] unknown field [{bad}]"),
+        ));
+    }
     let use_field = o.get("use_field").and_then(Value::as_str).unwrap_or(field).to_string();
+    if use_field != field {
+        check_text_field(cx.mappings, &use_field)?;
+    }
     let src = match name {
         "match" => {
             let text = query_text(o.get("query"));
@@ -584,15 +629,8 @@ fn apply_filter(src: Src, spec: &Value, field: &str, cx: &mut Ctx) -> Result<Src
     Ok(Src::Filtered { filter, src: Box::new(src), reference: Box::new(reference) })
 }
 
-/// `intervals`.
-pub fn eval_intervals(
-    v: &Value,
-    mappings: &Value,
-    docs: &[CommittedDoc],
-) -> Result<Scores, EsError> {
-    let Some((field, spec)) = field_and_spec(v) else {
-        return Err(EsError::parsing("Expected [FIELD_NAME] but got [END_OBJECT]"));
-    };
+/// Interval queries run on text fields only.
+fn check_text_field(mappings: &Value, field: &str) -> Result<(), EsError> {
     let ty = resolve_field(mappings, field).1;
     if let Some(t) = ty.as_deref().filter(|t| !matches!(*t, "text" | "match_only_text")) {
         let reason = format!(
@@ -605,6 +643,19 @@ pub fn eval_intervals(
         )
         .caused_by("illegal_argument_exception", &reason));
     }
+    Ok(())
+}
+
+/// `intervals`.
+pub fn eval_intervals(
+    v: &Value,
+    mappings: &Value,
+    docs: &[CommittedDoc],
+) -> Result<Scores, EsError> {
+    let Some((field, spec)) = field_and_spec(v) else {
+        return Err(EsError::parsing("Expected [FIELD_NAME] but got [END_OBJECT]"));
+    };
+    check_text_field(mappings, field)?;
     let (name, body) = rule_of(spec)?;
     let boost = spec.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32;
     let mut cx = Ctx { mappings, docs, terms: HashMap::new() };
@@ -929,7 +980,7 @@ pub fn eval_span(
         if ivs.is_empty() {
             continue;
         }
-        let freq: f32 = ivs.iter().map(|iv| 1.0 / (1 + iv.gaps.max(0)) as f32).sum();
+        let freq: f32 = ivs.iter().map(|iv| 1.0 / (1 + src.span_width(iv).max(0)) as f32).sum();
         let len = scoring::norm_doc_len(lens.get(i).copied().unwrap_or(0)).max(1) as f32;
         let norm = scoring::K1 * ((1.0 - scoring::B) + scoring::B * len / avg);
         out.insert(i, boost * idf * freq * (scoring::K1 + 1.0) / (freq + norm));

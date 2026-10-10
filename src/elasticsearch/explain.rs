@@ -406,6 +406,14 @@ fn java_class(kind: &str) -> String {
 /// An error response's root cause (and its cause) as `Class: reason`.
 fn error_text(resp: &Value) -> String {
     let err = &resp["error"];
+    // A failure inside a compound query's clause.
+    if err["type"] == "x_content_parse_exception" {
+        return format!(
+            "org.elasticsearch.common.ParsingException: Failed to parse; \
+             org.elasticsearch.xcontent.XContentParseException: {}",
+            err["reason"].as_str().unwrap_or_default()
+        );
+    }
     let root = err.get("root_cause").and_then(|r| r.get(0)).unwrap_or(err);
     let mut out = format!(
         "{}: {}",
@@ -595,8 +603,8 @@ impl Engine {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         params.insert("size".into(), "0".into());
-        let bytes = serde_json::to_vec(&req).unwrap_or_default();
-        let (status, resp) = self.search_or_count("POST", "_search", target, &params, &bytes);
+        // The body as sent, so errors point at its positions.
+        let (status, resp) = self.search_or_count("POST", "_search", target, &params, body);
         if status == 404 {
             return (status, resp);
         }

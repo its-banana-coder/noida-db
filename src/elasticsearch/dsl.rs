@@ -134,10 +134,74 @@ pub fn did_you_mean(name: &str, candidates: &[&str]) -> String {
     }
 }
 
-/// The parse error for an unknown query name.
+/// The parse error for a query name `eval` doesn't know (one
+/// Elasticsearch has but noida doesn't run is reported as unknown, without
+/// suggestions).
 pub fn unknown_query(name: &str) -> EsError {
-    EsError::parsing(&format!("unknown query [{name}]{}", did_you_mean(name, QUERY_NAMES)))
-        .caused_by("named_object_not_found_exception", &format!("[1:2] unknown field [{name}]"))
+    let hint =
+        if QUERY_NAMES.contains(&name) { String::new() } else { did_you_mean(name, QUERY_NAMES) };
+    EsError::parsing(&format!("unknown query [{name}]{hint}"))
+}
+
+/// The `line:col` Elasticsearch reports for `"name"` in the request body:
+/// the name itself, or (`value`) the value after it.
+fn locate(raw: &str, name: &str, value: bool) -> Option<(usize, usize)> {
+    let quoted = format!("\"{name}\"");
+    let mut from = 0;
+    while let Some(i) = raw[from..].find(&quoted).map(|i| i + from) {
+        let rest = &raw[i + quoted.len()..];
+        let ws = rest.len() - rest.trim_start().len();
+        if rest[ws..].starts_with(':') {
+            let at = if value {
+                let after = &rest[ws + 1..];
+                i + quoted.len() + ws + 1 + (after.len() - after.trim_start().len())
+            } else {
+                i
+            };
+            let line = raw[..at].matches('\n').count() + 1;
+            let col = at - raw[..at].rfind('\n').map_or(0, |n| n + 1) + 1;
+            return Some((line, col));
+        }
+        from = i + quoted.len();
+    }
+    None
+}
+
+/// A `parsing_exception` response, positioned in the body when known.
+fn parse_failure(reason: &str, at: Option<(usize, usize)>, cause: Option<Value>) -> Fail {
+    let mut e = json!({"type": "parsing_exception", "reason": reason});
+    if let Some((line, col)) = at {
+        e["line"] = json!(line);
+        e["col"] = json!(col);
+    }
+    let root = e.clone();
+    if let Some(c) = cause {
+        e["caused_by"] = c;
+    }
+    e["root_cause"] = json!([root]);
+    (400, json!({"error": e, "status": 400}))
+}
+
+/// A parse failure inside a `bool` clause, wrapped the way
+/// Elasticsearch's object parser reports it.
+fn wrap_bool_clause(f: Fail, clause: &str) -> Fail {
+    let (status, mut v) = f;
+    let kind = v["error"]["type"].as_str().unwrap_or_default().to_string();
+    if !matches!(kind.as_str(), "parsing_exception" | "x_content_parse_exception") {
+        return (status, v);
+    }
+    let mut inner = v["error"].take();
+    let root = inner.as_object_mut().and_then(|o| o.remove("root_cause"));
+    let pos = match (inner.get("line"), inner.get("col")) {
+        (Some(l), Some(c)) => format!("[{l}:{c}] "),
+        _ => String::new(),
+    };
+    (
+        status,
+        json!({"error": {"root_cause": root, "type": "x_content_parse_exception",
+                         "reason": format!("{pos}[bool] failed to parse field [{clause}]"),
+                         "caused_by": inner}, "status": status}),
+    )
 }
 
 /// The keys a search request body may have.
@@ -204,6 +268,8 @@ pub struct Env<'a> {
     pub max_terms_count: usize,
     /// A `_search` body (a `_count` body takes only `query`).
     pub search: bool,
+    /// The request body as sent (for error positions).
+    pub raw: &'a str,
 }
 
 /// Checks and rewrites a search request before it runs.
@@ -262,23 +328,35 @@ fn walk(q: &mut Value, env: &Env) -> Result<(), Fail> {
             .keys()
             .find(|k| QUERY_NAMES.contains(&k.as_str()))
             .unwrap_or_else(|| o.keys().next().expect("non-empty"));
-        return Err(fail(EsError::parsing(&format!(
-            "[{name}] malformed query, expected [END_OBJECT] but found [FIELD_NAME]"
-        ))));
+        let extra = o.keys().find(|k| *k != name).cloned().unwrap_or_default();
+        return Err(parse_failure(
+            &format!("[{name}] malformed query, expected [END_OBJECT] but found [FIELD_NAME]"),
+            locate(env.raw, &extra, false),
+            None,
+        ));
     }
     let Some((name, body)) = o.iter_mut().next() else { return Ok(()) };
     if !QUERY_NAMES.contains(&name.as_str()) {
-        return Err(fail(unknown_query(name)));
+        let at = locate(env.raw, name, true);
+        let pos = at.map_or(String::new(), |(l, c)| format!("[{l}:{c}] "));
+        return Err(parse_failure(
+            &format!("unknown query [{name}]{}", did_you_mean(name, QUERY_NAMES)),
+            at,
+            Some(json!({"type": "named_object_not_found_exception",
+                        "reason": format!("{pos}unknown field [{name}]")})),
+        ));
     }
     if let Some((_, keys)) = CHILD_QUERIES.iter().find(|(n, _)| *n == name) {
+        let in_bool = name == "bool";
         for k in *keys {
+            let wrap = |f: Fail| if in_bool { wrap_bool_clause(f, k) } else { f };
             match body.get_mut(*k) {
                 Some(Value::Array(a)) => {
                     for c in a {
-                        walk(c, env)?;
+                        walk(c, env).map_err(wrap)?;
                     }
                 }
-                Some(c @ Value::Object(_)) => walk(c, env)?,
+                Some(c @ Value::Object(_)) => walk(c, env).map_err(wrap)?,
                 _ => {}
             }
         }
@@ -539,6 +617,9 @@ fn numeric_match(
         ),
         other => (other.clone(), 1.0, false),
     };
+    if spec.get("fuzziness").is_some() {
+        fuzzy::check_fuzzy_field(ty, field)?;
+    }
     let as_num = |v: &Value| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
     let Some(target) = as_num(&text) else {
         if lenient {
@@ -567,6 +648,128 @@ fn numeric_match(
         .collect())
 }
 
+/// A numeric field's `range` bounds as numbers (YAML and clients may send
+/// `"1e+300"`), `from`/`to` as `gte`/`lte` (`gt`/`lt` when not
+/// `include_lower`/`include_upper`); `None` for other fields.
+pub fn numeric_range_bounds(cond: &Value, ty: Option<&str>) -> Result<Option<Value>, EsError> {
+    if !ty.is_some_and(|t| NUMERIC.contains(&t)) {
+        return Ok(None);
+    }
+    let Some(o) = cond.as_object() else { return Ok(None) };
+    let mut out = Map::new();
+    let inclusive = |k: &str| o.get(k).and_then(Value::as_bool).unwrap_or(true);
+    for (key, target) in [
+        ("gte", "gte"),
+        ("gt", "gt"),
+        ("lte", "lte"),
+        ("lt", "lt"),
+        ("from", if inclusive("include_lower") { "gte" } else { "gt" }),
+        ("to", if inclusive("include_upper") { "lte" } else { "lt" }),
+    ] {
+        let n = match o.get(key) {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(s)) => s.trim().parse::<f64>().map_err(|_| {
+                let reason = format!("For input string: \"{s}\"");
+                EsError::shard_failure(
+                    "query_shard_exception",
+                    &format!("failed to create query: {reason}"),
+                )
+                .caused_by("number_format_exception", &reason)
+            })?,
+            Some(v) => match v.as_f64() {
+                Some(n) => n,
+                None => continue,
+            },
+        };
+        out.insert(target.into(), json!(n));
+    }
+    Ok(Some(Value::Object(out)))
+}
+
+/// The leaf values of a `flattened` field, as its keyword terms.
+pub fn flattened_values(source: &Value, path: &str) -> Vec<String> {
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::String(s) => out.push(s.clone()),
+            Value::Number(n) => out.push(n.to_string()),
+            Value::Bool(b) => out.push(b.to_string()),
+            Value::Null => {}
+        }
+    }
+    let mut out = Vec::new();
+    for v in raw_values(source, path) {
+        walk(v, &mut out);
+    }
+    out
+}
+
+/// `source` with only the fields mapped `store: true` (what a highlighter
+/// can read when `_source` is disabled).
+pub fn stored_only(mappings: &Value, source: &Value) -> Value {
+    fn walk(props: &Value, src: &Value) -> Option<Value> {
+        let (Some(props), Some(src)) = (props.as_object(), src.as_object()) else { return None };
+        let mut out = Map::new();
+        for (k, v) in src {
+            let Some(def) = props.get(k) else { continue };
+            if let Some(sub) = def.get("properties") {
+                let kept = match v {
+                    Value::Array(a) => {
+                        let items: Vec<Value> = a.iter().filter_map(|x| walk(sub, x)).collect();
+                        (!items.is_empty()).then_some(Value::Array(items))
+                    }
+                    other => walk(sub, other),
+                };
+                if let Some(x) = kept {
+                    out.insert(k.clone(), x);
+                }
+            } else if def.get("store").and_then(Value::as_bool) == Some(true) {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        (!out.is_empty()).then_some(Value::Object(out))
+    }
+    mappings.get("properties").and_then(|p| walk(p, source)).unwrap_or_else(|| json!({}))
+}
+
+/// A `term` query's BM25 scores on a text, keyword or boolean field (as
+/// Elasticsearch scores a `TermQuery`); `None` where it scores a constant
+/// (numbers, dates, `_id`, `case_insensitive`).
+pub fn term_scores(
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    field: &str,
+    spec: &Value,
+    term: &str,
+    boost: f32,
+) -> Option<Scores> {
+    if spec.get("case_insensitive").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let ty = resolve_field(mappings, field).1?;
+    let ft = fuzzy::FieldTerms::new(mappings, docs, field);
+    match ty.as_str() {
+        "text" => Some(ft.term_scores(term, ft.doc_freq(term), boost)),
+        "keyword" | "boolean" | "flattened" => Some(ft.term_scores_no_norms(term, boost)),
+        _ => None,
+    }
+}
+
+/// Names in the order a Java `HashMap` iterates them (how Elasticsearch
+/// lists a hit's `matched_queries`).
+pub fn java_hash_order(names: &mut [&String]) {
+    let hash = |s: &str| {
+        let h = s.encode_utf16().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(c as u32));
+        h ^ (h >> 16)
+    };
+    let mut cap = 16usize;
+    while names.len() * 4 > cap * 3 {
+        cap *= 2;
+    }
+    names.sort_by_key(|n| hash(n) as usize & (cap - 1));
+}
+
 /// A duration with its unit (`1h`, `100000000nanos`) in nanoseconds.
 fn duration_nanos(s: &str) -> Option<f64> {
     let s = s.trim();
@@ -588,9 +791,12 @@ fn duration_nanos(s: &str) -> Option<f64> {
 
 /// Epoch nanoseconds of a date (math), keeping a `date_nanos` string's
 /// sub-millisecond digits.
-fn date_nanos(v: &Value, format: Option<&str>) -> Option<f64> {
+fn date_nanos(v: &Value, format: Option<&str>, round_up: bool) -> Option<f64> {
     let ms = match v {
-        Value::String(s) => dates::parse_math(s, dates::now_ms(), false, format, 0)?,
+        Value::String(s) => {
+            dates::parse_math(s, dates::now_ms(), round_up, format, 0)?
+                + if round_up { round_up_fill(s) } else { 0 }
+        }
         other => dates::value_millis(other, format)?,
     };
     let mut nanos = ms as f64 * 1e6;
@@ -605,6 +811,31 @@ fn date_nanos(v: &Value, format: Option<&str>) -> Option<f64> {
         }
     }
     Some(nanos)
+}
+
+/// The milliseconds a rounded-up ISO date adds for the fields it leaves
+/// out (`2018-02-01` is that day's last millisecond).
+fn round_up_fill(s: &str) -> i64 {
+    if s.contains("now") || s.contains("||") {
+        return 0;
+    }
+    match s.split_once('T') {
+        None if s.len() == 10 => 86_399_999,
+        None => 0,
+        Some((_, time)) => {
+            let time = time.trim_end_matches('Z');
+            let time = time.split(['+', '-']).next().unwrap_or(time);
+            if time.contains('.') {
+                0
+            } else {
+                match time.matches(':').count() {
+                    0 => 3_599_999,
+                    1 => 59_999,
+                    _ => 999,
+                }
+            }
+        }
+    }
 }
 
 /// `distance_feature`: `boost * pivot / (pivot + distance)` from `origin`
@@ -636,7 +867,8 @@ fn distance_feature(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Resul
                 .and_then(|d| d.get("format"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let o = date_nanos(origin, None).ok_or_else(|| {
+            // The origin rounds up (`2018-02-01` is the end of that day).
+            let o = date_nanos(origin, None, true).ok_or_else(|| {
                 EsError::shard_failure(
                     "parse_exception",
                     &format!(
@@ -649,7 +881,7 @@ fn distance_feature(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Resul
             for (i, d) in docs.iter().enumerate() {
                 let best = raw_values(&d.source, field)
                     .into_iter()
-                    .filter_map(|x| date_nanos(x, format.as_deref()))
+                    .filter_map(|x| date_nanos(x, format.as_deref(), false))
                     .map(|t| (t - o).abs())
                     .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.min(x))));
                 if let Some(dist) = best {

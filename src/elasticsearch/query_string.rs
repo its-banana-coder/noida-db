@@ -258,7 +258,9 @@ impl Ctx<'_> {
             }
             match ty {
                 "text" | "match_only_text" => Some(json!({"match": {f: {"query": text}}})),
-                "keyword" | "constant_keyword" | "wildcard" => Some(json!({"term": {f: text}})),
+                "keyword" | "constant_keyword" | "wildcard" | "flattened" => {
+                    Some(json!({"term": {f: text}}))
+                }
                 "boolean" => match text {
                     "true" | "false" => Some(json!({"term": {f: text}})),
                     _ if lenient => None,
@@ -289,7 +291,7 @@ impl Ctx<'_> {
             "text" | "match_only_text" => {
                 Some(json!({"match_phrase": {f: {"query": text, "slop": slop}}}))
             }
-            "keyword" => Some(json!({"term": {f: text}})),
+            "keyword" | "flattened" => Some(json!({"term": {f: text}})),
             _ => None,
         })
     }
