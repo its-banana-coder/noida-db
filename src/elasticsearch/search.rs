@@ -12,11 +12,13 @@ use std::collections::{HashMap, HashSet};
 
 use super::analysis;
 use super::dates;
+use super::features;
 use super::fields;
 use super::highlight;
 use super::queries;
 use super::query_string;
 use super::rescore;
+use super::retrievers;
 use super::scoring;
 use super::sorting;
 use super::suggest;
@@ -1303,6 +1305,9 @@ pub fn eval(
     if let Some(r) = super::ranges::eval(obj, mappings, docs) {
         return r;
     }
+    if let Some(r) = features::eval(obj, mappings, docs) {
+        return r;
+    }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
     }
@@ -2403,6 +2408,9 @@ pub fn search_with(
     body: &Value,
     opts: &SearchOptions,
 ) -> Result<Value, EsError> {
+    if retrievers::applies(body) {
+        return retrievers::search(mappings, docs, body, opts);
+    }
     if let Some(spec) = body.get("suggest") {
         let suggestions = suggest::suggest(spec, mappings, docs)?;
         let mut rest = body.clone();
@@ -2526,8 +2534,9 @@ pub fn search_with(
         let min_score = min_score as f32;
         scores.retain(|_, s| *s >= min_score);
     }
+    let terminated = retrievers::terminate_after(body, &query, &mut scores);
     let matched: Vec<usize> = scores.keys().copied().collect();
-    let total = scores.len();
+    let total = terminated.as_ref().map_or(scores.len(), |t| t.total);
 
     let mut ranked: Vec<(usize, f32, Vec<Value>)> = scores
         .into_iter()
@@ -2728,6 +2737,13 @@ pub fn search_with(
         "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
         "hits": hits_obj,
     });
+    if let Some(t) = terminated {
+        resp["terminated_early"] = json!(t.early);
+    }
+    let warnings = features::warnings(body);
+    if !warnings.is_empty() {
+        resp[super::engine::WARNINGS] = json!(warnings);
+    }
     if let Some(agg_spec) = agg_spec {
         resp["aggregations"] = eval_aggs(agg_spec, mappings, docs, &matched);
     }

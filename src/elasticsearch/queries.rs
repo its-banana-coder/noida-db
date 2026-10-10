@@ -374,8 +374,12 @@ pub(super) fn doc_view(mappings: &Value, d: &CommittedDoc, src: &str) -> Value {
     let mut m = Map::new();
     // Only the fields the script names (`doc['x']`).
     let mut rest = src;
-    while let Some(i) = rest.find("doc[") {
-        rest = &rest[i + 4..];
+    // `doc['x']`, or `$('x', default)`.
+    let next = |s: &str| {
+        [s.find("doc[").map(|i| i + 4), s.find("$(").map(|i| i + 2)].into_iter().flatten().min()
+    };
+    while let Some(i) = next(rest) {
+        rest = &rest[i..];
         let q = rest.chars().next().unwrap_or('\'');
         let name: String = rest[1..].chars().take_while(|c| *c != q).collect();
         if let Some(v) = vectors::field_def(mappings, &name)

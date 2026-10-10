@@ -2692,6 +2692,303 @@ scenario("stats_shards", [
     ("GET", "/st-a/_stats"),
     ("DELETE", "/st-a"),
 ])
+# --- Retrievers, quantized kNN scores, feature fields (vec-*) ---------
+
+VEC_RET = "/vec-ret/_search"
+
+
+def vec_hits(r):
+    out = [(h["_id"], h.get("_score"), h.get("fields"), h.get("sort")) for h in r["hits"]["hits"]]
+    return out + [r["hits"].get("total"), r["hits"].get("max_score"), r.get("terminated_early"),
+                  r.get("aggregations")]
+
+
+VEC_RET_DOCS = [
+    {"t": "a b", "k": "x", "n": 1, "v": [1, 1]},
+    {"t": "a", "k": "y", "n": 2, "v": [2, 2]},
+    {"t": "b", "k": "x", "n": 3, "v": [3, 3]},
+    {"t": "a c", "k": "x", "n": 4, "v": [4, 4]},
+    {"t": "c", "k": "y", "n": 5, "v": [5, 5]},
+]
+
+VEC_KNN = {"field": "v", "query_vector": [2, 2], "k": 3, "num_candidates": 5}
+
+scenario("vec_retrievers", setup("vec-ret", {"settings": {"number_of_shards": 1}, "mappings": {"properties": {
+    "t": {"type": "text"}, "k": {"type": "keyword"}, "n": {"type": "integer"},
+    "v": {"type": "dense_vector", "dims": 2, "similarity": "l2_norm"}}}}, VEC_RET_DOCS) + [
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a"}}, "filter": {"term": {"k": "x"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"filter": [{"term": {"k": "x"}}, {"range": {"n": {"gt": 1}}}]}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match_all": {}}, "sort": [{"n": "desc"}], "search_after": [4]}}, "size": 2}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match_all": {}}, "sort": [{"n": "asc"}], "collapse": {"field": "k"}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a"}}, "min_score": 0.5}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match": {"t": "a c"}}, "_name": "q"}}, "size": 1, "from": 1, "fields": ["k"]}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"match_all": {}}}}, "size": 0, "aggs": {"a": {"terms": {"field": "k"}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"filter": {"bool": {"must_not": {"term": {"k": "y"}}}}, "sort": ["n"], "terminate_after": 2}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": VEC_KNN}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, filter={"term": {"k": "x"}})}, "fields": ["n"]}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, similarity=1.5, _name="kn")}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, filter=[{"term": {"k": "x"}}])}, "size": 1, "from": 1}, {"pick": vec_hits}),
+    # Errors.
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "query_vector": [1, 1]}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "query_vector": [1, 1], "k": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"query_vector": [1, 1], "k": 2, "num_candidates": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "k": 2, "num_candidates": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, k=0)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, num_candidates=1)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, num_candidates=20000)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, boost=2)}}),
+    ("POST", VEC_RET, {"retriever": {"knn": dict(VEC_KNN, query_vector=[1, 2, 3])}}),
+    ("POST", VEC_RET, {"retriever": {"knn": {"field": "v", "query_vector_builder": {"text_embedding": {"model_id": "m", "model_text": "x"}}, "k": 1, "num_candidates": 2}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}}, "query": {"match_all": {}}, "knn": VEC_KNN, "sort": ["n"], "min_score": 1, "search_after": [1], "terminate_after": 2}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}}, "sub_searches": [{"query": {"match_all": {}}}]}),
+    ("POST", VEC_RET, {"retriever": {}}),
+    ("POST", VEC_RET, {"retriever": []}),
+    ("POST", VEC_RET, {"retriever": "x"}),
+    ("POST", VEC_RET, {"retriever": {"standard": 1}}),
+    ("POST", VEC_RET, {"retriever": {"foo": {}}}),
+    ("POST", VEC_RET, {"retriever": {"standar": {}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {}, "knn": VEC_KNN}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"bad": 1}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"query": {"bogus": {}}}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"filter": [{"bogus": {}}]}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"sort": "n"}}}),
+    ("POST", VEC_RET, {"retriever": {"standard": {"terminate_after": -1}}}),
+    ("POST", VEC_RET, {"retriever": {"rrf": 1}}),
+    # sub_searches and rank without a license.
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}, {"query": {"match": {"t": "b"}}}]}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}]}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}], "knn": VEC_KNN}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}}], "query": {"match_all": {}}}),
+    ("POST", VEC_RET, {"sub_searches": [{"query": {"match": {"t": "a"}}, "x": 1}]}),
+    ("POST", VEC_RET, {"sub_searches": {}}),
+    ("POST", VEC_RET, {"rank": {"foo": {}}}),
+    ("POST", VEC_RET, {"rank": {}}),
+    ("POST", VEC_RET, {"rank": 1}),
+    # terminate_after on a plain search.
+    ("POST", VEC_RET, {"terminate_after": 2, "query": {"match": {"t": "a"}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"terminate_after": 1, "query": {"constant_score": {"filter": {"term": {"k": "x"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"terminate_after": 10, "query": {"constant_score": {"filter": {"term": {"k": "x"}}}}}, {"pick": vec_hits}),
+    ("POST", VEC_RET, {"terminate_after": 2, "query": {"bool": {"must_not": {"term": {"k": "y"}}}}, "sort": [{"n": "desc"}]}, {"pick": vec_hits}),
+    ("DELETE", "/vec-ret"),
+])
+
+
+def vec_vectors(seed, n, dims, unit=False):
+    import random
+    rnd = random.Random(seed)
+    out = []
+    for _ in range(n):
+        v = [round(rnd.uniform(-50, 50), 3) for _ in range(dims)]
+        if unit:
+            m = sum(x * x for x in v) ** 0.5
+            v = [x / m for x in v]
+        out.append(v)
+    return out
+
+
+def vec_scores(r):
+    return [(h["_id"], h["_score"]) for h in r["hits"]["hits"]]
+
+
+def vec_quantized(name, opts, sim, vectors, queries):
+    props = {"v": {"type": "dense_vector", "dims": len(vectors[0]), "similarity": sim, "index_options": opts}}
+    steps = [("DELETE", f"/{name}?ignore_unavailable=true"),
+             ("PUT", f"/{name}", {"settings": {"number_of_shards": 1}, "mappings": {"properties": props}}, ACK)]
+    bulk = []
+    for i, v in enumerate(vectors, 1):
+        bulk += [{"index": {"_index": name, "_id": str(i)}}, {"v": v}]
+    steps.append(("POST", "/_bulk?refresh=true", bulk, {"pick": lambda r: r["errors"]}))
+    for q in queries:
+        steps.append(("POST", f"/{name}/_search", {"knn": {"field": "v", "query_vector": q, "k": 8, "num_candidates": 100}, "size": 8, "_source": False}, {"pick": vec_scores}))
+    steps.append(("DELETE", f"/{name}"))
+    return steps
+
+
+VEC_Q = vec_vectors(1, 30, 6)
+VEC_QU = vec_vectors(2, 30, 6, unit=True)
+VEC_QS = vec_vectors(3, 7, 4)
+vec_quant_steps = []
+for vec_t in ["int8_hnsw", "int4_hnsw", "int8_flat", "int4_flat"]:
+    for vec_sim, vec_docs in [("l2_norm", VEC_Q), ("cosine", VEC_Q), ("dot_product", VEC_QU), ("max_inner_product", VEC_Q)]:
+        vec_quant_steps += vec_quantized(f"vec-q-{vec_t.replace('_', '-')}-{vec_sim.replace('_', '-')}", {"type": vec_t}, vec_sim, vec_docs, [vec_docs[3], vec_vectors(9, 1, 6, unit=vec_sim == "dot_product")[0]])
+    vec_quant_steps += vec_quantized(f"vec-q-{vec_t.replace('_', '-')}-small", {"type": vec_t}, "l2_norm", VEC_QS, [VEC_QS[0], [1, 2, 3, 4]])
+vec_quant_steps += vec_quantized("vec-q-ci", {"type": "int8_hnsw", "confidence_interval": 0.95}, "l2_norm", VEC_Q, [VEC_Q[0]])
+vec_quant_steps += vec_quantized("vec-q-ci1", {"type": "int8_flat", "confidence_interval": 1.0}, "cosine", VEC_Q, [VEC_Q[0]])
+vec_quant_steps += vec_quantized("vec-q-int4-ci", {"type": "int4_hnsw", "confidence_interval": 0.9}, "l2_norm", VEC_Q, [VEC_Q[0]])
+scenario("vec_quantized", vec_quant_steps + [
+    ("DELETE", "/vec-q-sim?ignore_unavailable=true"),
+    ("PUT", "/vec-q-sim", {"settings": {"number_of_shards": 1}, "mappings": {"properties": {"v": {"type": "dense_vector", "dims": 5, "similarity": "l2_norm", "index_options": {"type": "int8_hnsw"}}, "n": {"type": "keyword"}}}}, ACK),
+    ("POST", "/_bulk?refresh=true", [{"index": {"_index": "vec-q-sim", "_id": "1"}}, {"n": "a", "v": [230.0, 300.33, -34.8988, 15.555, -200.0]},
+                                     {"index": {"_index": "vec-q-sim", "_id": "2"}}, {"n": "b", "v": [-0.5, 100.0, -13, 14.8, -156.0]},
+                                     {"index": {"_index": "vec-q-sim", "_id": "3"}}, {"n": "c", "v": [0.5, 111.3, -13.0, 14.8, -156.0]}], {"pick": lambda r: r["errors"]}),
+    ("POST", "/vec-q-sim/_search", {"knn": {"field": "v", "query_vector": [-0.5, 90.0, -10, 14.8, -156.0], "k": 3, "num_candidates": 3, "similarity": 10.3}}, {"pick": vec_scores}),
+    ("POST", "/vec-q-sim/_search", {"query": {"knn": {"field": "v", "query_vector": [-0.5, 90.0, -10, 14.8, -156.0], "similarity": 11, "filter": {"term": {"n": "b"}}}}}, {"pick": vec_scores}),
+    ("POST", "/vec-q-sim/_search", {"query": {"script_score": {"query": {"match_all": {}}, "script": {"source": "1 / (1 + l2norm(params.q, 'v'))", "params": {"q": [-0.5, 90.0, -10, 14.8, -156.0]}}}}}, {"pick": vec_scores}),
+    ("DELETE", "/vec-q-sim"),
+])
+
+VEC_FEAT = "/vec-feat/_search"
+VEC_FEAT_DOCS = [
+    {"t": {"a": 1.5, "b": 0.33333}, "rf": 10, "rfs": {"x": 2.5, "y": 7}, "neg": 3},
+    {"t": [{"a": 0.2, "c": 3.1}, {"a": 2.7}], "rf": 0.5, "rfs": {"x": 11}, "neg": 0.25},
+    {"t": {"d": 1}, "rf": 100},
+    {"t": {}, "rf": "7.5", "rfs": {"y": 0.001}},
+    {"t": [], "o": {"s": "z"}},
+]
+
+
+def vec_feat(q):
+    return ("POST", VEC_FEAT, {"query": q}, {"pick": lambda r: [(h["_id"], h["_score"], h.get("matched_queries")) for h in r["hits"]["hits"]]})
+
+
+def vec_doc(body):
+    return ("PUT", "/vec-feat/_doc/x", body, {"pick": lambda r: r.get("result")})
+
+
+scenario("vec_features", setup("vec-feat", {"settings": {"number_of_shards": 1}, "mappings": {"properties": {
+    "t": {"type": "sparse_vector"}, "rf": {"type": "rank_feature"}, "rfs": {"type": "rank_features"},
+    "neg": {"type": "rank_feature", "positive_score_impact": False}, "txt": {"type": "text"},
+    "o": {"properties": {"s": {"type": "keyword"}}}}}}, VEC_FEAT_DOCS) + [
+    ("GET", "/vec-feat/_mapping"),
+    vec_feat({"rank_feature": {"field": "rf"}}),
+    vec_feat({"rank_feature": {"field": "rf", "boost": 2, "_name": "f"}}),
+    vec_feat({"rank_feature": {"field": "rf", "saturation": {"pivot": 5}}}),
+    vec_feat({"rank_feature": {"field": "rf", "saturation": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {"scaling_factor": 4}}}),
+    vec_feat({"rank_feature": {"field": "rf", "sigmoid": {"pivot": 7, "exponent": 0.6}}}),
+    vec_feat({"rank_feature": {"field": "rf", "linear": {}}}),
+    vec_feat({"rank_feature": {"field": "rfs.x"}}),
+    vec_feat({"rank_feature": {"field": "rfs.y", "log": {"scaling_factor": 2}}}),
+    vec_feat({"rank_feature": {"field": "rfs.zzz"}}),
+    vec_feat({"rank_feature": {"field": "neg"}}),
+    vec_feat({"rank_feature": {"field": "neg", "linear": {}}}),
+    vec_feat({"rank_feature": {"field": "nope"}}),
+    vec_feat({"rank_feature": {"field": "t.a"}}),
+    vec_feat({"rank_feature": {"field": "o"}}),
+    vec_feat({"rank_feature": {}}),
+    vec_feat({"rank_feature": "rf"}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {"scaling_factor": 2}, "saturation": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "foo": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {}}}),
+    vec_feat({"rank_feature": {"field": "rf", "sigmoid": {"pivot": 5}}}),
+    vec_feat({"rank_feature": {"field": "neg", "log": {"scaling_factor": 2}}}),
+    vec_feat({"rank_feature": {"field": "rf", "saturation": {"pivot": -1}}}),
+    vec_feat({"rank_feature": {"field": "rf", "log": {"scaling_factor": 0.5}}}),
+    vec_feat({"rank_feature": {"field": "t"}}),
+    vec_feat({"rank_feature": {"field": "rfs"}}),
+    vec_feat({"rank_feature": {"field": "txt"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "b": 2, "c": 0.5}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "boost": 3, "_name": "n"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "zz": 5}, "prune": True}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "c": 0.1}, "prune": True, "pruning_config": {"tokens_freq_ratio_threshold": 1, "tokens_weight_threshold": 0.5}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1, "c": 0.1}, "prune": True, "pruning_config": {"tokens_freq_ratio_threshold": 1, "tokens_weight_threshold": 0.5, "only_score_pruned_tokens": True}}}),
+    vec_feat({"sparse_vector": {"field": "nope", "query_vector": {"a": 1}}}),
+    vec_feat({"sparse_vector": {}}),
+    vec_feat({"sparse_vector": {"field": "t"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "inference_id": "m"}}),
+    vec_feat({"sparse_vector": {"field": "t", "inference_id": "m"}}),
+    vec_feat({"sparse_vector": {"field": "t", "inference_id": "m", "query": "hi"}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": -1}}}),
+    vec_feat({"sparse_vector": {"field": "rfs", "query_vector": {"x": 1}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": "x"}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "foo": 1}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "pruning_config": {"tokens_freq_ratio_threshold": 200}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "prune": True, "pruning_config": {"tokens_weight_threshold": 2}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": [{"a": 1}, {"c": 2}], "boost": 2, "_name": "w"}}}),
+    vec_feat({"weighted_tokens": {"rfs": {"tokens": {"x": 1, "y": 0.5}}}}),
+    vec_feat({"weighted_tokens": {"t": {}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}, "pruning_config": {"tokens_freq_ratio_threshold": 200}}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}, "pruning_config": {"bad": 1}}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": 1}, "foo": 1}}}),
+    vec_feat({"weighted_tokens": {"t": {"tokens": {"a": "x"}}}}),
+    vec_feat({"sparse_vector": {"field": "t", "query_vector": {"a": 1}, "pruning_config": {"bad": 2}}}),
+    vec_feat({"weighted_tokens": {}}),
+    vec_feat({"weighted_tokens": {"nope": {"tokens": {"a": 1}}}}),
+    vec_feat({"weighted_tokens": {"txt": {"tokens": {"a": 1}}}}),
+    vec_feat({"text_expansion": {"t": {"model_id": "m", "model_text": "x"}}}),
+    vec_feat({"text_expansion": {"t": {"model_text": "x"}}}),
+    vec_feat({"text_expansion": {"t": {"model_id": "m"}}}),
+    vec_feat({"term": {"t": "a"}}),
+    vec_feat({"term": {"t": {"value": "a", "boost": 2}}}),
+    vec_feat({"term": {"rfs": "x"}}),
+    vec_feat({"terms": {"t": ["a", "c"]}}),
+    vec_feat({"terms": {"rfs": ["x", "y"], "boost": 3}}),
+    vec_feat({"match": {"t": "a"}}),
+    vec_feat({"match": {"t": "a c"}}),
+    vec_feat({"match": {"t": {"query": "c", "boost": 2}}}),
+    vec_feat({"bool": {"should": [{"term": {"t": "a"}}, {"term": {"t": "c"}}]}}),
+    vec_feat({"exists": {"field": "t"}}),
+    vec_feat({"exists": {"field": "rf"}}),
+    vec_feat({"exists": {"field": "rfs"}}),
+    vec_feat({"term": {"rf": 10}}),
+    vec_feat({"match": {"rf": "1"}}),
+    vec_feat({"range": {"rf": {"gte": 1}}}),
+    vec_feat({"range": {"t": {"gte": 1}}}),
+    vec_feat({"prefix": {"t": "a"}}),
+    vec_feat({"wildcard": {"t": "a*"}}),
+    vec_feat({"regexp": {"t": "a.*"}}),
+    vec_feat({"fuzzy": {"t": "a"}}),
+    ("POST", VEC_FEAT, {"fields": ["t", "rf", "rfs", "neg"], "_source": False, "sort": ["_doc"]}, {"pick": lambda r: [h.get("fields") for h in r["hits"]["hits"]]}),
+    ("POST", VEC_FEAT, {"docvalue_fields": ["rf"]}),
+    ("POST", VEC_FEAT, {"docvalue_fields": ["t"]}),
+    ("POST", VEC_FEAT, {"aggs": {"a": {"terms": {"field": "t"}}}, "size": 0}),
+    ("POST", VEC_FEAT, {"aggs": {"a": {"avg": {"field": "rf"}}}, "size": 0}),
+    ("POST", VEC_FEAT, {"aggs": {"a": {"terms": {"field": "rfs"}}}, "size": 0}),
+    ("POST", VEC_FEAT, {"sort": ["rf"]}),
+    ("POST", VEC_FEAT, {"sort": [{"t": "desc"}]}),
+    # Indexing checks.
+    vec_doc({"rf": -1}), vec_doc({"rf": "abc"}), vec_doc({"rf": [1, 2]}), vec_doc({"rf": True}),
+    vec_doc({"rf": {"a": 1}}), vec_doc({"rf": 0}), vec_doc({"rf": 1e-40}), vec_doc({"rf": None}), vec_doc({"rf": "5"}),
+    vec_doc({"rfs": {"x": -1}}), vec_doc({"rfs": {"x": "a"}}), vec_doc({"rfs": 5}), vec_doc({"rfs": {"x": [1, 2]}}),
+    vec_doc({"rfs": {"x": 0}}), vec_doc({"rfs": {"x.y": 1}}), vec_doc({"rfs": [{"x": 1}, {"x": 2}]}),
+    vec_doc({"rfs": [{"x": 1}, {"y": 2}]}), vec_doc({"rfs": {"x": True}}),
+    vec_doc({"t": {"a": -1}}), vec_doc({"t": {"a": "2"}}), vec_doc({"t": {"a": 0}}), vec_doc({"t": {"a.b": 1}}),
+    vec_doc({"t": 5}), vec_doc({"t": "x"}), vec_doc({"t": {"a": [1, 2]}}), vec_doc({"t": {"a": {"b": 1}}}),
+    vec_doc({"t": [[{"a": 1}]]}), vec_doc({"t": {"a": 1e-40}}), vec_doc({"t": {"a": None}}), vec_doc({"t": {"a": True}}),
+    ("DELETE", "/vec-feat"),
+])
+
+scenario("vec_semantic", [
+    ("DELETE", "/vec-sem?ignore_unavailable=true"),
+    ("DELETE", "/vec-sem2?ignore_unavailable=true"),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"s": {"type": "semantic_text"}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"o": {"properties": {"s": {"type": "semantic_text"}}}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"s": {"type": "semantic_text", "inference_id": "x", "foo": 1}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"rf": {"type": "rank_feature", "positive_score_impact": "maybe"}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"rf": {"type": "rank_feature", "foo": 1}}}}),
+    ("PUT", "/vec-sem2", {"mappings": {"properties": {"t": {"type": "sparse_vector", "store": True}}}}),
+    ("PUT", "/vec-sem", {"mappings": {"properties": {"s": {"type": "semantic_text", "inference_id": "nope"}, "t": {"type": "text"}}}}, ACK),
+    ("GET", "/vec-sem/_mapping"),
+    ("PUT", "/vec-sem/_doc/1?refresh=true", {"s": "hello", "t": "x"}),
+    ("PUT", "/vec-sem/_doc/2?refresh=true", {"t": "x"}, {"pick": lambda r: r.get("result")}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "s", "query": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "t", "query": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "nope", "query": "hi"}}}, {"pick": vec_scores}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"query": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"query": {"semantic": {"field": "s", "query": "hi", "x": 1}}}),
+    ("POST", "/vec-sem/_search", {"query": {"match": {"s": "hi"}}}),
+    ("POST", "/vec-sem/_search", {"retriever": {"text_similarity_reranker": 1}}),
+    ("DELETE", "/vec-sem"),
+])
+
+
+def vec_bit_score(f, q):
+    return ("POST", "/vec-bit/_search", {"query": {"script_score": {"query": {"match_all": {}}, "script": {"source": f"{f}(params.q, 'b') + 100", "params": {"q": q}}}}}, {"pick": vec_scores})
+
+
+scenario("vec_bits", [
+    ("DELETE", "/vec-bit?ignore_unavailable=true"),
+    ("PUT", "/vec-bit", {"mappings": {"properties": {"b": {"type": "dense_vector", "dims": 16, "element_type": "bit"}}}}, ACK),
+    ("PUT", "/vec-bit/_doc/1?refresh=true", {"b": [5, -3]}, {"pick": lambda r: r.get("result")}),
+] + [vec_bit_score(f, q) for f in ["hamming", "l1norm", "l2norm", "dotProduct", "cosineSimilarity"]
+     for q in [[1, 2], "0a0b", [0.5, 1.5, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]] + [
+    ("DELETE", "/vec-bit"),
+])
+
 
 failures = 0
 for name, steps in SCENARIOS.items():
