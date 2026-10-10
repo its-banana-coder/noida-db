@@ -682,7 +682,8 @@ fn sparse_vector(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<S
     )
     .map_err(|(kind, reason)| {
         let outer = "[sparse_vector] failed to parse field [pruning_config]";
-        EsError::parsing(outer).caused_by("x_content_parse_exception", &format!("{outer}: {kind}: {reason}"))
+        EsError::parsing(outer)
+            .caused_by("x_content_parse_exception", &format!("{outer}: {kind}: {reason}"))
     })?;
     let tokens = match (o.get("query_vector"), o.get("inference_id")) {
         (Some(_), Some(_)) | (None, None) => {

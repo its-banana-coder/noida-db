@@ -1357,7 +1357,10 @@ pub fn script_function(name: &str, query: &Value, doc: &Value) -> Result<f64, St
     // A bit vector's L1 distance is its Hamming distance (L2: the root of
     // it); dot product and cosine aren't defined for bits.
     let bits = || -> f64 {
-        q.iter().zip(&v).map(|(a, b)| ((*a as i8 as u8) ^ (*b as i8 as u8)).count_ones() as f64).sum()
+        q.iter()
+            .zip(&v)
+            .map(|(a, b)| ((*a as i8 as u8) ^ (*b as i8 as u8)).count_ones() as f64)
+            .sum()
     };
     if element == "bit" {
         return match name {

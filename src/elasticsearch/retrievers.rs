@@ -1084,17 +1084,24 @@ mod tests {
     #[test]
     fn rrf_errors() {
         let two = json!([{"standard": {"query": {"match_all": {}}}}, {"standard": {"query": {"match_all": {}}}}]);
-        let e = run(json!({"retriever": {"rrf": {"retrievers": two, "rank_window_size": 5}}, "size": 6}))
-            .unwrap_err();
-        assert!(e.reason.contains("[rank] requires [rank_window_size: 5] be greater than or equal to [size: 6]"));
+        let e = run(
+            json!({"retriever": {"rrf": {"retrievers": two, "rank_window_size": 5}}, "size": 6}),
+        )
+        .unwrap_err();
+        assert!(e.reason.contains(
+            "[rank] requires [rank_window_size: 5] be greater than or equal to [size: 6]"
+        ));
         let e = run(json!({"retriever": {"rrf": {"retrievers": [
             {"rrf": {"retrievers": two}}, {"standard": {}}]}}}))
         .unwrap_err();
         assert_eq!(e.reason, "[rank] cannot be used in children of compound retrievers");
-        let e = run(json!({"retriever": {"rrf": {"retrievers": two, "rank_constant": 0}}})).unwrap_err();
+        let e = run(json!({"retriever": {"rrf": {"retrievers": two, "rank_constant": 0}}}))
+            .unwrap_err();
         assert_eq!(e.reason, "[rank_constant] must be greater than or equal to [1] for [rrf]");
-        let e = run(json!({"sub_searches": [{"query": {"match_all": {}}}, {"query": {"match_all": {}}}],
-                           "rank": {"rrf": {}}, "sort": ["n"], "collapse": {"field": "k"}}))
+        let e = run(
+            json!({"sub_searches": [{"query": {"match_all": {}}}, {"query": {"match_all": {}}}],
+                           "rank": {"rrf": {}}, "sort": ["n"], "collapse": {"field": "k"}}),
+        )
         .unwrap_err();
         assert_eq!(
             e.reason,
