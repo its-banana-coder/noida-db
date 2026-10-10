@@ -167,7 +167,12 @@ pub(super) fn render(table: &str, rows: Vec<Row>, q: &HashMap<String, String>) -
     let shown = wanted(cols, q);
     let cells: Vec<Vec<Option<String>>> = rows
         .iter()
-        .map(|r| shown.iter().map(|(_, c)| r.get(c.name.as_str()).and_then(|x| cell_text(x, q))).collect())
+        .map(|r| {
+            shown
+                .iter()
+                .map(|(_, c)| r.get(c.name.as_str()).and_then(|x| cell_text(x, q)))
+                .collect()
+        })
         .collect();
     if q.get("format").map(String::as_str) == Some("json") {
         return (
@@ -180,7 +185,9 @@ pub(super) fn render(table: &str, rows: Vec<Row>, q: &HashMap<String, String>) -
                             shown
                                 .iter()
                                 .zip(r)
-                                .map(|((name, _), v)| (name.clone(), v.clone().map_or(Value::Null, Value::String)))
+                                .map(|((name, _), v)| {
+                                    (name.clone(), v.clone().map_or(Value::Null, Value::String))
+                                })
                                 .collect(),
                         )
                     })
@@ -230,8 +237,21 @@ pub(super) fn render(table: &str, rows: Vec<Row>, q: &HashMap<String, String>) -
 /// `&'static str` a row is keyed by.
 fn leak(s: &str) -> &'static str {
     for table in [
-        "allocation", "fielddata", "health", "indices", "master", "nodeattrs", "nodes", "plugins",
-        "recovery", "segments", "shards", "tasks", "thread_pool", "count", "pending_tasks",
+        "allocation",
+        "fielddata",
+        "health",
+        "indices",
+        "master",
+        "nodeattrs",
+        "nodes",
+        "plugins",
+        "recovery",
+        "segments",
+        "shards",
+        "tasks",
+        "thread_pool",
+        "count",
+        "pending_tasks",
     ] {
         if let Some(c) = columns(table).iter().find(|c| c.name == s) {
             return c.name.as_str();
@@ -410,7 +430,9 @@ impl Engine {
                     .unwrap_or_default();
                 let rows = node::thread_pools()
                     .into_iter()
-                    .filter(|(n, _)| patterns.is_empty() || patterns.iter().any(|p| glob_match(p, n)))
+                    .filter(|(n, _)| {
+                        patterns.is_empty() || patterns.iter().any(|p| glob_match(p, n))
+                    })
                     .map(|(name, info)| {
                         let mut r = Row::new();
                         node_cells(&mut r, false);
@@ -428,10 +450,7 @@ impl Engine {
                         r.insert("core", num(&info["core"]));
                         r.insert("max", num(&info["max"]));
                         r.insert("size", num(&info["size"]));
-                        r.insert(
-                            "keep_alive",
-                            info["keep_alive"].as_str().map_or(Cell::Null, t),
-                        );
+                        r.insert("keep_alive", info["keep_alive"].as_str().map_or(Cell::Null, t));
                         r
                     })
                     .collect();
@@ -611,7 +630,8 @@ impl Engine {
         let s = self.0.lock().unwrap();
         let mut r = Row::new();
         node_cells(&mut r, flag(q, "full_id"));
-        let names: Vec<String> = s.indices.iter().filter(|(_, i)| i.opened).map(|(n, _)| n.clone()).collect();
+        let names: Vec<String> =
+            s.indices.iter().filter(|(_, i)| i.opened).map(|(n, _)| n.clone()).collect();
         let req = stats::StatsRequest::all();
         let mut sum = json!({});
         for n in &names {
@@ -645,12 +665,19 @@ impl Engine {
         r.insert("disk.avail", Cell::Bytes(disk_avail));
         r.insert(
             "disk.used_percent",
-            t(format!("{:.2}", (disk_total - disk_avail) as f64 * 100.0 / disk_total.max(1) as f64)),
+            t(format!(
+                "{:.2}",
+                (disk_total - disk_avail) as f64 * 100.0 / disk_total.max(1) as f64
+            )),
         );
         r.insert("http_address", t(node::http_address()));
         r.insert("http", t(node::http_address()));
-        r.insert("shard_stats.total_count", t(sum["shard_stats"]["total_count"].as_u64().unwrap_or(0)));
-        let fields: u64 = names.iter().map(|n| super::nodes::mapping_field_count(&s.indices[n])).sum();
+        r.insert(
+            "shard_stats.total_count",
+            t(sum["shard_stats"]["total_count"].as_u64().unwrap_or(0)),
+        );
+        let fields: u64 =
+            names.iter().map(|n| super::nodes::mapping_field_count(&s.indices[n])).sum();
         r.insert("mappings.total_count", t(fields));
         r.insert("mappings.total_estimated_overhead_in_bytes", t(fields * 1024));
         r.insert("script.compilations", t(0));
@@ -717,7 +744,10 @@ impl Engine {
             let i = &s.indices[n];
             let (_, rep) = shard_counts(i);
             let disabled = super::cluster::allocation_disabled(i);
-            let created = i.settings["index"]["creation_date"].as_str().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+            let created = i.settings["index"]["creation_date"]
+                .as_str()
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
             for shard in stats::primaries(i) {
                 let mut base = Row::new();
                 base.insert("index", t(n));
@@ -781,7 +811,10 @@ impl Engine {
                 r.insert("docs.deleted", t(0));
                 r.insert("size", Cell::Bytes(stats::shard_store(i, shard)));
                 r.insert("size.memory", t(0));
-                r.insert("committed", t(i.counters.shards.get(&shard).is_some_and(|c| c.flush_total > 0)));
+                r.insert(
+                    "committed",
+                    t(i.counters.shards.get(&shard).is_some_and(|c| c.flush_total > 0)),
+                );
                 r.insert("searchable", t(true));
                 r.insert("version", t("9.11.1"));
                 r.insert("compound", t(true));
@@ -866,7 +899,10 @@ impl Engine {
                         let mut r = Row::new();
                         node_cells(&mut r, true);
                         r.insert("field", t(f));
-                        r.insert("size", Cell::Bytes(v["memory_size_in_bytes"].as_u64().unwrap_or(0)));
+                        r.insert(
+                            "size",
+                            Cell::Bytes(v["memory_size_in_bytes"].as_u64().unwrap_or(0)),
+                        );
                         r
                     })
                     .collect()
@@ -902,15 +938,17 @@ mod tests {
         let q: HashMap<String, String> =
             [("h".to_string(), "i,dc,store.*".to_string())].into_iter().collect();
         assert_eq!(text(render("indices", vec![r.clone()], &q)), "foo 2 2kb\n");
-        let q: HashMap<String, String> = [("h".to_string(), "store.size".to_string()), ("bytes".to_string(), "b".to_string())]
-            .into_iter()
-            .collect();
+        let q: HashMap<String, String> =
+            [("h".to_string(), "store.size".to_string()), ("bytes".to_string(), "b".to_string())]
+                .into_iter()
+                .collect();
         assert_eq!(text(render("indices", vec![r], &q)), "2048\n");
     }
 
     #[test]
     fn help_lists_every_column() {
-        let q: HashMap<String, String> = [("help".to_string(), String::new())].into_iter().collect();
+        let q: HashMap<String, String> =
+            [("help".to_string(), String::new())].into_iter().collect();
         let h = text(render("count", vec![], &q));
         assert!(h.starts_with("epoch "));
         assert_eq!(h.lines().count(), 3);

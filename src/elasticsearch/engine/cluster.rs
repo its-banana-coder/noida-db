@@ -41,11 +41,7 @@ pub(super) fn allocation_disabled(i: &Index) -> bool {
 /// unassigned copies).
 pub(super) fn index_shards(i: &Index) -> (u64, u64, u64, u64) {
     let (p, r) = shard_counts(i);
-    if allocation_disabled(i) {
-        (p, r, 0, p * (1 + r))
-    } else {
-        (p, r, p, p * r)
-    }
+    if allocation_disabled(i) { (p, r, 0, p * (1 + r)) } else { (p, r, p, p * r) }
 }
 
 fn status_of(active_pri: u64, pri: u64, unassigned: u64) -> &'static str {
@@ -231,10 +227,13 @@ impl Engine {
                     let shards: Map<String, Value> = (0..p)
                         .map(|sh| {
                             let active = u64::from(a > 0);
-                            (sh.to_string(), json!({"status": status_of(active, 1, per),
+                            (
+                                sh.to_string(),
+                                json!({"status": status_of(active, 1, per),
                                 "primary_active": a > 0, "active_shards": active,
                                 "relocating_shards": 0, "initializing_shards": 0,
-                                "unassigned_shards": per}))
+                                "unassigned_shards": per}),
+                            )
                         })
                         .collect();
                     e["shards"] = Value::Object(shards);
@@ -285,7 +284,8 @@ impl Engine {
             },
         };
         let version = STATE_VERSION.load(Ordering::Relaxed) + s.indices.len() as u64;
-        let mut out = json!({"cluster_name": node::CLUSTER_NAME, "cluster_uuid": node::CLUSTER_UUID});
+        let mut out =
+            json!({"cluster_name": node::CLUSTER_NAME, "cluster_uuid": node::CLUSTER_UUID});
         if wanted.contains(&"version") {
             out["version"] = json!(version);
             out["state_uuid"] = json!(format!("noida_state_{version:010}"));
@@ -339,7 +339,11 @@ impl Engine {
         if wanted.contains(&"routing_nodes") {
             let (mut assigned, mut unassigned) = (vec![], vec![]);
             for n in &names {
-                for copies in routing_shards(n, &s.indices[n]).as_object().into_iter().flat_map(|m| m.values()) {
+                for copies in routing_shards(n, &s.indices[n])
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|m| m.values())
+                {
                     for c in copies.as_array().into_iter().flatten() {
                         if c["state"] == json!("STARTED") {
                             assigned.push(c.clone());
@@ -495,11 +499,7 @@ impl Engine {
             let unassigned = names.iter().find_map(|n| {
                 let i = &s.indices[*n];
                 let (_, r, a, u) = index_shards(i);
-                if u == 0 {
-                    None
-                } else {
-                    Some(((*n).clone(), 0u64, a == 0 || r == 0))
-                }
+                if u == 0 { None } else { Some(((*n).clone(), 0u64, a == 0 || r == 0)) }
             });
             match unassigned {
                 Some(t) => t,
@@ -533,10 +533,15 @@ impl Engine {
         let current_node = json!({"id": node::NODE_ID, "name": node::NODE_NAME,
             "transport_address": node::TRANSPORT_ADDRESS, "attributes": node::attributes(),
             "roles": node::ROLES, "weight_ranking": 1});
-        let created = i.settings["index"]["creation_date"].as_str().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let created = i.settings["index"]["creation_date"]
+            .as_str()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
         let mut out = json!({"index": idx, "shard": shard, "primary": primary});
         if req.get("index").is_none() {
-            out["note"] = json!("No shard was specified in the explain API request, so this response explains a randomly chosen unassigned shard. There may be other unassigned shards in this cluster which cannot be assigned for different reasons. It may not be possible to assign this shard until one of the other shards is assigned correctly. To explain the allocation of other shards (whether assigned or unassigned) you must specify the target shard in the request to this API.");
+            out["note"] = json!(
+                "No shard was specified in the explain API request, so this response explains a randomly chosen unassigned shard. There may be other unassigned shards in this cluster which cannot be assigned for different reasons. It may not be possible to assign this shard until one of the other shards is assigned correctly. To explain the allocation of other shards (whether assigned or unassigned) you must specify the target shard in the request to this API."
+            );
         }
         if primary && a > 0 {
             out["current_state"] = json!("started");
@@ -546,7 +551,9 @@ impl Engine {
             out["can_rebalance_cluster_decisions"] = json!([{"decider": "rebalance_only_when_active",
                 "decision": "NO", "explanation": "rebalancing is not allowed until all copies of this shard are active"}]);
             out["can_rebalance_to_other_node"] = json!("no");
-            out["rebalance_explanation"] = json!("Elasticsearch is not allowed to allocate or rebalance this shard to another node. If you expect this shard to be rebalanced to another node, find this node in the node-by-node explanation and address the reasons which prevent Elasticsearch from rebalancing this shard there.");
+            out["rebalance_explanation"] = json!(
+                "Elasticsearch is not allowed to allocate or rebalance this shard to another node. If you expect this shard to be rebalanced to another node, find this node in the node-by-node explanation and address the reasons which prevent Elasticsearch from rebalancing this shard there."
+            );
         } else {
             out["current_state"] = json!("unassigned");
             out["unassigned_info"] = json!({"reason": "INDEX_CREATED",
@@ -558,13 +565,18 @@ impl Engine {
                     "free_disk_percent": (avail as f64 * 1000.0 / total as f64).round() / 10.0,
                     "used_disk_percent": ((total - avail) as f64 * 1000.0 / total as f64).round() / 10.0});
                 let mut nodes = Map::new();
-                nodes.insert(node::NODE_ID.into(), json!({"node_name": node::NODE_NAME,
-                    "least_available": disk, "most_available": disk}));
+                nodes.insert(
+                    node::NODE_ID.into(),
+                    json!({"node_name": node::NODE_NAME,
+                    "least_available": disk, "most_available": disk}),
+                );
                 out["cluster_info"] = json!({"nodes": nodes, "shard_sizes": {}, "shard_data_set_sizes": {},
                     "shard_paths": {}, "reserved_sizes": []});
             }
             out["can_allocate"] = json!("no");
-            out["allocate_explanation"] = json!("Elasticsearch isn't allowed to allocate this shard to any of the nodes in the cluster. Choose a node to which you expect this shard to be allocated, find this node in the node-by-node explanation, and address the reasons which prevent Elasticsearch from allocating this shard there.");
+            out["allocate_explanation"] = json!(
+                "Elasticsearch isn't allowed to allocate this shard to any of the nodes in the cluster. Choose a node to which you expect this shard to be allocated, find this node in the node-by-node explanation, and address the reasons which prevent Elasticsearch from allocating this shard there."
+            );
             let decider = if primary {
                 json!({"decider": "enable", "decision": "NO",
                        "explanation": "no allocations are allowed due to index setting [index.routing.allocation.enable=none]"})
@@ -592,7 +604,9 @@ impl Engine {
         let s = self.0.lock().unwrap();
         let mut explanations = Vec::new();
         for cmd in req["commands"].as_array().into_iter().flatten() {
-            let Some((name, params)) = cmd.as_object().and_then(|o| o.iter().next()) else { continue };
+            let Some((name, params)) = cmd.as_object().and_then(|o| o.iter().next()) else {
+                continue;
+            };
             let idx = params["index"].as_str().unwrap_or("");
             let shard = params["shard"].as_u64().unwrap_or(0);
             let node_name = params["node"].as_str().unwrap_or("");
@@ -631,14 +645,17 @@ impl Engine {
                 Some(m) => m,
             };
             drop(s);
-            let (_, state) = self.cluster_state(Some(m), None, &HashMap::new(), "/_cluster/reroute");
+            let (_, state) =
+                self.cluster_state(Some(m), None, &HashMap::new(), "/_cluster/reroute");
             out["state"] = state;
         }
         if explain {
             out["explanations"] = Value::Array(explanations);
         }
         if warn {
-            out[WARNINGS] = json!(["The [state] field in the response to the reroute API is deprecated and will be removed in a future version. Specify ?metric=none to adopt the future behaviour."]);
+            out[WARNINGS] = json!([
+                "The [state] field in the response to the reroute API is deprecated and will be removed in a future version. Specify ?metric=none to adopt the future behaviour."
+            ]);
         }
         (200, out)
     }
@@ -653,7 +670,8 @@ impl Engine {
                     (Some(ids), None) => ids
                         .split(',')
                         .map(|id| {
-                            let name = if id == node::NODE_ID { node::NODE_NAME } else { "_absent_" };
+                            let name =
+                                if id == node::NODE_ID { node::NODE_NAME } else { "_absent_" };
                             json!({"node_id": id, "node_name": name})
                         })
                         .collect(),
@@ -691,12 +709,17 @@ impl Engine {
     /// `/_info/<targets>`.
     pub(super) fn cluster_info(&self, target: Option<&str>, path: &str) -> (u16, Value) {
         let known = ["_all", "http", "ingest", "thread_pool", "script"];
-        let targets: Vec<&str> = target.unwrap_or("").split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+        let targets: Vec<&str> =
+            target.unwrap_or("").split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
         if targets.contains(&"_all") && targets.len() > 1 {
-            let msg = format!("request [{path}] contains _all and individual target [{}]", targets.join(","));
+            let msg = format!(
+                "request [{path}] contains _all and individual target [{}]",
+                targets.join(",")
+            );
             return bad_request("illegal_argument_exception", &msg);
         }
-        let bad: Vec<String> = targets.iter().filter(|t| !known.contains(t)).map(|t| t.to_string()).collect();
+        let bad: Vec<String> =
+            targets.iter().filter(|t| !known.contains(t)).map(|t| t.to_string()).collect();
         if !bad.is_empty() {
             let msg = node::unrecognized(path, &bad, &known, "target");
             return bad_request("illegal_argument_exception", &msg);
@@ -726,7 +749,11 @@ impl Engine {
     }
 
     /// `GET /_health_report[/<indicator>]`.
-    pub(super) fn health_report(&self, feature: Option<&str>, q: &HashMap<String, String>) -> (u16, Value) {
+    pub(super) fn health_report(
+        &self,
+        feature: Option<&str>,
+        q: &HashMap<String, String>,
+    ) -> (u16, Value) {
         let verbose = q.get("verbose").is_none_or(|v| v != "false");
         let s = self.0.lock().unwrap();
         let mut names: Vec<&String> = s.indices.keys().collect();
@@ -746,12 +773,17 @@ impl Engine {
                 replicated.push((*n).clone());
             }
         }
-        let plural = |n: u64, what: &str| format!("{n} unavailable {what} shard{}", if n == 1 { "" } else { "s" });
+        let plural = |n: u64, what: &str| {
+            format!("{n} unavailable {what} shard{}", if n == 1 { "" } else { "s" })
+        };
         let (status, symptom) = match (unassigned_pri, unassigned_rep) {
             (0, 0) => ("green", "This cluster has all shards available.".to_string()),
             (0, r) => ("yellow", format!("This cluster has {}.", plural(r, "replica"))),
             (p, 0) => ("red", format!("This cluster has {}.", plural(p, "primary"))),
-            (p, r) => ("red", format!("This cluster has {}, {}.", plural(p, "primary"), plural(r, "replica"))),
+            (p, r) => (
+                "red",
+                format!("This cluster has {}, {}.", plural(p, "primary"), plural(r, "replica")),
+            ),
         };
         let list = |v: &[String]| {
             let shown: Vec<&str> = v.iter().take(10).map(String::as_str).collect();
@@ -796,22 +828,43 @@ impl Engine {
         }
         let master = json!({"node_id": node::NODE_ID, "name": node::NODE_NAME});
         let indicators: Vec<(&str, Value)> = vec![
-            ("master_is_stable", json!({"status": "green", "symptom": "The cluster has a stable master node",
-                "details": {"current_master": master, "recent_masters": [master]}})),
-            ("repository_integrity", json!({"status": "green", "symptom": "No snapshot repositories configured."})),
-            ("disk", json!({"status": "green", "symptom": "The cluster has enough available disk space.",
+            (
+                "master_is_stable",
+                json!({"status": "green", "symptom": "The cluster has a stable master node",
+                "details": {"current_master": master, "recent_masters": [master]}}),
+            ),
+            (
+                "repository_integrity",
+                json!({"status": "green", "symptom": "No snapshot repositories configured."}),
+            ),
+            (
+                "disk",
+                json!({"status": "green", "symptom": "The cluster has enough available disk space.",
                 "details": {"indices_with_readonly_block": 0, "nodes_with_enough_disk_space": 1,
                             "nodes_with_unknown_disk_status": 0, "nodes_over_high_watermark": 0,
-                            "nodes_over_flood_stage_watermark": 0}})),
-            ("shards_capacity", json!({"status": "green", "symptom": "The cluster has enough room to add new shards.",
-                "details": {"data": {"max_shards_in_cluster": 1000}, "frozen": {"max_shards_in_cluster": 3000}}})),
+                            "nodes_over_flood_stage_watermark": 0}}),
+            ),
+            (
+                "shards_capacity",
+                json!({"status": "green", "symptom": "The cluster has enough room to add new shards.",
+                "details": {"data": {"max_shards_in_cluster": 1000}, "frozen": {"max_shards_in_cluster": 3000}}}),
+            ),
             ("shards_availability", availability),
-            ("data_stream_lifecycle", json!({"status": "green", "symptom": "Data streams are executing their lifecycles without issues",
-                "details": {"stagnating_backing_indices_count": 0, "total_backing_indices_in_error": 0}})),
-            ("slm", json!({"status": "green", "symptom": "No Snapshot Lifecycle Management policies configured",
-                "details": {"slm_status": "RUNNING", "policies": 0}})),
-            ("ilm", json!({"status": "green", "symptom": "No Index Lifecycle Management policies configured",
-                "details": {"policies": 0, "stagnating_indices": 0, "ilm_status": "RUNNING"}})),
+            (
+                "data_stream_lifecycle",
+                json!({"status": "green", "symptom": "Data streams are executing their lifecycles without issues",
+                "details": {"stagnating_backing_indices_count": 0, "total_backing_indices_in_error": 0}}),
+            ),
+            (
+                "slm",
+                json!({"status": "green", "symptom": "No Snapshot Lifecycle Management policies configured",
+                "details": {"slm_status": "RUNNING", "policies": 0}}),
+            ),
+            (
+                "ilm",
+                json!({"status": "green", "symptom": "No Index Lifecycle Management policies configured",
+                "details": {"policies": 0, "stagnating_indices": 0, "ilm_status": "RUNNING"}}),
+            ),
         ];
         let rank = |s: &str| match s {
             "green" => 0,
@@ -831,7 +884,13 @@ impl Engine {
             }
             let st = v["status"].as_str().unwrap_or("green");
             if rank(st) > rank(worst) {
-                worst = if st == "red" { "red" } else if st == "yellow" { "yellow" } else { worst };
+                worst = if st == "red" {
+                    "red"
+                } else if st == "yellow" {
+                    "yellow"
+                } else {
+                    worst
+                };
             }
             chosen.insert(name.into(), v);
         }
@@ -850,11 +909,17 @@ impl Engine {
     }
 
     /// `/_tasks...`.
-    pub(super) fn tasks_api(&self, method: &str, segments: &[&str], q: &HashMap<String, String>) -> (u16, Value) {
+    pub(super) fn tasks_api(
+        &self,
+        method: &str,
+        segments: &[&str],
+        q: &HashMap<String, String>,
+    ) -> (u16, Value) {
         match (method, segments) {
             ("GET", ["_tasks"]) => {
                 let detailed = q.get("detailed").is_some_and(|v| v.is_empty() || v == "true");
-                let actions: Option<Vec<&str>> = q.get("actions").map(|a| a.split(',').map(str::trim).collect());
+                let actions: Option<Vec<&str>> =
+                    q.get("actions").map(|a| a.split(',').map(str::trim).collect());
                 let picked_node = q.get("nodes").is_none_or(|n| node::selected(n));
                 let tasks: Vec<Value> = current_tasks(detailed)
                     .into_iter()
@@ -864,7 +929,8 @@ impl Engine {
                         })
                     })
                     .filter(|t| {
-                        q.get("parent_task_id").is_none_or(|p| t["parent_task_id"].as_str() == Some(p.as_str()))
+                        q.get("parent_task_id")
+                            .is_none_or(|p| t["parent_task_id"].as_str() == Some(p.as_str()))
                     })
                     .filter(|_| picked_node)
                     .collect();
@@ -894,11 +960,15 @@ impl Engine {
                     _ => {
                         let mut nodes = Map::new();
                         if !tasks.is_empty() {
-                            let by_id: Map<String, Value> = tasks.iter().map(|t| (key(t), t.clone())).collect();
-                            nodes.insert(node::NODE_ID.into(), json!({"name": node::NODE_NAME,
+                            let by_id: Map<String, Value> =
+                                tasks.iter().map(|t| (key(t), t.clone())).collect();
+                            nodes.insert(
+                                node::NODE_ID.into(),
+                                json!({"name": node::NODE_NAME,
                                 "transport_address": node::TRANSPORT_ADDRESS, "host": node::HOST,
                                 "ip": node::TRANSPORT_ADDRESS, "roles": node::ROLES,
-                                "attributes": node::attributes(), "tasks": by_id}));
+                                "attributes": node::attributes(), "tasks": by_id}),
+                            );
                         }
                         (200, json!({"nodes": nodes}))
                     }
@@ -906,8 +976,12 @@ impl Engine {
             }
             ("POST", ["_tasks", "_cancel"]) => (200, json!({"nodes": {}})),
             ("POST", ["_tasks", id, "_cancel"]) | ("GET", ["_tasks", id]) => {
-                let Some((n, num)) = id.split_once(':').filter(|(_, x)| x.parse::<u64>().is_ok()) else {
-                    return bad_request("illegal_argument_exception", &format!("malformed task id {id}"));
+                let Some((n, num)) = id.split_once(':').filter(|(_, x)| x.parse::<u64>().is_ok())
+                else {
+                    return bad_request(
+                        "illegal_argument_exception",
+                        &format!("malformed task id {id}"),
+                    );
                 };
                 let _ = num;
                 if n != node::NODE_ID {
@@ -993,7 +1067,9 @@ impl Engine {
             problems.push("version must be positive");
         }
         let has_master = nodes.iter().any(|n| {
-            n["settings"]["node"]["roles"].as_array().is_none_or(|r| r.iter().any(|x| x == "master"))
+            n["settings"]["node"]["roles"]
+                .as_array()
+                .is_none_or(|r| r.iter().any(|x| x == "master"))
         });
         if !has_master {
             problems.push("nodes must contain at least one master node");
@@ -1001,7 +1077,10 @@ impl Engine {
         if !problems.is_empty() {
             let reason: String =
                 problems.iter().enumerate().map(|(i, p)| format!("{}: {p};", i + 1)).collect();
-            return bad_request("action_request_validation_exception", &format!("Validation Failed: {reason}"));
+            return bad_request(
+                "action_request_validation_exception",
+                &format!("Validation Failed: {reason}"),
+            );
         }
         for key in ["external_id", "name"] {
             let mut seen = std::collections::HashSet::new();
@@ -1009,7 +1088,8 @@ impl Engine {
                 if let Some(v) = n["settings"]["node"][key].as_str()
                     && !seen.insert(v.to_string())
                 {
-                    let msg = format!("Some nodes contain the same setting value [{v}] for [node.{key}]");
+                    let msg =
+                        format!("Some nodes contain the same setting value [{v}] for [node.{key}]");
                     return bad_request("illegal_argument_exception", &msg);
                 }
             }
@@ -1021,7 +1101,9 @@ impl Engine {
             if cur["history_id"] == json!(history) {
                 let cur_version = cur["version"].as_i64().unwrap_or(0);
                 if version < cur_version {
-                    let msg = format!("version [{version}] has been superseded by version [{cur_version}] for history [{history}]");
+                    let msg = format!(
+                        "version [{version}] has been superseded by version [{cur_version}] for history [{history}]"
+                    );
                     return (409, error("version_conflict_exception", &msg, 409));
                 }
                 if version == cur_version {
@@ -1032,7 +1114,9 @@ impl Engine {
                         items
                     };
                     if key(&cur["nodes"]) != key(&Value::Array(nodes.clone())) {
-                        let msg = format!("Desired nodes with history [{history}] and version [{version}] already exists with a different definition");
+                        let msg = format!(
+                            "Desired nodes with history [{history}] and version [{version}] already exists with a different definition"
+                        );
                         return bad_request("illegal_argument_exception", &msg);
                     }
                 }
@@ -1047,7 +1131,9 @@ impl Engine {
         }
         let mut out = json!({"replaced_existing_history_id": replaced, "dry_run": dry_run});
         if warn {
-            out[WARNINGS] = json!(["[version removal] Specifying node_version in desired nodes requests is deprecated."]);
+            out[WARNINGS] = json!([
+                "[version removal] Specifying node_version in desired nodes requests is deprecated."
+            ]);
         }
         (200, out)
     }
@@ -1107,22 +1193,28 @@ impl Engine {
         let disk = json!({"path": "/usr/share/elasticsearch/data", "total_bytes": total,
             "used_bytes": total - avail, "free_bytes": avail});
         let mut info_nodes = Map::new();
-        info_nodes.insert(node::NODE_ID.into(), json!({"node_name": node::NODE_NAME,
-            "least_available": disk, "most_available": disk}));
+        info_nodes.insert(
+            node::NODE_ID.into(),
+            json!({"node_name": node::NODE_NAME,
+            "least_available": disk, "most_available": disk}),
+        );
         let n = STATE_VERSION.load(Ordering::Relaxed);
-        (200, json!({
-            "stats": {"computation_converged_index": n, "computation_active": false,
-                      "computation_submitted": n, "computation_executed": n, "computation_converged": n,
-                      "computation_iterations": n, "computed_shard_movements": 0,
-                      "computation_time_in_millis": 0, "reconciliation_time_in_millis": 0,
-                      "unassigned_shards": 0, "total_allocations": shard_count,
-                      "undesired_allocations": 0, "undesired_allocations_ratio": 0.0},
-            "cluster_balance_stats": {"shard_count": shard_count, "undesired_shard_allocation_count": 0,
-                                      "tiers": tiers, "nodes": nodes},
-            "routing_table": routing,
-            "cluster_info": {"nodes": info_nodes, "shard_sizes": sizes, "shard_data_set_sizes": {},
-                             "shard_paths": {}, "reserved_sizes": []},
-        }))
+        (
+            200,
+            json!({
+                "stats": {"computation_converged_index": n, "computation_active": false,
+                          "computation_submitted": n, "computation_executed": n, "computation_converged": n,
+                          "computation_iterations": n, "computed_shard_movements": 0,
+                          "computation_time_in_millis": 0, "reconciliation_time_in_millis": 0,
+                          "unassigned_shards": 0, "total_allocations": shard_count,
+                          "undesired_allocations": 0, "undesired_allocations_ratio": 0.0},
+                "cluster_balance_stats": {"shard_count": shard_count, "undesired_shard_allocation_count": 0,
+                                          "tiers": tiers, "nodes": nodes},
+                "routing_table": routing,
+                "cluster_info": {"nodes": info_nodes, "shard_sizes": sizes, "shard_data_set_sizes": {},
+                                 "shard_paths": {}, "reserved_sizes": []},
+            }),
+        )
     }
 
     fn prevalidate_node_removal(&self, q: &HashMap<String, String>) -> (u16, Value) {
@@ -1131,9 +1223,17 @@ impl Engine {
             .filter_map(|k| q.get(k).filter(|v| !v.is_empty()).map(|v| (k, v)))
             .collect();
         let (kind, list) = match given.as_slice() {
-            [] => return validation("request must contain one of the parameters 'names', 'ids', or 'external_ids'"),
+            [] => {
+                return validation(
+                    "request must contain one of the parameters 'names', 'ids', or 'external_ids'",
+                );
+            }
             [one] => *one,
-            _ => return validation("request must contain only one of the parameters 'names', 'ids', or 'external_ids'"),
+            _ => {
+                return validation(
+                    "request must contain only one of the parameters 'names', 'ids', or 'external_ids'",
+                );
+            }
         };
         let wanted: Vec<&str> = list.split(',').map(str::trim).collect();
         let ours = match kind {
@@ -1159,8 +1259,11 @@ impl Engine {
         } else {
             json!({"is_safe": true, "reason": "no_problems", "message": ""})
         };
-        (200, json!({"is_safe": !red, "message": "", "nodes": [{"id": node::NODE_ID, "name": node::NODE_NAME,
-            "external_id": node::NODE_NAME, "result": result}]}))
+        (
+            200,
+            json!({"is_safe": !red, "message": "", "nodes": [{"id": node::NODE_ID, "name": node::NODE_NAME,
+            "external_id": node::NODE_NAME, "result": result}]}),
+        )
     }
 }
 
@@ -1170,7 +1273,11 @@ impl Engine {
 /// whether it carried the deprecated `node_version`.
 fn parse_desired_node(n: &Value) -> Result<(Value, bool), (u16, Value)> {
     let parse_err = |inner: Value| {
-        let mut e = error("x_content_parse_exception", "[1:1] [update_desired_nodes_request] failed to parse field [nodes]", 400);
+        let mut e = error(
+            "x_content_parse_exception",
+            "[1:1] [update_desired_nodes_request] failed to parse field [nodes]",
+            400,
+        );
         e["error"]["caused_by"] = inner;
         e["error"]["root_cause"] = json!([{"type": "x_content_parse_exception",
             "reason": "[1:1] [update_desired_nodes_request] failed to parse field [nodes]"}]);
@@ -1187,7 +1294,9 @@ fn parse_desired_node(n: &Value) -> Result<(Value, bool), (u16, Value)> {
             "caused_by": {"type": "illegal_argument_exception", "reason": reason}}))
     };
     let Some(o) = n.as_object() else {
-        return parse_err(json!({"type": "illegal_argument_exception", "reason": "Required [settings]"}));
+        return parse_err(
+            json!({"type": "illegal_argument_exception", "reason": "Required [settings]"}),
+        );
     };
     for k in ["memory", "storage", "settings"] {
         if o.get(k) == Some(&Value::Null) {
@@ -1196,11 +1305,15 @@ fn parse_desired_node(n: &Value) -> Result<(Value, bool), (u16, Value)> {
         }
     }
     let Some(settings) = o.get("settings").and_then(Value::as_object) else {
-        return parse_err(json!({"type": "illegal_argument_exception", "reason": "Required [settings]"}));
+        return parse_err(
+            json!({"type": "illegal_argument_exception", "reason": "Required [settings]"}),
+        );
     };
     for k in ["memory", "storage"] {
         if !o.contains_key(k) {
-            return parse_err(json!({"type": "illegal_argument_exception", "reason": format!("Required [{k}]")}));
+            return parse_err(
+                json!({"type": "illegal_argument_exception", "reason": format!("Required [{k}]")}),
+            );
         }
     }
     let number = |v: &Value| -> Option<f64> {
@@ -1218,7 +1331,9 @@ fn parse_desired_node(n: &Value) -> Result<(Value, bool), (u16, Value)> {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                Err(format!("Only a positive number of [{field}] are allowed and [{shown}] was provided"))
+                Err(format!(
+                    "Only a positive number of [{field}] are allowed and [{shown}] was provided"
+                ))
             }
         }
     };
@@ -1236,7 +1351,11 @@ fn parse_desired_node(n: &Value) -> Result<(Value, bool), (u16, Value)> {
     let name = |k: &str| nested["node"][k].as_str().map(str::trim).is_some_and(|v| !v.is_empty());
     let named = name("name") || name("external_id");
     if let Some(roles) = nested["node"]["roles"].as_str().map(str::to_string) {
-        let known = node::ROLES.iter().chain(["voting_only", "index", "search"].iter()).copied().collect::<Vec<_>>();
+        let known = node::ROLES
+            .iter()
+            .chain(["voting_only", "index", "search"].iter())
+            .copied()
+            .collect::<Vec<_>>();
         let list: Vec<&str> = roles.split(',').map(str::trim).filter(|r| !r.is_empty()).collect();
         if let Some(bad) = list.iter().find(|r| !known.contains(r)) {
             return build_err(format!("unknown role [{bad}]"));
@@ -1290,7 +1409,10 @@ fn parse_desired_node(n: &Value) -> Result<(Value, bool), (u16, Value)> {
     };
     match (&processors, &range) {
         (Some(_), Some(_)) => {
-            return build_err("processors and processors_range were specified, but only one should be specified".into());
+            return build_err(
+                "processors and processors_range were specified, but only one should be specified"
+                    .into(),
+            );
         }
         (None, None) => {
             return build_err("Either processors or processors_range must be specified".into());
@@ -1357,7 +1479,10 @@ fn blocks(s: &State) -> Value {
             m.insert("5".into(), json!({"description": "index read-only (api)", "retryable": false, "levels": ["write", "metadata_write"]}));
         }
         if on("read") {
-            m.insert("7".into(), json!({"description": "index read (api)", "retryable": false, "levels": ["read"]}));
+            m.insert(
+                "7".into(),
+                json!({"description": "index read (api)", "retryable": false, "levels": ["read"]}),
+            );
         }
         if on("write") {
             m.insert("8".into(), json!({"description": "index write (api)", "retryable": false, "levels": ["write"]}));
@@ -1406,7 +1531,10 @@ fn index_metadata(i: &Index) -> Value {
 fn routing_shards(name: &str, i: &Index) -> Value {
     let (p, r, a, _) = index_shards(i);
     let uuid = i.settings["index"]["uuid"].as_str().unwrap_or("_na_");
-    let created = i.settings["index"]["creation_date"].as_str().and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let created = i.settings["index"]["creation_date"]
+        .as_str()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
     let unassigned = |primary: bool, shard: u64| {
         json!({"state": "UNASSIGNED", "primary": primary, "node": null, "relocating_node": null,
                "shard": shard, "index": name,
@@ -1444,7 +1572,8 @@ fn mapping_sizes(s: &State) -> (u64, u64, u64) {
         distinct.insert(i.mappings.to_string(), n);
     }
     let fields = distinct.values().sum();
-    let bytes = distinct.keys().filter(|k| *k != "{\"properties\":{}}").map(|k| k.len() as u64).sum();
+    let bytes =
+        distinct.keys().filter(|k| *k != "{\"properties\":{}}").map(|k| k.len() as u64).sum();
     (total, fields, bytes)
 }
 
@@ -1588,11 +1717,17 @@ pub(super) fn capabilities(q: &HashMap<String, String>) -> (u16, Value) {
     let Some(path) = q.get("path") else {
         return (
             500,
-            error("null_pointer_exception", "Cannot invoke \"String.length()\" because \"s\" is null", 500),
+            error(
+                "null_pointer_exception",
+                "Cannot invoke \"String.length()\" because \"s\" is null",
+                500,
+            ),
         );
     };
     let list = |k: &str| -> Vec<&str> {
-        q.get(k).map(|v| v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect()).unwrap_or_default()
+        q.get(k)
+            .map(|v| v.split(',').map(str::trim).filter(|x| !x.is_empty()).collect())
+            .unwrap_or_default()
     };
     let params = list("parameters");
     let caps = list("capabilities");
@@ -1614,14 +1749,18 @@ pub(super) fn capabilities(q: &HashMap<String, String>) -> (u16, Value) {
     } else if let Some((_, _, p, c)) =
         declared.iter().find(|(m, d, _, _)| *d == path && *m == method)
     {
-        let params_ok = p.is_none_or(|p| params.iter().all(|x| p.contains(x) || common.contains(x)));
+        let params_ok =
+            p.is_none_or(|p| params.iter().all(|x| p.contains(x) || common.contains(x)));
         params_ok && caps.iter().all(|x| c.contains(x))
     } else if declared.iter().any(|(_, d, _, _)| *d == path) {
         false
     } else {
         caps.is_empty()
     };
-    (200, json!({"_nodes": node::nodes_header(1), "cluster_name": node::CLUSTER_NAME, "supported": supported}))
+    (
+        200,
+        json!({"_nodes": node::nodes_header(1), "cluster_name": node::CLUSTER_NAME, "supported": supported}),
+    )
 }
 
 #[cfg(test)]
@@ -1644,7 +1783,10 @@ mod tests {
         assert_eq!(n["settings"]["node"]["name"], json!("a"));
         assert_eq!(n["processors"], json!(8.0));
         let nan = json!({"settings": {"node.name": "a"}, "processors": "NaN", "memory": "1gb", "storage": "1gb"});
-        assert_eq!(parse_desired_node(&nan).err().unwrap().1["error"]["type"], json!("x_content_parse_exception"));
+        assert_eq!(
+            parse_desired_node(&nan).err().unwrap().1["error"]["type"],
+            json!("x_content_parse_exception")
+        );
         let nameless = json!({"settings": {}, "processors": 8, "memory": "1gb", "storage": "1gb"});
         let e = parse_desired_node(&nameless).err().unwrap().1;
         assert_eq!(
@@ -1655,11 +1797,24 @@ mod tests {
 
     #[test]
     fn capabilities_answers() {
-        let q = |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let q =
+            |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         let ask = |p: &[(&str, &str)]| capabilities(&q(p)).1["supported"].clone();
-        assert_eq!(ask(&[("method", "GET"), ("path", "/_capabilities"), ("parameters", "method,path")]), json!(true));
-        assert_eq!(ask(&[("method", "GET"), ("path", "/_capabilities"), ("parameters", "unknown")]), json!(false));
-        assert_eq!(ask(&[("method", "PUT"), ("path", "/{index}"), ("capabilities", "logsdb_index_mode")]), json!(true));
-        assert_eq!(ask(&[("method", "GET"), ("path", "/_search"), ("capabilities", "xyz")]), json!(false));
+        assert_eq!(
+            ask(&[("method", "GET"), ("path", "/_capabilities"), ("parameters", "method,path")]),
+            json!(true)
+        );
+        assert_eq!(
+            ask(&[("method", "GET"), ("path", "/_capabilities"), ("parameters", "unknown")]),
+            json!(false)
+        );
+        assert_eq!(
+            ask(&[("method", "PUT"), ("path", "/{index}"), ("capabilities", "logsdb_index_mode")]),
+            json!(true)
+        );
+        assert_eq!(
+            ask(&[("method", "GET"), ("path", "/_search"), ("capabilities", "xyz")]),
+            json!(false)
+        );
     }
 }

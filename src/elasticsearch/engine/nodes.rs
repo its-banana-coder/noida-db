@@ -125,7 +125,9 @@ impl Engine {
             }
             Some("usage") if method == "GET" => nodes_usage(nodes),
             Some("hot_threads" | "hotthreads") if method == "GET" => hot_threads(nodes, q),
-            Some("reload_secure_settings") if method == "POST" => reload_secure_settings(nodes, body),
+            Some("reload_secure_settings") if method == "POST" => {
+                reload_secure_settings(nodes, body)
+            }
             _ if method == "GET" && rest.len() <= 2 => {
                 // `/_nodes`, `/_nodes/<ids or metrics>`, `/_nodes/<ids>/<metrics>`.
                 let (ids, metrics) = match rest {
@@ -275,7 +277,8 @@ impl Engine {
                 "ip": node::TRANSPORT_ADDRESS, "roles": node::ROLES, "attributes": node::attributes(),
             });
             let open: Vec<&String> = {
-                let mut v: Vec<&String> = s.indices.iter().filter(|(_, i)| i.opened).map(|(k, _)| k).collect();
+                let mut v: Vec<&String> =
+                    s.indices.iter().filter(|(_, i)| i.opened).map(|(k, _)| k).collect();
                 v.sort();
                 v
             };
@@ -290,17 +293,25 @@ impl Engine {
                     continue;
                 }
                 let (key, v) = match *m {
-                    "os" => ("os", json!({"timestamp": now,
+                    "os" => (
+                        "os",
+                        json!({"timestamp": now,
                         "cpu": {"percent": 1, "load_average": {"1m": 0.0, "5m": 0.0, "15m": 0.0}},
                         "mem": {"total_in_bytes": mem_total, "adjusted_total_in_bytes": mem_total,
                                 "free_in_bytes": mem_free, "used_in_bytes": mem_total - mem_free,
                                 "free_percent": mem_free * 100 / mem_total.max(1),
                                 "used_percent": (mem_total - mem_free) * 100 / mem_total.max(1)},
-                        "swap": {"total_in_bytes": 0, "free_in_bytes": 0, "used_in_bytes": 0}})),
-                    "process" => ("process", json!({"timestamp": now, "open_file_descriptors": 64,
+                        "swap": {"total_in_bytes": 0, "free_in_bytes": 0, "used_in_bytes": 0}}),
+                    ),
+                    "process" => (
+                        "process",
+                        json!({"timestamp": now, "open_file_descriptors": 64,
                         "max_file_descriptors": 65535, "cpu": {"percent": 0, "total_in_millis": 0},
-                        "mem": {"total_virtual_in_bytes": 0}})),
-                    "jvm" => ("jvm", json!({"timestamp": now, "uptime_in_millis": uptime,
+                        "mem": {"total_virtual_in_bytes": 0}}),
+                    ),
+                    "jvm" => (
+                        "jvm",
+                        json!({"timestamp": now, "uptime_in_millis": uptime,
                         "mem": {"heap_used_in_bytes": 134_217_728u64, "heap_used_percent": 25,
                                 "heap_committed_in_bytes": 536_870_912u64,
                                 "heap_max_in_bytes": 536_870_912u64,
@@ -315,7 +326,8 @@ impl Engine {
                         "buffer_pools": {"mapped": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0},
                                          "direct": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0},
                                          "mapped - 'non-volatile memory'": {"count": 0, "used_in_bytes": 0, "total_capacity_in_bytes": 0}},
-                        "classes": {"current_loaded_count": 0, "total_loaded_count": 0, "total_unloaded_count": 0}})),
+                        "classes": {"current_loaded_count": 0, "total_loaded_count": 0, "total_unloaded_count": 0}}),
+                    ),
                     "thread_pool" => {
                         let pools: Map<String, Value> = node::thread_pools()
                             .into_iter()
@@ -325,33 +337,47 @@ impl Engine {
                     }
                     "fs" => {
                         let path = "/usr/share/elasticsearch/data";
-                        ("fs", json!({"timestamp": now,
+                        (
+                            "fs",
+                            json!({"timestamp": now,
                             "total": {"total_in_bytes": disk_total, "free_in_bytes": disk_avail, "available_in_bytes": disk_avail},
                             "data": [{"path": path, "mount": "/ (overlay)", "type": "overlay",
                                       "total_in_bytes": disk_total, "free_in_bytes": disk_avail,
                                       "available_in_bytes": disk_avail,
                                       "low_watermark_free_space_in_bytes": disk_total / 100 * 15,
                                       "high_watermark_free_space_in_bytes": disk_total / 10,
-                                      "flood_stage_free_space_in_bytes": disk_total / 20}]}))
+                                      "flood_stage_free_space_in_bytes": disk_total / 20}]}),
+                        )
                     }
-                    "transport" => ("transport", json!({"server_open": 0, "total_outbound_connections": 0,
+                    "transport" => (
+                        "transport",
+                        json!({"server_open": 0, "total_outbound_connections": 0,
                         "rx_count": 0, "rx_size_in_bytes": 0, "tx_count": 0, "tx_size_in_bytes": 0,
-                        "inbound_handling_time_histogram": [], "outbound_handling_time_histogram": []})),
+                        "inbound_handling_time_histogram": [], "outbound_handling_time_histogram": []}),
+                    ),
                     "http" => {
                         let mut h = node::http_stats();
                         h["routes"] = json!({});
                         ("http", h)
                     }
                     "breaker" => {
-                        let b = |limit: u64, overhead: f64| json!({"limit_size_in_bytes": limit,
+                        let b = |limit: u64, overhead: f64| {
+                            json!({"limit_size_in_bytes": limit,
                             "limit_size": node::human_size(limit), "estimated_size_in_bytes": 0,
-                            "estimated_size": "0b", "overhead": overhead, "tripped": 0});
-                        ("breakers", json!({"fielddata": b(214_748_364, 1.03), "request": b(322_122_547, 1.0),
-                            "inflight_requests": b(536_870_912, 2.0), "parent": b(510_027_366, 1.0)}))
+                            "estimated_size": "0b", "overhead": overhead, "tripped": 0})
+                        };
+                        (
+                            "breakers",
+                            json!({"fielddata": b(214_748_364, 1.03), "request": b(322_122_547, 1.0),
+                            "inflight_requests": b(536_870_912, 2.0), "parent": b(510_027_366, 1.0)}),
+                        )
                     }
-                    "script" => ("script", json!({"compilations": 0, "cache_evictions": 0,
+                    "script" => (
+                        "script",
+                        json!({"compilations": 0, "cache_evictions": 0,
                         "compilation_limit_triggered": 0,
-                        "compilations_history": {"5m": 0, "15m": 0, "24h": 0}, "contexts": []})),
+                        "compilations_history": {"5m": 0, "15m": 0, "24h": 0}, "contexts": []}),
+                    ),
                     "discovery" => {
                         let t = |extra: &[&str]| {
                             let mut m = Map::new();
@@ -361,36 +387,59 @@ impl Engine {
                             }
                             Value::Object(m)
                         };
-                        let phases = ["computation", "publication", "context_construction", "commit",
-                                      "completion", "master_apply", "notification"];
-                        ("discovery", json!({
-                            "cluster_state_queue": {"total": 0, "pending": 0, "committed": 0},
-                            "serialized_cluster_states": {
-                                "full_states": {"count": 0, "uncompressed_size_in_bytes": 0, "compressed_size_in_bytes": 0},
-                                "diffs": {"count": 0, "uncompressed_size_in_bytes": 0, "compressed_size_in_bytes": 0}},
-                            "published_cluster_states": {"full_states": 0, "incompatible_diffs": 0, "compatible_diffs": 0},
-                            "cluster_state_update": {"unchanged": t(&["computation", "notification"]),
-                                                     "success": t(&phases), "failure": t(&phases)},
-                            "cluster_applier_stats": {"recordings": [
-                                {"name": "IndicesClusterStateService#applyClusterState",
-                                 "cumulative_execution_count": 1, "cumulative_execution_time_millis": 1}]},
-                        }))
+                        let phases = [
+                            "computation",
+                            "publication",
+                            "context_construction",
+                            "commit",
+                            "completion",
+                            "master_apply",
+                            "notification",
+                        ];
+                        (
+                            "discovery",
+                            json!({
+                                "cluster_state_queue": {"total": 0, "pending": 0, "committed": 0},
+                                "serialized_cluster_states": {
+                                    "full_states": {"count": 0, "uncompressed_size_in_bytes": 0, "compressed_size_in_bytes": 0},
+                                    "diffs": {"count": 0, "uncompressed_size_in_bytes": 0, "compressed_size_in_bytes": 0}},
+                                "published_cluster_states": {"full_states": 0, "incompatible_diffs": 0, "compatible_diffs": 0},
+                                "cluster_state_update": {"unchanged": t(&["computation", "notification"]),
+                                                         "success": t(&phases), "failure": t(&phases)},
+                                "cluster_applier_stats": {"recordings": [
+                                    {"name": "IndicesClusterStateService#applyClusterState",
+                                     "cumulative_execution_count": 1, "cumulative_execution_time_millis": 1}]},
+                            }),
+                        )
                     }
-                    "ingest" => ("ingest", json!({"total": {"count": 0, "time_in_millis": 0, "current": 0, "failed": 0},
-                        "pipelines": {}})),
+                    "ingest" => (
+                        "ingest",
+                        json!({"total": {"count": 0, "time_in_millis": 0, "current": 0, "failed": 0},
+                        "pipelines": {}}),
+                    ),
                     "adaptive_selection" => ("adaptive_selection", json!({})),
-                    "script_cache" => ("script_cache", json!({"sum": {"compilations": 0, "cache_evictions": 0,
-                        "compilation_limit_triggered": 0}})),
+                    "script_cache" => (
+                        "script_cache",
+                        json!({"sum": {"compilations": 0, "cache_evictions": 0,
+                        "compilation_limit_triggered": 0}}),
+                    ),
                     "indexing_pressure" => {
                         let cur = json!({"combined_coordinating_and_primary_in_bytes": 0, "coordinating_in_bytes": 0,
                             "primary_in_bytes": 0, "replica_in_bytes": 0, "all_in_bytes": 0});
                         let mut total = cur.clone();
-                        for k in ["coordinating_rejections", "primary_rejections", "replica_rejections",
-                                  "primary_document_rejections"] {
+                        for k in [
+                            "coordinating_rejections",
+                            "primary_rejections",
+                            "replica_rejections",
+                            "primary_document_rejections",
+                        ] {
                             total[k] = json!(0);
                         }
-                        ("indexing_pressure", json!({"memory": {"current": cur, "total": total,
-                            "limit_in_bytes": 53_687_091}}))
+                        (
+                            "indexing_pressure",
+                            json!({"memory": {"current": cur, "total": total,
+                            "limit_in_bytes": 53_687_091}}),
+                        )
                     }
                     "repositories" => ("repositories", json!({})),
                     "allocations" => {
@@ -401,11 +450,17 @@ impl Engine {
                                 continue;
                             }
                             shards += shard_counts(i).0;
-                            bytes += stats::primaries(i).iter().map(|sh| stats::shard_store(i, *sh)).sum::<u64>();
+                            bytes += stats::primaries(i)
+                                .iter()
+                                .map(|sh| stats::shard_store(i, *sh))
+                                .sum::<u64>();
                         }
-                        ("allocations", json!({"shards": shards, "undesired_shards": 0,
+                        (
+                            "allocations",
+                            json!({"shards": shards, "undesired_shards": 0,
                             "forecasted_ingest_load": 0.0, "forecasted_disk_usage_in_bytes": bytes,
-                            "current_disk_usage_in_bytes": bytes}))
+                            "current_disk_usage_in_bytes": bytes}),
+                        )
                     }
                     _ => continue,
                 };
@@ -519,7 +574,10 @@ fn nodes_usage(ids: &str) -> (u16, Value) {
                    "rest_actions": {}, "aggregations": {}}),
         );
     }
-    (200, json!({"_nodes": node::nodes_header(nodes.len()), "cluster_name": node::CLUSTER_NAME, "nodes": nodes}))
+    (
+        200,
+        json!({"_nodes": node::nodes_header(nodes.len()), "cluster_name": node::CLUSTER_NAME, "nodes": nodes}),
+    )
 }
 
 /// `GET /_nodes/hot_threads`: the node's header and an empty sample (no
@@ -545,7 +603,10 @@ fn hot_threads(ids: &str, q: &HashMap<String, String>) -> (u16, Value) {
     let attrs = node::attributes()
         .as_object()
         .map(|m| {
-            m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(", ")
+            m.iter()
+                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join(", ")
         })
         .unwrap_or_default();
     let now = dates::format(node::now_millis(), None, 0);
@@ -577,7 +638,10 @@ fn reload_secure_settings(ids: &str, body: &[u8]) -> (u16, Value) {
         }
         nodes.insert(node::NODE_ID.into(), n);
     }
-    (200, json!({"_nodes": node::nodes_header(nodes.len()), "cluster_name": node::CLUSTER_NAME, "nodes": nodes}))
+    (
+        200,
+        json!({"_nodes": node::nodes_header(nodes.len()), "cluster_name": node::CLUSTER_NAME, "nodes": nodes}),
+    )
 }
 
 #[cfg(test)]

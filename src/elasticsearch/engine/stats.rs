@@ -112,8 +112,10 @@ pub(super) struct Resolve {
 }
 
 impl Resolve {
-    pub const STRICT_OPEN: Resolve = Resolve { expand: "open", lenient: false, forbid_closed: false };
-    pub const LENIENT_OPEN: Resolve = Resolve { expand: "open", lenient: true, forbid_closed: false };
+    pub const STRICT_OPEN: Resolve =
+        Resolve { expand: "open", lenient: false, forbid_closed: false };
+    pub const LENIENT_OPEN: Resolve =
+        Resolve { expand: "open", lenient: true, forbid_closed: false };
 }
 
 /// Resolves an index expression the way Elasticsearch's resolver does:
@@ -353,7 +355,9 @@ fn fielddata_bytes(m: &Value, docs: &[&CommittedDoc], field: &str) -> u64 {
 fn vector_count(m: &Value, docs: &[&CommittedDoc], ty: &str) -> u64 {
     let fields = fields_of_type(m, ty);
     docs.iter()
-        .map(|d| fields.iter().filter(|f| !search::raw_values(&d.source, f).is_empty()).count() as u64)
+        .map(|d| {
+            fields.iter().filter(|f| !search::raw_values(&d.source, f).is_empty()).count() as u64
+        })
         .sum()
 }
 
@@ -424,7 +428,12 @@ impl StatsRequest {
             return Err((400, error("illegal_argument_exception", &msg, 400)));
         }
         let list = |k: &str| {
-            q.get(k).map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect::<Vec<_>>())
+            q.get(k).map(|v| {
+                v.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>()
+            })
         };
         let fields = list("fields");
         let truthy = |k: &str| q.get(k).is_some_and(|v| v.is_empty() || v == "true");
@@ -471,7 +480,9 @@ pub(super) fn shard_sections(i: &Index, shard: u64, r: &StatsRequest) -> Map<Str
             continue;
         }
         let (key, v) = match *metric {
-            "docs" => ("docs", json!({"count": docs.len(), "deleted": 0, "total_size_in_bytes": store})),
+            "docs" => {
+                ("docs", json!({"count": docs.len(), "deleted": 0, "total_size_in_bytes": store}))
+            }
             "shard_stats" => ("shard_stats", json!({"total_count": 1})),
             "store" => (
                 "store",
@@ -504,11 +515,14 @@ pub(super) fn shard_sections(i: &Index, shard: u64, r: &StatsRequest) -> Map<Str
                         .iter()
                         .filter(|(g, _)| any_glob(wanted, g))
                         .map(|(g, (qt, ft))| {
-                            (g.clone(), json!({"query_total": qt, "query_time_in_millis": 0,
+                            (
+                                g.clone(),
+                                json!({"query_total": qt, "query_time_in_millis": 0,
                                 "query_current": 0, "fetch_total": ft, "fetch_time_in_millis": 0,
                                 "fetch_current": 0, "scroll_total": 0, "scroll_time_in_millis": 0,
                                 "scroll_current": 0, "suggest_total": 0,
-                                "suggest_time_in_millis": 0, "suggest_current": 0}))
+                                "suggest_time_in_millis": 0, "suggest_current": 0}),
+                            )
                         })
                         .collect();
                     if !groups.is_empty() {
@@ -536,9 +550,10 @@ pub(super) fn shard_sections(i: &Index, shard: u64, r: &StatsRequest) -> Map<Str
                 json!({"total": c.flush_total, "periodic": 0, "total_time_in_millis": 0,
                        "total_time_excluding_waiting_on_lock_in_millis": 0}),
             ),
-            "warmer" => {
-                ("warmer", json!({"current": 0, "total": c.warmer_total, "total_time_in_millis": 0}))
-            }
+            "warmer" => (
+                "warmer",
+                json!({"current": 0, "total": c.warmer_total, "total_time_in_millis": 0}),
+            ),
             "query_cache" => (
                 "query_cache",
                 json!({"memory_size_in_bytes": 0, "total_count": 0, "hit_count": 0, "miss_count": 0,
@@ -571,7 +586,10 @@ pub(super) fn shard_sections(i: &Index, shard: u64, r: &StatsRequest) -> Map<Str
                                 .iter()
                                 .map(|d| field_values(m, &d.source, f).len())
                                 .sum::<usize>();
-                            ((*f).clone(), json!({"build_time_in_millis": 0, "shard_max_value_count": count}))
+                            (
+                                (*f).clone(),
+                                json!({"build_time_in_millis": 0, "shard_max_value_count": count}),
+                            )
                         })
                         .collect();
                     if !ords.is_empty() {
@@ -619,9 +637,12 @@ pub(super) fn shard_sections(i: &Index, shard: u64, r: &StatsRequest) -> Map<Str
                         ("cfe", "Compound Files Entries", 479),
                         ("cfs", "Compound Files", store.saturating_sub(EMPTY_SHARD_BYTES).max(1)),
                     ] {
-                        files.insert(ext.into(), json!({"size_in_bytes": size * count,
+                        files.insert(
+                            ext.into(),
+                            json!({"size_in_bytes": size * count,
                             "min_size_in_bytes": size, "max_size_in_bytes": size,
-                            "average_size_in_bytes": size, "count": count, "description": desc}));
+                            "average_size_in_bytes": size, "count": count, "description": desc}),
+                        );
                     }
                     v["file_sizes"] = Value::Object(files);
                 }
@@ -630,12 +651,8 @@ pub(super) fn shard_sections(i: &Index, shard: u64, r: &StatsRequest) -> Map<Str
             "translog" => {
                 let ops = if i.opened { c.translog_ops } else { 0 };
                 let bytes = EMPTY_TRANSLOG_BYTES + if i.opened { c.translog_bytes } else { 0 };
-                let age = i
-                    .counters
-                    .last_write
-                    .unwrap_or(i.counters.created)
-                    .elapsed()
-                    .as_millis() as u64;
+                let age = i.counters.last_write.unwrap_or(i.counters.created).elapsed().as_millis()
+                    as u64;
                 (
                     "translog",
                     json!({"operations": ops, "size_in_bytes": bytes, "uncommitted_operations": ops,
@@ -881,7 +898,10 @@ impl Engine {
             }
             indices.insert(n.clone(), json!({"shards": shards}));
         }
-        (200, json!({"_shards": {"total": total, "successful": ok, "failed": 0}, "indices": indices}))
+        (
+            200,
+            json!({"_shards": {"total": total, "successful": ok, "failed": 0}, "indices": indices}),
+        )
     }
 
     /// `GET [/<index>]/_recovery`: each primary was recovered once, from
@@ -945,9 +965,9 @@ impl Engine {
             Ok(n) => n,
             Err(e) => return e,
         };
-        let wanted: Vec<&str> = q.get("status").map_or(vec!["yellow", "red"], |v| {
-            v.split(',').map(str::trim).collect()
-        });
+        let wanted: Vec<&str> = q
+            .get("status")
+            .map_or(vec!["yellow", "red"], |v| v.split(',').map(str::trim).collect());
         let mut indices = Map::new();
         for n in &names {
             let i = &s.indices[n];
@@ -1051,7 +1071,8 @@ impl Engine {
 
 fn usage_entry(kinds: &BTreeMap<&'static str, u64>) -> Value {
     let g = |k: &str| kinds.get(k).copied().unwrap_or(0);
-    let inverted = ["terms", "postings", "proximity", "term_frequencies", "positions", "offsets", "payloads"];
+    let inverted =
+        ["terms", "postings", "proximity", "term_frequencies", "positions", "offsets", "payloads"];
     let any = kinds.values().copied().max().unwrap_or(0);
     let mut inv = Map::new();
     for k in inverted {
@@ -1188,7 +1209,11 @@ fn loaded_fields(body: &Value) -> Vec<(String, bool)> {
             for (kind, body) in d {
                 if matches!(
                     kind.as_str(),
-                    "terms" | "significant_terms" | "rare_terms" | "cardinality" | "diversified_sampler"
+                    "terms"
+                        | "significant_terms"
+                        | "rare_terms"
+                        | "cardinality"
+                        | "diversified_sampler"
                 ) && let Some(f) = body.get("field").and_then(Value::as_str)
                 {
                     out.push((f.to_string(), true));
@@ -1213,7 +1238,9 @@ fn query_usage(q: &Value, scored: bool, out: &mut Vec<(String, &'static str)>) {
     for (kind, body) in m {
         match kind.as_str() {
             "bool" => {
-                for (clause, sc) in [("must", scored), ("should", scored), ("filter", false), ("must_not", false)] {
+                for (clause, sc) in
+                    [("must", scored), ("should", scored), ("filter", false), ("must_not", false)]
+                {
                     match body.get(clause) {
                         Some(Value::Array(a)) => a.iter().for_each(|x| query_usage(x, sc, out)),
                         Some(x) => query_usage(x, sc, out),
@@ -1281,15 +1308,34 @@ impl Engine {
             .collect();
         let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
         let q = query_params(query);
-        let refresh = q.get("refresh").is_some_and(|v| v.is_empty() || v == "true" || v == "wait_for");
+        let refresh =
+            q.get("refresh").is_some_and(|v| v.is_empty() || v == "true" || v == "wait_for");
         let write = matches!(method, "PUT" | "POST");
         let doc_op = segs.iter().any(|x| {
             matches!(
                 *x,
-                "_doc" | "_create" | "_update" | "_bulk" | "_search" | "_count" | "_msearch"
-                    | "_mget" | "_refresh" | "_flush" | "_forcemerge" | "_termvectors" | "_explain"
-                    | "_validate" | "_field_caps" | "_analyze" | "_pit" | "_cat" | "_nodes"
-                    | "_tasks" | "_capabilities" | "_health_report"
+                "_doc"
+                    | "_create"
+                    | "_update"
+                    | "_bulk"
+                    | "_search"
+                    | "_count"
+                    | "_msearch"
+                    | "_mget"
+                    | "_refresh"
+                    | "_flush"
+                    | "_forcemerge"
+                    | "_termvectors"
+                    | "_explain"
+                    | "_validate"
+                    | "_field_caps"
+                    | "_analyze"
+                    | "_pit"
+                    | "_cat"
+                    | "_nodes"
+                    | "_tasks"
+                    | "_capabilities"
+                    | "_health_report"
             )
         });
         if status < 300 && !doc_op && matches!(method, "PUT" | "POST" | "DELETE") {
@@ -1321,7 +1367,9 @@ impl Engine {
             }
             [idx, "_doc" | "_source", id] if matches!(method, "GET" | "HEAD") => {
                 let target = resp["_index"].as_str().map(str::to_string).or_else(|| {
-                    resolve(s, idx, &q, &Resolve::LENIENT_OPEN).ok().and_then(|v| v.into_iter().next())
+                    resolve(s, idx, &q, &Resolve::LENIENT_OPEN)
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
                 });
                 if let Some(t) = target {
                     note_get(s, &t, id, status == 200);
@@ -1329,7 +1377,9 @@ impl Engine {
             }
             [idx, "_update", id] if method == "POST" => {
                 let target = resp["_index"].as_str().map(str::to_string).or_else(|| {
-                    resolve(s, idx, &q, &Resolve::LENIENT_OPEN).ok().and_then(|v| v.into_iter().next())
+                    resolve(s, idx, &q, &Resolve::LENIENT_OPEN)
+                        .ok()
+                        .and_then(|v| v.into_iter().next())
                 });
                 if let Some(t) = target {
                     note_get(s, &t, id, resp["result"] != json!("created") && status < 300);
@@ -1409,7 +1459,10 @@ impl Engine {
                 let responses = resp["responses"].as_array().cloned().unwrap_or_default();
                 for (n, pair) in lines.chunks(2).enumerate() {
                     let header = parse_json(pair[0].as_bytes()).unwrap_or_else(|| json!({}));
-                    let body = pair.get(1).and_then(|b| parse_json(b.as_bytes())).unwrap_or_else(|| json!({}));
+                    let body = pair
+                        .get(1)
+                        .and_then(|b| parse_json(b.as_bytes()))
+                        .unwrap_or_else(|| json!({}));
                     let pattern = match &header["index"] {
                         Value::String(x) => x.clone(),
                         Value::Array(a) => {
@@ -1474,7 +1527,12 @@ impl Engine {
                 let target = resp["_index"].as_str().unwrap_or(idx).to_string();
                 if let Some(i) = s.indices.get_mut(&target) {
                     for f in fields {
-                        *i.counters.field_usage.entry(f).or_default().entry("term_vectors").or_default() += 1;
+                        *i.counters
+                            .field_usage
+                            .entry(f)
+                            .or_default()
+                            .entry("term_vectors")
+                            .or_default() += 1;
                     }
                 }
             }
@@ -1604,7 +1662,9 @@ fn note_search(
                 Some("text") => {
                     let mut leaves = Vec::new();
                     mapped_leaves(&i.mappings, "", &mut leaves);
-                    leaves.iter().any(|(name, d)| name == &path && d.get("fielddata") == Some(&json!(true)))
+                    leaves
+                        .iter()
+                        .any(|(name, d)| name == &path && d.get("fielddata") == Some(&json!(true)))
                 }
                 Some("keyword") => *by_agg,
                 _ => false,
@@ -1639,20 +1699,26 @@ mod tests {
     #[test]
     fn stats_are_added() {
         let mut a = json!({"docs": {"count": 1}, "segments": {"max_unsafe_auto_id_timestamp": -1}});
-        add_stats(&mut a, &json!({"docs": {"count": 2}, "segments": {"max_unsafe_auto_id_timestamp": 5}}));
+        add_stats(
+            &mut a,
+            &json!({"docs": {"count": 2}, "segments": {"max_unsafe_auto_id_timestamp": 5}}),
+        );
         assert_eq!(a["docs"]["count"], json!(3));
         assert_eq!(a["segments"]["max_unsafe_auto_id_timestamp"], json!(5));
     }
 
     #[test]
     fn unknown_metric_is_rejected() {
-        let e = StatsRequest::parse(Some("fieldata"), &HashMap::new(), "/_stats/fieldata", "metric")
-            .err()
-            .unwrap();
+        let e =
+            StatsRequest::parse(Some("fieldata"), &HashMap::new(), "/_stats/fieldata", "metric")
+                .err()
+                .unwrap();
         assert_eq!(e.0, 400);
         assert_eq!(
             e.1["error"]["reason"],
-            json!("request [/_stats/fieldata] contains unrecognized metric: [fieldata] -> did you mean [fielddata]?")
+            json!(
+                "request [/_stats/fieldata] contains unrecognized metric: [fieldata] -> did you mean [fielddata]?"
+            )
         );
     }
 

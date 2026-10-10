@@ -305,7 +305,8 @@ pub(crate) fn thread_pools() -> Vec<(String, Value)> {
 /// A thread pool's live counters (`threads`, `queue`, `active`, ...):
 /// idle pools, their core threads started.
 pub(crate) fn thread_pool_stats(info: &Value) -> Value {
-    let threads = info.get("size").or_else(|| info.get("core")).and_then(Value::as_u64).unwrap_or(0);
+    let threads =
+        info.get("size").or_else(|| info.get("core")).and_then(Value::as_u64).unwrap_or(0);
     json!({"threads": threads, "queue": 0, "active": 0, "rejected": 0, "largest": threads, "completed": 0})
 }
 
@@ -435,12 +436,11 @@ pub(crate) fn unrecognized(path: &str, invalid: &[String], known: &[&str], what:
         if n > 0 {
             msg.push_str(", ");
         }
-        let mut scored: Vec<(f32, &str)> = known
-            .iter()
-            .map(|k| (similarity(bad, k), *k))
-            .filter(|(s, _)| *s > 0.5)
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1)));
+        let mut scored: Vec<(f32, &str)> =
+            known.iter().map(|k| (similarity(bad, k), *k)).filter(|(s, _)| *s > 0.5).collect();
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1))
+        });
         msg.push_str(&format!("[{bad}]"));
         match scored.len() {
             0 => {}
@@ -473,7 +473,12 @@ mod tests {
     #[test]
     fn unrecognized_metric_message() {
         assert_eq!(
-            unrecognized("/_stats/fieldata", &["fieldata".into()], &["fielddata", "docs"], "metric"),
+            unrecognized(
+                "/_stats/fieldata",
+                &["fieldata".into()],
+                &["fielddata", "docs"],
+                "metric"
+            ),
             "request [/_stats/fieldata] contains unrecognized metric: [fieldata] -> did you mean [fielddata]?"
         );
         assert_eq!(
