@@ -4,9 +4,7 @@
 
 use std::collections::HashSet;
 
-use regex_lite::Regex;
-
-use super::jregex;
+use super::jregex::JPattern;
 
 /// Output-offset to input-offset corrections: the cumulative difference
 /// in effect from each recorded output offset onwards.
@@ -143,28 +141,22 @@ pub fn parse_mapping_rules(rules: &[String]) -> Result<Vec<(Vec<char>, Vec<char>
     Ok(out)
 }
 
-fn pattern_replace(text: &[char], re: &Regex, replacement: &str) -> (Vec<char>, Corrections) {
-    let s: String = text.iter().collect();
-    let mut out = String::new();
+fn pattern_replace(text: &[char], re: &JPattern, replacement: &str) -> (Vec<char>, Corrections) {
+    let mut out: Vec<char> = Vec::with_capacity(text.len());
     let mut corr = Corrections::default();
     let mut last = 0;
-    let mut out_chars = 0;
-    for caps in re.captures_iter(&s) {
-        let Some(m) = caps.get(0) else { continue };
-        let before = &s[last..m.start()];
-        out.push_str(before);
-        out_chars += before.chars().count();
-        let rep = jregex::expand(replacement, &caps);
-        let (matched, replaced) = (m.as_str().chars().count(), rep.chars().count());
-        if matched != replaced {
-            corr.record(out_chars, matched, replaced);
+    for g in re.captures_all(text) {
+        let Some((a, b)) = g[0] else { continue };
+        out.extend_from_slice(&text[last..a]);
+        let rep: Vec<char> = re.expand(replacement, &g, text).chars().collect();
+        if b - a != rep.len() {
+            corr.record(out.len(), b - a, rep.len());
         }
-        out.push_str(&rep);
-        out_chars += replaced;
-        last = m.end();
+        out.extend_from_slice(&rep);
+        last = b;
     }
-    out.push_str(&s[last..]);
-    (out.chars().collect(), corr)
+    out.extend_from_slice(&text[last..]);
+    (out, corr)
 }
 
 /// Inline elements Lucene's `HTMLStripCharFilter` removes without a

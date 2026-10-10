@@ -15,7 +15,8 @@ use super::stopwords;
 use super::synonyms::{self, ParseOptions, RuleError};
 use super::token::Token;
 use super::tokenizers::{TokenChars, Tokenizer};
-use super::{AnalysisError, Analyzer, jregex};
+use super::jregex::JPattern;
+use super::{AnalysisError, Analyzer};
 
 /// Where names are looked up: the index's `analysis` settings (if any),
 /// its other settings (limits), and the synonym sets.
@@ -130,8 +131,8 @@ fn token_chars(list: &[String], custom: Option<&str>) -> Result<TokenChars, Anal
     Ok(tc)
 }
 
-fn regex(pattern: &str, flags: &str) -> Result<regex_lite::Regex, AnalysisError> {
-    jregex::compile(pattern, flags).map_err(|m| AnalysisError::new("pattern_syntax_exception", m))
+fn regex(pattern: &str, flags: &str) -> Result<JPattern, AnalysisError> {
+    JPattern::compile(pattern, flags).map_err(|m| AnalysisError::new("pattern_syntax_exception", m))
 }
 
 /// Built-in tokenizer names.
@@ -148,7 +149,7 @@ fn builtin_tokenizer(name: &str) -> Option<Tokenizer> {
         "edge_ngram" => {
             Tokenizer::NGram { min: 1, max: 2, chars: TokenChars::default(), edge: true }
         }
-        "pattern" => Tokenizer::Pattern { re: regex_lite::Regex::new(r"\W+").ok()?, group: -1 },
+        "pattern" => Tokenizer::Pattern { re: JPattern::compile(r"\W+", "").ok()?, group: -1 },
         "path_hierarchy" | "PathHierarchy" => {
             Tokenizer::PathHierarchy { delimiter: '/', replacement: '/', skip: 0, reverse: false }
         }

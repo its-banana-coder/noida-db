@@ -8,6 +8,7 @@
 //! request against that index; built analyzers are cached in it.
 
 mod api;
+mod backtrack;
 mod char_filters;
 mod chars;
 mod filters;

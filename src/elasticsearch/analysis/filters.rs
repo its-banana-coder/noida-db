@@ -3,13 +3,13 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use regex_lite::Regex;
 
 use super::chars::{is_digit, lower, lowercase, upper};
 use super::stemmers;
 use super::synonyms::{self, SynonymMap};
 use super::token::{SHINGLE, Token, WORD};
-use super::{fold, jregex};
+use super::fold;
+use super::jregex::JPattern;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LowerLang {
@@ -98,12 +98,12 @@ pub enum TokenFilter {
     },
     KeywordMarker {
         words: HashSet<String>,
-        pattern: Option<Regex>,
+        pattern: Option<JPattern>,
         ignore_case: bool,
     },
     KeywordRepeat,
     PatternReplace {
-        re: Regex,
+        re: JPattern,
         replacement: String,
         all: bool,
     },
@@ -124,6 +124,36 @@ pub enum TokenFilter {
     DelimitedPayload {
         delimiter: char,
     },
+    Keep {
+        words: HashSet<String>,
+        case_sensitive: bool,
+    },
+    KeepTypes {
+        types: HashSet<String>,
+        include: bool,
+    },
+    PatternCapture {
+        patterns: Vec<JPattern>,
+        preserve: bool,
+    },
+    CommonGrams {
+        words: HashSet<String>,
+        ignore_case: bool,
+        query_mode: bool,
+    },
+    Multiplexer {
+        chains: Vec<Vec<TokenFilter>>,
+        preserve: bool,
+    },
+    Decompounder {
+        words: HashSet<String>,
+        min_word: usize,
+        min_sub: usize,
+        max_sub: usize,
+        longest_only: bool,
+    },
+    ScandinavianFolding,
+    ScandinavianNormalization,
     /// `flatten_graph` and other filters that leave the terms alone.
     Identity,
 }
@@ -307,9 +337,7 @@ impl TokenFilter {
                 .into_iter()
                 .map(|mut t| {
                     let hit = match pattern {
-                        Some(re) => re
-                            .find(&t.term)
-                            .is_some_and(|m| m.start() == 0 && m.end() == t.term.len()),
+                        Some(re) => re.full_match(&t.term),
                         None if *ignore_case => words.contains(&lowercase(&t.term)),
                         None => words.contains(&t.term),
                     };
@@ -333,18 +361,19 @@ impl TokenFilter {
                 out
             }
             TokenFilter::PatternReplace { re, replacement, all } => map_terms(tokens, |t| {
+                let chars: Vec<char> = t.chars().collect();
                 let mut out = String::new();
                 let mut last = 0;
-                for caps in re.captures_iter(t) {
-                    let Some(m) = caps.get(0) else { continue };
-                    out.push_str(&t[last..m.start()]);
-                    out.push_str(&jregex::expand(replacement, &caps));
-                    last = m.end();
+                for g in re.captures_all(&chars) {
+                    let Some((a, b)) = g[0] else { continue };
+                    out.extend(&chars[last..a]);
+                    out.push_str(&re.expand(replacement, &g, &chars));
+                    last = b;
                     if !*all {
                         break;
                     }
                 }
-                out.push_str(&t[last..]);
+                out.extend(&chars[last..]);
                 out
             }),
             TokenFilter::Limit { max } => tokens.into_iter().take(*max).collect(),
@@ -386,9 +415,233 @@ impl TokenFilter {
                     None => t.to_string(),
                 })
             }
+            TokenFilter::Keep { words, case_sensitive } => filter_tokens(tokens, |_, t| {
+                if *case_sensitive { words.contains(&t.term) } else { words.contains(&lowercase(&t.term)) }
+            }),
+            TokenFilter::KeepTypes { types, include } => {
+                filter_tokens(tokens, |_, t| types.contains(&t.ty) == *include)
+            }
+            TokenFilter::PatternCapture { patterns, preserve } => pattern_capture(tokens, patterns, *preserve),
+            TokenFilter::CommonGrams { words, ignore_case, query_mode } => {
+                let grams = common_grams(tokens, words, *ignore_case);
+                if *query_mode { common_grams_query(grams) } else { grams }
+            }
+            TokenFilter::Multiplexer { chains, preserve } => {
+                let mut out = Vec::new();
+                for t in tokens {
+                    let mut here: Vec<Token> = Vec::new();
+                    if *preserve {
+                        here.push(t.clone());
+                    }
+                    for chain in chains {
+                        let mut ts = vec![t.clone()];
+                        for f in chain {
+                            ts = f.apply(ts);
+                        }
+                        here.extend(ts);
+                    }
+                    let mut first = true;
+                    let mut seen: Vec<String> = Vec::new();
+                    for mut h in here {
+                        if seen.contains(&h.term) {
+                            continue;
+                        }
+                        seen.push(h.term.clone());
+                        h.pos_inc = if first { t.pos_inc } else { 0 };
+                        first = false;
+                        out.push(h);
+                    }
+                }
+                out
+            }
+            TokenFilter::Decompounder { words, min_word, min_sub, max_sub, longest_only } => {
+                let mut out = Vec::new();
+                for t in tokens {
+                    let chars: Vec<char> = t.term.chars().collect();
+                    let n = chars.len();
+                    out.push(t.clone());
+                    if n < *min_word || t.keyword {
+                        continue;
+                    }
+                    for i in 0..=n.saturating_sub(*min_sub) {
+                        let mut longest: Option<String> = None;
+                        for j in *min_sub..=*max_sub {
+                            if i + j > n {
+                                break;
+                            }
+                            let sub: String = chars[i..i + j].iter().collect();
+                            if words.contains(&sub) {
+                                if *longest_only {
+                                    longest = Some(sub);
+                                } else {
+                                    let mut p = t.with_term(sub);
+                                    p.pos_inc = 0;
+                                    out.push(p);
+                                }
+                            }
+                        }
+                        if let Some(sub) = longest {
+                            let mut p = t.with_term(sub);
+                            p.pos_inc = 0;
+                            out.push(p);
+                        }
+                    }
+                }
+                out
+            }
+            TokenFilter::ScandinavianFolding => map_terms(tokens, scandinavian_folding),
+            TokenFilter::ScandinavianNormalization => map_terms(tokens, scandinavian_normalization),
             TokenFilter::Identity => tokens,
         }
     }
+}
+
+/// Lucene's `PatternCaptureGroupTokenFilter`: every capture group of
+/// every pattern's matches, in text order, stacked on the token.
+fn pattern_capture(tokens: Vec<Token>, patterns: &[JPattern], preserve: bool) -> Vec<Token> {
+    let mut out = Vec::new();
+    for t in tokens {
+        let chars: Vec<char> = t.term.chars().collect();
+        let mut caps: Vec<(usize, usize, usize)> = Vec::new();
+        for (pi, p) in patterns.iter().enumerate() {
+            for g in p.captures_all(&chars) {
+                for span in g.iter().skip(1).flatten() {
+                    if span.1 > span.0 && !(preserve && span.0 == 0 && span.1 == chars.len()) {
+                        caps.push((span.0, pi, span.1));
+                    }
+                }
+            }
+        }
+        caps.sort();
+        caps.dedup_by(|a, b| a.0 == b.0 && a.2 == b.2);
+        if caps.is_empty() {
+            out.push(t);
+            continue;
+        }
+        let mut first = true;
+        if preserve {
+            out.push(t.clone());
+            first = false;
+        }
+        for (a, _, b) in caps {
+            let mut c = t.with_term(chars[a..b].iter().collect::<String>());
+            c.pos_inc = if first { t.pos_inc } else { 0 };
+            first = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Lucene's `CommonGramsFilter`: a `word_word` gram after every token
+/// that, or whose successor, is a common word.
+fn common_grams(tokens: Vec<Token>, words: &HashSet<String>, ignore_case: bool) -> Vec<Token> {
+    let common = |t: &Token| {
+        if ignore_case { words.contains(&lowercase(&t.term)) } else { words.contains(&t.term) }
+    };
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        out.push(tokens[i].clone());
+        if let Some(next) = tokens.get(i + 1)
+            && (common(&tokens[i]) || common(next))
+        {
+            let mut g = Token::new(format!("{}_{}", tokens[i].term, next.term), tokens[i].start, next.end, "gram");
+            g.pos_inc = 0;
+            g.pos_len = 2;
+            out.push(g);
+        }
+    }
+    out
+}
+
+/// Lucene's `CommonGramsQueryFilter` over a common-grams stream: a word
+/// is dropped when a gram starts at it, and the last word after a gram.
+fn common_grams_query(stream: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut previous: Option<Token> = None;
+    let mut previous_was_gram = false;
+    let fix = |mut t: Token| {
+        if t.ty == "gram" {
+            t.pos_inc = 1;
+            t.pos_len = 1;
+        }
+        t
+    };
+    for cur in stream {
+        if cur.ty != "gram"
+            && let Some(p) = previous.take()
+        {
+            previous_was_gram = p.ty == "gram";
+            out.push(fix(p));
+        }
+        previous = Some(cur);
+    }
+    if let Some(p) = previous
+        && !(previous_was_gram && p.ty != "gram" && false)
+        && !out.last().is_some_and(|l: &Token| l.ty == "gram" && p.ty != "gram")
+    {
+        out.push(fix(p));
+    }
+    out
+}
+
+fn scandinavian_folding(t: &str) -> String {
+    let mut out: Vec<char> = Vec::new();
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let mapped = match c {
+            'å' | 'ä' | 'á' | 'à' | 'â' | 'æ' => 'a',
+            'Å' | 'Ä' | 'Á' | 'À' | 'Â' | 'Æ' => 'A',
+            'ö' | 'ø' | 'ó' | 'ò' | 'ô' => 'o',
+            'Ö' | 'Ø' | 'Ó' | 'Ò' | 'Ô' => 'O',
+            c => c,
+        };
+        out.push(mapped);
+        if let Some(&n) = chars.get(i + 1) {
+            let skip = (matches!(c, 'a' | 'A') && matches!(n, 'a' | 'A' | 'e' | 'E' | 'o' | 'O'))
+                || (matches!(c, 'o' | 'O') && matches!(n, 'e' | 'E' | 'o' | 'O'));
+            if skip {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out.into_iter().collect()
+}
+
+fn scandinavian_normalization(t: &str) -> String {
+    let mut out: Vec<char> = Vec::new();
+    let chars: Vec<char> = t.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let n = chars.get(i + 1).copied();
+        let pair = match (c, n) {
+            ('a', Some('a')) | ('a', Some('o')) => Some('å'),
+            ('A', Some('a' | 'A' | 'o' | 'O')) => Some('Å'),
+            ('a', Some('e')) => Some('æ'),
+            ('A', Some('e' | 'E')) => Some('Æ'),
+            ('o', Some('e' | 'o')) => Some('ø'),
+            ('O', Some('e' | 'E' | 'o' | 'O')) => Some('Ø'),
+            _ => None,
+        };
+        if let Some(p) = pair {
+            out.push(p);
+            i += 2;
+            continue;
+        }
+        out.push(match c {
+            'ä' => 'æ',
+            'Ä' => 'Æ',
+            'ö' => 'ø',
+            'Ö' => 'Ø',
+            c => c,
+        });
+        i += 1;
+    }
+    out.into_iter().collect()
 }
 
 fn map_terms(tokens: Vec<Token>, f: impl Fn(&str) -> String) -> Vec<Token> {

@@ -5,6 +5,8 @@
 use regex_lite::Regex;
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::jregex::JPattern;
+
 use super::chars::*;
 use super::token::{ALPHANUM, NUM, Token, WORD};
 
@@ -44,9 +46,9 @@ pub enum Tokenizer {
     Letter { max_len: usize, lowercase: bool },
     Keyword,
     NGram { min: usize, max: usize, chars: TokenChars, edge: bool },
-    Pattern { re: Regex, group: i64 },
-    SimplePattern { re: Regex },
-    SimplePatternSplit { re: Regex },
+    Pattern { re: JPattern, group: i64 },
+    SimplePattern { re: JPattern },
+    SimplePatternSplit { re: JPattern },
     CharGroup { split_on: TokenChars, max_len: usize },
     PathHierarchy { delimiter: char, replacement: char, skip: usize, reverse: bool },
     Thai,
@@ -512,69 +514,56 @@ fn ngrams(text: &[char], min: usize, max: usize, keep: &TokenChars, edge: bool) 
     out
 }
 
-/// Char index of each byte offset boundary in `s`.
-fn byte_to_char(s: &str) -> Vec<usize> {
-    let mut map = vec![0; s.len() + 1];
-    let mut ci = 0;
-    for (b, c) in s.char_indices() {
-        for k in 0..c.len_utf8() {
-            map[b + k] = ci;
-        }
-        ci += 1;
-    }
-    map[s.len()] = ci;
-    map
+fn piece(text: &[char], a: usize, b: usize) -> Token {
+    Token::new(text[a..b].iter().collect::<String>(), a, b, WORD)
 }
 
-fn pattern(text: &[char], re: &Regex, group: i64) -> Vec<Token> {
-    let s: String = text.iter().collect();
-    let b2c = byte_to_char(&s);
+fn pattern(text: &[char], re: &JPattern, group: i64) -> Vec<Token> {
     let mut out = Vec::new();
     if group < 0 {
         let mut last = 0;
-        for m in re.find_iter(&s) {
-            if m.start() > last {
-                out.push(Token::new(&s[last..m.start()], b2c[last], b2c[m.start()], WORD));
+        for g in re.captures_all(text) {
+            let Some((a, b)) = g[0] else { continue };
+            if a > last {
+                out.push(piece(text, last, a));
             }
-            last = m.end();
+            last = b;
         }
-        if last < s.len() {
-            out.push(Token::new(&s[last..], b2c[last], b2c[s.len()], WORD));
+        if last < text.len() {
+            out.push(piece(text, last, text.len()));
         }
     } else {
-        for caps in re.captures_iter(&s) {
-            if let Some(m) = caps.get(group as usize)
-                && !m.as_str().is_empty()
+        for g in re.captures_all(text) {
+            if let Some(Some((a, b))) = g.get(group as usize)
+                && b > *a
             {
-                out.push(Token::new(m.as_str(), b2c[m.start()], b2c[m.end()], WORD));
+                out.push(piece(text, *a, *b));
             }
         }
     }
     out
 }
 
-fn simple_pattern(text: &[char], re: &Regex) -> Vec<Token> {
-    let s: String = text.iter().collect();
-    let b2c = byte_to_char(&s);
-    re.find_iter(&s)
-        .filter(|m| !m.as_str().is_empty())
-        .map(|m| Token::new(m.as_str(), b2c[m.start()], b2c[m.end()], WORD))
+fn simple_pattern(text: &[char], re: &JPattern) -> Vec<Token> {
+    re.captures_all(text)
+        .into_iter()
+        .filter_map(|g| g[0])
+        .filter(|(a, b)| b > a)
+        .map(|(a, b)| piece(text, a, b))
         .collect()
 }
 
-fn simple_pattern_split(text: &[char], re: &Regex) -> Vec<Token> {
-    let s: String = text.iter().collect();
-    let b2c = byte_to_char(&s);
+fn simple_pattern_split(text: &[char], re: &JPattern) -> Vec<Token> {
     let mut out = Vec::new();
     let mut last = 0;
-    for m in re.find_iter(&s).filter(|m| !m.as_str().is_empty()) {
-        if m.start() > last {
-            out.push(Token::new(&s[last..m.start()], b2c[last], b2c[m.start()], WORD));
+    for (a, b) in re.captures_all(text).into_iter().filter_map(|g| g[0]).filter(|(a, b)| b > a) {
+        if a > last {
+            out.push(piece(text, last, a));
         }
-        last = m.end();
+        last = b;
     }
-    if last < s.len() {
-        out.push(Token::new(&s[last..], b2c[last], b2c[s.len()], WORD));
+    if last < text.len() {
+        out.push(piece(text, last, text.len()));
     }
     out
 }
