@@ -1368,6 +1368,7 @@ impl Engine {
             Ok(mut resp) => {
                 if q.get("typed_keys").is_some_and(|v| v == "true") {
                     suggest::type_keys(&req, &mut resp);
+                    super::typed_keys::aggs(&req, &mut resp, &mappings);
                 }
                 set_search_shards(&mut resp, shard_total);
                 Self::fill_lookups(&s, &req, &mut resp);
@@ -2174,6 +2175,7 @@ impl Engine {
                     }
                     merge(&mut index.mappings, m);
                     suggest::normalize_mappings(&mut index.mappings);
+                    super::docparse::normalize(&mut index.mappings);
                 }
                 if let Some(st) = req.get("settings") {
                     apply_settings(&mut index.settings, st);
@@ -2266,6 +2268,7 @@ impl Engine {
                     if let Some(i) = s.indices.get_mut(n) {
                         merge(&mut i.mappings, next.clone());
                         suggest::normalize_mappings(&mut i.mappings);
+                        super::docparse::normalize(&mut i.mappings);
                     }
                 }
                 (200, json!({"acknowledged":true}))
@@ -3251,6 +3254,20 @@ impl Engine {
     ) -> (u16, Value) {
         if !matches!(method, "GET" | "POST") {
             return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        if let Some(bad) = termvectors::unknown_param(q) {
+            let path = match id {
+                Some(id) => format!("/{index}/_termvectors/{id}"),
+                None => format!("/{index}/_termvectors"),
+            };
+            return (
+                400,
+                error(
+                    "illegal_argument_exception",
+                    &format!("request [{path}] contains unrecognized parameter: [{bad}]"),
+                    400,
+                ),
+            );
         }
         let mut o = termvectors::Options::from_params(q);
         if !body.iter().all(u8::is_ascii_whitespace) {

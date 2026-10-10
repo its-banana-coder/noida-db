@@ -2795,8 +2795,7 @@ fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSp
             None => false,
         };
         if !same {
-            return Err(EsError::new(
-                400,
+            return Err(EsError::shard_failure(
                 "illegal_argument_exception",
                 "Cannot use [collapse] in conjunction with [search_after] unless the search is \
                  sorted on the same field. Multiple sort fields are not allowed.",

@@ -25,6 +25,7 @@ mod sorting;
 mod suggest;
 mod templates;
 mod termvectors;
+mod typed_keys;
 mod vectors;
 
 #[cfg(test)]

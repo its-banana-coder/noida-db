@@ -119,8 +119,13 @@ fn as_f64(v: &Value) -> Option<f64> {
 /// field would have rejected or ignored (`ignore_malformed`, `ignore_above`).
 fn format_value(leaf: &Leaf, v: &Value, format: Option<&str>) -> Option<Value> {
     match leaf.ty.as_str() {
+        // A malformed address was ignored, not indexed.
+        "ip" => match v {
+            Value::String(s) if s.parse::<std::net::IpAddr>().is_ok() => Some(json!(s)),
+            _ => None,
+        },
         "keyword" | "constant_keyword" | "wildcard" | "text" | "match_only_text" | "version"
-        | "ip" | "binary" | "search_as_you_type" => {
+        | "binary" | "search_as_you_type" => {
             let s = match v {
                 Value::String(s) => s.clone(),
                 Value::Number(n) => n.to_string(),

@@ -60,7 +60,6 @@ const KEYS: &[&str] = &[
     "_id",
     "doc",
     "routing",
-    "_routing",
     "version",
     "version_type",
     "per_field_analyzer",
@@ -83,6 +82,34 @@ fn list(v: &Value) -> Vec<String> {
         Value::Array(a) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
         _ => vec![],
     }
+}
+
+/// URL parameters the term vectors APIs take.
+const PARAMS: &[&str] = &[
+    "fields",
+    "field_statistics",
+    "offsets",
+    "payloads",
+    "positions",
+    "term_statistics",
+    "routing",
+    "realtime",
+    "version",
+    "version_type",
+    "preference",
+    "ids",
+    "pretty",
+    "human",
+    "error_trace",
+    "filter_path",
+];
+
+/// A URL parameter the API doesn't take, as Elasticsearch names it.
+pub fn unknown_param(q: &HashMap<String, String>) -> Option<&str> {
+    let mut bad: Vec<&str> =
+        q.keys().map(String::as_str).filter(|k| !PARAMS.contains(k)).collect();
+    bad.sort();
+    bad.first().copied()
 }
 
 impl Options {
@@ -115,7 +142,7 @@ impl Options {
                 "offsets" => self.offsets = truthy(v).unwrap_or(true),
                 "payloads" => self.payloads = truthy(v).unwrap_or(true),
                 "realtime" => self.realtime = truthy(v).unwrap_or(true),
-                "routing" | "_routing" => {
+                "routing" => {
                     self.routing = v.as_str().map(str::to_string).or_else(|| Some(v.to_string()))
                 }
                 "version" => self.version = v.as_i64(),

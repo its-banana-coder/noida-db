@@ -935,6 +935,7 @@ pub fn parse(mappings: &mut Value, src: &Value, ctx: &Ctx) -> Result<(), Failure
         }
     }
     validate(&next, obj, "", ctx, &pos)?;
+    normalize(&mut next);
     *mappings = next;
     Ok(())
 }
@@ -1007,6 +1008,22 @@ pub fn ignored_values(
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// A mapping as Elasticsearch stores (and shows) it: `dynamic` as a
+/// string, and no `"type": "object"` on an object that has properties.
+pub fn normalize(m: &mut Value) {
+    let Some(o) = m.as_object_mut() else { return };
+    if let Some(Value::Bool(b)) = o.get("dynamic") {
+        let s = b.to_string();
+        o.insert("dynamic".into(), Value::String(s));
+    }
+    if o.get("type").and_then(Value::as_str) == Some("object") && o.contains_key("properties") {
+        o.remove("type");
+    }
+    if let Some(Value::Object(props)) = o.get_mut("properties") {
+        props.values_mut().for_each(normalize);
+    }
 }
 
 /// A field mapping with every parameter's default spelled out, as

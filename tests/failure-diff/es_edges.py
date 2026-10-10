@@ -1445,6 +1445,275 @@ scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
     ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
 ])
 
+
+# --- search response features and document parsing (resp_*) ----------
+
+RESULT = {"pick": lambda r: r.get("result")}
+
+
+def resp_hits(r):
+    return [(h["_id"], h.get("_score"), h.get("sort"), h.get("fields"), h.get("_ignored"),
+             h.get("ignored_field_values")) for h in r["hits"]["hits"]] + [r["hits"].get("total")]
+
+
+def resp_inner(r):
+    return [(h["_id"], h.get("fields"), {n: ([x["_id"] for x in ih["hits"]["hits"]], ih["hits"]["total"])
+                                         for n, ih in h.get("inner_hits", {}).items()})
+            for h in r["hits"]["hits"]]
+
+
+scenario("resp_docparse", [
+    ("DELETE", "/resp-dp?ignore_unavailable=true"),
+    ("PUT", "/resp-dp", {"settings": STATIC, "mappings": {"dynamic": "strict", "properties": {
+        "ip": {"type": "ip", "ignore_malformed": True}, "n": {"type": "integer"},
+        "d": {"type": "date", "ignore_malformed": True}, "k": {"type": "keyword", "ignore_above": 3},
+        "b": {"type": "boolean"}, "o": {"type": "object", "dynamic": True},
+        "f": {"type": "object", "dynamic": False}}}}, ACK),
+    ("PUT", "/resp-dp/_doc/1", {"ip": "10.0.0.1", "n": 5, "k": "ab"}, RESULT),
+    ("PUT", "/resp-dp/_doc/2", {"ip": "garbage", "d": "nope", "k": "abcdef"}, RESULT),
+    ("PUT", "/resp-dp/_doc/3", {"ip": ["1.1.1.1", "bad", 7], "n": "12", "o": {"new": "x"}}, RESULT),
+    ("PUT", "/resp-dp/_doc/4", {"f": {"anything": [1, "a"]}, "b": "false"}, RESULT),
+    ("PUT", "/resp-dp/_doc/5", {"zz": 1}),
+    ("PUT", "/resp-dp/_doc/5", {"n": "abc"}),
+    ("PUT", "/resp-dp/_doc/5", {"n": 3000000000}),
+    ("PUT", "/resp-dp/_doc/5", {"n": True}),
+    ("PUT", "/resp-dp/_doc/5", {"b": "yes"}),
+    ("PUT", "/resp-dp/_doc/5", {"ip": {"object": "wow"}}),
+    ("PUT", "/resp-dp/_doc/5", {"k": {"a": 1}}),
+    ("PUT", "/resp-dp/_doc/5", {"o": "concrete"}),
+    ("PUT", "/resp-dp/_doc/5", {"o": {"p": {"q": 1}}, "n": "1e3"}, RESULT),
+    ("POST", "/resp-dp/_refresh"),
+    ("GET", "/resp-dp/_mapping"),
+    ("GET", "/resp-dp/_doc/2?stored_fields=_ignored"),
+    ("GET", "/resp-dp/_doc/1?stored_fields=_ignored"),
+    ("POST", "/resp-dp/_search", {"query": {"exists": {"field": "_ignored"}}, "sort": ["_doc"]}, {"pick": resp_hits}),
+    ("POST", "/resp-dp/_search", {"query": {"term": {"_ignored": "k"}}}, {"pick": ids}),
+    ("POST", "/resp-dp/_search", {"query": {"ids": {"values": ["2", "3"]}}, "_source": False, "fields": ["ip", "k", "d"],
+                                  "sort": ["_doc"]}, {"pick": resp_hits}),
+    ("DELETE", "/resp-dt?ignore_unavailable=true"),
+    ("PUT", "/resp-dt", {"settings": STATIC, "mappings": {"dynamic_templates": [
+        {"strs": {"match_mapping_type": "string", "match": "k_*", "mapping": {"type": "keyword"}}},
+        {"longs": {"match_mapping_type": "long", "mapping": {"type": "integer"}}},
+        {"named": {"mapping": {"type": "keyword"}}},
+        {"rt": {"match": "r_*", "runtime": {}}}]}}, ACK),
+    ("PUT", "/resp-dt/_doc/1", {"k_a": "x", "n": 5, "f": 1.5, "s": "text", "d": "2020-01-01", "d2": "2015/09/02",
+                                "dotted.name": "y", "r_x": "v", "e": [], "nul": None}, RESULT),
+    ("GET", "/resp-dt/_mapping"),
+    ("POST", "/_bulk", [{"index": {"_index": "resp-dt", "_id": "2", "dynamic_templates": {"t": "named"}}},
+                        {"t": "abc"},
+                        {"index": {"_index": "resp-dt", "_id": "3", "dynamic_templates": {"u": "missing"}}},
+                        {"u": "abc"},
+                        {"index": {"_index": "resp-dt", "_id": "4", "bogus": 1}}, {"x": 1}],
+     ),
+    ("POST", "/_bulk", [{"index": {"_index": "resp-dt", "_id": "2", "dynamic_templates": {"t": "named"}}},
+                        {"t": "abc"},
+                        {"index": {"_index": "resp-dt", "_id": "3", "dynamic_templates": {"u": "missing"}}},
+                        {"u": "abc"}],
+     {"pick": lambda r: [(list(i)[0], i[list(i)[0]]["status"], i[list(i)[0]].get("error", {}).get("type"))
+                         for i in r["items"]]}),
+    ("GET", "/resp-dt/_mapping/field/t,u"),
+    ("GET", "/resp-dt/_mapping/field/k_a?include_defaults=true"),
+    ("DELETE", "/resp-dp"), ("DELETE", "/resp-dt"),
+])
+
+scenario("resp_termvectors", [
+    ("DELETE", "/resp-tvx?ignore_unavailable=true"),
+    ("PUT", "/resp-tvx", {"settings": STATIC, "mappings": {"properties": {
+        "text": {"type": "text", "term_vector": "with_positions_offsets"}, "kw": {"type": "keyword"},
+        "plain": {"type": "text"}}}}, ACK),
+    ("PUT", "/resp-tvx/_doc/1?refresh=true", {"text": "The quick brown fox is brown.", "kw": "Hello World",
+                                              "plain": "some text here"}, RESULT),
+    ("PUT", "/resp-tvx/_doc/2?refresh=true", {"text": "brown cows", "plain": "more text"}, RESULT),
+    ("GET", "/resp-tvx/_termvectors/1?term_statistics=true"),
+    ("GET", "/resp-tvx/_termvectors/1?fields=kw,plain&positions=false"),
+    ("GET", "/resp-tvx/_termvectors/1?fields=plain&offsets=false&field_statistics=false"),
+    ("GET", "/resp-tvx/_termvectors/9"),
+    ("GET", "/resp-nope/_termvectors/1"),
+    ("POST", "/resp-tvx/_termvectors", {"doc": {"text": "brown cow", "x": "y"}, "term_statistics": True}),
+    ("POST", "/resp-tvx/_termvectors/1?bogus=1"),
+    ("POST", "/resp-tvx/_termvectors/1", {"versionType": "x"}),
+    ("POST", "/_mtermvectors", {"docs": [{"_index": "resp-tvx", "_id": "1", "fields": ["plain"]},
+                                         {"_index": "resp-tvx", "_id": "9"},
+                                         {"_index": "resp-nope", "_id": "1"}]}),
+    ("POST", "/resp-tvx/_mtermvectors?fields=plain", {"ids": ["1", "2"]}),
+    ("POST", "/resp-tvx/_mtermvectors", {"docs": [{"_id": "1", "_routing": "x"}]}),
+    ("POST", "/resp-tvx/_mtermvectors", {}),
+    ("DELETE", "/resp-tvx"),
+])
+
+COLLAPSE_DOCS = [
+    {"g": 1, "tag": "A", "sort": 10, "t": "red fox"}, {"g": 1, "tag": "B", "sort": 6, "t": "red red fox"},
+    {"g": 1, "tag": "A", "sort": 24, "t": "blue fox"}, {"g": 25, "tag": "B", "sort": 10, "t": "red dog"},
+    {"g": 25, "tag": "A", "sort": 5, "t": "red"}, {"g": 3, "tag": "B", "sort": 36, "t": "fox"},
+]
+
+scenario("resp_collapse", setup("resp-col", {"settings": STATIC, "mappings": {"properties": {
+    "g": {"type": "integer"}, "tag": {"type": "keyword"}, "sort": {"type": "long"}, "t": {"type": "text"}}}},
+    COLLAPSE_DOCS) + [
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g", "inner_hits": {"name": "s", "size": 2, "sort": [{"sort": "asc"}]}},
+                                   "sort": [{"sort": "desc"}]}, {"pick": resp_inner}),
+    ("POST", "/resp-col/_search", {"query": {"match": {"t": "red"}},
+                                   "collapse": {"field": "g", "inner_hits": [{"name": "a", "size": 1},
+                                                                             {"name": "b", "collapse": {"field": "tag"}}]}},
+     {"pick": resp_inner}),
+    ("POST", "/resp-col/_search?rest_total_hits_as_int=true",
+     {"collapse": {"field": "g", "inner_hits": {"name": "s", "version": True, "_source": False, "fields": ["tag"]}},
+      "sort": [{"sort": "desc"}]}, {"pick": resp_inner}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g", "inner_hits": {"size": 1}}}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g", "inner_hits": {"name": "x", "collapse": {"field": "tag", "inner_hits": {}}}}}),
+    ("POST", "/resp-col/_search?scroll=1m", {"collapse": {"field": "g"}}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "t"}}),
+    ("POST", "/resp-col/_search", {"collapse": {"field": "g"}, "search_after": [6], "sort": [{"sort": "desc"}]}),
+    ("POST", "/resp-col/_search", {"query": {"match": {"t": "red"}}, "collapse": {"field": "g"},
+                                   "rescore": {"window_size": 2, "query": {"rescore_query": {"match": {"t": "fox"}},
+                                                                           "query_weight": 0.5, "rescore_query_weight": 2}}},
+     {"pick": resp_hits}),
+    ("POST", "/resp-col/_search", {"rescore": {"query": {"rescore_query": {"match_all": {}}}}, "sort": ["sort"]}),
+    ("DELETE", "/resp-col"),
+])
+
+scenario("resp_limits", setup("resp-lim", {"settings": {"index": {"refresh_interval": "-1", "max_docvalue_fields_search": 2,
+                                                                     "max_script_fields": 1, "max_result_window": 5,
+                                                                     "max_terms_count": 2, "number_of_shards": 3}},
+                                           "mappings": {"properties": {"k": {"type": "keyword"}, "n": {"type": "long"}}}},
+                                [{"k": "a", "n": 1}, {"k": "b", "n": 2}, {"k": "c", "n": 3}]) + [
+    ("POST", "/resp-lim/_search", {"match": {"k": "a"}}),
+    ("POST", "/resp-lim/_search", {"query": {"match_all": {}}, "bogus": [1]}),
+    ("POST", "/resp-lim/_search", {"query": {"term": {"k": "a"}, "preference": "_local"}}),
+    ("POST", "/resp-lim/_search", {"from": -1}),
+    ("POST", "/resp-lim/_search?from=-1"),
+    ("POST", "/resp-lim/_search", {"size": 6}),
+    ("POST", "/resp-lim/_search?scroll=1m", {"size": 6}),
+    ("POST", "/resp-lim/_search", {"docvalue_fields": ["k", "n", "x"]}),
+    ("POST", "/resp-lim/_search", {"script_fields": {"a": {"script": "1"}, "b": {"script": "2"}}}),
+    ("POST", "/resp-lim/_search", {"query": {"terms": {"k": ["a", "b", "c"]}}}),
+    ("POST", "/resp-lim/_search", {"query": {"regexp": {"k": "a" * 1001}}}),
+    ("POST", "/resp-lim/_search", {"query": {"prefix": {"k": "a" * 1001}}}),
+    ("POST", "/resp-lim/_search", {"rescore": [{"window_size": 10001, "query": {"rescore_query": {"match_all": {}}}}]}),
+    ("POST", "/resp-lim/_search?batched_reduce_size=1"),
+    ("POST", "/resp-lim/_search?pre_filter_shard_size=0"),
+    ("POST", "/resp-lim/_search?batched_reduce_size=2", {"size": 0, "aggs": {"k": {"terms": {"field": "k"}}}},
+     {"pick": lambda r: (r.get("num_reduce_phases"), r["hits"]["total"])}),
+    ("POST", "/resp-lim/_search", {"track_total_hits": -2}),
+    ("POST", "/resp-lim/_search?terminate_after=-1"),
+    ("POST", "/resp-lim/_count?terminate_after=-1"),
+    ("POST", "/resp-lim/_search", {"indices_boost": {"resp-lim": 2}}),
+    ("POST", "/resp-lim/_search", {"indices_boost": [{"resp-nope": 2}]}),
+    ("POST", "/resp-nomatch*/_search"),
+    ("POST", "/resp-nomatch*/_count"),
+    ("POST", "/resp-nomatch*/_search?allow_no_indices=false"),
+    ("POST", "/resp-lim,resp-nope/_search"),
+    ("POST", "/<resp-nope-{now/d}>/_search"),
+    ("GET", "/resp-lim/_search_shards?routing=x", None, {"pick": lambda r: (r["indices"], [[(c["index"], c["shard"], c["primary"]) for c in g] for g in r["shards"]])}),
+    ("GET", "/resp-lim/_search_shards", None, {"pick": lambda r: (r["indices"], [[(c["index"], c["shard"]) for c in g] for g in r["shards"]])}),
+    ("DELETE", "/resp-lim"),
+])
+
+scenario("resp_fields", [
+    ("DELETE", "/resp-fl?ignore_unavailable=true"),
+    ("PUT", "/resp-fl", {"settings": STATIC, "mappings": {"properties": {
+        "id": {"type": "keyword"}, "idAlias": {"type": "alias", "path": "_id"},
+        "num": {"type": "integer"}, "numAlias": {"type": "alias", "path": "num"},
+        "user": {"type": "nested", "properties": {"first": {"type": "keyword"},
+                                                  "address": {"type": "nested"}}},
+        "owner": {"type": "text", "fields": {"length": {"type": "token_count", "analyzer": "standard"}}},
+        "ts": {"type": "date", "format": "yyyy-MM-dd HH:mm:ss.SSS"},
+        "flat": {"type": "flattened"}, "geo": {"type": "geo_point"},
+        "off": {"type": "object", "enabled": False}}}}, ACK),
+    ("PUT", "/resp-fl/_doc/1?refresh=true", {"id": "x", "num": 7, "owner": "Anna Ott", "ts": "2021-02-11 08:30:04.828",
+                                             "user": [{"first": "John", "address": {"city": "Berlin"}, "acct": {"size": 1}},
+                                                      {"first": "Alice", "address": [{"city": "Paris"}, {"zip": "1"}]},
+                                                      {"last": "Snow"}],
+                                             "flat": {"a": "b", "c": ["d", "e"]}, "geo": {"lat": 41.12, "lon": -71.34},
+                                             "off": {"z": "q"}}, RESULT),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": ["*"]}, {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": ["user.address*"]}, {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": [{"field": "*", "include_unmapped": True}]}, {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": ["_id", "_index", "_version", "_*", "flat.c", "flat.*"]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"_source": False, "fields": [{"field": "geo", "format": "wkt"}, {"field": "ts", "format": "yyyy"}]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"fields": ["_seq_no"]}),
+    ("POST", "/resp-fl/_search", {"fields": [{"field": "id", "format": "yyyy"}]}),
+    ("POST", "/resp-fl/_search", {"fields": [{"field": "i*", "format": "yyyy"}]}),
+    ("POST", "/resp-fl/_search", {"script_fields": {"a": {"script": "doc['num'].value * 2"},
+                                                    "b": {"script": {"source": "params._source.id + params.x", "params": {"x": "!"}}},
+                                                    "c": {"script": "return null"}}},
+     {"pick": lambda r: [(h.get("_source"), h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("POST", "/resp-fl/_search", {"sort": [{"ts": {"order": "asc", "format": "strict_date_optional_time_nanos"}}]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"sort": [{"ts": {"order": "asc"}}], "search_after": ["2021-02-11 08:30:04.827"]},
+     {"pick": resp_hits}),
+    ("POST", "/resp-fl/_search", {"sort": [{"ts": {"order": "asc", "format": "epoch_millis"}}], "search_after": ["2021-02-11T08:30:04.828Z"]}),
+    ("POST", "/resp-fl/_search", {"sort": ["_shard_doc"]}),
+    ("DELETE", "/resp-fl"),
+])
+
+
+def resp_profile(r):
+    out = []
+    for sh in r["profile"]["shards"]:
+        f = sh.get("fetch")
+        out.append((sh["shard_id"], sh["index"], sh.get("cluster"), sorted(sh), len(sh["node_id"]),
+                    f and (f["type"], f["debug"], [c["type"] for c in f.get("children", [])]),
+                    sh.get("dfs") and sorted(sh["dfs"]),
+                    [(s["query"][0]["type"], [c["name"] for c in s["collector"]]) for s in sh.get("searches", [])]))
+    return out
+
+
+scenario("resp_profile", setup("resp-prof", {"settings": {"index": {"refresh_interval": "-1", "number_of_shards": 2}},
+                                             "mappings": {"properties": {"k": {"type": "keyword"}, "t": {"type": "text"}}}},
+                               [{"k": "a", "t": "quick fox"}, {"k": "b", "t": "lazy dog"}]) + [
+    ("POST", "/resp-prof/_search", {"profile": True, "query": {"term": {"k": "a"}}}, {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search", {"profile": True, "_source": False, "fields": ["k"], "query": {"term": {"k": "a"}}},
+     {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search", {"profile": True, "stored_fields": "_none_", "query": {"term": {"k": "a"}}},
+     {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search?search_type=dfs_query_then_fetch", {"profile": True, "query": {"term": {"k": "zz"}}},
+     {"pick": resp_profile}),
+    ("POST", "/resp-prof/_search", {"profile": True, "query": {"bool": {"must": [{"match": {"t": "quick fox"}}],
+                                                                        "filter": [{"term": {"k": "a"}}]}}},
+     {"pick": lambda r: [s["searches"][0]["query"][0]["description"] for s in r["profile"]["shards"]]}),
+    ("DELETE", "/resp-prof"),
+])
+
+scenario("resp_misc", setup("resp-misc", {"settings": STATIC, "mappings": {"properties": {
+    "k": {"type": "keyword"}, "n": {"type": "long"}, "f": {"type": "double"}, "d": {"type": "date"}}}},
+    [{"k": "a", "n": 1, "f": 1.5, "d": "2020-01-01"}, {"k": "b", "n": 2, "f": 2.5, "d": "2021-01-01"}]) + [
+    ("POST", "/resp-misc/_search?typed_keys=true", {"size": 0, "aggs": {
+        "t": {"terms": {"field": "k"}, "aggs": {"m": {"max": {"field": "n"}}}}, "l": {"terms": {"field": "n"}},
+        "dt": {"terms": {"field": "f"}}, "a": {"avg": {"field": "n"}}, "c": {"cardinality": {"field": "k"}},
+        "r": {"range": {"field": "d", "ranges": [{"to": "2020-06-01"}]}}, "f": {"filter": {"term": {"k": "a"}}},
+        "h": {"histogram": {"field": "n", "interval": 1}}, "m": {"missing": {"field": "k"}}}},
+     {"pick": lambda r: sorted(r["aggregations"])}),
+    ("POST", "/_msearch?typed_keys=true", [{"index": "resp-misc"}, {"size": 0, "aggs": {"f": {"filter": {"term": {"k": "a"}}}}}],
+     {"pick": lambda r: [sorted(x.get("aggregations", {})) for x in r["responses"]]}),
+    ("POST", "/resp-misc/_pit?keep_alive=1m", None, {"save": {"pit": "id"}, "pick": lambda r: "id" in r}),
+    ("POST", "/_msearch", [{"index": "resp-misc"}, {"pit": {"id": "{pit}"}}]),
+    ("POST", "/_msearch", [{}, {"pit": {"id": "{pit}"}, "query": {"match": {"_index": "resp-misc"}}}],
+     {"pick": lambda r: [x["hits"]["total"] for x in r["responses"]]}),
+    ("DELETE", "/_pit", {"id": "{pit}"}, {"pick": lambda r: r}),
+    ("POST", "/resp-misc/_search?include_named_queries_score=true",
+     {"query": {"bool": {"should": [{"term": {"k": {"value": "a", "_name": "ka"}}}, {"match_all": {"_name": "all"}}]}}},
+     {"pick": lambda r: [(h["_id"], sorted(h.get("matched_queries"))) for h in r["hits"]["hits"]]}),
+    ("PUT", "/%3Cresp-dm-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E", None, ACK),
+    ("GET", "/resp-dm-2022-12-31", None, {"pick": lambda r: sorted(r)}),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "<resp-dm-{2022-12-31||/d{yyyy-MM-dd}}>",
+                                                "alias": "<resp-dma-{2022-12-31||/d{yyyy-MM-dd}}>"}}]}, ACK),
+    ("GET", "/_alias/resp-dma-2022-12-31"),
+    ("GET", "/resp-misc/_mget", {"docs": [{"_id": "1", "_routing": "x"}]}),
+    ("POST", "/_bulk", [{"index": {"_index": "resp-misc", "_id": "9", "_type": "x"}}, {"k": "z"}]),
+    ("POST", "/resp-misc/_search", {"runtime_mappings": {"loc": {"type": "lookup", "target_index": "resp-misc",
+                                                                 "input_field": "k", "target_field": "k",
+                                                                 "fetch_fields": ["n"]}},
+                                    "fields": ["loc"], "_source": False, "sort": ["n"]}, {"pick": resp_hits}),
+    ("POST", "/resp-misc/_search", {"runtime_mappings": {"loc": {"type": "lookup", "target_index": "resp-misc",
+                                                                 "input_field": "k", "target_field": "k",
+                                                                 "fetch_fields": ["n"]}},
+                                    "query": {"match": {"loc": "x"}}}),
+    ("DELETE", "/resp-misc"), ("DELETE", "/resp-dm-2022-12-31"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:
