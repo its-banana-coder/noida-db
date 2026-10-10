@@ -261,6 +261,7 @@ fn token_kind(v: &Value) -> &'static str {
 pub struct Env<'a> {
     /// A document's current source (real-time, like a GET), `None` when
     /// it doesn't exist; an error when the index doesn't.
+    #[allow(clippy::type_complexity)]
     pub fetch: &'a dyn Fn(&str, &str, Option<&str>) -> Result<Option<Value>, Fail>,
     /// The index searched (where an item without `_index` is looked up).
     pub default_index: Option<String>,

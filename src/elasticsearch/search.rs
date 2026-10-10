@@ -2621,6 +2621,7 @@ fn apply_indices_boost(body: &Value, docs: &[CommittedDoc], scores: &mut HashMap
 
 /// Every clause of `query` carrying a `_name`, with the documents it
 /// matches and their scores (for each hit's `matched_queries`).
+#[allow(clippy::type_complexity)]
 fn named_queries(
     query: &Value,
     mappings: &Value,
