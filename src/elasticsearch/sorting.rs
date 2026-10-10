@@ -168,7 +168,7 @@ fn typed_value(v: &Value, ty: Option<&str>) -> Option<Value> {
     match ty {
         // `date_nanos` sorts (and reports) nanoseconds.
         Some("date_nanos") => super::tsdb::date_nanos(v).map(|n| json!(n)),
-        Some(t) if t == "date" => dates::value_millis(v, None).map(|m| json!(m)),
+        Some("date") => dates::value_millis(v, None).map(|m| json!(m)),
         Some(t) if is_long(t) => match v {
             Value::Number(n) => {
                 n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).map(|n| json!(n))

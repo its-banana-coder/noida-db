@@ -1663,6 +1663,14 @@ scenario("range_fields", setup("rng-fields", RNG_MAPPING, [
     ("POST", "/rng-fields/_search", {"query": {"terms": {"integer_range": [0, 5]}}, "_source": False}, {"pick": ids}),
     ("POST", "/rng-fields/_search", {"query": {"query_string": {"query": "integer_range:[2 TO 3]"}}, "_source": False}, {"pick": ids}),
     ("POST", "/rng-fields/_search", {"query": {"range": {"integer_range": {"gte": 3, "relation": "disjoint"}}}}),
+    ("POST", "/rng-fields/_search", {"query": {"range": {"integer_range": {"gte": 3, "relation": "foo"}}}}),
+    ("PUT", "/rng-fields/_doc/7?refresh=true", {"ip_range": {"gte": None, "lte": "10.10.10.10"}}, {"pick": lambda r: r["result"]}),
+    ("PUT", "/rng-fields/_doc/8?refresh=true", {"ip_range": {"gt": "2001:db8::", "lt": "200a:100::"}}, {"pick": lambda r: r["result"]}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "10.0.0.0"}}, "_source": False}, {"pick": ids}),
+    ("POST", "/rng-fields/_search", {"query": {"term": {"ip_range": "2001:db9::1"}}, "_source": False}, {"pick": ids}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": {"gte": 5, "lte": 1}}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": {"gte": "a"}}),
+    ("PUT", "/rng-fields/_doc/9", {"integer_range": 5}),
     ("DELETE", "/rng-fields"),
 ])
 

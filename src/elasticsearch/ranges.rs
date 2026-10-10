@@ -51,7 +51,8 @@ impl Kind {
             Kind::Long | Kind::Date => K::I(i128::from(i64::MIN)),
             Kind::Float => K::F(f64::from(f32::NEG_INFINITY)),
             Kind::Double => K::F(f64::NEG_INFINITY),
-            Kind::Ip => K::I(0),
+            // IPv6 addresses as unsigned 128-bit numbers, shifted to fit.
+            Kind::Ip => K::I(i128::MIN),
         }
     }
 
@@ -61,7 +62,6 @@ impl Kind {
             Kind::Long | Kind::Date => K::I(i128::from(i64::MAX)),
             Kind::Float => K::F(f64::from(f32::INFINITY)),
             Kind::Double => K::F(f64::INFINITY),
-            // IPv6 addresses as unsigned 128-bit numbers, shifted to fit.
             Kind::Ip => K::I(i128::MAX),
         }
     }

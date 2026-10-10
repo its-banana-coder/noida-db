@@ -748,11 +748,8 @@ pub(super) fn prepare_new_mapping(settings: &Value, mappings: &mut Value) -> Res
             e["error"]["root_cause"][0]["reason"] = json!(reason);
             return Err((status, e));
         }
-        match src.get("mode").and_then(Value::as_str) {
-            Some("stored" | "disabled") => {
-                return Err(mapping_failure("time series indices only support synthetic source"));
-            }
-            _ => {}
+        if let Some("stored" | "disabled") = src.get("mode").and_then(Value::as_str) {
+            return Err(mapping_failure("time series indices only support synthetic source"));
         }
         if src.contains_key("includes") || src.contains_key("excludes") {
             return Err(mapping_failure(
@@ -1599,22 +1596,6 @@ pub(super) fn check_query(query: &Map<String, Value>) -> Result<(), super::searc
         .caused_by("illegal_argument_exception", "[_tsid] is not searchable"));
     }
     Ok(())
-}
-
-/// The `time_series_dimension` / `time_series_metric` entries
-/// `_field_caps` reports for a mapped field.
-pub(super) fn field_caps_extras(def: &Value, time_series: bool) -> Map<String, Value> {
-    let mut out = Map::new();
-    if !time_series {
-        return out;
-    }
-    if is_dimension(def) {
-        out.insert("time_series_dimension".into(), json!(true));
-    }
-    if let Some(m) = def.get("time_series_metric").and_then(Value::as_str) {
-        out.insert("time_series_metric".into(), json!(m));
-    }
-    out
 }
 
 #[cfg(test)]
