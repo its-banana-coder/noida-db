@@ -142,13 +142,14 @@ impl Engine {
                 {
                     after_update = true;
                 }
-                if is_body && let Some(mut v) = parse_json(trimmed.as_bytes()) {
-                    if replace_scripts(&s, &mut v, search)? {
-                        changed = true;
-                        out.push_str(&v.to_string());
-                        out.push('\n');
-                        continue;
-                    }
+                if is_body
+                    && let Some(mut v) = parse_json(trimmed.as_bytes())
+                    && replace_scripts(&s, &mut v, search)?
+                {
+                    changed = true;
+                    out.push_str(&v.to_string());
+                    out.push('\n');
+                    continue;
                 }
                 out.push_str(line);
             }

@@ -14,9 +14,13 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::{Engine, State, error, glob_match, painless, parse_json};
 
-/// An ingest failure: Elasticsearch's exception type, reason and status.
+/// An ingest failure: Elasticsearch's exception type, reason and status
+/// (boxed: errors travel through every processor's `Result`).
 #[derive(Debug, Clone)]
-pub(super) struct IngestError {
+pub(super) struct IngestError(Box<ErrorInner>);
+
+#[derive(Debug, Clone)]
+pub(super) struct ErrorInner {
     kind: String,
     reason: String,
     status: u16,
@@ -26,16 +30,29 @@ pub(super) struct IngestError {
     failed: Option<(String, String)>,
 }
 
+impl std::ops::Deref for IngestError {
+    type Target = ErrorInner;
+    fn deref(&self) -> &ErrorInner {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for IngestError {
+    fn deref_mut(&mut self) -> &mut ErrorInner {
+        &mut self.0
+    }
+}
+
 impl IngestError {
     fn new(kind: &str, reason: impl Into<String>, status: u16) -> Self {
-        Self {
+        Self(Box::new(ErrorInner {
             kind: kind.into(),
             reason: reason.into(),
             status,
             caused_by: None,
             extra: Map::new(),
             failed: None,
-        }
+        }))
     }
 
     fn iae(reason: impl Into<String>) -> Self {
@@ -677,7 +694,7 @@ fn validate_processor(p: &Value) -> R<()> {
     if kind == "grok"
         && let Err(e) = Grok::new(cfg)
     {
-        return Err(IngestError::parse(e.reason, Some("grok"), None));
+        return Err(IngestError::parse(e.reason.clone(), Some("grok"), None));
     }
     Ok(())
 }
@@ -1207,8 +1224,9 @@ fn execute(kind: &str, cfg: &Map<String, Value>, doc: &mut Doc, store: &Store) -
                 (None, Some(v)) => render_value(v, doc),
                 (None, None) => Value::Null,
             };
-            let templated = cfg.get("value").and_then(Value::as_str).is_some_and(|v| v.contains("{{"))
-                || cfg.contains_key("copy_from");
+            let templated =
+                cfg.get("value").and_then(Value::as_str).is_some_and(|v| v.contains("{{"))
+                    || cfg.contains_key("copy_from");
             if opt_bool(cfg, "ignore_empty_value", false)
                 && templated
                 && (value.is_null() || value.as_str() == Some(""))
@@ -1316,10 +1334,41 @@ fn execute(kind: &str, cfg: &Map<String, Value>, doc: &mut Doc, store: &Store) -
             return string_op(kind, cfg, doc, |s| {
                 // Block elements become line breaks, inline ones vanish.
                 const BLOCK: &[&str] = &[
-                    "address", "article", "aside", "blockquote", "br", "center", "dd", "div",
-                    "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form", "h1",
-                    "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav", "ol",
-                    "p", "pre", "section", "table", "td", "th", "tr", "ul",
+                    "address",
+                    "article",
+                    "aside",
+                    "blockquote",
+                    "br",
+                    "center",
+                    "dd",
+                    "div",
+                    "dl",
+                    "dt",
+                    "fieldset",
+                    "figcaption",
+                    "figure",
+                    "footer",
+                    "form",
+                    "h1",
+                    "h2",
+                    "h3",
+                    "h4",
+                    "h5",
+                    "h6",
+                    "header",
+                    "hr",
+                    "li",
+                    "main",
+                    "nav",
+                    "ol",
+                    "p",
+                    "pre",
+                    "section",
+                    "table",
+                    "td",
+                    "th",
+                    "tr",
+                    "ul",
                 ];
                 let mut out = String::new();
                 let mut tag: Option<String> = None;
@@ -1929,8 +1978,11 @@ const GROK_PATTERNS: &[(&str, &str)] = &[
     ),
 ];
 
+/// A named capture: (regex group, field, conversion type).
+type Capture = (String, String, Option<String>);
+
 struct Grok {
-    patterns: Vec<(regex_lite::Regex, Vec<(String, String, Option<String>)>)>,
+    patterns: Vec<(regex_lite::Regex, Vec<Capture>)>,
 }
 
 impl Grok {
@@ -2213,9 +2265,12 @@ impl Engine {
             let s = self.0.lock().unwrap();
             let (default, final_) = index_pipelines(&s, index);
             let requested = q.get("pipeline").map(String::as_str);
-            if requested.is_none() && default.is_none() && final_.is_none() {
-                None
-            } else if requested == Some("_none") && final_.is_none() {
+            let none = match requested {
+                None => default.is_none() && final_.is_none(),
+                Some("_none") => final_.is_none(),
+                Some(_) => false,
+            };
+            if none {
                 None
             } else {
                 let Some(Value::Object(source)) = parse_json(body) else {
@@ -2265,6 +2320,17 @@ impl Engine {
                 let id = new_id.unwrap_or_default();
                 self.document_api(method, &target, &id, kind, &q, source.to_string().as_bytes())
             }
+        }
+    }
+
+    /// Whether a write to `index` with these parameters runs a pipeline.
+    pub(super) fn uses_pipelines(&self, index: &str, q: &HashMap<String, String>) -> bool {
+        let s = self.0.lock().unwrap();
+        let (default, final_) = index_pipelines(&s, index);
+        match q.get("pipeline").map(String::as_str) {
+            Some("_none") => final_.is_some(),
+            Some(_) => true,
+            None => default.is_some() || final_.is_some(),
         }
     }
 

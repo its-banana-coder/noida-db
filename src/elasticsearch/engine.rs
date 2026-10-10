@@ -2735,6 +2735,8 @@ impl Engine {
         let mut items = Vec::new();
         let mut errors = false;
         let mut touched: Vec<String> = Vec::new();
+        // Whether any item went through an ingest pipeline.
+        let mut ingested = false;
         while let Some(meta) = lines.next() {
             let Ok(m) = serde_json::from_str::<Value>(meta) else {
                 errors = true;
@@ -2858,6 +2860,7 @@ impl Engine {
                 let data = lines.next().unwrap_or("").as_bytes();
                 let verb = if action == "create" { "POST" } else { "PUT" };
                 let kind = if action == "create" { "_create" } else { "_doc" };
+                ingested |= self.uses_pipelines(ix, &item_q);
                 let (status, res) = self.index_with_pipelines(verb, ix, &id, kind, &item_q, data);
                 errors |= status >= 300;
                 let res = bulk_item(ix, &id, status, res);
@@ -2876,7 +2879,11 @@ impl Engine {
                 }
             }
         }
-        (200, json!({"took":0,"errors":errors,"items":items}))
+        let mut out = json!({"took":0,"errors":errors,"items":items});
+        if ingested {
+            out["ingest_took"] = json!(0);
+        }
+        (200, out)
     }
 
     fn mget(
@@ -3023,6 +3030,7 @@ impl Engine {
         let (mut total, mut done, mut conflicts, mut noops) = (0, 0, 0, 0);
         let mut failures = Vec::new();
         for name in &names {
+            let blocked = lifecycle::write_blocked(&s, name);
             let i = s.indices.get_mut(name).unwrap();
             let matched = match search::eval_root(&query, &i.mappings, &i.committed) {
                 Ok(m) => m,
@@ -3035,6 +3043,13 @@ impl Engine {
             for k in hits {
                 let snap = i.committed[k].clone();
                 total += 1;
+                // An index write block fails each write.
+                if let Some((status, e)) = &blocked {
+                    failures.push(json!({"index": name, "id": snap.id,
+                        "cause": {"type": e["error"]["type"], "reason": e["error"]["reason"]},
+                        "status": status}));
+                    continue;
+                }
                 // Like Elasticsearch, these work from the last refresh: the
                 // script sees the refreshed source, and a write to a
                 // document changed (or deleted) since is a version conflict.
@@ -3120,8 +3135,9 @@ impl Engine {
         if action == "_update_by_query" {
             out["updated"] = json!(done);
         }
-        let status = if conflicts > 0 && !proceed { 409 } else { 200 };
-        (status, out)
+        // The response carries the worst failure's status.
+        let status = failures.iter().filter_map(|f| f["status"].as_u64()).max().unwrap_or(200);
+        (status as u16, out)
     }
 
     /// `PUT|DELETE /<index>/_alias/<name>` and `GET /<index>/_alias`.

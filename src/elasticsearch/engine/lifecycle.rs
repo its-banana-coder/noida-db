@@ -113,12 +113,10 @@ impl Engine {
                     return Some((200, json!({"task": format!("noida:{n}")})));
                 }
             }
-            Some("_flush") => {
-                if truthy("force") && q.get("wait_if_ongoing").is_some_and(|v| v == "false") {
-                    return Some(validation_failed(
-                        "wait_if_ongoing must be true for a force flush",
-                    ));
-                }
+            Some("_flush")
+                if truthy("force") && q.get("wait_if_ongoing").is_some_and(|v| v == "false") =>
+            {
+                return Some(validation_failed("wait_if_ongoing must be true for a force flush"));
             }
             _ => {}
         }
@@ -285,9 +283,11 @@ impl Engine {
         let read = matches!(method, "GET" | "HEAD");
         let (expr, level) = match seg {
             [] => return None,
-            ["_search" | "_count" | "_msearch" | "_field_caps", ..] => ("*", Level::Read),
+            ["_search" | "_count"] => ("*", Level::Read),
             [first, ..] if first.starts_with('_') => return None,
-            [e] => (*e, if read { Level::MetadataRead } else { Level::MetadataWrite }),
+            [e] if read => (*e, Level::MetadataRead),
+            [e] if method == "DELETE" => (*e, Level::MetadataWrite),
+            [_] => return None,
             [e, "_mapping" | "_alias" | "_aliases", ..] => {
                 (*e, if read { Level::MetadataRead } else { Level::MetadataWrite })
             }

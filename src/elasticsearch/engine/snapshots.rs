@@ -215,6 +215,7 @@ impl Engine {
     ) -> (u16, Value) {
         match (method, &seg[1..]) {
             ("GET", []) => self.get_repositories("_all"),
+            ("GET", ["_status"]) => (200, json!({"snapshots": []})),
             ("GET", [repo]) => self.get_repositories(repo),
             ("PUT" | "POST", [repo]) => self.put_repository(repo, q, body),
             ("DELETE", [repo]) => self.delete_repository(repo),
@@ -226,7 +227,6 @@ impl Engine {
                 }
                 (200, json!({"results": {"deleted_bytes": 0, "deleted_blobs": 0}}))
             }
-            ("GET", ["_status"]) => (200, json!({"snapshots": []})),
             ("GET", [repo, "_status"]) => {
                 let s = self.0.lock().unwrap();
                 if !s.admin.repositories.contains_key(*repo) {
