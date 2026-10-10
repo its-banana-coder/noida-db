@@ -1445,6 +1445,297 @@ scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
     ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
 ])
 
+
+# --- Synthetic `_source` (`"_source": {"mode": "synthetic"}`) -------------
+
+SYN = {"mode": "synthetic"}
+
+
+def syn_docs(index, docs):
+    """Index each doc (id = position) and GET it back."""
+    steps = []
+    for i, d in enumerate(docs):
+        steps.append(("PUT", f"/{index}/_doc/{i}?refresh=true", d, {"pick": lambda r: r.get("result")}))
+        steps.append(("GET", f"/{index}/_doc/{i}", None, {"pick": lambda r: r.get("_source")}))
+    return steps
+
+
+def src_hits(r):
+    return [(h["_id"], h.get("_source")) for h in r["hits"]["hits"]]
+
+
+scenario("synth_leaf_types", [
+    ("DELETE", "/syn-leaf?ignore_unavailable=true"),
+    ("PUT", "/syn-leaf", {"mappings": {"_source": SYN, "properties": {
+        "k": {"type": "keyword"}, "kia": {"type": "keyword", "ignore_above": 3},
+        "ks": {"type": "keyword", "store": True, "doc_values": False, "ignore_above": 3},
+        "kn": {"type": "keyword", "doc_values": False},
+        "knv": {"type": "keyword", "null_value": "NULL"},
+        "l": {"type": "long"}, "i": {"type": "integer"}, "sh": {"type": "short"},
+        "f": {"type": "float"}, "h": {"type": "half_float"}, "d": {"type": "double"},
+        "sf": {"type": "scaled_float", "scaling_factor": 100}, "ul": {"type": "unsigned_long"},
+        "ln": {"type": "long", "doc_values": False},
+        "b": {"type": "boolean"}, "ip": {"type": "ip"},
+        "ipm": {"type": "ip", "ignore_malformed": True},
+        "im": {"type": "integer", "ignore_malformed": True},
+        "dt": {"type": "date"}, "dtf": {"type": "date", "format": "yyyy/MM/dd||epoch_millis"},
+        "dte": {"type": "date", "format": "epoch_millis"}, "dn": {"type": "date_nanos"},
+        "t": {"type": "text", "store": True},
+        "tk": {"type": "text", "fields": {"raw": {"type": "keyword", "ignore_above": 4}}},
+        "w": {"type": "wildcard"}, "v": {"type": "version"}, "mot": {"type": "match_only_text"},
+        "gp": {"type": "geo_point"}, "dv": {"type": "dense_vector", "dims": 3},
+        "fl": {"type": "flattened"}, "flia": {"type": "flattened", "ignore_above": 3},
+        "am": {"type": "aggregate_metric_double", "metrics": ["min", "max"], "default_metric": "max"},
+        "cp": {"type": "completion"},
+    }}}),
+] + syn_docs("syn-leaf", [
+    {"k": ["b", "a", "b", "c"], "kia": ["long", "b", "a", "long"], "ks": ["zz", "longer", "aa", "zz"]},
+    {"kn": ["b", "a", "b"], "knv": [None, "a"], "k": None},
+    {"l": [3, 1, 2, 1, "5", 1.7], "i": [2.9, -2.9], "sh": "7", "ln": ["3", 1.7, 1]},
+    {"f": [1.1, 2.5, 1.1], "h": [1.1, 3, 0.1], "d": [1.1, "2.5", 1e300], "sf": [1.234, 5, 1.005]},
+    {"ul": [18446744073709551615, 1, "5"], "b": ["true", False, True, "false"]},
+    {"ip": ["10.0.0.2", "10.0.0.1", "::ffff:10.0.0.1", "2001:db8::1", "::1", "fe80::1"]},
+    {"ipm": ["10.0.0.1", "garbage", "1.1.1.1", 7], "im": [5, "x", False, 1]},
+    {"dt": ["2017-09-01", 1504224000000, "2017-09-01T10:20:30.123+01:00", "2017"],
+     "dtf": ["2017/09/01", 1504224000000], "dte": ["1504224000123", 5]},
+    {"dn": ["2017-09-01T00:00:00.123456789Z", "2017-09-01T00:00:00.1Z", "2017-09-01T00:00:00Z", 1504224000000]},
+    {"t": ["b c", "a", "b c"], "tk": ["b c", "a", "b c", "longer text", "a"]},
+    {"w": ["b", "a", "b"], "v": ["1.10.0", "1.2.0", "1.2.0", "1.2.0-beta"], "mot": ["b", "a"]},
+    {"gp": [{"lat": 1.5, "lon": 2.5}, "41.12,-71.34", [-71.34, 41.12], "POINT (2 1)"]},
+    {"gp": {"lat": 41.12, "lon": -71.34}, "dv": [1, 2.5, 300.33]},
+    {"fl": {"b": [3, True, None, "x", 1.5], "a": {"c": None}, "e": [], "d": {}, "z": {"y": ["2", "10", "2"]}}},
+    {"fl": [{"x": 1}, {"x": 2, "y": 0}], "flia": {"a": "abcd", "b": ["x", "abcd", "y"]}},
+    {"am": {"min": 1, "max": 5}, "cp": ["b", "a"]},
+    {"k": ["a"], "l": [7], "f": [], "x_unmapped": [3, 1], "_doc_count": 2},
+]) + [
+    ("POST", "/syn-leaf/_search", {"query": {"ids": {"values": [0, 2]}}, "_source": ["k", "l", "i"]}, {"pick": src_hits}),
+    ("POST", "/syn-leaf/_search", {"query": {"ids": {"values": ["0", "3"]}}, "fields": ["k", "f", "h"], "_source": False},
+     {"pick": lambda r: [(h["_id"], h.get("fields")) for h in r["hits"]["hits"]]}),
+    ("DELETE", "/syn-leaf"),
+])
+
+scenario("synth_objects", [
+    ("DELETE", "/syn-obj?ignore_unavailable=true"),
+    ("PUT", "/syn-obj", {"mappings": {"_source": SYN, "properties": {
+        "o": {"properties": {"a": {"type": "long"}, "b": {"type": "keyword"},
+                             "in": {"properties": {"x": {"type": "long"}}},
+                             "dis": {"enabled": False}, "kn": {"type": "keyword", "doc_values": False}}},
+        "n": {"type": "nested", "properties": {"a": {"type": "long"}, "nn": {"type": "nested"}}},
+        "dis": {"type": "object", "enabled": False},
+        "df": {"dynamic": False, "properties": {"m": {"type": "keyword"}}},
+        "dr": {"dynamic": "runtime", "properties": {"m": {"type": "keyword"}}},
+        "sas": {"store_array_source": True, "properties": {"a": {"type": "long"}, "b": {"type": "keyword"}}},
+        "so": {"type": "object", "subobjects": False, "properties": {"a.b": {"type": "keyword"}}},
+        "z": {"type": "keyword"},
+    }}}),
+] + syn_docs("syn-obj", [
+    {"o": [{"a": 2, "b": "y"}, {"a": 1, "b": "x", "in": [{"x": 5}, {"x": 4}]}]},
+    {"o": [{"a": 1}], "o.b": "q", "o.in.x": 3},
+    {"o": [{"dis": {"b": 2}}, {"dis": {"a": 1}}, {"a": 5}]},
+    {"o": [{"kn": "b"}, {"kn": "a"}], "z": "1"},
+    {"n": [{"a": [3, 1]}, {}, {"a": 2, "nn": [{"q": [3, 2]}, {"q": 1}]}]},
+    {"n": {"a": 1}}, {"n": []}, {"n": [None, {"a": 1}]},
+    {"dis": {"b": 2, "a": [3, 1, {"c": None}], "x.y": 1}, "z": "x"},
+    {"dis": [{"b": 2}, {"a": 1}]}, {"dis": 5},
+    {"df": {"m": ["b", "a"], "zz": [3, 1, {"q": 1}], "y": {"w": 2}, "y.x": 1}},
+    {"df": [{"m": "x", "u": 1}, {"m": "y", "u": 2}]},
+    {"dr": {"m": ["b", "a"], "zz": [3, 1]}}, {"dr": [{"m": "b"}, {"m": "a"}]}, {"dr": {"m": "b", "x": 1}},
+    {"sas": [{"b": "z", "a": 2}, {"a": 1}]}, {"sas": {"b": "z", "a": [2, 1]}},
+    {"so": {"a.b": ["y", "x"], "c.d": 5, "e": {"f": 1}}}, {"so.a.b": "q"},
+    {"o": {"a": None, "b": None}, "z": []}, {"o": [{}, {}]},
+    {"a.b.c": 1, "a": {"b": {"d": [2, 1]}}, "new_obj": [{"p": 2}, {"p": 1}]},
+]) + [
+    ("GET", "/syn-obj/_mapping"),
+    ("POST", "/syn-obj/_search", {"query": {"ids": {"values": ["0", "4", "11"]}}}, {"pick": lambda r: sorted(src_hits(r), key=lambda h: h[0])}),
+    ("DELETE", "/syn-obj"),
+    # A disabled root keeps everything as sent.
+    ("DELETE", "/syn-root?ignore_unavailable=true"),
+    ("PUT", "/syn-root", {"mappings": {"_source": SYN, "enabled": False}}),
+] + syn_docs("syn-root", [{"name": "aaaa", "b": [3, 1], "a.very.deeply": "AAAA", "n": None}]) + [
+    ("GET", "/syn-root/_mapping"),
+    ("DELETE", "/syn-root"),
+    # Beyond the total fields limit, dynamic fields are kept unmapped.
+    ("DELETE", "/syn-limit?ignore_unavailable=true"),
+    ("PUT", "/syn-limit", {"settings": {"index.mapping.total_fields.limit": 3,
+                                        "index.mapping.total_fields.ignore_dynamic_beyond_limit": True},
+                           "mappings": {"_source": SYN, "properties": {"name": {"type": "keyword"}}}}),
+] + syn_docs("syn-limit", [
+    {"name": "x", "p_int": 1000, "q_double": 123.456789, "r_str": "AaAa", "s.very.deep": "A"},
+    {"name": "y", "arr": [3, 1, 2], "objs": [{"v": 2}, {"v": 1}]},
+]) + [
+    ("GET", "/syn-limit/_mapping"),
+    ("DELETE", "/syn-limit"),
+])
+
+scenario("synth_ranges", [
+    ("DELETE", "/syn-range?ignore_unavailable=true"),
+    ("PUT", "/syn-range", {"mappings": {"_source": SYN, "properties": {
+        "ir": {"type": "integer_range"}, "lr": {"type": "long_range"}, "fr": {"type": "float_range"},
+        "dr": {"type": "double_range"}, "dtr": {"type": "date_range"},
+        "dtf": {"type": "date_range", "format": "yyyy-MM-dd"}, "ipr": {"type": "ip_range"}}}}),
+] + syn_docs("syn-range", [
+    {"ir": [{"gte": 1, "lte": 2}, {"gte": 1, "lte": 2}, {"lte": 0}, {"gte": None}]},
+    {"ir": {"gt": 1.5, "lt": 3.7}, "lr": {"gte": "5", "lte": "10"}},
+    {"fr": {"gt": 1.0, "lt": 2.0}, "dr": [{"gte": 4, "lte": 8}, {"gte": 4, "lte": 7}]},
+    {"fr": {"gte": 1.1}, "dr": {"gt": 1.5}},
+    {"dtr": {"gt": "2017-09-01", "lt": "2017-09-05"}, "dtf": {"gte": "2017-09-01", "lt": "2017-09-03"}},
+    {"dtr": {"gte": 1504224000000, "lte": "2017-09-05T03:04:05.789Z"}},
+    {"ipr": "74.125.227.0/25"}, {"ipr": {"gt": "2001:db8::", "lt": "200a:100::"}},
+    {"ipr": {"gte": "::ffff:1.2.3.4", "lte": "1.2.3.5"}}, {"ir": None},
+]) + [("DELETE", "/syn-range")])
+
+
+def syn_create(fields, index="syn-bad", mode=SYN, settings=None):
+    body = {"mappings": {"_source": mode, "properties": fields}}
+    if settings:
+        body["settings"] = settings
+    return [("PUT", f"/{index}", body, {"pick": lambda r: r.get("acknowledged")}),
+            ("DELETE", f"/{index}?ignore_unavailable=true")]
+
+
+scenario("synth_mapping_errors", [("DELETE", "/syn-bad?ignore_unavailable=true")]
+  + syn_create({"t": {"type": "text"}})
+  + syn_create({"t": {"type": "text", "store": True}})
+  + syn_create({"t": {"type": "text", "fields": {"raw": {"type": "keyword"}}}})
+  + syn_create({"t": {"type": "text", "fields": {"raw": {"type": "keyword", "normalizer": "lowercase"}}}})
+  + syn_create({"t": {"type": "text", "fields": {"raw": {"type": "keyword", "doc_values": False}}}})
+  + syn_create({"b": {"type": "binary"}})
+  + syn_create({"b": {"type": "binary", "doc_values": True}})
+  + syn_create({"k": {"type": "keyword", "normalizer": "lowercase"}})
+  + syn_create({"k": {"type": "keyword", "copy_to": "other"}, "other": {"type": "keyword"}})
+  + syn_create({"k": {"type": "boolean", "doc_values": False}})
+  + syn_create({"k": {"type": "ip", "doc_values": False}})
+  + syn_create({"k": {"type": "date", "doc_values": False}})
+  + syn_create({"k": {"type": "geo_point", "doc_values": False}})
+  + syn_create({"k": {"type": "flattened", "doc_values": False}})
+  + syn_create({"k": {"type": "integer_range", "doc_values": False}})
+  + syn_create({"k": {"type": "keyword", "doc_values": False}})
+  + syn_create({"k": {"type": "long", "doc_values": False}})
+  + syn_create({"o": {"properties": {"z": {"type": "text"}, "b": {"type": "binary"}}}})
+  + syn_create({"n": {"type": "nested", "properties": {"t": {"type": "text"}}}})
+  + syn_create({"t": {"type": "text"}}, settings={"index.mode": "logsdb"})
+  + syn_create({"t": {"type": "text"}}, mode={"mode": "stored"})
+  + syn_create({}, mode={"mode": "synthetic", "includes": ["a"]})
+  + syn_create({}, mode={"mode": "synthetic", "enabled": False})
+  + syn_create({}, mode={"mode": "bogus"})
+  + [
+    ("PUT", "/syn-bad", {"mappings": {"_source": SYN}}),
+    ("PUT", "/syn-bad/_mapping", {"properties": {"t": {"type": "text"}}}),
+    ("PUT", "/syn-bad/_mapping", {"properties": {"t": {"type": "keyword", "normalizer": "lowercase"}}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"mode": "stored"}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"enabled": True}}),
+    ("GET", "/syn-bad/_mapping"),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"excludes": ["a"]}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {"mode": "synthetic"}}),
+    ("PUT", "/syn-bad/_mapping", {"_source": {}}),
+    ("GET", "/syn-bad/_mapping"),
+    ("DELETE", "/syn-bad"),
+    ("PUT", "/syn-bad", {"mappings": {"_source": {"mode": "stored"}}}),
+    ("GET", "/syn-bad/_mapping"),
+    ("PUT", "/syn-bad/_mapping", {"_source": SYN}),
+    ("PUT", "/syn-bad/_doc/1?refresh=true", {"a.b": [3, 1]}, {"pick": lambda r: r.get("result")}),
+    ("GET", "/syn-bad/_doc/1", None, {"pick": lambda r: r.get("_source")}),
+    ("DELETE", "/syn-bad"),
+])
+
+scenario("synth_force", [
+    ("DELETE", "/syn-f1?ignore_unavailable=true"), ("DELETE", "/syn-f2?ignore_unavailable=true"),
+    ("PUT", "/syn-f1", {"mappings": {"properties": {"text": {"type": "text"}, "o": {"properties": {"k": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-f1/_doc/1?refresh=true", {"text": "foo", "o.k": ["b", "a"]}),
+    ("GET", "/syn-f1/_doc/1?force_synthetic_source=true"),
+    ("GET", "/syn-f1/_doc/1"),
+    ("POST", "/syn-f1/_mget?force_synthetic_source=true", {"ids": ["1", "2"]}),
+    ("POST", "/syn-f1/_search?force_synthetic_source=true", {}),
+    ("PUT", "/syn-f2", {"mappings": {"properties": {"o": {"properties": {"k": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-f2/_doc/1?refresh=true", {"o.k": ["b", "a"], "x": 1.5, "s": "str", "n": [3, 1]}),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=true"),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=false"),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=bogus"),
+    ("GET", "/syn-f2/_doc/1?force_synthetic_source=true&realtime=false"),
+    ("POST", "/syn-f2/_mget?force_synthetic_source=true", {"ids": ["1"]}),
+    ("POST", "/syn-f2/_search?force_synthetic_source=true", {}, {"pick": src_hits}),
+    ("POST", "/syn-f2/_search", {}, {"pick": src_hits}),
+    ("DELETE", "/syn-f1"), ("DELETE", "/syn-f2"),
+])
+
+scenario("synth_update", [
+    ("DELETE", "/syn-up?ignore_unavailable=true"),
+    ("PUT", "/syn-up", {"settings": {"index": {"refresh_interval": "-1"}},
+                        "mappings": {"_source": SYN, "properties": {"k": {"type": "keyword"}, "n": {"type": "long"}}}}),
+    ("PUT", "/syn-up/_doc/1", {"k": ["b", "a"], "n": "3", "o.p": 1}),
+    ("GET", "/syn-up/_doc/1"),
+    ("GET", "/syn-up/_doc/1?realtime=false"),
+    ("POST", "/syn-up/_update/1", {"doc": {"x": 1}, "_source": True}),
+    ("GET", "/syn-up/_doc/1"),
+    ("POST", "/syn-up/_update/1", {"doc": {"k": ["a", "b"]}}),
+    ("POST", "/syn-up/_update/1", {"script": {"source": "ctx._source.n += 1"}}),
+    ("GET", "/syn-up/_doc/1"),
+    ("GET", "/syn-up/_source/1"),
+    ("GET", "/syn-up/_doc/1?_source_includes=k"),
+    ("POST", "/syn-up/_refresh"),
+    ("POST", "/syn-up/_search", {"query": {"ids": {"values": ["1"]}}, "fields": ["k", "n", "o.p"]}),
+    ("DELETE", "/syn-up"),
+])
+
+scenario("synth_index_misc", [
+    ("DELETE", "/syn-misc?ignore_unavailable=true"),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {"": {"type": "keyword"}}}}),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {"a": {"properties": {"": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {" ": {"type": "keyword"}}}}),
+    ("PUT", "/syn-misc", {"mappings": {"properties": {"a..b": {"type": "keyword"}}}}),
+    ("PUT", "/syn-misc", {"settings": {"soft_deletes.enabled": False}}),
+    ("PUT", "/syn-misc", {"settings": {"index.soft_deletes.enabled": "false"}}),
+    ("PUT", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E",
+     {"aliases": {"<syn-misc-alias-{2022-12-31||/M{yyyy.MM}}>": {}}}),
+    ("PUT", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7D%3E"),
+    ("PUT", "/%3Csyn-misc-%7Bnow%2Fd%7Byyyy%7D%3E"),
+    ("PUT", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E",
+     {"aliases": {"<syn-misc-alias-{2022-12-31||/M{yyyy-MM-dd}}>": {}}}),
+    ("GET", "/syn-misc-2022-12-31/_alias"),
+    ("HEAD", "/_alias/syn-misc-alias-2022-12-01"),
+    ("GET", "/%3Csyn-misc-%7B2022-12-31%7C%7C%2Fd%7Byyyy-MM-dd%7D%7D%3E/_count"),
+    ("POST", "/_aliases", {"actions": [{"add": {"index": "<syn-misc-{2022-12-31||/d{yyyy-MM-dd}}>",
+                                                "alias": "<syn-misc-al2-{2022-12-31||+1d{yyyy-MM-dd}}>"}}]}),
+    ("GET", "/syn-misc-2022-12-31/_alias"),
+    ("DELETE", "/syn-misc-2022-12-31"),
+    # Index sorting.
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": "nested_field.foo"},
+                          "mappings": {"properties": {"nested_field": {"type": "nested", "properties": {"foo": {"type": "keyword"}}}}}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": "nope"}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": "t"}, "mappings": {"properties": {"t": {"type": "text"}}}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": ["a", "b"], "index.sort.order": ["desc"]},
+                          "mappings": {"properties": {"a": {"type": "long"}, "b": {"type": "long"}}}}),
+    ("PUT", "/syn-misc", {"settings": {"index.sort.field": ["a", "b"], "index.sort.order": ["desc", "asc"],
+                                       "index.sort.missing": ["_first", "_last"], "index.refresh_interval": "-1"},
+                          "mappings": {"properties": {"a": {"type": "long"}, "b": {"type": "keyword"}}}}),
+    ("POST", "/_bulk?refresh=true", [
+        {"index": {"_index": "syn-misc", "_id": "1"}}, {"a": 1, "b": "x"},
+        {"index": {"_index": "syn-misc", "_id": "2"}}, {"a": 3, "b": "y"},
+        {"index": {"_index": "syn-misc", "_id": "3"}}, {"b": "z"},
+        {"index": {"_index": "syn-misc", "_id": "4"}}, {"a": 3, "b": "a"},
+        {"index": {"_index": "syn-misc", "_id": "5"}}, {"a": [1, 5]}], {"pick": lambda r: r["errors"]}),
+    ("POST", "/syn-misc/_search", {"sort": ["_doc"]}, {"pick": ids}),
+    ("POST", "/syn-misc/_search?scroll=1m", {"track_total_hits": False}),
+    ("POST", "/syn-misc/_search?scroll=1m", {"track_total_hits": 5}),
+    ("DELETE", "/syn-misc"),
+    # Values a field can't take.
+    ("PUT", "/syn-misc", {"mappings": {"properties": {
+        "l": {"type": "long"}, "i": {"type": "integer"}, "b": {"type": "boolean"}, "ip": {"type": "ip"},
+        "k": {"type": "keyword"}, "t": {"type": "text"}, "f": {"type": "float"},
+        "lim": {"type": "long", "ignore_malformed": True}, "o": {"properties": {"s": {"type": "short"}}}}}}),
+] + [("PUT", "/syn-misc/_doc/1", d, {"pick": lambda r: r.get("result")}) for d in [
+    {"l": "abc"}, {"l": True}, {"l": {"a": 1}}, {"l": [1, "x"]}, {"i": 3000000000}, {"l": 1.5e30},
+    {"b": "yes"}, {"b": 1}, {"ip": "x"}, {"ip": 7}, {"k": {"a": 1}}, {"t": {"a": 1}}, {"f": "NaN"},
+    {"lim": {"a": 1}}, {"lim": [{"a": 1}]}, {"lim": "x"}, {"k": [{"a": 1}]}, {"l": ""}, {"ip": ""}, {"b": ""},
+    {"l": []}, {"l": [[1, 2]]}, {"k": [["a"]]}, {"o.s": 40000}, {"o": [{"s": 1}, {"s": "x"}]},
+    {"l": "1.5", "i": 2.9, "b": "true", "ip": "::1", "k": 5, "f": "2.5"}, {"new": [1, "x"]},
+]] + [
+    ("POST", "/_bulk", [{"index": {"_index": "syn-misc", "_id": "2"}}, {"l": "abc"},
+                        {"index": {"_index": "syn-misc", "_id": "3"}}, {"l": 3}],
+     {"pick": lambda r: [(list(i.values())[0]["status"], list(i.values())[0].get("error", {}).get("type")) for i in r["items"]]}),
+    ("DELETE", "/syn-misc"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:

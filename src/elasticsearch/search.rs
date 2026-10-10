@@ -1172,16 +1172,19 @@ pub(super) fn eval_prefix(
 }
 
 fn eval_ids(v: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
-    let ids: Vec<&str> = v
+    // Numbers name ids too (`"values": [1]`).
+    let ids: Vec<String> = v
         .get("values")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.as_str().map(str::to_string).or_else(|| x.as_number().map(|n| n.to_string()))
+                })
+                .collect()
+        })
         .unwrap_or_default();
-    docs.iter()
-        .enumerate()
-        .filter(|(_, d)| ids.contains(&d.id.as_str()))
-        .map(|(i, _)| (i, 1.0))
-        .collect()
+    docs.iter().enumerate().filter(|(_, d)| ids.contains(&d.id)).map(|(i, _)| (i, 1.0)).collect()
 }
 
 pub(super) fn clauses(v: &Value, key: &str) -> Vec<Value> {

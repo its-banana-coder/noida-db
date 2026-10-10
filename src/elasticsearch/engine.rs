@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex};
 use super::analysis;
 use super::cat;
 use super::dates;
+use super::index_sort;
+use super::names;
 use super::painless;
 use super::search::{self, CommittedDoc};
 use super::suggest;
+use super::synthetic;
 
 #[derive(Clone)]
 pub struct Engine(Arc<Mutex<State>>);
@@ -127,6 +130,7 @@ impl Index {
 
     fn refresh(&mut self, name: &str) {
         self.last_refresh = Some(std::time::Instant::now());
+        // Searches see `_source` as the index returns it (synthetic or not).
         self.committed = self
             .order
             .iter()
@@ -134,13 +138,14 @@ impl Index {
                 self.docs.get(id).map(|d| CommittedDoc {
                     index: name.to_string(),
                     id: id.clone(),
-                    source: d.source.clone(),
+                    source: synthetic::view(&self.mappings, &self.settings, &d.source),
                     version: d.version,
                     seq: d.seq,
                     full_source: None,
                 })
             })
             .collect();
+        index_sort::apply(&self.settings, &self.mappings, &mut self.committed);
     }
 }
 
@@ -302,14 +307,37 @@ impl Engine {
         // Each path segment is percent-decoded on its own (an encoded `/`
         // inside a document id stays inside that id), as Elasticsearch
         // does: `PUT /test-%E4%B8%AD` creates the index `test-中`.
-        let decoded: Vec<String> = path
+        let mut decoded: Vec<String> = path
             .trim_matches('/')
             .split('/')
             .filter(|s| !s.is_empty())
             .map(percent_decode_segment)
             .collect();
+        // Date math in index and alias names (`<logs-{now/d}>`).
+        for n in 0..decoded.len() {
+            let names_part =
+                n == 0 || (n > 0 && matches!(decoded[n - 1].as_str(), "_alias" | "_aliases"));
+            if names_part && decoded[n].contains('<') {
+                match names::resolve_list(&decoded[n]) {
+                    Ok(r) => decoded[n] = r,
+                    Err(e) => return (400, error("parse_exception", &e, 400)),
+                }
+            }
+        }
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let q = query_params(query);
+        if let Some(v) = q.get("force_synthetic_source")
+            && !matches!(v.as_str(), "true" | "false" | "")
+        {
+            return (
+                400,
+                error(
+                    "illegal_argument_exception",
+                    &format!("Failed to parse value [{v}] as only [true] or [false] are allowed."),
+                    400,
+                ),
+            );
+        }
         if path == "/" || path.is_empty() {
             return (
                 200,
@@ -1132,6 +1160,14 @@ impl Engine {
             }
             (json!({"properties": props}), docs, !names.is_empty())
         };
+        let docs = if q.get("force_synthetic_source").is_some_and(|v| v == "true" || v.is_empty()) {
+            match force_synthetic(&s, &names, docs) {
+                Ok(d) => d,
+                Err(e) => return (e.status, e.to_json()),
+            }
+        } else {
+            docs
+        };
         // Every primary shard of the targets is searched.
         let shard_total: u64 =
             names.iter().filter_map(|n| s.indices.get(n)).map(|i| shard_counts(i).0.max(1)).sum();
@@ -1863,12 +1899,38 @@ impl Engine {
                     }
                     merge(&mut index.mappings, m);
                     suggest::normalize_mappings(&mut index.mappings);
+                    normalize_dynamic(&mut index.mappings);
+                    synthetic::tidy_source(&mut index.mappings);
                 }
                 if let Some(st) = req.get("settings") {
                     apply_settings(&mut index.settings, st);
                 }
+                if index.settings["index"]["soft_deletes"]["enabled"] == "false" {
+                    return (
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            "Creating indices with soft-deletes disabled is no longer supported. \
+                             Please do not specify a value for setting [index.soft_deletes.enabled].",
+                            400,
+                        ),
+                    );
+                }
                 if let Some(a) = req.get("aliases").and_then(Value::as_object) {
-                    index.aliases.extend(a.iter().map(|(k, v)| (k.clone(), normalize_alias(v))));
+                    for (k, v) in a {
+                        match names::resolve(k) {
+                            Ok(alias) => {
+                                index.aliases.insert(alias, normalize_alias(v));
+                            }
+                            Err(e) => return (400, error("parse_exception", &e, 400)),
+                        }
+                    }
+                }
+                if let Err(e) = synthetic::check_mapping(&index.mappings, &index.settings) {
+                    return e;
+                }
+                if let Err(e) = index_sort::validate(&index.settings, &index.mappings) {
+                    return e;
                 }
                 s.indices.insert(name.to_string(), index);
                 (200, json!({"acknowledged":true,"shards_acknowledged":true,"index":name}))
@@ -1942,6 +2004,14 @@ impl Engine {
                         if let Err(e) = validate_mapping(&i.mappings, &next) {
                             return e;
                         }
+                        let mut merged = i.mappings.clone();
+                        synthetic::put_source(&mut merged, &next);
+                        merge(&mut merged, next.clone());
+                        if let Err(e) =
+                            synthetic::check_update(&i.mappings, &next, &merged, &i.settings)
+                        {
+                            return e;
+                        }
                         if let Err(e) = vectors::prepare_mapping(&i.mappings, &mut next.clone()) {
                             return e;
                         }
@@ -1952,8 +2022,11 @@ impl Engine {
                 }
                 for n in &names {
                     if let Some(i) = s.indices.get_mut(n) {
+                        synthetic::put_source(&mut i.mappings, &next);
                         merge(&mut i.mappings, next.clone());
                         suggest::normalize_mappings(&mut i.mappings);
+                        normalize_dynamic(&mut i.mappings);
+                        synthetic::tidy_source(&mut i.mappings);
                     }
                 }
                 (200, json!({"acknowledged":true}))
@@ -2345,7 +2418,7 @@ impl Engine {
                     }
                     return (e.status, e.to_json());
                 }
-                if let Err(e) = index_mapping(&mut i.mappings, &src, &id) {
+                if let Err(e) = index_mapping(&mut i.mappings, &i.settings, &src, &id) {
                     return e;
                 }
                 let exists = i.docs.contains_key(&id);
@@ -2524,8 +2597,10 @@ impl Engine {
         }
         let visible = routed_visible(i, id, q.get("routing").map(String::as_str));
         let mut result = if let Some(d) = i.docs.get(id).filter(|_| visible) {
+            // An update starts from `_source` as a get returns it.
+            let current = synthetic::view(&i.mappings, &i.settings, &d.source);
             let (new_source, op) = match &script {
-                Some(sc) => match run_script(sc, d.source.clone(), "index", d.version) {
+                Some(sc) => match run_script(sc, current.clone(), "index", d.version) {
                     Ok(ctx) => (
                         ctx.get("_source").cloned().unwrap_or_default(),
                         ctx.get("op").and_then(Value::as_str).unwrap_or("index").to_string(),
@@ -2533,11 +2608,11 @@ impl Engine {
                     Err(e) => return e,
                 },
                 None => {
-                    let mut src = d.source.clone();
+                    let mut src = current.clone();
                     merge(&mut src, patch.clone().unwrap_or_default());
                     let detect_noop =
                         req.get("detect_noop").and_then(Value::as_bool).unwrap_or(true);
-                    let op = if detect_noop && src == d.source { "noop" } else { "index" };
+                    let op = if detect_noop && src == current { "noop" } else { "index" };
                     (src, op.to_string())
                 }
             };
@@ -2556,7 +2631,7 @@ impl Engine {
                     )
                 }
                 "index" | "create" => {
-                    if let Err(e) = index_mapping(&mut i.mappings, &new_source, id) {
+                    if let Err(e) = index_mapping(&mut i.mappings, &i.settings, &new_source, id) {
                         return e;
                     }
                     let key = d.routing.clone().unwrap_or_else(|| id.to_string());
@@ -2609,7 +2684,7 @@ impl Engine {
                     Err(e) => return e,
                 }
             }
-            if let Err(e) = index_mapping(&mut i.mappings, &src, id) {
+            if let Err(e) = index_mapping(&mut i.mappings, &i.settings, &src, id) {
                 return e;
             }
             let seq = i.next_seq(q.get("routing").map_or(id, String::as_str));
@@ -2649,8 +2724,9 @@ impl Engine {
         if let Some(filter) = want_get
             && let Some(d) = i.docs.get(id)
         {
+            let source = synthetic::view(&i.mappings, &i.settings, &d.source);
             result.1["get"] = json!({"_seq_no": d.seq, "_primary_term": 1, "found": true,
-                                     "_source": search::filter_source(&d.source, filter.as_ref())});
+                                     "_source": search::filter_source(&source, filter.as_ref())});
         }
         maybe_refresh(i, index, q);
         if result.1["result"] != "noop" {
@@ -3047,7 +3123,8 @@ impl Engine {
                     continue;
                 }
                 if op != "delete"
-                    && let Err((status, e)) = index_mapping(&mut i.mappings, &src, &snap.id)
+                    && let Err((status, e)) =
+                        index_mapping(&mut i.mappings, &i.settings, &src, &snap.id)
                 {
                     failures.push(json!({"index": name, "id": snap.id, "cause": e["error"],
                                          "status": status}));
@@ -3283,7 +3360,8 @@ impl Engine {
                     _ => {}
                 }
             }
-            out
+            // Date math names (`<logs-{now/d}>`) name what they resolve to.
+            out.into_iter().map(|n| names::resolve(&n).unwrap_or(n)).collect::<Vec<_>>()
         };
         let mut s = self.0.lock().unwrap();
         // Work on a copy; nothing changes unless every action can apply.
@@ -3415,6 +3493,36 @@ impl Engine {
 
 /// An index's searchable documents, narrowed to those matching any of
 /// the alias filters it was reached through.
+/// `force_synthetic_source` on a search: hits from indices that store
+/// their source get the synthetic view (an index whose mapping can't
+/// produce one fails the search).
+fn force_synthetic(
+    s: &State,
+    names: &[String],
+    docs: Vec<CommittedDoc>,
+) -> Result<Vec<CommittedDoc>, search::EsError> {
+    for n in names {
+        if let Some(i) = s.indices.get(n)
+            && !synthetic::enabled(&i.mappings, &i.settings)
+            && let Some(reason) = synthetic::unsupported(&i.mappings, &i.settings)
+        {
+            return Err(search::EsError::shard_failure("illegal_argument_exception", &reason)
+                .caused_by("illegal_argument_exception", &reason));
+        }
+    }
+    Ok(docs
+        .into_iter()
+        .map(|mut d| {
+            if let Some(i) = s.indices.get(&d.index)
+                && !synthetic::enabled(&i.mappings, &i.settings)
+            {
+                d.source = synthetic::source(&i.mappings, &d.source);
+            }
+            d
+        })
+        .collect())
+}
+
 fn filtered_docs(
     i: &Index,
     filters: Option<&Option<Vec<Value>>>,
@@ -3778,6 +3886,9 @@ fn validate_scroll_and_slice(
         if q.get("request_cache").is_some_and(|v| v == "true") {
             return invalid("[request_cache] cannot be used in a scroll context");
         }
+        if req.get("track_total_hits").is_some_and(|t| t.is_number() || t == false) {
+            return invalid("disabling [track_total_hits] is not allowed in a scroll context");
+        }
         if let Some(keep) = parse_keep_alive(sc)
             && keep > max_keep
         {
@@ -3968,11 +4079,17 @@ struct GetOpts {
     realtime: bool,
     version: Option<i64>,
     routing: Option<String>,
+    /// `force_synthetic_source`: a synthetic `_source` from an index that
+    /// stores it.
+    force_synthetic: bool,
 }
 
 impl GetOpts {
     fn from_params(q: &HashMap<String, String>) -> Self {
         GetOpts {
+            force_synthetic: q
+                .get("force_synthetic_source")
+                .is_some_and(|v| v == "true" || v.is_empty()),
             source: source_filter_from_params(q),
             source_explicit: q.contains_key("_source")
                 || q.contains_key("_source_includes")
@@ -4000,6 +4117,20 @@ fn get_doc(i: &Index, index: &str, id: &str, o: &GetOpts) -> (u16, Value) {
     }
     let Some((source, version, seq)) = found else {
         return missing_doc(index, id);
+    };
+    let synthetic = synthetic::enabled(&i.mappings, &i.settings);
+    if o.force_synthetic
+        && !synthetic
+        && let Some(reason) = synthetic::unsupported(&i.mappings, &i.settings)
+    {
+        return (400, error("illegal_argument_exception", &reason, 400));
+    }
+    // The last refresh holds the synthetic view already; live documents
+    // hold what was sent.
+    let source = if (o.realtime && synthetic) || (o.force_synthetic && !synthetic) {
+        synthetic::source(&i.mappings, &source)
+    } else {
+        source
     };
     if !routed_visible(i, id, o.routing.as_deref()) {
         return missing_doc(index, id);
@@ -4538,21 +4669,195 @@ pub(super) fn merge(a: &mut Value, b: Value) {
 }
 /// The mapping a document is indexed with: dynamic mapping applied, and
 /// its vectors checked (only a document Elasticsearch accepts changes it).
-fn index_mapping(m: &mut Value, src: &Value, id: &str) -> Result<(), (u16, Value)> {
+fn index_mapping(
+    m: &mut Value,
+    settings: &Value,
+    src: &Value,
+    id: &str,
+) -> Result<(), (u16, Value)> {
     let mut next = m.clone();
-    dynamic_mapping(&mut next, src);
+    let mut st = DynState { budget: dynamic_budget(&next, settings), runtime: Vec::new() };
+    dynamic_mapping(&mut next, src, "true", "", &mut st)?;
+    if !st.runtime.is_empty() {
+        if !next.get("runtime").is_some_and(Value::is_object) {
+            next["runtime"] = json!({});
+        }
+        let rt = next["runtime"].as_object_mut().unwrap();
+        for (path, ty) in st.runtime {
+            rt.entry(path).or_insert_with(|| json!({"type": ty}));
+        }
+    }
     vectors::check_source(&mut next, src, id)?;
+    synthetic::check_values(&next, settings, src, id)?;
+    normalize_dynamic(&mut next);
     *m = next;
     Ok(())
 }
 
-fn dynamic_mapping(m: &mut Value, src: &Value) {
+/// What dynamic mapping adds besides objects' own properties.
+struct DynState {
+    /// See `dynamic_budget`.
+    budget: Option<usize>,
+    /// New fields under `dynamic: runtime` objects: root runtime fields.
+    runtime: Vec<(String, &'static str)>,
+}
+
+/// The runtime fields a `dynamic: runtime` object's new value maps (by
+/// full path; objects aren't mapped, their leaves are).
+fn runtime_fields(path: &str, v: &Value, st: &mut DynState) {
+    let ty = match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                runtime_fields(&format!("{path}.{k}"), x, st);
+            }
+            return;
+        }
+        Value::Array(a) => {
+            for x in a.iter().filter(|x| x.is_object()) {
+                runtime_fields(path, x, st);
+            }
+            if let Some(first) = a.iter().find(|x| !x.is_null() && !x.is_object()) {
+                runtime_fields(path, first, st);
+            }
+            return;
+        }
+        Value::Null => return,
+        Value::String(s) if looks_like_date(s) => "date",
+        Value::String(_) => "keyword",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "long",
+        Value::Number(_) => "double",
+    };
+    if !st.runtime.iter().any(|(p, _)| p == path) && take_fields(&mut st.budget, 1) {
+        st.runtime.push((path.to_string(), ty));
+    }
+}
+
+/// Under `subobjects: false`, `{"a": {"b": 1}}` is the field `a.b`.
+fn flatten_source_objects(v: &Value) -> Value {
+    fn go(prefix: &str, v: &Value, out: &mut Map<String, Value>) {
+        match v {
+            Value::Object(m) if !prefix.is_empty() && !m.is_empty() => {
+                for (k, x) in m {
+                    go(&format!("{prefix}.{k}"), x, out);
+                }
+            }
+            other => {
+                out.insert(prefix.to_string(), other.clone());
+            }
+        }
+    }
+    let Some(m) = v.as_object() else { return v.clone() };
+    let mut out = Map::new();
+    for (k, x) in m {
+        go(k, x, &mut out);
+    }
+    Value::Object(out)
+}
+
+/// How many more fields dynamic mapping may add when the index ignores the
+/// ones beyond `index.mapping.total_fields.limit` (`None`: no budget kept).
+fn dynamic_budget(m: &Value, settings: &Value) -> Option<usize> {
+    fn count(m: &Value) -> usize {
+        m.get("properties").and_then(Value::as_object).map_or(0, |props| {
+            props
+                .values()
+                .map(|d| {
+                    1 + count(d) + d.get("fields").and_then(Value::as_object).map_or(0, Map::len)
+                })
+                .sum()
+        })
+    }
+    let tf = settings.get("index")?.get("mapping")?.get("total_fields")?;
+    let truthy = |v: &Value| v == "true" || v == &json!(true);
+    if !tf.get("ignore_dynamic_beyond_limit").is_some_and(truthy) {
+        return None;
+    }
+    let limit = tf
+        .get("limit")
+        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or(v.as_u64()))
+        .unwrap_or(1000) as usize;
+    let runtime = m.get("runtime").and_then(Value::as_object).map_or(0, Map::len);
+    Some(limit.saturating_sub(count(m) + runtime))
+}
+
+/// Takes `n` fields from the dynamic-mapping budget, if they fit.
+fn take_fields(budget: &mut Option<usize>, n: usize) -> bool {
+    match budget {
+        None => true,
+        Some(left) if *left >= n => {
+            *left -= n;
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// `{"a.b": 1}` as `{"a": {"b": 1}}` (merged into any `a` object): the
+/// object structure dynamic mapping sees.
+fn expand_source_dots(v: &Value) -> Value {
+    fn insert(out: &mut Map<String, Value>, k: &str, v: Value) {
+        match (out.get_mut(k), v) {
+            (Some(Value::Object(prev)), Value::Object(more)) => {
+                for (k2, v2) in more {
+                    insert(prev, &k2, v2);
+                }
+            }
+            (Some(_), _) => {}
+            (None, v) => {
+                out.insert(k.to_string(), v);
+            }
+        }
+    }
+    let Some(m) = v.as_object().filter(|m| m.keys().any(|k| k.contains('.'))) else {
+        return v.clone();
+    };
+    let mut out = Map::new();
+    for (k, x) in m {
+        let parts: Vec<&str> = k.split('.').collect();
+        if parts.iter().any(|p| p.is_empty()) {
+            insert(&mut out, k, x.clone());
+            continue;
+        }
+        let mut val = x.clone();
+        for p in parts[1..].iter().rev() {
+            val = json!({ *p: val });
+        }
+        insert(&mut out, parts[0], val);
+    }
+    Value::Object(out)
+}
+
+/// Maps `src`'s new fields into the object mapping `m`. Objects with
+/// `dynamic: false` (or `runtime`, `strict`) map nothing new, inherited by
+/// their sub-objects; a disabled object maps nothing at all.
+fn dynamic_mapping(
+    m: &mut Value,
+    src: &Value,
+    inherited: &str,
+    path: &str,
+    st: &mut DynState,
+) -> Result<(), (u16, Value)> {
+    if m.get("enabled").and_then(Value::as_bool) == Some(false) {
+        return Ok(());
+    }
+    let mode = match m.get("dynamic") {
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => inherited.to_string(),
+    };
+    let src = if m.get("subobjects").is_some_and(|v| v == false || v == "false") {
+        flatten_source_objects(src)
+    } else {
+        expand_source_dots(src)
+    };
     if m.get("properties").is_none() {
         m["properties"] = json!({});
     }
     let props = m["properties"].as_object_mut().unwrap();
     if let Some(fields) = src.as_object() {
         for (k, v) in fields {
+            let full = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
             // An object (or an array of them) maps its own fields, as
             // Elasticsearch maps sub-objects: `{"properties": {...}}`.
             let objects: Vec<&Value> = match v {
@@ -4564,9 +4869,16 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
                 let ty = existing.get("type").and_then(Value::as_str);
                 if existing.get("properties").is_some() || matches!(ty, Some("object" | "nested")) {
                     for o in objects {
-                        dynamic_mapping(existing, o);
+                        dynamic_mapping(existing, o, &mode, &full, st)?;
                     }
                 }
+                continue;
+            }
+            if mode == "runtime" {
+                runtime_fields(&full, v, st);
+                continue;
+            }
+            if mode != "true" {
                 continue;
             }
             // No value (null, `[]`) maps nothing yet.
@@ -4574,9 +4886,12 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
                 continue;
             }
             if !objects.is_empty() && v.as_array().is_none_or(|a| a[0].is_object()) {
+                if !take_fields(&mut st.budget, 1) {
+                    continue;
+                }
                 let mut def = json!({});
                 for o in objects {
-                    dynamic_mapping(&mut def, o);
+                    dynamic_mapping(&mut def, o, "true", &full, st)?;
                 }
                 if def["properties"].as_object().is_some_and(Map::is_empty) {
                     def = json!({"type": "object"});
@@ -4584,46 +4899,61 @@ fn dynamic_mapping(m: &mut Value, src: &Value) {
                 props.insert(k.clone(), def);
                 continue;
             }
-            let ty = match v {
-                // `date_detection` (on by default): an ISO date string maps
-                // as a date, not text.
-                Value::String(s) if looks_like_date(s) => "date",
-                Value::String(_) => "text",
-                Value::Bool(_) => "boolean",
-                Value::Number(n) => {
-                    if n.is_i64() {
-                        "long"
-                    } else {
-                        "float"
-                    }
-                }
-                Value::Array(a) => a
-                    .first()
-                    .map(|v| match v {
-                        Value::String(_) => "text",
-                        Value::Bool(_) => "boolean",
-                        Value::Number(n) => {
-                            if n.is_i64() {
-                                "long"
-                            } else {
-                                "float"
-                            }
-                        }
-                        Value::Object(_) => "object",
-                        _ => "object",
-                    })
-                    .unwrap_or("object"),
-                _ => "object",
-            };
             if let Value::Array(a) = v
                 && let Some(def) = vectors::dynamic_def(a)
             {
-                props.insert(k.clone(), def);
+                if take_fields(&mut st.budget, 1) {
+                    props.insert(k.clone(), def);
+                }
+                continue;
+            }
+            // `date_detection` (on by default): an ISO date string maps as
+            // a date, not text. Every value of an array maps the same way.
+            let scalar = |v: &Value| match v {
+                Value::String(s) if looks_like_date(s) => Some("date"),
+                Value::String(_) => Some("text"),
+                Value::Bool(_) => Some("boolean"),
+                Value::Number(n) if n.is_i64() || n.is_u64() => Some("long"),
+                Value::Number(_) => Some("float"),
+                _ => None,
+            };
+            let ty = match v {
+                Value::Array(a) => {
+                    let mut kinds = flat_values(a).into_iter().filter_map(scalar);
+                    let first = kinds.next().unwrap_or("object");
+                    if let Some(other) = kinds.find(|t| *t != first) {
+                        return Err((
+                            400,
+                            error(
+                                "illegal_argument_exception",
+                                &format!(
+                                    "mapper [{full}] cannot be changed from type [{first}] to [{other}]"
+                                ),
+                                400,
+                            ),
+                        ));
+                    }
+                    first
+                }
+                other => scalar(other).unwrap_or("object"),
+            };
+            if !take_fields(&mut st.budget, if ty == "text" { 2 } else { 1 }) {
                 continue;
             }
             props.insert(k.clone(),if ty=="text"{json!({"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}})}else{json!({"type":ty})});
         }
     }
+    Ok(())
+}
+
+/// Every element of a (possibly nested) array.
+fn flat_values(a: &[Value]) -> Vec<&Value> {
+    a.iter()
+        .flat_map(|v| match v {
+            Value::Array(inner) => flat_values(inner),
+            other => vec![other],
+        })
+        .collect()
 }
 
 /// A new index's starting state: the defaults, then whatever the
@@ -4851,15 +5181,45 @@ fn field_type_stats(s: &State) -> Value {
 
 /// The mapping as GET shows it: no `properties` key when there are none.
 fn shown_mappings(m: &Value) -> Value {
-    match m.as_object() {
-        Some(o)
-            if o.len() == 1
-                && o.get("properties")
-                    .is_some_and(|p| p.as_object().is_some_and(Map::is_empty)) =>
-        {
-            json!({})
+    let mut out = m.clone();
+    // No fields mapped yet: no `properties` at all.
+    if let Some(o) = out.as_object_mut()
+        && o.get("properties").is_some_and(|p| p.as_object().is_some_and(Map::is_empty))
+    {
+        o.remove("properties");
+    }
+    out
+}
+
+/// Object mappings as Elasticsearch keeps them: `dynamic` as a string
+/// (`false` is `"false"`), and `"type": "object"` spelled out only for an
+/// object without fields.
+fn normalize_dynamic(m: &mut Value) {
+    fn object_def(o: &mut Map<String, Value>) {
+        let ty = o.get("type").and_then(Value::as_str);
+        if ty.is_some_and(|t| t != "object") {
+            return;
         }
-        _ => m.clone(),
+        if o.get("properties").and_then(Value::as_object).is_some_and(|p| !p.is_empty()) {
+            o.remove("type");
+        } else {
+            o.remove("properties");
+            o.insert("type".into(), json!("object"));
+        }
+    }
+    if let Some(o) = m.as_object_mut() {
+        if let Some(Value::Bool(b)) = o.get("dynamic") {
+            let s = b.to_string();
+            o.insert("dynamic".into(), json!(s));
+        }
+        if let Some(Value::Object(props)) = o.get_mut("properties") {
+            for def in props.values_mut() {
+                normalize_dynamic(def);
+                if let Some(d) = def.as_object_mut() {
+                    object_def(d);
+                }
+            }
+        }
     }
 }
 
@@ -4895,6 +5255,23 @@ fn validate_mapping(current: &Value, incoming: &Value) -> Result<(), (u16, Value
         for (k, def) in props {
             let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
             let existing = cur.and_then(|c| c.get("properties")).and_then(|p| p.get(k));
+            if k.trim().is_empty() {
+                let why = if k.is_empty() {
+                    "field name cannot be an empty string"
+                } else {
+                    "field name cannot contain only whitespaces"
+                };
+                return Err((
+                    400,
+                    json!({"error": {
+                        "root_cause": [{"type": "mapper_parsing_exception",
+                                        "reason": format!("Failed to parse mapping: {why}")}],
+                        "type": "mapper_parsing_exception",
+                        "reason": format!("Failed to parse mapping: {why}"),
+                        "caused_by": {"type": "illegal_argument_exception", "reason": why}},
+                        "status": 400}),
+                ));
+            }
             if !def.is_object() {
                 let class = match def {
                     Value::String(_) => "java.lang.String",
