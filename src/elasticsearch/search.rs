@@ -2414,6 +2414,14 @@ pub fn search_with(
     if opts.pit && !specs.is_empty() && after_len.is_none_or(|n| n == specs.len() + 1) {
         specs.extend(sorting::parse(&json!("_shard_doc"), mappings, typed)?);
     }
+    // `_shard_doc` is the order of a point in time.
+    if !opts.pit && body.get("sort").is_some_and(|v| v.to_string().contains("\"_shard_doc\"")) {
+        return Err(EsError::new(
+            400,
+            "action_request_validation_exception",
+            "Validation Failed: 1: [_shard_doc] sort field cannot be used without [point in time];",
+        ));
+    }
     if search_after.is_some() && specs.is_empty() {
         return Err(EsError::shard_failure(
             "illegal_argument_exception",
@@ -2544,9 +2552,12 @@ pub fn search_with(
                 .and_then(|s| s.get("enabled"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            // Script fields alone don't bring `_source` along.
+            let scripted_only = body.get("script_fields").is_some() && source_filter.is_none();
             if !matches!(source_filter, Some(Value::Bool(false)))
                 && !stored_none
                 && source_enabled
+                && !scripted_only
                 && (stored_wants_source || source_filter.is_some())
             {
                 hit["_source"] = apply_source_filter(&d.source, source_filter);
@@ -2583,6 +2594,9 @@ pub fn search_with(
                     }
                 }
             }
+            for (k, v) in super::script_fields::values(body, mappings, d)? {
+                fetched.entry(k).or_insert(v);
+            }
             if !fetched.is_empty() {
                 hit["fields"] = Value::Object(fetched);
             }
@@ -2598,7 +2612,7 @@ pub fn search_with(
                 }
             }
             if !specs.is_empty() {
-                hit["sort"] = Value::Array(keys.clone());
+                hit["sort"] = Value::Array(sorting::display(&specs, keys));
             }
             for (name, per) in &inner {
                 if let Some(h) = per.get(idx) {

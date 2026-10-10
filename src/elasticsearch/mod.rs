@@ -17,6 +17,7 @@ mod queries;
 mod query_string;
 mod rescore;
 mod scoring;
+mod script_fields;
 mod search;
 mod server;
 mod sorting;

@@ -90,6 +90,16 @@ struct Index {
     last_refresh: Option<std::time::Instant>,
     #[serde(skip)]
     last_search: Option<std::time::Instant>,
+    /// Segments are read newest `@timestamp` first: set when the index
+    /// is created (or reopened) with `@timestamp` mapped as a date.
+    #[serde(default)]
+    sort_on_timestamp: bool,
+    /// The refresh ("segment") each live document version became
+    /// visible in: (refresh number, `_seq_no`).
+    #[serde(skip)]
+    segments: HashMap<String, (u64, i64)>,
+    #[serde(skip)]
+    refreshes: u64,
 }
 
 /// `index.refresh_interval` (default 1s; `-1` turns periodic refresh off).
@@ -128,9 +138,41 @@ impl Index {
 
     fn refresh(&mut self, name: &str) {
         self.last_refresh = Some(std::time::Instant::now());
-        self.committed = self
-            .order
-            .iter()
+        self.refreshes += 1;
+        let now = self.refreshes;
+        for id in &self.order {
+            if let Some(d) = self.docs.get(id) {
+                let seg = self.segments.entry(id.clone()).or_insert((now, d.seq));
+                if seg.1 != d.seq {
+                    *seg = (now, d.seq);
+                }
+            }
+        }
+        self.segments.retain(|id, _| self.docs.contains_key(id));
+        let mut order: Vec<&String> = self.order.iter().collect();
+        if self.sort_on_timestamp {
+            // Segments newest `@timestamp` first (those without one last);
+            // documents keep their order within a segment.
+            let mut newest: HashMap<u64, i64> = HashMap::new();
+            for (id, (seg, _)) in &self.segments {
+                if let Some(t) = self
+                    .docs
+                    .get(id)
+                    .and_then(|d| search::raw_values(&d.source, "@timestamp").first().copied())
+                    .and_then(|v| dates::value_millis(v, None))
+                {
+                    let e = newest.entry(*seg).or_insert(i64::MIN);
+                    *e = (*e).max(t);
+                }
+            }
+            let rank = |id: &String| {
+                let seg = self.segments.get(id).map_or(0, |s| s.0);
+                std::cmp::Reverse(newest.get(&seg).copied().unwrap_or(i64::MIN))
+            };
+            order.sort_by_key(|id| rank(id));
+        }
+        self.committed = order
+            .into_iter()
             .filter_map(|id| {
                 self.docs.get(id).map(|d| CommittedDoc {
                     index: name.to_string(),
@@ -142,6 +184,14 @@ impl Index {
                 })
             })
             .collect();
+    }
+
+    /// Whether `@timestamp` is mapped as a date (segments then sort by it).
+    fn timestamp_mapped(&self) -> bool {
+        matches!(
+            self.mappings["properties"]["@timestamp"]["type"].as_str(),
+            Some("date" | "date_nanos")
+        )
     }
 }
 
@@ -558,7 +608,7 @@ impl Engine {
                 self.search_or_count(method, segments[1], segments[0], &q, body)
             }
             "_knn_search" if segments.len() == 2 => self.knn_search(method, segments[0], &q, body),
-            "_pit" if method == "POST" => self.open_pit(index_name, &q),
+            "_pit" if method == "POST" => self.open_pit(index_name, &q, body),
             "_stats" if method == "GET" => self.stats_api(index_name),
             "_delete_by_query" | "_update_by_query" => {
                 self.by_query(method, segments[1], index_name, &q, body)
@@ -587,6 +637,9 @@ impl Engine {
             }
             "_mtermvectors" if segments.len() == 2 => {
                 self.mtermvectors(method, segments[0], &q, body)
+            }
+            "_explain" if segments.len() == 3 => {
+                self.explain(method, segments[0], index_name, segments[2], &q, body)
             }
             "_search_shards" if segments.len() == 2 && matches!(method, "GET" | "POST") => {
                 self.search_shards(segments[0], &q)
@@ -725,6 +778,24 @@ impl Engine {
                 }
             }
         }
+        // A point-in-time search can't name indices: the whole request is
+        // refused.
+        for pair in lines.chunks(2) {
+            let header = serde_json::from_str::<Value>(pair[0]).unwrap_or_default();
+            let item = pair.get(1).and_then(|l| serde_json::from_str::<Value>(l).ok());
+            if item.is_some_and(|b| b.get("pit").is_some())
+                && (header.get("index").is_some() || !index.is_empty())
+            {
+                return (
+                    400,
+                    error(
+                        "action_request_validation_exception",
+                        "Validation Failed: 1: [indices] cannot be used with point in time. Do not specify any index with point in time.;",
+                        400,
+                    ),
+                );
+            }
+        }
         let mut responses = Vec::new();
         for pair in lines.chunks(2) {
             let Ok(header) = serde_json::from_str::<Value>(pair[0]) else {
@@ -736,7 +807,7 @@ impl Engine {
                     a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")
                 }
                 _ if !index.is_empty() => index.to_string(),
-                _ => "_all".to_string(),
+                _ => "*".to_string(),
             };
             let mut item_q = q.clone();
             if let Some(h) = header.as_object() {
@@ -1221,7 +1292,30 @@ impl Engine {
                 if let Some(p) = s.indices[n].mappings.get("properties").and_then(Value::as_object)
                 {
                     for (k, v) in p {
-                        props.entry(k.clone()).or_insert_with(|| v.clone());
+                        match props.get_mut(k) {
+                            None => {
+                                props.insert(k.clone(), v.clone());
+                            }
+                            // Dates written in different formats in each
+                            // index: values are read with either.
+                            Some(have) => {
+                                let date = |d: &Value| {
+                                    matches!(d["type"].as_str(), Some("date" | "date_nanos"))
+                                };
+                                if date(have) && date(v) {
+                                    let fmt = |d: &Value| {
+                                        d["format"]
+                                            .as_str()
+                                            .unwrap_or("strict_date_optional_time||epoch_millis")
+                                            .to_string()
+                                    };
+                                    let (a, b) = (fmt(have), fmt(v));
+                                    if a != b {
+                                        have["format"] = json!(format!("{a}||{b}"));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1657,8 +1751,16 @@ impl Engine {
                 for n in idx {
                     let mut aliases: Vec<(&String, &Value)> = s.indices[n].aliases.iter().collect();
                     aliases.sort_by_key(|a| a.0);
+                    // `expand_wildcards` (default `all` here) without
+                    // `hidden` leaves hidden aliases out.
+                    let hidden_ok = q
+                        .get("expand_wildcards")
+                        .is_none_or(|w| w.split(',').any(|x| matches!(x.trim(), "all" | "hidden")));
                     for (a, spec) in aliases {
                         if !alias_selected(&patterns, a) {
+                            continue;
+                        }
+                        if !hidden_ok && spec.get("is_hidden").and_then(Value::as_bool) == Some(true) {
                             continue;
                         }
                         let w = spec
@@ -1897,7 +1999,7 @@ impl Engine {
 
     /// `POST /<index>/_pit?keep_alive=1m`: freezes the index's searchable
     /// documents for later `pit` searches.
-    fn open_pit(&self, index_pattern: &str, q: &HashMap<String, String>) -> (u16, Value) {
+    fn open_pit(&self, index_pattern: &str, q: &HashMap<String, String>, body: &[u8]) -> (u16, Value) {
         let Some(keep) = q.get("keep_alive").and_then(|k| parse_keep_alive(k)) else {
             return (
                 400,
@@ -1909,7 +2011,7 @@ impl Engine {
             );
         };
         let mut s = self.0.lock().unwrap();
-        let names = Self::resolve_indices(&s, index_pattern);
+        let mut names = Self::resolve_indices(&s, index_pattern);
         if names.is_empty() {
             return missing_index(index_pattern);
         }
@@ -1917,6 +2019,10 @@ impl Engine {
             if let Some(i) = s.indices.get_mut(n) {
                 i.auto_refresh(n);
             }
+        }
+        // `index_filter`: indices where it can't match are left out.
+        if let Some(f) = parse_json(body).and_then(|b| b.get("index_filter").cloned()) {
+            names.retain(|n| s.indices.get(n).is_some_and(|i| index_can_match(i, &f)));
         }
         let mut docs = Vec::new();
         let mut props = Map::new();
@@ -2022,6 +2128,7 @@ impl Engine {
                 if let Some(a) = req.get("aliases").and_then(Value::as_object) {
                     index.aliases.extend(a.iter().map(|(k, v)| (k.clone(), normalize_alias(v))));
                 }
+                index.sort_on_timestamp = index.timestamp_mapped();
                 s.indices.insert(name.to_string(), index);
                 (200, json!({"acknowledged":true,"shards_acknowledged":true,"index":name}))
             }
@@ -2153,6 +2260,11 @@ impl Engine {
             for (full, def) in leaves {
                 if patterns.iter().any(|p| glob_match(p, &full)) {
                     let leaf = full.rsplit('.').next().unwrap_or(&full).to_string();
+                    let def = if q.get("include_defaults").is_some_and(|v| v != "false") {
+                        super::docparse::with_defaults(&def)
+                    } else {
+                        def
+                    };
                     m.insert(full.clone(), json!({"full_name": full, "mapping": {(leaf): def}}));
                 }
             }
@@ -2382,6 +2494,11 @@ impl Engine {
                     if let Some(i) = s.indices.get_mut(n) {
                         i.opened = open;
                         out.insert(n.clone(), json!({"closed": true}));
+                        // A reopened index reads its segments afresh.
+                        if open {
+                            i.sort_on_timestamp = i.timestamp_mapped();
+                            i.refresh(n);
+                        }
                     }
                 }
                 if open {
@@ -2435,6 +2552,9 @@ impl Engine {
             return missing_index(index);
         };
         if kind == "_source" && matches!(method, "GET" | "HEAD") {
+            if q.get("refresh").is_some_and(|v| v.is_empty() || v == "true") {
+                i.refresh(index);
+            }
             let (status, doc) = get_doc(i, index, id, &GetOpts::from_params(q));
             if status != 200 {
                 return (status, if status == 404 { missing_doc(index, id).1 } else { doc });
@@ -2860,6 +2980,38 @@ impl Engine {
                         "expected field [create], [delete], [index] or [update] but found [{action}]"
                     ));
                 }
+                let known = [
+                    "_index",
+                    "_id",
+                    "routing",
+                    "op_type",
+                    "version",
+                    "version_type",
+                    "retry_on_conflict",
+                    "pipeline",
+                    "_source",
+                    "if_seq_no",
+                    "if_primary_term",
+                    "require_alias",
+                    "require_data_stream",
+                    "list_executed_pipelines",
+                    "dynamic_templates",
+                ];
+                if let Some(bad) = m
+                    .values()
+                    .next()
+                    .and_then(Value::as_object)
+                    .and_then(|o| o.keys().find(|k| !known.contains(&k.as_str())))
+                {
+                    return (
+                        400,
+                        error(
+                            "illegal_argument_exception",
+                            &format!("Action/metadata line [{}] contains an unknown parameter [{bad}]", n + 1),
+                            400,
+                        ),
+                    );
+                }
                 if action != "delete" {
                     numbered.next();
                 }
@@ -2972,11 +3124,29 @@ impl Engine {
                 // the new document.
                 let data = lines.next().unwrap_or("").as_bytes();
                 let mut uq = item_q.clone();
-                if let Some(src) = opts.get("_source") {
-                    uq.insert(
-                        "_source".into(),
-                        src.as_str().map(str::to_string).unwrap_or_else(|| src.to_string()),
-                    );
+                // `_source` as `true`/`false`, field names, or
+                // `{"includes", "excludes"}`: as the URL parameters.
+                let csv = |v: &Value| match v {
+                    Value::Array(a) => {
+                        a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(",")
+                    }
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                match opts.get("_source") {
+                    Some(Value::Object(f)) => {
+                        for (key, param) in
+                            [("includes", "_source_includes"), ("excludes", "_source_excludes")]
+                        {
+                            if let Some(v) = f.get(key) {
+                                uq.insert(param.into(), csv(v));
+                            }
+                        }
+                    }
+                    Some(src) => {
+                        uq.insert("_source".into(), csv(src));
+                    }
+                    None => {}
                 }
                 let (status, res) = self.update("POST", ix, &id, &uq, data);
                 errors |= status >= 300;
@@ -3205,6 +3375,116 @@ impl Engine {
         (200, json!({"docs": docs}))
     }
 
+    /// `/<index>/_explain/<id>`: whether (and with what score) a query
+    /// matches one document, searched through `target` (an alias's
+    /// filter applies) on its index `index`.
+    fn explain(
+        &self,
+        method: &str,
+        target: &str,
+        index: &str,
+        id: &str,
+        q: &HashMap<String, String>,
+        body: &[u8],
+    ) -> (u16, Value) {
+        if !matches!(method, "GET" | "POST") {
+            return (405, error("method_not_allowed_exception", "Incorrect HTTP method", 405));
+        }
+        let req = if body.iter().all(u8::is_ascii_whitespace) {
+            json!({})
+        } else {
+            match parse_json(body) {
+                Some(v) => v,
+                None => return (400, malformed_body()),
+            }
+        };
+        // The body takes only `query`.
+        if let Some(bad) = req.as_object().and_then(|m| m.keys().find(|k| *k != "query")) {
+            let text = String::from_utf8_lossy(body);
+            let all = super::jsonpos::scan(&text);
+            let (line, col) = all
+                .iter()
+                .find(|p| p.path == *bad)
+                .map_or((1, 1), |p| (p.start.0, super::limits::key_col(&text, p, bad)));
+            let reason = format!("request does not support [{bad}]");
+            return (
+                400,
+                json!({"error": {"root_cause": [{"type": "parsing_exception", "reason": reason, "line": line, "col": col}],
+                    "type": "parsing_exception", "reason": reason, "line": line, "col": col}, "status": 400}),
+            );
+        }
+        let query = match (req.get("query"), q.get("q")) {
+            (Some(query), _) => query.clone(),
+            (None, Some(text)) => {
+                let mut qs = json!({"query": text});
+                for (param, key) in [
+                    ("df", "default_field"),
+                    ("default_operator", "default_operator"),
+                    ("analyze_wildcard", "analyze_wildcard"),
+                    ("lenient", "lenient"),
+                ] {
+                    if let Some(v) = q.get(param) {
+                        qs[key] = match v.as_str() {
+                            "true" => json!(true),
+                            "false" => json!(false),
+                            other => json!(other),
+                        };
+                    }
+                }
+                json!({"query_string": qs})
+            }
+            (None, None) => {
+                return (
+                    400,
+                    error(
+                        "action_request_validation_exception",
+                        "Validation Failed: 1: query is missing;",
+                        400,
+                    ),
+                );
+            }
+        };
+        let (doc, mappings) = {
+            let s = self.0.lock().unwrap();
+            let Some(i) = s.indices.get(index) else { return missing_index(index) };
+            (i.docs.get(id).map(|d| (d.source.clone(), d.seq)), i.mappings.clone())
+        };
+        let Some((source, seq)) = doc else {
+            return (200, json!({"_index": index, "_id": id, "matched": false}));
+        };
+        let search = json!({"query": {"bool": {"must": [query.clone()], "filter": [{"ids": {"values": [id]}}]}},
+            "size": 1, "_source": false});
+        let mut sq = HashMap::new();
+        if let Some(r) = q.get("routing") {
+            sq.insert("routing".to_string(), r.clone());
+        }
+        let bytes = serde_json::to_vec(&search).unwrap_or_default();
+        let (status, resp) = self.search_or_count("POST", "_search", target, &sq, &bytes);
+        if status >= 400 {
+            return (status, resp);
+        }
+        let hit = resp["hits"]["hits"].as_array().and_then(|h| h.first()).cloned();
+        let mut out = json!({"_index": index, "_id": id, "matched": hit.is_some()});
+        out["explanation"] = match &hit {
+            Some(h) => json!({"value": h["_score"],
+                "description": super::profile::lucene_description(&query, &mappings), "details": []}),
+            None => json!({"value": 0.0, "description": "no matching term", "details": []}),
+        };
+        // `_source` / `stored_fields` parameters add the document.
+        let source_params = ["_source", "_source_includes", "_source_excludes"];
+        if source_params.iter().any(|k| q.contains_key(*k)) || q.contains_key("stored_fields") {
+            let mut get = json!({"_seq_no": seq, "_primary_term": 1, "found": true});
+            let filter = source_filter_from_params(q);
+            let wants = !q.contains_key("stored_fields")
+                || source_params.iter().any(|k| q.contains_key(*k));
+            if wants && !matches!(filter, Some(Value::Bool(false))) {
+                get["_source"] = search::filter_source(&source, filter.as_ref());
+            }
+            out["get"] = get;
+        }
+        (200, out)
+    }
+
     /// `/<index>/_search_shards`: the shards a search would reach, with
     /// the aliases (and their combined filter) each index was reached
     /// through.
@@ -3290,6 +3570,21 @@ impl Engine {
             Some(Value::Number(n)) => Some(n.to_string()),
             _ => None,
         };
+        // Item fields the parser knows (`_routing`, `_version` and the
+        // like are long gone).
+        for d in &docs {
+            let known = ["_index", "_id", "routing", "stored_fields", "_source", "version", "version_type"];
+            if let Some(bad) = d.as_object().and_then(|m| m.keys().find(|k| !known.contains(&k.as_str()))) {
+                return (
+                    400,
+                    error(
+                        "parse_exception",
+                        &format!("failed to parse multi get request. unknown field [{bad}]"),
+                        400,
+                    ),
+                );
+            }
+        }
         let mut problems = Vec::new();
         if docs.is_empty() {
             problems.push("no documents to get".to_string());
@@ -5009,8 +5304,12 @@ pub(super) fn merge(a: &mut Value, b: Value) {
         return;
     }
     if let (Some(x), Some(y)) = (a.as_object_mut(), b.as_object()) {
+        // A field's `meta` is replaced as a whole, not merged.
+        let is_field = x.contains_key("type");
         for (k, v) in y {
-            if let Some(existing) = x.get_mut(k) {
+            if k == "meta" && is_field {
+                x.insert(k.clone(), v.clone());
+            } else if let Some(existing) = x.get_mut(k) {
                 merge(existing, v.clone());
             } else {
                 x.insert(k.clone(), v.clone());
@@ -5077,6 +5376,7 @@ fn new_index_from_templates(templates: &Templates, name: &str) -> Index {
     let mut settings = generated;
     merge(&mut settings, index.settings.clone());
     index.settings = settings;
+    index.sort_on_timestamp = index.timestamp_mapped();
     index
 }
 
@@ -5289,6 +5589,17 @@ fn validate_mapping(current: &Value, incoming: &Value) -> Result<(), (u16, Value
     fn walk(cur: Option<&Value>, inc: &Value, prefix: &str) -> Result<(), (u16, Value)> {
         let Some(props) = inc.get("properties").and_then(Value::as_object) else { return Ok(()) };
         for (k, def) in props {
+            if k.is_empty() {
+                return Err((
+                    400,
+                    json!({"error": {"root_cause": [{"type": "mapper_parsing_exception",
+                            "reason": "Failed to parse mapping: field name cannot be an empty string"}],
+                        "type": "mapper_parsing_exception",
+                        "reason": "Failed to parse mapping: field name cannot be an empty string",
+                        "caused_by": {"type": "illegal_argument_exception",
+                            "reason": "field name cannot be an empty string"}}, "status": 400}),
+                ));
+            }
             let full = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
             let existing = cur.and_then(|c| c.get("properties")).and_then(|p| p.get(k));
             if !def.is_object() {

@@ -156,7 +156,7 @@ pub fn check_body(raw: &[u8]) -> Result<(), (u16, Value)> {
 
 /// The column of the `"key"` whose value starts at `p` (the parser
 /// stands on a field name when it rejects it).
-fn key_col(text: &str, p: &jsonpos::ValuePos, key: &str) -> usize {
+pub(super) fn key_col(text: &str, p: &jsonpos::ValuePos, key: &str) -> usize {
     let line = text.lines().nth(p.start.0 - 1).unwrap_or("");
     let before: String = line.chars().take(p.start.1 - 1).collect();
     before.rfind(&format!("\"{key}\"")).map_or(p.start.1, |b| before[..b].chars().count() + 1)

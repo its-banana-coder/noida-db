@@ -826,7 +826,18 @@ fn validate(
             }
             let mut vals = vec![];
             leaf_values(v, &mut vals);
+            let nested = def.get("type").and_then(Value::as_str) == Some("nested");
             for (n, x) in vals.iter().enumerate() {
+                if nested && x.is_object() {
+                    pos.nested.set(pos.nested.get() + 1);
+                    let limit = setting_u64(ctx.settings, "nested_objects", "limit").unwrap_or(10_000);
+                    if pos.nested.get() as u64 > limit {
+                        return Err(parse_error(&format!(
+                            "{} The number of nested documents has exceeded the allowed limit of [{limit}]. This limit can be set by changing the [index.mapping.nested_objects.limit] index level setting.",
+                            pos.at(&full, n, false)
+                        )));
+                    }
+                }
                 match x {
                     Value::Object(m) => validate(def, m, &full, ctx, pos)?,
                     _ => {
@@ -867,9 +878,16 @@ fn validate(
     Ok(())
 }
 
-/// Value positions in the raw source.
+/// Value positions in the raw source (and the nested objects seen).
 struct Positions {
     all: Vec<jsonpos::ValuePos>,
+    nested: std::cell::Cell<usize>,
+}
+
+/// An `index.mapping.<group>.<key>` setting as a number.
+fn setting_u64(settings: &Value, group: &str, key: &str) -> Option<u64> {
+    let v = &settings["index"]["mapping"][group][key];
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
 impl Positions {
@@ -906,7 +924,7 @@ pub fn parse(mappings: &mut Value, src: &Value, ctx: &Ctx) -> Result<(), Failure
             &serialized
         }
     };
-    let pos = Positions { all: jsonpos::scan(raw) };
+    let pos = Positions { all: jsonpos::scan(raw), nested: std::cell::Cell::new(0) };
     let at = |path: &str, end: bool| pos.at(path, 0, end);
     let mut next = mappings.clone();
     let root = next.clone();
@@ -993,6 +1011,43 @@ pub fn ignored_values(
         }
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// A field mapping with every parameter's default spelled out, as
+/// `include_defaults=true` shows it.
+pub fn with_defaults(def: &Value) -> Value {
+    let ty = def.get("type").and_then(Value::as_str).unwrap_or("object");
+    let mut out = match ty {
+        "text" => json!({"type": "text", "index": true, "store": false, "meta": {},
+            "index_options": "positions", "term_vector": "no", "norms": true,
+            "analyzer": "default", "search_analyzer": "default", "search_quote_analyzer": "default",
+            "similarity": null, "eager_global_ordinals": false, "position_increment_gap": 100,
+            "fielddata": false,
+            "fielddata_frequency_filter": {"min": 0.0, "max": 2.147483647E9, "min_segment_size": 0},
+            "index_prefixes": null, "index_phrases": false}),
+        "keyword" => json!({"type": "keyword", "index": true, "doc_values": true, "store": false,
+            "null_value": null, "eager_global_ordinals": false, "ignore_above": 2147483647,
+            "index_options": "docs", "norms": false, "similarity": null, "normalizer": null,
+            "split_queries_on_whitespace": false, "script": null, "on_script_error": "fail",
+            "meta": {}, "time_series_dimension": false}),
+        t if NUMERIC.contains(&t) => json!({"type": t, "index": true, "doc_values": true,
+            "store": false, "ignore_malformed": false, "coerce": true, "null_value": null,
+            "script": null, "on_script_error": "fail", "meta": {}, "time_series_dimension": false,
+            "time_series_metric": null}),
+        "date" | "date_nanos" => json!({"type": ty, "index": true, "doc_values": true,
+            "store": false, "format": "strict_date_optional_time||epoch_millis", "locale": "ENGLISH",
+            "ignore_malformed": false, "null_value": null, "script": null,
+            "on_script_error": "fail", "meta": {}}),
+        "boolean" => json!({"type": "boolean", "index": true, "doc_values": true, "store": false,
+            "null_value": null, "script": null, "on_script_error": "fail", "meta": {}}),
+        _ => json!({}),
+    };
+    if let (Some(o), Some(d)) = (out.as_object_mut(), def.as_object()) {
+        for (k, v) in d {
+            o.insert(k.clone(), v.clone());
+        }
+    }
     out
 }
 
