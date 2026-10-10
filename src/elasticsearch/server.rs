@@ -1,4 +1,4 @@
-use super::engine::{Engine, error};
+use super::engine::{Engine, error, node};
 use serde_json::Value;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -20,6 +20,7 @@ pub fn spawn_persistent_for_test(
 ) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
+    node::set_http_address(local);
     let snapshot_path = data_dir.join("elasticsearch.json");
 
     let engine = if let Ok(bytes) = std::fs::read(&snapshot_path) {
@@ -61,6 +62,7 @@ pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
+    node::set_http_address(local);
     let engine = Engine::default();
     thread::Builder::new().name("elasticsearch-listener".into()).spawn(move || {
         for incoming in listener.incoming() {
@@ -80,7 +82,17 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     Ok(local)
 }
 
+/// Serves one connection, recorded in the node's HTTP client stats.
 fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
+    let remote = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let local = stream.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let client = node::http_opened(remote, local);
+    let result = serve_connection(stream, engine, client);
+    node::http_closed(client);
+    result
+}
+
+fn serve_connection(stream: TcpStream, engine: Engine, client: u64) -> io::Result<()> {
     // See the identical note in src/mysql/server.rs: disabling Nagle's
     // algorithm here avoids the same class of request-latency stall for
     // any response written in more than one syscall.
@@ -141,6 +153,7 @@ fn serve(stream: TcpStream, engine: Engine) -> io::Result<()> {
             body
         };
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        node::http_request(client, &target, body.len(), &headers);
         let (status, payload) = if method == "OPTIONS" {
             (200, serde_json::json!({}))
         } else {

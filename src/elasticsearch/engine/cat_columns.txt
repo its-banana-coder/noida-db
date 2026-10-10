@@ -1,0 +1,456 @@
+allocation|shards|s|number of shards on node|1|r
+allocation|shards.undesired||number of shards that are scheduled to be moved elsewhere in the cluster|1|r
+allocation|write_load.forecast|wlf,writeLoadForecast|sum of index write load forecasts|1|r
+allocation|disk.indices.forecast|dif,diskIndicesForecast|sum of shard size forecasts|1|r
+allocation|disk.indices|di,diskIndices|disk used by ES indices|1|r
+allocation|disk.used|du,diskUsed|disk used (total, not just ES)|1|r
+allocation|disk.avail|da,diskAvail|disk available|1|r
+allocation|disk.total|dt,diskTotal|total capacity of all volumes|1|r
+allocation|disk.percent|dp,diskPercent|percent disk used|1|r
+allocation|host|h|host of node|1|l
+allocation|ip||ip of node|1|l
+allocation|node|n|name of node|1|l
+allocation|node.role|r,role,nodeRole|node roles|1|l
+fielddata|id||node id|1|l
+fielddata|host|h|host name|1|l
+fielddata|ip||ip address|1|l
+fielddata|node|n|node name|1|l
+fielddata|field|f|field name|1|l
+fielddata|size|s|field data usage|1|r
+health|epoch|t,time|seconds since 1970-01-01 00:00:00|1|l
+health|timestamp|ts,hms,hhmmss|time in HH:MM:SS|1|l
+health|cluster|cl|cluster name|1|l
+health|status|st|health status|1|l
+health|node.total|nt,nodeTotal|total number of nodes|1|r
+health|node.data|nd,nodeData|number of nodes that can store data|1|r
+health|shards|t,sh,shards.total,shardsTotal|total number of shards|1|r
+health|pri|p,shards.primary,shardsPrimary|number of primary shards|1|r
+health|relo|r,shards.relocating,shardsRelocating|number of relocating nodes|1|r
+health|init|i,shards.initializing,shardsInitializing|number of initializing nodes|1|r
+health|unassign|u,shards.unassigned,shardsUnassigned|number of unassigned shards|1|r
+health|pending_tasks|pt,pendingTasks|number of pending tasks|1|r
+health|max_task_wait_time|mtwt,maxTaskWaitTime|wait time of longest task pending|1|r
+health|active_shards_percent|asp,activeShardsPercent|active number of shards in percent|1|r
+indices|health|h|current health status|1|l
+indices|status|s|open/close status|1|l
+indices|index|i,idx|index name|1|l
+indices|uuid|id,uuid|index uuid|1|l
+indices|pri|p,shards.primary,shardsPrimary|number of primary shards|1|r
+indices|rep|r,shards.replica,shardsReplica|number of replica shards|1|r
+indices|docs.count|dc,docsCount|available docs|1|r
+indices|docs.deleted|dd,docsDeleted|deleted docs|1|r
+indices|creation.date|cd|index creation date (millisecond value)|0|l
+indices|creation.date.string|cds|index creation date (as string)|0|l
+indices|store.size|ss,storeSize|store size of primaries & replicas|1|r
+indices|pri.store.size||store size of primaries|1|r
+indices|dataset.size||total size of dataset|1|r
+indices|completion.size|cs,completionSize|size of completion|0|r
+indices|pri.completion.size||size of completion|0|r
+indices|fielddata.memory_size|fm,fielddataMemory|used fielddata cache|0|r
+indices|pri.fielddata.memory_size||used fielddata cache|0|r
+indices|fielddata.evictions|fe,fielddataEvictions|fielddata evictions|0|r
+indices|pri.fielddata.evictions||fielddata evictions|0|r
+indices|query_cache.memory_size|qcm,queryCacheMemory|used query cache|0|r
+indices|pri.query_cache.memory_size||used query cache|0|r
+indices|query_cache.evictions|qce,queryCacheEvictions|query cache evictions|0|r
+indices|pri.query_cache.evictions||query cache evictions|0|r
+indices|request_cache.memory_size|rcm,requestCacheMemory|used request cache|0|r
+indices|pri.request_cache.memory_size||used request cache|0|r
+indices|request_cache.evictions|rce,requestCacheEvictions|request cache evictions|0|r
+indices|pri.request_cache.evictions||request cache evictions|0|r
+indices|request_cache.hit_count|rchc,requestCacheHitCount|request cache hit count|0|r
+indices|pri.request_cache.hit_count||request cache hit count|0|r
+indices|request_cache.miss_count|rcmc,requestCacheMissCount|request cache miss count|0|r
+indices|pri.request_cache.miss_count||request cache miss count|0|r
+indices|flush.total|ft,flushTotal|number of flushes|0|r
+indices|pri.flush.total||number of flushes|0|r
+indices|flush.total_time|ftt,flushTotalTime|time spent in flush|0|r
+indices|pri.flush.total_time||time spent in flush|0|r
+indices|get.current|gc,getCurrent|number of current get ops|0|r
+indices|pri.get.current||number of current get ops|0|r
+indices|get.time|gti,getTime|time spent in get|0|r
+indices|pri.get.time||time spent in get|0|r
+indices|get.total|gto,getTotal|number of get ops|0|r
+indices|pri.get.total||number of get ops|0|r
+indices|get.exists_time|geti,getExistsTime|time spent in successful gets|0|r
+indices|pri.get.exists_time||time spent in successful gets|0|r
+indices|get.exists_total|geto,getExistsTotal|number of successful gets|0|r
+indices|pri.get.exists_total||number of successful gets|0|r
+indices|get.missing_time|gmti,getMissingTime|time spent in failed gets|0|r
+indices|pri.get.missing_time||time spent in failed gets|0|r
+indices|get.missing_total|gmto,getMissingTotal|number of failed gets|0|r
+indices|pri.get.missing_total||number of failed gets|0|r
+indices|indexing.delete_current|idc,indexingDeleteCurrent|number of current deletions|0|r
+indices|pri.indexing.delete_current||number of current deletions|0|r
+indices|indexing.delete_time|idti,indexingDeleteTime|time spent in deletions|0|r
+indices|pri.indexing.delete_time||time spent in deletions|0|r
+indices|indexing.delete_total|idto,indexingDeleteTotal|number of delete ops|0|r
+indices|pri.indexing.delete_total||number of delete ops|0|r
+indices|indexing.index_current|iic,indexingIndexCurrent|number of current indexing ops|0|r
+indices|pri.indexing.index_current||number of current indexing ops|0|r
+indices|indexing.index_time|iiti,indexingIndexTime|time spent in indexing|0|r
+indices|pri.indexing.index_time||time spent in indexing|0|r
+indices|indexing.index_total|iito,indexingIndexTotal|number of indexing ops|0|r
+indices|pri.indexing.index_total||number of indexing ops|0|r
+indices|indexing.index_failed|iif,indexingIndexFailed|number of failed indexing ops|0|r
+indices|pri.indexing.index_failed||number of failed indexing ops|0|r
+indices|merges.current|mc,mergesCurrent|number of current merges|0|r
+indices|pri.merges.current||number of current merges|0|r
+indices|merges.current_docs|mcd,mergesCurrentDocs|number of current merging docs|0|r
+indices|pri.merges.current_docs||number of current merging docs|0|r
+indices|merges.current_size|mcs,mergesCurrentSize|size of current merges|0|r
+indices|pri.merges.current_size||size of current merges|0|r
+indices|merges.total|mt,mergesTotal|number of completed merge ops|0|r
+indices|pri.merges.total||number of completed merge ops|0|r
+indices|merges.total_docs|mtd,mergesTotalDocs|docs merged|0|r
+indices|pri.merges.total_docs||docs merged|0|r
+indices|merges.total_size|mts,mergesTotalSize|size merged|0|r
+indices|pri.merges.total_size||size merged|0|r
+indices|merges.total_time|mtt,mergesTotalTime|time spent in merges|0|r
+indices|pri.merges.total_time||time spent in merges|0|r
+indices|refresh.total|rto,refreshTotal|total refreshes|0|r
+indices|pri.refresh.total||total refreshes|0|r
+indices|refresh.time|rti,refreshTime|time spent in refreshes|0|r
+indices|pri.refresh.time||time spent in refreshes|0|r
+indices|refresh.external_total|rto,refreshTotal|total external refreshes|0|r
+indices|pri.refresh.external_total||total external refreshes|0|r
+indices|refresh.external_time|rti,refreshTime|time spent in external refreshes|0|r
+indices|pri.refresh.external_time||time spent in external refreshes|0|r
+indices|refresh.listeners|rli,refreshListeners|number of pending refresh listeners|0|r
+indices|pri.refresh.listeners||number of pending refresh listeners|0|r
+indices|search.fetch_current|sfc,searchFetchCurrent|current fetch phase ops|0|r
+indices|pri.search.fetch_current||current fetch phase ops|0|r
+indices|search.fetch_time|sfti,searchFetchTime|time spent in fetch phase|0|r
+indices|pri.search.fetch_time||time spent in fetch phase|0|r
+indices|search.fetch_total|sfto,searchFetchTotal|total fetch ops|0|r
+indices|pri.search.fetch_total||total fetch ops|0|r
+indices|search.open_contexts|so,searchOpenContexts|open search contexts|0|r
+indices|pri.search.open_contexts||open search contexts|0|r
+indices|search.query_current|sqc,searchQueryCurrent|current query phase ops|0|r
+indices|pri.search.query_current||current query phase ops|0|r
+indices|search.query_time|sqti,searchQueryTime|time spent in query phase|0|r
+indices|pri.search.query_time||time spent in query phase|0|r
+indices|search.query_total|sqto,searchQueryTotal|total query phase ops|0|r
+indices|pri.search.query_total||total query phase ops|0|r
+indices|search.scroll_current|scc,searchScrollCurrent|open scroll contexts|0|r
+indices|pri.search.scroll_current||open scroll contexts|0|r
+indices|search.scroll_time|scti,searchScrollTime|time scroll contexts held open|0|r
+indices|pri.search.scroll_time||time scroll contexts held open|0|r
+indices|search.scroll_total|scto,searchScrollTotal|completed scroll contexts|0|r
+indices|pri.search.scroll_total||completed scroll contexts|0|r
+indices|segments.count|sc,segmentsCount|number of segments|0|r
+indices|pri.segments.count||number of segments|0|r
+indices|segments.memory|sm,segmentsMemory|memory used by segments|0|r
+indices|pri.segments.memory||memory used by segments|0|r
+indices|segments.index_writer_memory|siwm,segmentsIndexWriterMemory|memory used by index writer|0|r
+indices|pri.segments.index_writer_memory||memory used by index writer|0|r
+indices|segments.version_map_memory|svmm,segmentsVersionMapMemory|memory used by version map|0|r
+indices|pri.segments.version_map_memory||memory used by version map|0|r
+indices|segments.fixed_bitset_memory|sfbm,fixedBitsetMemory|memory used by fixed bit sets for nested object field types and type filters for types referred in _parent fields|0|r
+indices|pri.segments.fixed_bitset_memory||memory used by fixed bit sets for nested object field types and type filters for types referred in _parent fields|0|r
+indices|warmer.current|wc,warmerCurrent|current warmer ops|0|r
+indices|pri.warmer.current||current warmer ops|0|r
+indices|warmer.total|wto,warmerTotal|total warmer ops|0|r
+indices|pri.warmer.total||total warmer ops|0|r
+indices|warmer.total_time|wtt,warmerTotalTime|time spent in warmers|0|r
+indices|pri.warmer.total_time||time spent in warmers|0|r
+indices|suggest.current|suc,suggestCurrent|number of current suggest ops|0|r
+indices|pri.suggest.current||number of current suggest ops|0|r
+indices|suggest.time|suti,suggestTime|time spend in suggest|0|r
+indices|pri.suggest.time||time spend in suggest|0|r
+indices|suggest.total|suto,suggestTotal|number of suggest ops|0|r
+indices|pri.suggest.total||number of suggest ops|0|r
+indices|memory.total|tm,memoryTotal|total used memory|0|r
+indices|pri.memory.total||total user memory|0|r
+indices|search.throttled|sth|indicates if the index is search throttled|0|l
+indices|bulk.total_operations|bto,bulkTotalOperation|number of bulk shard ops|0|r
+indices|pri.bulk.total_operations||number of bulk shard ops|0|r
+indices|bulk.total_time|btti,bulkTotalTime|time spend in shard bulk|0|r
+indices|pri.bulk.total_time||time spend in shard bulk|0|r
+indices|bulk.total_size_in_bytes|btsi,bulkTotalSizeInBytes|total size in bytes of shard bulk|0|r
+indices|pri.bulk.total_size_in_bytes||total size in bytes of shard bulk|0|r
+indices|bulk.avg_time|bati,bulkAvgTime|average time spend in shard bulk|0|r
+indices|pri.bulk.avg_time||average time spend in shard bulk|0|r
+indices|bulk.avg_size_in_bytes|basi,bulkAvgSizeInBytes|average size in bytes of shard bulk|0|r
+indices|pri.bulk.avg_size_in_bytes||average size in bytes of shard bulk|0|r
+indices|dense_vector.value_count|dvc,denseVectorCount|total count of indexed dense vector|0|r
+indices|pri.dense_vector.value_count||total count of indexed dense vector|0|r
+indices|sparse_vector.value_count|svc,sparseVectorCount|total count of indexed sparse vectors|0|r
+indices|pri.sparse_vector.value_count||total count of indexed sparse vectors|0|r
+master|id||node id|1|l
+master|host|h|host name|1|l
+master|ip||ip address|1|l
+master|node|n|node name|1|l
+nodeattrs|node|name|node name|1|l
+nodeattrs|id|id,nodeId|unique node id|0|l
+nodeattrs|pid|p|process id|0|l
+nodeattrs|host|h|host name|1|l
+nodeattrs|ip|i|ip address|1|l
+nodeattrs|port|po|bound transport port|0|l
+nodeattrs|attr|attr.name|attribute description|1|l
+nodeattrs|value|attr.value|attribute value|1|l
+nodes|id|id,nodeId|unique node id|0|l
+nodes|pid|p|process id|0|l
+nodes|ip|i|ip address|1|l
+nodes|port|po|bound transport port|0|l
+nodes|http_address|http|bound http address|0|l
+nodes|version|v|es version|0|l
+nodes|type|t|es distribution type|0|l
+nodes|build|b|es build hash|0|l
+nodes|jdk|j|jdk version|0|l
+nodes|disk.total|dt,diskTotal|total disk space|0|r
+nodes|disk.used|du,diskUsed|used disk space|0|r
+nodes|disk.avail|d,da,disk,diskAvail|available disk space|0|r
+nodes|disk.used_percent|dup,diskUsedPercent|used disk space percentage|0|r
+nodes|heap.current|hc,heapCurrent|used heap|0|r
+nodes|heap.percent|hp,heapPercent|used heap ratio|1|r
+nodes|heap.max|hm,heapMax|max configured heap|0|r
+nodes|ram.current|rc,ramCurrent|used machine memory|0|r
+nodes|ram.percent|rp,ramPercent|used machine memory ratio|1|r
+nodes|ram.max|rm,ramMax|total machine memory|0|r
+nodes|file_desc.current|fdc,fileDescriptorCurrent|used file descriptors|0|r
+nodes|file_desc.percent|fdp,fileDescriptorPercent|used file descriptor ratio|0|r
+nodes|file_desc.max|fdm,fileDescriptorMax|max file descriptors|0|r
+nodes|cpu|cpu|recent cpu usage|1|r
+nodes|load_1m|l|1m load avg|1|r
+nodes|load_5m|l|5m load avg|1|r
+nodes|load_15m|l|15m load avg|1|r
+nodes|uptime|u|node uptime|0|r
+nodes|node.role|r,role,nodeRole|m:master eligible node, d:data node, i:ingest node, -:coordinating node only|1|l
+nodes|master|m|*:current master|1|l
+nodes|name|n|node name|1|l
+nodes|completion.size|cs,completionSize|size of completion|0|r
+nodes|fielddata.memory_size|fm,fielddataMemory|used fielddata cache|0|r
+nodes|fielddata.evictions|fe,fielddataEvictions|fielddata evictions|0|r
+nodes|query_cache.memory_size|qcm,queryCacheMemory|used query cache|0|r
+nodes|query_cache.evictions|qce,queryCacheEvictions|query cache evictions|0|r
+nodes|query_cache.hit_count|qchc,queryCacheHitCount|query cache hit counts|0|r
+nodes|query_cache.miss_count|qcmc,queryCacheMissCount|query cache miss counts|0|r
+nodes|request_cache.memory_size|rcm,requestCacheMemory|used request cache|0|r
+nodes|request_cache.evictions|rce,requestCacheEvictions|request cache evictions|0|r
+nodes|request_cache.hit_count|rchc,requestCacheHitCount|request cache hit counts|0|r
+nodes|request_cache.miss_count|rcmc,requestCacheMissCount|request cache miss counts|0|r
+nodes|flush.total|ft,flushTotal|number of flushes|0|r
+nodes|flush.total_time|ftt,flushTotalTime|time spent in flush|0|r
+nodes|get.current|gc,getCurrent|number of current get ops|0|r
+nodes|get.time|gti,getTime|time spent in get|0|r
+nodes|get.total|gto,getTotal|number of get ops|0|r
+nodes|get.exists_time|geti,getExistsTime|time spent in successful gets|0|r
+nodes|get.exists_total|geto,getExistsTotal|number of successful gets|0|r
+nodes|get.missing_time|gmti,getMissingTime|time spent in failed gets|0|r
+nodes|get.missing_total|gmto,getMissingTotal|number of failed gets|0|r
+nodes|indexing.delete_current|idc,indexingDeleteCurrent|number of current deletions|0|r
+nodes|indexing.delete_time|idti,indexingDeleteTime|time spent in deletions|0|r
+nodes|indexing.delete_total|idto,indexingDeleteTotal|number of delete ops|0|r
+nodes|indexing.index_current|iic,indexingIndexCurrent|number of current indexing ops|0|r
+nodes|indexing.index_time|iiti,indexingIndexTime|time spent in indexing|0|r
+nodes|indexing.index_total|iito,indexingIndexTotal|number of indexing ops|0|r
+nodes|indexing.index_failed|iif,indexingIndexFailed|number of failed indexing ops|0|r
+nodes|merges.current|mc,mergesCurrent|number of current merges|0|r
+nodes|merges.current_docs|mcd,mergesCurrentDocs|number of current merging docs|0|r
+nodes|merges.current_size|mcs,mergesCurrentSize|size of current merges|0|r
+nodes|merges.total|mt,mergesTotal|number of completed merge ops|0|r
+nodes|merges.total_docs|mtd,mergesTotalDocs|docs merged|0|r
+nodes|merges.total_size|mts,mergesTotalSize|size merged|0|r
+nodes|merges.total_time|mtt,mergesTotalTime|time spent in merges|0|r
+nodes|refresh.total|rto,refreshTotal|total refreshes|0|r
+nodes|refresh.time|rti,refreshTime|time spent in refreshes|0|r
+nodes|refresh.external_total|rto,refreshTotal|total external refreshes|0|r
+nodes|refresh.external_time|rti,refreshTime|time spent in external refreshes|0|r
+nodes|refresh.listeners|rli,refreshListeners|number of pending refresh listeners|0|r
+nodes|script.compilations|scrcc,scriptCompilations|script compilations|0|r
+nodes|script.cache_evictions|scrce,scriptCacheEvictions|script cache evictions|0|r
+nodes|script.compilation_limit_triggered|scrclt,scriptCacheCompilationLimitTriggered|script cache compilation limit triggered|0|r
+nodes|search.fetch_current|sfc,searchFetchCurrent|current fetch phase ops|0|r
+nodes|search.fetch_time|sfti,searchFetchTime|time spent in fetch phase|0|r
+nodes|search.fetch_total|sfto,searchFetchTotal|total fetch ops|0|r
+nodes|search.open_contexts|so,searchOpenContexts|open search contexts|0|r
+nodes|search.query_current|sqc,searchQueryCurrent|current query phase ops|0|r
+nodes|search.query_time|sqti,searchQueryTime|time spent in query phase|0|r
+nodes|search.query_total|sqto,searchQueryTotal|total query phase ops|0|r
+nodes|search.scroll_current|scc,searchScrollCurrent|open scroll contexts|0|r
+nodes|search.scroll_time|scti,searchScrollTime|time scroll contexts held open|0|r
+nodes|search.scroll_total|scto,searchScrollTotal|completed scroll contexts|0|r
+nodes|segments.count|sc,segmentsCount|number of segments|0|r
+nodes|segments.memory|sm,segmentsMemory|memory used by segments|0|r
+nodes|segments.index_writer_memory|siwm,segmentsIndexWriterMemory|memory used by index writer|0|r
+nodes|segments.version_map_memory|svmm,segmentsVersionMapMemory|memory used by version map|0|r
+nodes|segments.fixed_bitset_memory|sfbm,fixedBitsetMemory|memory used by fixed bit sets for nested object field types and type filters for types referred in _parent fields|0|r
+nodes|suggest.current|suc,suggestCurrent|number of current suggest ops|0|r
+nodes|suggest.time|suti,suggestTime|time spend in suggest|0|r
+nodes|suggest.total|suto,suggestTotal|number of suggest ops|0|r
+nodes|bulk.total_operations|bto,bulkTotalOperations|number of bulk shard ops|0|r
+nodes|bulk.total_time|btti,bulkTotalTime|time spend in shard bulk|0|r
+nodes|bulk.total_size_in_bytes|btsi,bulkTotalSizeInBytes|total size in bytes of shard bulk|0|r
+nodes|bulk.avg_time|bati,bulkAvgTime|average time spend in shard bulk|0|r
+nodes|bulk.avg_size_in_bytes|basi,bulkAvgSizeInBytes|average size in bytes of shard bulk|0|r
+nodes|shard_stats.total_count|sstc,shards,shardStatsTotalCount|number of shards assigned|0|r
+nodes|mappings.total_count|mtc,mappingsTotalCount|number of mappings|0|r
+nodes|mappings.total_estimated_overhead_in_bytes|mteo,mappingsTotalEstimatedOverheadInBytes|estimated overhead in bytes of mappings|0|r
+plugins|id||unique node id|0|l
+plugins|name|n|node name|1|l
+plugins|component|c|component|1|l
+plugins|version|v|component version|1|l
+plugins|description|d|plugin details|0|l
+recovery|index|i,idx|index name|1|l
+recovery|shard|s,sh|shard name|1|l
+recovery|start_time|start|recovery start time|0|l
+recovery|start_time_millis|start_millis|recovery start time in epoch milliseconds|0|l
+recovery|stop_time|stop|recovery stop time|0|l
+recovery|stop_time_millis|stop_millis|recovery stop time in epoch milliseconds|0|l
+recovery|time|t,ti|recovery time|1|l
+recovery|type|ty|recovery type|1|l
+recovery|stage|st|recovery stage|1|l
+recovery|source_host|shost|source host|1|l
+recovery|source_node|snode|source node name|1|l
+recovery|target_host|thost|target host|1|l
+recovery|target_node|tnode|target node name|1|l
+recovery|repository|rep|repository|1|l
+recovery|snapshot|snap|snapshot|1|l
+recovery|files|f|number of files to recover|1|l
+recovery|files_recovered|fr|files recovered|1|l
+recovery|files_percent|fp|percent of files recovered|1|l
+recovery|files_total|tf|total number of files|1|l
+recovery|bytes|b|number of bytes to recover|1|l
+recovery|bytes_recovered|br|bytes recovered|1|l
+recovery|bytes_percent|bp|percent of bytes recovered|1|l
+recovery|bytes_total|tb|total number of bytes|1|l
+recovery|translog_ops|to|number of translog ops to recover|1|l
+recovery|translog_ops_recovered|tor|translog ops recovered|1|l
+recovery|translog_ops_percent|top|percent of translog ops recovered|1|l
+segments|index|i,idx|index name|1|l
+segments|shard|s,sh|shard name|1|l
+segments|prirep|p,pr,primaryOrReplica|primary or replica|1|l
+segments|ip||ip of node where it lives|1|l
+segments|id||unique id of node where it lives|0|l
+segments|segment|seg|segment name|1|l
+segments|generation|g,gen|segment generation|1|r
+segments|docs.count|dc,docsCount|number of docs in segment|1|r
+segments|docs.deleted|dd,docsDeleted|number of deleted docs in segment|1|r
+segments|size|si|segment size in bytes|1|r
+segments|size.memory|sm,sizeMemory|segment memory in bytes|1|r
+segments|committed|ic,isCommitted|is segment committed|1|l
+segments|searchable|is,isSearchable|is segment searched|1|l
+segments|version|v,ver|version|1|l
+segments|compound|ico,isCompound|is segment compound|1|l
+shards|index|i,idx|index name|1|l
+shards|shard|s,sh|shard name|1|l
+shards|prirep|p,pr,primaryOrReplica|primary or replica|1|l
+shards|state|st|shard state|1|l
+shards|docs|d,dc|number of docs in shard|1|r
+shards|store|sto|store size of shard (how much disk it uses)|1|r
+shards|dataset||total size of dataset|1|r
+shards|ip||ip of node where it lives|1|l
+shards|id||unique id of node where it lives|0|l
+shards|node|n|name of node where it lives|1|l
+shards|sync_id|sync_id|sync id|0|l
+shards|unassigned.reason|ur|reason shard became unassigned|0|l
+shards|unassigned.at|ua|time shard became unassigned (UTC)|0|l
+shards|unassigned.for|uf|time has been unassigned|0|r
+shards|unassigned.details|ud|additional details as to why the shard became unassigned|0|l
+shards|recoverysource.type|rs|recovery source type|0|l
+shards|completion.size|cs,completionSize|size of completion|0|r
+shards|fielddata.memory_size|fm,fielddataMemory|used fielddata cache|0|r
+shards|fielddata.evictions|fe,fielddataEvictions|fielddata evictions|0|r
+shards|query_cache.memory_size|qcm,queryCacheMemory|used query cache|0|r
+shards|query_cache.evictions|qce,queryCacheEvictions|query cache evictions|0|r
+shards|flush.total|ft,flushTotal|number of flushes|0|r
+shards|flush.total_time|ftt,flushTotalTime|time spent in flush|0|r
+shards|get.current|gc,getCurrent|number of current get ops|0|r
+shards|get.time|gti,getTime|time spent in get|0|r
+shards|get.total|gto,getTotal|number of get ops|0|r
+shards|get.exists_time|geti,getExistsTime|time spent in successful gets|0|r
+shards|get.exists_total|geto,getExistsTotal|number of successful gets|0|r
+shards|get.missing_time|gmti,getMissingTime|time spent in failed gets|0|r
+shards|get.missing_total|gmto,getMissingTotal|number of failed gets|0|r
+shards|indexing.delete_current|idc,indexingDeleteCurrent|number of current deletions|0|r
+shards|indexing.delete_time|idti,indexingDeleteTime|time spent in deletions|0|r
+shards|indexing.delete_total|idto,indexingDeleteTotal|number of delete ops|0|r
+shards|indexing.index_current|iic,indexingIndexCurrent|number of current indexing ops|0|r
+shards|indexing.index_time|iiti,indexingIndexTime|time spent in indexing|0|r
+shards|indexing.index_total|iito,indexingIndexTotal|number of indexing ops|0|r
+shards|indexing.index_failed|iif,indexingIndexFailed|number of failed indexing ops|0|r
+shards|merges.current|mc,mergesCurrent|number of current merges|0|r
+shards|merges.current_docs|mcd,mergesCurrentDocs|number of current merging docs|0|r
+shards|merges.current_size|mcs,mergesCurrentSize|size of current merges|0|r
+shards|merges.total|mt,mergesTotal|number of completed merge ops|0|r
+shards|merges.total_docs|mtd,mergesTotalDocs|docs merged|0|r
+shards|merges.total_size|mts,mergesTotalSize|size merged|0|r
+shards|merges.total_time|mtt,mergesTotalTime|time spent in merges|0|r
+shards|refresh.total|rto,refreshTotal|total refreshes|0|r
+shards|refresh.time|rti,refreshTime|time spent in refreshes|0|r
+shards|refresh.external_total|rto,refreshTotal|total external refreshes|0|r
+shards|refresh.external_time|rti,refreshTime|time spent in external refreshes|0|r
+shards|refresh.listeners|rli,refreshListeners|number of pending refresh listeners|0|r
+shards|search.fetch_current|sfc,searchFetchCurrent|current fetch phase ops|0|r
+shards|search.fetch_time|sfti,searchFetchTime|time spent in fetch phase|0|r
+shards|search.fetch_total|sfto,searchFetchTotal|total fetch ops|0|r
+shards|search.open_contexts|so,searchOpenContexts|open search contexts|0|r
+shards|search.query_current|sqc,searchQueryCurrent|current query phase ops|0|r
+shards|search.query_time|sqti,searchQueryTime|time spent in query phase|0|r
+shards|search.query_total|sqto,searchQueryTotal|total query phase ops|0|r
+shards|search.scroll_current|scc,searchScrollCurrent|open scroll contexts|0|r
+shards|search.scroll_time|scti,searchScrollTime|time scroll contexts held open|0|r
+shards|search.scroll_total|scto,searchScrollTotal|completed scroll contexts|0|r
+shards|segments.count|sc,segmentsCount|number of segments|0|r
+shards|segments.memory|sm,segmentsMemory|memory used by segments|0|r
+shards|segments.index_writer_memory|siwm,segmentsIndexWriterMemory|memory used by index writer|0|r
+shards|segments.version_map_memory|svmm,segmentsVersionMapMemory|memory used by version map|0|r
+shards|segments.fixed_bitset_memory|sfbm,fixedBitsetMemory|memory used by fixed bit sets for nested object field types and type filters for types referred in _parent fields|0|r
+shards|seq_no.max|sqm,maxSeqNo|max sequence number|0|r
+shards|seq_no.local_checkpoint|sql,localCheckpoint|local checkpoint|0|r
+shards|seq_no.global_checkpoint|sqg,globalCheckpoint|global checkpoint|0|r
+shards|warmer.current|wc,warmerCurrent|current warmer ops|0|r
+shards|warmer.total|wto,warmerTotal|total warmer ops|0|r
+shards|warmer.total_time|wtt,warmerTotalTime|time spent in warmers|0|r
+shards|path.data|pd,dataPath|shard data path|0|r
+shards|path.state|ps,statsPath|shard state path|0|r
+shards|bulk.total_operations|bto,bulkTotalOperations|number of bulk shard ops|0|r
+shards|bulk.total_time|btti,bulkTotalTime|time spend in shard bulk|0|r
+shards|bulk.total_size_in_bytes|btsi,bulkTotalSizeInBytes|total size in bytes of shard bulk|0|r
+shards|bulk.avg_time|bati,bulkAvgTime|average time spend in shard bulk|0|r
+shards|bulk.avg_size_in_bytes|basi,bulkAvgSizeInBytes|avg size in bytes of shard bulk|0|r
+shards|dense_vector.value_count|dvc,denseVectorCount|number of indexed dense vectors in shard|0|r
+shards|sparse_vector.value_count|svc,sparseVectorCount|number of indexed sparse vectors in shard|0|r
+tasks|id||id of the task with the node|0|l
+tasks|action|ac|task action|1|l
+tasks|task_id|ti|unique task id|1|l
+tasks|parent_task_id|pti|parent task id|1|l
+tasks|type|ty|task type|1|l
+tasks|start_time|start|start time in ms|1|l
+tasks|timestamp|ts,hms,hhmmss|start time in HH:MM:SS|1|l
+tasks|running_time_ns|time|running time ns|0|l
+tasks|running_time|time|running time|1|l
+tasks|node_id|ni|unique node id|0|l
+tasks|ip|i|ip address|1|l
+tasks|port|po|bound transport port|0|l
+tasks|node|n|node name|1|l
+tasks|version|v|es version|0|l
+tasks|x_opaque_id|x|X-Opaque-ID header|0|l
+thread_pool|node_name|nn|node name|1|l
+thread_pool|node_id|id|persistent node id|0|l
+thread_pool|ephemeral_node_id|eid|ephemeral node id|0|l
+thread_pool|pid|p|process id|0|l
+thread_pool|host|h|host name|0|l
+thread_pool|ip|i|ip address|0|l
+thread_pool|port|po|bound transport port|0|l
+thread_pool|name|n|thread pool name|1|l
+thread_pool|type|t|thread pool type|0|l
+thread_pool|active|a|number of active threads|1|r
+thread_pool|pool_size|psz|number of threads|0|r
+thread_pool|queue|q|number of tasks currently in queue|1|r
+thread_pool|queue_size|qs|maximum number of tasks permitted in queue|0|r
+thread_pool|rejected|r|number of rejected tasks|1|r
+thread_pool|largest|l|highest number of seen active threads|0|r
+thread_pool|completed|c|number of completed tasks|0|r
+thread_pool|core|cr|core number of threads in a scaling thread pool|0|r
+thread_pool|max|mx|maximum number of threads in a scaling thread pool|0|r
+thread_pool|size|sz|number of threads in a fixed thread pool|0|r
+thread_pool|keep_alive|ka|thread keep alive time|0|r
+count|epoch|t,time|seconds since 1970-01-01 00:00:00|1|l
+count|timestamp|ts,hms,hhmmss|time in HH:MM:SS|1|l
+count|count|dc,docs.count,docsCount|the document count|1|l
+pending_tasks|insertOrder|o|task insertion order|1|l
+pending_tasks|timeInQueue|t|how long task has been in queue|1|l
+pending_tasks|priority|p|task priority|1|l
+pending_tasks|source|s|task source|1|l

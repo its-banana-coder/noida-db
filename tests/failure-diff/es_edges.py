@@ -1445,6 +1445,213 @@ scenario("knn", [("DELETE", "/knn-docs?ignore_unavailable=true"),
     ("DELETE", "/knn-ok"), ("DELETE", "/knn-bad?ignore_unavailable=true"),
 ])
 
+# --- stats / cluster / node / cat APIs (indices prefixed `st-`) -----------
+
+ST_SETTINGS = {"settings": {"index": {"number_of_shards": 2, "number_of_replicas": 0, "refresh_interval": "-1"}},
+               "mappings": {"properties": {"name": {"type": "keyword"}, "body": {"type": "text", "fielddata": True},
+                                           "sug": {"type": "completion"}, "n": {"type": "long"}}}}
+ST_DOCS = [{"index": {"_index": "st-a", "_id": str(i)}} if j == 0 else
+           {"name": f"n{i}", "body": f"word{i} common", "sug": f"sug{i}", "n": i}
+           for i in range(1, 6) for j in range(2)]
+
+
+def section_keys(r):
+    return {k: sorted(v) if isinstance(v, dict) else v for k, v in r["_all"]["total"].items()}
+
+
+def st_counts(r):
+    t = r["indices"]["st-a"]["total"]
+    return {"docs": t["docs"]["count"], "index_total": t["indexing"]["index_total"],
+            "delete_total": t["indexing"]["delete_total"], "noop": t["indexing"]["noop_update_total"],
+            "get": [t["get"]["total"], t["get"]["exists_total"], t["get"]["missing_total"]],
+            "query_total": t["search"]["query_total"], "suggest_total": t["search"]["suggest_total"],
+            "segments": t["segments"]["count"], "translog_ops": t["translog"]["operations"],
+            "shard_stats": t["shard_stats"], "health": r["indices"]["st-a"]["health"],
+            "status": r["indices"]["st-a"]["status"]}
+
+
+def keys_of(path):
+    def pick(r):
+        for k in path:
+            r = r[k]
+        return sorted(r) if isinstance(r, dict) else r
+    return pick
+
+
+def node_entry(r):
+    return next(iter(r["nodes"].values()))
+
+
+def shape(v):
+    """A response's structure: keys kept, values reduced to their type."""
+    if isinstance(v, dict):
+        return {k: shape(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [shape(v[0])] if v else []
+    return type(v).__name__
+
+
+scenario("stats_indices", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/st-a/_stats", None, {"pick": st_counts}),
+    ("POST", "/_bulk?refresh=true", ST_DOCS, {"pick": lambda r: r["errors"]}),
+    ("GET", "/st-a/_doc/1", None, {"pick": lambda r: r["found"]}),
+    ("GET", "/st-a/_doc/nope"),
+    ("POST", "/st-a/_update/2", {"doc": {"n": 2}}, {"pick": lambda r: r["result"]}),
+    ("POST", "/st-a/_update/2", {"doc": {"n": 3}}, {"pick": lambda r: r["result"]}),
+    ("DELETE", "/st-a/_doc/5", None, {"pick": lambda r: r["result"]}),
+    ("POST", "/st-a/_search", {"query": {"match_all": {}}}, {"pick": lambda r: r["hits"]["total"]}),
+    ("POST", "/st-a/_search", {"suggest": {"s": {"prefix": "sug", "completion": {"field": "sug"}}}},
+     {"pick": lambda r: len(r["suggest"]["s"][0]["options"])}),
+    ("GET", "/st-a/_stats", None, {"pick": st_counts}),
+    ("GET", "/st-a/_stats", None, {"pick": section_keys}),
+    ("GET", "/st-a/_stats?level=shards", None, {"pick": lambda r: shape(r["indices"]["st-a"]["shards"]["0"][0])}),
+    ("GET", "/st-a/_stats?human", None, {"pick": lambda r: shape(r["_all"])}),
+    ("GET", "/st-a/_stats/docs,store,merge", None, {"pick": section_keys}),
+    ("GET", "/st-a/_stats?level=shards", None, {"pick": lambda r: sorted(r["indices"]["st-a"]["shards"]["0"][0])}),
+    ("GET", "/st-a/_stats?level=cluster", None, {"pick": lambda r: sorted(r)}),
+    ("GET", "/st-a/_stats/fieldata"),
+    ("GET", "/st-a/_stats?level=bad"),
+    ("GET", "/st-zz/_stats"),
+    ("GET", "/st-zz*/_stats", None, {"pick": lambda r: r["_all"]}),
+    ("POST", "/st-a/_search", {"sort": ["body"], "size": 1}, {"pick": lambda r: r["hits"]["hits"][0]["sort"]}),
+    ("GET", "/st-a/_stats/fielddata?fielddata_fields=body", None,
+     {"pick": lambda r: sorted(r["_all"]["total"]["fielddata"]["fields"])}),
+    ("GET", "/st-a/_stats/completion?completion_fields=*", None,
+     {"pick": lambda r: sorted(r["_all"]["total"]["completion"]["fields"])}),
+    ("POST", "/st-a/_search", {"stats": ["g1"], "size": 0}, {"pick": lambda r: r["hits"]["total"]}),
+    ("GET", "/st-a/_stats/search?groups=g*", None,
+     {"pick": lambda r: r["_all"]["total"]["search"]["groups"]["g1"]["query_total"]}),
+    ("POST", "/st-a/_flush", None, {"pick": lambda r: r["_shards"]["failed"]}),
+    ("GET", "/st-a/_stats/translog", None, {"pick": lambda r: r["_all"]["total"]["translog"]["operations"]}),
+    ("PUT", "/st-b", {"settings": {"index.translog.retention.size": "1mb"}}),
+    ("DELETE", "/st-a"),
+])
+
+scenario("stats_cat", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("POST", "/_bulk?refresh=true", ST_DOCS, {"pick": lambda r: r["errors"]}),
+    ("GET", "/_cat/indices/st-a?h=health,status,index,pri,rep,docs.count,docs.deleted&v"),
+    ("GET", "/_cat/indices/st-a?h=i,dc,p&format=json"),
+    ("GET", "/_cat/indices/st-a?health=bogus"),
+    ("GET", "/_cat/indices/st-zz"),
+    ("GET", "/_cat/count/st-a?h=count"),
+    ("GET", "/_cat/shards/st-a?h=index,shard,prirep,state,docs&s=shard&v"),
+    ("GET", "/_cat/segments/st-a?h=index,shard,prirep,segment,generation,docs.count,docs.deleted&s=shard&format=json"),
+    ("GET", "/_cat/recovery/st-a?h=index,shard,type,stage,files,translog_ops_percent&v"),
+    ("GET", "/_cat/thread_pool/write,generic?h=name,type,queue_size,core,max,keep_alive&v"),
+    ("GET", "/_cat/nodes?h=node.role,master&v"),
+    ("GET", "/_cat/indices/st-a?help"),
+    ("GET", "/_cat/shards?help"),
+    ("GET", "/_cat/nodes?help"),
+    ("GET", "/_cat/segments?help"),
+    ("GET", "/_cat/recovery?help"),
+    ("GET", "/_cat/allocation?help"),
+    ("GET", "/_cat/health?help"),
+    ("GET", "/_cat/thread_pool?help"),
+    ("GET", "/_cat/tasks?help"),
+    ("GET", "/_cat/fielddata?help"),
+    ("GET", "/_cat/nodeattrs?help"),
+    ("GET", "/_cat/plugins?v"),
+    ("POST", "/st-a/_close", None, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/_cat/indices/st-a?h=health,status,index,pri,rep,docs.count&format=json"),
+    ("GET", "/_cat/segments/st-a"),
+    ("GET", "/_cat/recovery/st-a?h=index,shard,type,stage&format=json"),
+    ("DELETE", "/st-a"),
+])
+
+scenario("stats_cluster", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/_cluster/health/st-a?level=shards", None,
+     {"pick": lambda r: {k: v for k, v in r.items()
+                         if k not in ("cluster_name", "number_of_pending_tasks", "task_max_waiting_in_queue_millis")}}),
+    ("GET", "/_cluster/health/st-a?wait_for_status=green&timeout=1s", None, {"pick": lambda r: r["status"]}),
+    ("GET", "/_cluster/health/st-a?level=bogus"),
+    ("GET", "/_cluster/state/metadata,routing_table/st-a", None,
+     {"pick": lambda r: [sorted(r), sorted(r["metadata"]["indices"]["st-a"]),
+                         r["metadata"]["indices"]["st-a"]["state"],
+                         sorted(r["routing_table"]["indices"]["st-a"]["shards"])]}),
+    ("GET", "/_cluster/state/master_node,version", None, {"pick": sorted}),
+    ("GET", "/_cluster/state/bogus", None, {"pick": sorted}),
+    ("GET", "/_cluster/state/metadata/st-nothere*?allow_no_indices=false"),
+    ("GET", "/_cluster/state/metadata/st-foobla?ignore_unavailable=false"),
+    ("GET", "/_cluster/allocation/explain", {"index": "st-a", "shard": 0, "primary": True},
+     {"pick": lambda r: [sorted(r), r["current_state"], sorted(r["current_node"])]}),
+    ("GET", "/_cluster/stats", None, {"pick": lambda r: [sorted(r), sorted(r["indices"]), sorted(r["nodes"]),
+                                                         sorted(r["nodes"]["count"])]}),
+    ("GET", "/_nodes/_all/_none", None, {"pick": lambda r: sorted(node_entry(r))}),
+    ("GET", "/_nodes/stats/indices/docs", None, {"pick": lambda r: sorted(node_entry(r)["indices"])}),
+    ("GET", "/_nodes/stats/os,jvm", None, {"pick": lambda r: sorted(node_entry(r))}),
+    ("GET", "/_nodes/stats/indices", None, {"pick": lambda r: shape(node_entry(r)["indices"])}),
+    ("GET", "/_nodes/stats/discovery,indexing_pressure,transport,thread_pool,script,script_cache,breaker", None,
+     {"pick": lambda r: {k: sorted(v) if isinstance(v, dict) else v for k, v in node_entry(r).items()
+                         if k in ("discovery", "indexing_pressure", "transport", "script", "script_cache")}}),
+    ("GET", "/_nodes/stats/indices/mappings?level=indices", None,
+     {"pick": lambda r: node_entry(r)["indices"]["indices"]["st-a"]}),
+    ("GET", "/_nodes/stats/transprot"),
+    ("GET", "/_nodes/stats/os/docs"),
+    ("GET", "/_nodes/hot_threads?type=bogus"),
+    ("GET", "/_nodes/settings", None, {"pick": lambda r: sorted(node_entry(r))}),
+    ("GET", "/_info/_all,ingest"),
+    ("GET", "/_info/ingest,bogus"),
+    ("GET", "/_info/script", None, {"pick": lambda r: sorted(r["script"])}),
+    ("GET", "/_health_report/master_is_stable?verbose=false", None,
+     {"pick": lambda r: [sorted(r), r["indicators"]["master_is_stable"]["status"]]}),
+    ("GET", "/_health_report/bogus"),
+    ("GET", "/_tasks/foo:1"),
+    ("GET", "/_tasks/bogus"),
+    ("POST", "/_tasks/_cancel?actions=unknown_action"),
+    ("GET", "/_tasks?actions=cluster:monitor/tasks/lists&group_by=none", None,
+     {"pick": lambda r: [t["action"] for t in r["tasks"]]}),
+    ("GET", "/_capabilities?method=GET&path=/_capabilities&parameters=method,path", None, {"pick": lambda r: r["supported"]}),
+    ("GET", "/_capabilities?method=GET&path=/_capabilities&parameters=bogus", None, {"pick": lambda r: r["supported"]}),
+    ("GET", "/_capabilities?method=PUT&path=/%7Bindex%7D&capabilities=logsdb_index_mode", None, {"pick": lambda r: r["supported"]}),
+    ("GET", "/_features"),
+    ("GET", "/_remote/info"),
+    ("POST", "/_cluster/voting_config_exclusions"),
+    ("POST", "/_internal/prevalidate_node_removal"),
+    ("POST", "/_internal/prevalidate_node_removal?names=st-nonode"),
+    ("PUT", "/_internal/desired_nodes/st-h/1?dry_run=true",
+     {"nodes": [{"settings": {"node.name": "x"}, "processors": 8, "memory": "1gb", "storage": "1gb"}]}),
+    ("PUT", "/_internal/desired_nodes/st-h/1?dry_run=true",
+     {"nodes": [{"settings": {}, "processors": 8, "memory": "1gb", "storage": "1gb"}]}),
+    ("PUT", "/_internal/desired_nodes/st-h/1?dry_run=true", {"nodes": []}),
+    ("PUT", "/_internal/desired_nodes/st-h/asa?dry_run=true",
+     {"nodes": [{"settings": {"node.name": "x"}, "processors": 8, "memory": "1gb", "storage": "1gb"}]}),
+    ("DELETE", "/st-a"),
+])
+
+scenario("stats_shards", [
+    ("DELETE", "/st-a?ignore_unavailable=true"),
+    ("PUT", "/st-a", ST_SETTINGS, {"pick": lambda r: r["acknowledged"]}),
+    ("POST", "/_bulk?refresh=true", ST_DOCS, {"pick": lambda r: r["errors"]}),
+    ("GET", "/st-a/_segments", None,
+     {"pick": lambda r: {s: [c["segments"]["_0"]["num_docs"] for c in copies]
+                         for s, copies in r["indices"]["st-a"]["shards"].items()}}),
+    ("GET", "/st-a/_recovery", None,
+     {"pick": lambda r: [(s["id"], s["type"], s["stage"], s["primary"]) for s in r["st-a"]["shards"]]}),
+    ("GET", "/st-a/_recovery?human&detailed=true", None,
+     {"pick": lambda r: sorted(r["st-a"]["shards"][0]["index"]["files"])}),
+    ("GET", "/st-zz*/_recovery"),
+    ("GET", "/st-zz/_recovery"),
+    ("GET", "/st-a/_shard_stores?status=green", None,
+     {"pick": lambda r: {s: [x["allocation"] for x in v["stores"]]
+                         for s, v in r["indices"]["st-a"]["shards"].items()}}),
+    ("GET", "/st-a/_shard_stores"),
+    ("POST", "/st-a/_disk_usage"),
+    ("POST", "/st-a/_disk_usage?run_expensive_tasks=true", None,
+     {"pick": lambda r: [sorted(r["st-a"]), sorted(r["st-a"]["fields"])]}),
+    ("POST", "/st-a/_close", None, {"pick": lambda r: r["acknowledged"]}),
+    ("GET", "/st-a/_segments"),
+    ("GET", "/st-a/_recovery", None,
+     {"pick": lambda r: [(s["id"], s["type"], s["stage"]) for s in r["st-a"]["shards"]]}),
+    ("GET", "/st-a/_stats"),
+    ("DELETE", "/st-a"),
+])
+
 failures = 0
 for name, steps in SCENARIOS.items():
     if ONLY and name not in ONLY:
