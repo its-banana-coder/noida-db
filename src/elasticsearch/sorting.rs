@@ -364,7 +364,9 @@ pub fn after_keys(specs: &[SortSpec], after: &[Value]) -> Result<Vec<Value>, EsE
             // A date given as text is read with the sort's `format` (or
             // the field's).
             Key::Field { date: Some(d), .. } if v.is_string() => {
-                let fmt = d.show.as_deref().or(d.parse.as_deref());
+                let fmt = d.show.as_deref().or(d.parse.as_deref()).map(|f| {
+                    if f == "strict_date_optional_time_nanos" { "strict_date_optional_time" } else { f }
+                });
                 let d2 = DateSort { parse: fmt.map(str::to_string), ..d.clone() };
                 date_key(v, &d2).ok_or_else(|| {
                     EsError::shard_failure(

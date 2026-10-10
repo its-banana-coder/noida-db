@@ -1303,6 +1303,13 @@ pub fn eval(
         return Ok(eval_terms(v, mappings, docs));
     }
     if let Some(v) = obj.get("match") {
+        // Metadata fields match their exact value.
+        if let Some((f @ ("_index" | "_id"), spec)) =
+            v.as_object().and_then(|m| m.iter().next()).map(|(f, s)| (f.as_str(), s))
+        {
+            let value = spec.get("query").unwrap_or(spec).clone();
+            return eval(&json!({"term": {f: {"value": value}}}), mappings, docs);
+        }
         return Ok(eval_match(v, mappings, docs));
     }
     if let Some(v) = obj.get("match_phrase") {
@@ -2631,10 +2638,15 @@ pub fn search_with(
                     }
                 }
             }
-            let names: Vec<&String> =
-                named.iter().filter(|(_, m)| m.contains(idx)).map(|(n, _)| n).collect();
+            let names: Vec<(&String, f32)> =
+                named.iter().filter_map(|(n, m)| m.get(idx).map(|sc| (n, *sc))).collect();
             if !names.is_empty() {
-                hit["matched_queries"] = json!(names);
+                // `include_named_queries_score`: each name with its score.
+                hit["matched_queries"] = if body["include_named_queries_score"] == json!(true) {
+                    Value::Object(names.iter().map(|(n, sc)| ((*n).clone(), json!(sc))).collect())
+                } else {
+                    json!(names.iter().map(|(n, _)| n).collect::<Vec<_>>())
+                };
             }
             Ok(hit)
         })
@@ -2693,13 +2705,10 @@ fn named_queries(
     query: &Value,
     mappings: &Value,
     docs: &[CommittedDoc],
-) -> Result<Vec<(String, HashSet<usize>)>, EsError> {
+) -> Result<Vec<(String, HashMap<usize, f32>)>, EsError> {
     let mut found: Vec<(String, Value)> = vec![];
     collect_named(query, &mut found);
-    found
-        .into_iter()
-        .map(|(n, q)| Ok((n, eval(&q, mappings, docs)?.into_keys().collect())))
-        .collect()
+    found.into_iter().map(|(n, q)| Ok((n, eval(&q, mappings, docs)?))).collect()
 }
 
 fn collect_named(v: &Value, out: &mut Vec<(String, Value)>) {

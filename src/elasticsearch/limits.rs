@@ -221,7 +221,7 @@ pub fn setting(settings: &Value, key: &str) -> Option<i64> {
 
 /// A failure while building the query on a shard (`query_shard_exception`
 /// wrapping the real cause).
-fn query_shard_failure(index: &str, settings: &Value, reason: &str) -> (u16, Value) {
+pub(super) fn query_shard_failure(index: &str, settings: &Value, reason: &str) -> (u16, Value) {
     let uuid = settings["index"]["uuid"].as_str().unwrap_or("_na_");
     let full = format!("failed to create query: {reason}");
     let root = json!({"type": "query_shard_exception", "reason": full, "index_uuid": uuid, "index": index});
@@ -237,7 +237,7 @@ fn query_shard_failure(index: &str, settings: &Value, reason: &str) -> (u16, Val
 }
 
 /// An `illegal_argument_exception` failing every shard of `index`.
-fn shard_iae(index: &str, reason: &str) -> (u16, Value) {
+pub(super) fn shard_iae(index: &str, reason: &str) -> (u16, Value) {
     let iae = json!({"type": "illegal_argument_exception", "reason": reason});
     let mut caused = iae.clone();
     caused["caused_by"] = iae.clone();

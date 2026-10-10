@@ -1059,6 +1059,9 @@ impl Engine {
         {
             return e;
         }
+        if q.get("include_named_queries_score").is_some_and(|v| v.is_empty() || v == "true") {
+            req["include_named_queries_score"] = json!(true);
+        }
         if q.get("rest_total_hits_as_int").is_some_and(|v| v == "true")
             && let Some(err) = total_hits_as_int_error(&req)
         {
@@ -1209,10 +1212,13 @@ impl Engine {
             }
         }
         for n in &names {
-            if let Some(i) = s.indices.get(n)
-                && let Err(e) = super::limits::check_index(n, &i.settings, &req, opens_scroll)
-            {
-                return e;
+            if let Some(i) = s.indices.get(n) {
+                if let Err(e) = super::limits::check_index(n, &i.settings, &req, opens_scroll) {
+                    return e;
+                }
+                if let Err(e) = super::lookup::check(&req, n, &i.settings) {
+                    return e;
+                }
             }
         }
         // `indices_boost` names indices, aliases or patterns: each index
@@ -1364,6 +1370,7 @@ impl Engine {
                     suggest::type_keys(&req, &mut resp);
                 }
                 set_search_shards(&mut resp, shard_total);
+                Self::fill_lookups(&s, &req, &mut resp);
                 // Partial reduces of shard results (`batched_reduce_size`,
                 // default 512): reported when there was more than one.
                 let batch =
@@ -1423,6 +1430,52 @@ impl Engine {
                 (200, resp)
             }
             Err(e) => (e.status, e.to_json()),
+        }
+    }
+
+    /// Lookup runtime fields asked for by `fields`: each hit gets, per
+    /// matching document of the target index, its `fetch_fields`.
+    fn fill_lookups(s: &State, req: &Value, resp: &mut Value) {
+        let lookups = super::lookup::fields(req);
+        let Some(spec) = req.get("fields") else { return };
+        let wanted: Vec<&(String, Value)> =
+            lookups.iter().filter(|(n, _)| super::fields::requested(spec, n)).collect();
+        if wanted.is_empty() {
+            return;
+        }
+        for hit in resp["hits"]["hits"].as_array_mut().into_iter().flatten() {
+            let (Some(index), Some(id)) = (hit["_index"].as_str(), hit["_id"].as_str()) else {
+                continue;
+            };
+            let Some(source) = s.indices.get(index).and_then(|i| i.docs.get(id)).map(|d| &d.source)
+            else {
+                continue;
+            };
+            for (name, def) in &wanted {
+                let target = def.get("target_index").and_then(Value::as_str).unwrap_or("");
+                let mut found = vec![];
+                for v in super::lookup::inputs(def, source) {
+                    for t in Self::resolve_indices(s, target) {
+                        let ti = &s.indices[&t];
+                        for c in &ti.committed {
+                            if super::lookup::is_target(def, &c.id, c.full(), &v)
+                                && let Ok(f) = super::fields::fetch(
+                                    &ti.mappings,
+                                    c,
+                                    &super::lookup::fetch_spec(def),
+                                    super::fields::Kind::Fields,
+                                )
+                                && !f.is_empty()
+                            {
+                                found.push(Value::Object(f));
+                            }
+                        }
+                    }
+                }
+                if !found.is_empty() {
+                    hit["fields"][name.as_str()] = Value::Array(found);
+                }
+            }
         }
     }
 

@@ -10,6 +10,7 @@ mod fields;
 mod highlight;
 mod jsonpos;
 mod limits;
+mod lookup;
 mod names;
 mod painless;
 mod profile;

@@ -269,12 +269,7 @@ fn template_matches(t: &Value, name: &str, path: &str, kind: &str) -> bool {
         return false;
     }
     let types = patterns(t.get("match_mapping_type"));
-    if types.is_empty() {
-        // Objects are matched only when asked for by type.
-        if kind == "object" {
-            return false;
-        }
-    } else if !types.iter().any(|m| m == "*" || m == kind) {
+    if !types.is_empty() && !types.iter().any(|m| m == "*" || m == kind) {
         return false;
     }
     if patterns(t.get("unmatch_mapping_type")).iter().any(|m| m == kind) {
