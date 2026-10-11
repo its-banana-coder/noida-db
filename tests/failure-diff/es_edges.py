@@ -2650,7 +2650,7 @@ scenario("stats_cluster", [
     ("GET", "/_capabilities?method=GET&path=/_capabilities&parameters=method,path", None, {"pick": lambda r: r["supported"]}),
     ("GET", "/_capabilities?method=GET&path=/_capabilities&parameters=bogus", None, {"pick": lambda r: r["supported"]}),
     ("GET", "/_capabilities?method=PUT&path=/%7Bindex%7D&capabilities=logsdb_index_mode", None, {"pick": lambda r: r["supported"]}),
-    ("GET", "/_features"),
+    ("GET", "/_features", None, {"pick": lambda r: sorted(f["name"] for f in r["features"])}),
     ("GET", "/_remote/info"),
     ("POST", "/_cluster/voting_config_exclusions"),
     ("POST", "/_internal/prevalidate_node_removal"),

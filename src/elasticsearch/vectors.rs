@@ -863,7 +863,7 @@ fn parse_query(v: &Value) -> Result<Knn, EsError> {
                 "either [query_vector] or [query_vector_builder] must be provided",
             ));
         }
-        (None, Some(_)) => return Err(no_inference()),
+        (None, Some(b)) => return Err(no_inference(builder_model(b))),
         (Some(q), None) => parse_query_vector(q)?,
     };
     let k = number(o.get("k")).map(|k| k as i64);
@@ -900,14 +900,20 @@ fn parse_query(v: &Value) -> Result<Knn, EsError> {
     })
 }
 
-/// A `query_vector_builder` needs an inference model, which noida doesn't
-/// have (neither does a real node without machine learning).
-pub(crate) fn no_inference() -> EsError {
+/// A `query_vector_builder` (or an inference id) needs a deployed model,
+/// which noida never has: a node with machine learning on (the default)
+/// answers that the model isn't there.
+pub(crate) fn no_inference(model: &str) -> EsError {
     EsError::new(
-        500,
-        "illegal_state_exception",
-        "failed to find action [cluster:internal/xpack/ml/coordinatedinference] to execute",
+        404,
+        "status_exception",
+        &format!("[{model}] is not an inference service model or a deployed ml model"),
     )
+}
+
+/// The `model_id` of a `query_vector_builder`.
+fn builder_model(b: &Value) -> &str {
+    b.get("text_embedding").and_then(|t| t.get("model_id")).and_then(Value::as_str).unwrap_or("")
 }
 
 fn create_failure(reason: &str) -> EsError {
@@ -1162,7 +1168,7 @@ pub fn top_level_query(
                     "either [query_vector_builder] or [query_vector] must be provided",
                 ));
             }
-            (None, Some(_)) => return Err(no_inference()),
+            (None, Some(b)) => return Err(no_inference(builder_model(b))),
             (Some(q), None) => parse_query_vector(q)?,
         };
         let k = number(o.get("k")).map_or(size, |k| k as i64);

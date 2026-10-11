@@ -697,7 +697,7 @@ fn sparse_vector(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Result<S
                 "[sparse_vector] requires [query] when [inference_id] is specified",
             ));
         }
-        (None, Some(_)) => return Err(no_inference()),
+        (None, Some(id)) => return Err(no_inference(id.as_str().unwrap_or(""))),
         (Some(q), None) => parse_tokens(Some(q), "sparse_vector")?,
     };
     let Some(def) = field_def(mappings, field) else { return Ok(Scores::new()) };
@@ -762,7 +762,7 @@ fn text_expansion(v: &Value) -> EsError {
     if spec.get("model_text").is_none() {
         return EsError::parsing("No text specified for text query");
     }
-    no_inference()
+    no_inference(spec.get("model_id").and_then(Value::as_str).unwrap_or(""))
 }
 
 /// The `semantic` query: needs the field's inference endpoint.
@@ -1035,7 +1035,7 @@ mod tests {
         assert_eq!((s[&1], s[&0]), (2.695_312_5, 1.5));
         let e = run(json!({"sparse_vector": {"field": "t", "inference_id": "m", "query": "x"}}))
             .unwrap_err();
-        assert_eq!(e.status, 500);
+        assert_eq!((e.status, e.kind.as_str()), (404, "status_exception"));
     }
 
     #[test]
