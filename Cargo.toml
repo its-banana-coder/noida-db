@@ -39,7 +39,7 @@ sql = ["dep:md-5", "dep:sha1", "dep:sha2", "dep:hmac"]
 postgres = ["sql", "dep:pgwire", "dep:sqlparser", "dep:bytes", "dep:regex-lite", "dep:rust-stemmers"]
 mysql = ["sql", "dep:sqlparser", "dep:bytes", "dep:regex-lite"]
 kafka = ["dep:kafka-protocol", "dep:bytes", "dep:crc32c"]
-elasticsearch = ["dep:regex-lite", "dep:flate2"]
+elasticsearch = ["dep:regex-lite", "dep:flate2", "dep:rust-stemmers", "dep:unicode-segmentation"]
 mongodb = []
 # HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
 # same as the other services' wire protocols.
@@ -62,6 +62,8 @@ regex-lite = { version = "0.1", optional = true }
 sqlparser = { version = "0.63", default-features = false, features = ["std"], optional = true }
 # Postgres: Snowball stemming for to_tsvector/to_tsquery's 'english' config.
 rust-stemmers = { version = "1.2", optional = true }
+# Elasticsearch: UAX#29 word boundaries for the `standard` tokenizer.
+unicode-segmentation = { version = "1.13", optional = true }
 # Redis: EVAL and friends run in Lua 5.1, the version Redis embeds. The
 # vendored interpreter is compiled in (~250KB), which is the whole feature.
 mlua = { version = "0.12", default-features = false, features = ["lua51", "vendored"], optional = true }

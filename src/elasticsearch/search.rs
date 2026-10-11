@@ -12,13 +12,20 @@ use std::collections::{HashMap, HashSet};
 
 use super::analysis;
 use super::dates;
+use super::dsl;
+use super::explain;
+use super::features;
 use super::fields;
+use super::fuzzy;
 use super::highlight;
 use super::queries;
 use super::query_string;
+use super::rescore;
+use super::retrievers;
 use super::scoring;
 use super::sorting;
 use super::suggest;
+use super::tsdb;
 use super::vectors;
 
 /// A search failure, shaped the way Elasticsearch reports it: most are a
@@ -120,6 +127,8 @@ pub struct CommittedDoc {
     /// objects removed (a nested object's fields aren't visible to
     /// queries outside a `nested` query, as in Elasticsearch).
     pub full_source: Option<Value>,
+    /// The `_tsid` of a document in a time-series index.
+    pub tsid: Option<String>,
 }
 
 impl CommittedDoc {
@@ -223,6 +232,7 @@ fn nested_children(
                 version: d.version,
                 seq: d.seq,
                 full_source: None,
+                tsid: None,
             });
             owners.push((p, offset));
         }
@@ -329,8 +339,18 @@ fn inner_hits(
             {
                 let path = n.get("path").and_then(Value::as_str).unwrap_or("").to_string();
                 let name = ih.get("name").and_then(Value::as_str).unwrap_or(&path).to_string();
+                let source_enabled = mappings
+                    .get("_source")
+                    .and_then(|s| s.get("enabled"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
                 let size = ih.get("size").and_then(Value::as_u64).unwrap_or(3) as usize;
                 let from = ih.get("from").and_then(Value::as_u64).unwrap_or(0) as usize;
+                // A nested query inside reports its inner hits per child.
+                let mut sub = Vec::new();
+                if let Some(q) = n.get("query") {
+                    inner_hits(q, mappings, &children, &mut sub)?;
+                }
                 let mut by_parent = HashMap::new();
                 for (parent, mut ms) in per {
                     ms.sort_by(|a, b| {
@@ -351,7 +371,15 @@ fn inner_hits(
                             "_nested": {"field": path, "offset": offset},
                             "_score": score,
                         });
-                        if !matches!(ih.get("_source"), Some(Value::Bool(false))) {
+                        if ih.get("version").and_then(Value::as_bool) == Some(true) {
+                            hit["_version"] = json!(c.version);
+                        }
+                        if ih.get("seq_no_primary_term").and_then(Value::as_bool) == Some(true) {
+                            hit["_seq_no"] = json!(c.seq);
+                            hit["_primary_term"] = json!(1);
+                        }
+                        if !matches!(ih.get("_source"), Some(Value::Bool(false))) && source_enabled
+                        {
                             hit["_source"] = apply_source_filter(src, ih.get("_source"));
                         }
                         if let Some(hl) = ih.get("highlight") {
@@ -362,8 +390,14 @@ fn inner_hits(
                                 settings: &settings,
                                 weighted: true,
                             };
+                            // Without `_source`, only stored fields have text.
+                            let shown = if source_enabled {
+                                c.source.clone()
+                            } else {
+                                dsl::stored_only(mappings, &c.source)
+                            };
                             if let Some(h) =
-                                highlight::highlight(hl, &inner_query, mappings, &c.source, &ctx)?
+                                highlight::highlight(hl, &inner_query, mappings, &shown, &ctx)?
                             {
                                 hit["highlight"] = h;
                             }
@@ -380,6 +414,17 @@ fn inner_hits(
                             }
                             if !grouped.is_empty() {
                                 hit["fields"] = json!({ (path.as_str()): [grouped] });
+                            }
+                        }
+                        if let Some(spec) = ih.get("docvalue_fields") {
+                            for (k, v) in fields::fetch(mappings, c, spec, fields::Kind::DocValue)?
+                            {
+                                hit["fields"][k.as_str()] = v;
+                            }
+                        }
+                        for (sub_name, per_child) in &sub {
+                            if let Some(h) = per_child.get(&ci) {
+                                hit["inner_hits"][sub_name.as_str()] = h.clone();
                             }
                         }
                         hits.push(hit);
@@ -421,19 +466,32 @@ fn inner_hits(
 pub(crate) fn resolve_field(mappings: &Value, field: &str) -> (String, Option<String>) {
     let segs: Vec<&str> = field.split('.').collect();
     let mut props = mappings.get("properties");
-    for (i, seg) in segs.iter().enumerate() {
-        let Some(node) = props.and_then(|p| p.get(*seg)) else { break };
-        if i + 1 == segs.len() {
+    let mut i = 0;
+    while i < segs.len() {
+        // A mapped name may itself hold dots (`subobjects: false`): the
+        // longest one present wins.
+        let Some((j, node)) = (i + 1..=segs.len())
+            .rev()
+            .find_map(|j| props.and_then(|p| p.get(segs[i..j].join("."))).map(|n| (j, n)))
+        else {
+            break;
+        };
+        if j == segs.len() {
             let ty = node.get("type").and_then(Value::as_str).unwrap_or("object");
             return (field.to_string(), Some(ty.to_string()));
         }
-        if i + 2 == segs.len()
-            && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        // A key inside a `flattened` field is a keyword.
+        if node.get("type").and_then(Value::as_str) == Some("flattened") {
+            return (field.to_string(), Some("keyword".to_string()));
+        }
+        if j + 1 == segs.len()
+            && let Some(sub) = node.get("fields").and_then(|f| f.get(segs[j]))
         {
             let ty = sub.get("type").and_then(Value::as_str).unwrap_or("keyword");
-            return (segs[..=i].join("."), Some(ty.to_string()));
+            return (segs[..j].join("."), Some(ty.to_string()));
         }
         props = node.get("properties");
+        i = j;
     }
     // Unmapped (e.g. a search across indices): `x.keyword` is the dynamic
     // keyword sub-field of `x`.
@@ -478,7 +536,16 @@ fn navigate<'a>(v: &'a Value, path: &[&str]) -> Vec<&'a Value> {
         };
     }
     match v {
-        Value::Object(m) => m.get(path[0]).map(|nv| navigate(nv, &path[1..])).unwrap_or_default(),
+        // A key may itself hold dots (`{"a.b": 1}` is field `a.b` too).
+        Value::Object(m) => {
+            let mut out = m.get(path[0]).map(|nv| navigate(nv, &path[1..])).unwrap_or_default();
+            for i in 2..=path.len() {
+                if let Some(nv) = m.get(&path[..i].join(".")) {
+                    out.extend(navigate(nv, &path[i..]));
+                }
+            }
+            out
+        }
         Value::Array(arr) => arr.iter().flat_map(|e| navigate(e, path)).collect(),
         _ => Vec::new(),
     }
@@ -504,12 +571,15 @@ fn value_to_term(v: &Value) -> String {
 pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> {
     let (path, ty) = resolve_field(mappings, field);
     let ty = ty.as_deref();
+    if ty == Some("flattened") {
+        return dsl::flattened_values(source, &path);
+    }
     if ty == Some("keyword") && path != field && field.ends_with(".keyword") {
         return raw_values(source, &path)
             .into_iter()
             .filter_map(Value::as_str)
             .filter(|s| s.chars().count() <= 256)
-            .map(str::to_string)
+            .map(|s| analysis::normalize(mappings, field, s))
             .collect();
     }
     let mut out = Vec::new();
@@ -520,10 +590,10 @@ pub fn tokens_for(mappings: &Value, source: &Value, field: &str) -> Vec<String> 
                 if ty == Some("keyword") {
                     // Values over `ignore_above` aren't indexed.
                     if ignore_above.is_none_or(|n| s.chars().count() <= n) {
-                        out.push(s.clone());
+                        out.push(analysis::normalize(mappings, field, s));
                     }
                 } else {
-                    out.extend(analysis::standard(s));
+                    out.extend(analysis::field_terms(mappings, field, s, analysis::Mode::Index));
                 }
             }
             Value::Number(n) => out.push(n.to_string()),
@@ -539,12 +609,46 @@ fn meta_tokens(mappings: &Value, d: &CommittedDoc, field: &str) -> Vec<String> {
     match field {
         "_id" => vec![d.id.clone()],
         "_index" => vec![d.index.clone()],
+        "_ignored" => super::docparse::ignored_fields(mappings, &Value::Null, d.full()),
         _ => tokens_for(mappings, &d.source, field),
     }
 }
 
 pub(super) fn doc_tokens(mappings: &Value, docs: &[CommittedDoc], field: &str) -> Vec<Vec<String>> {
     docs.iter().map(|d| tokens_for(mappings, &d.source, field)).collect()
+}
+
+/// Each document's terms of `field` with their positions (phrase
+/// matching): analyzed for text fields, whole values otherwise.
+pub(super) fn doc_positions(
+    mappings: &Value,
+    docs: &[CommittedDoc],
+    field: &str,
+) -> Vec<Vec<(String, i64)>> {
+    let (path, ty) = resolve_field(mappings, field);
+    let text = matches!(ty.as_deref(), None | Some("text") | Some("match_only_text"));
+    docs.iter()
+        .map(|d| {
+            if !text {
+                return tokens_for(mappings, &d.source, field)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, t)| (t, i as i64 * 101))
+                    .collect();
+            }
+            let vals: Vec<String> = raw_values(&d.source, &path)
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let refs: Vec<&str> = vals.iter().map(String::as_str).collect();
+            analysis::field_positions(mappings, field, &refs, analysis::Mode::Index)
+        })
+        .collect()
 }
 
 /// BM25 (Lucene/Elasticsearch defaults k1=1.2, b=0.75) over the given field
@@ -609,7 +713,10 @@ fn eval_term(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usiz
         Some(t) => (t.clone(), spec.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32),
         None => value_and_boost(spec),
     };
-    let target = value_to_term(&value);
+    let target = analysis::normalize(mappings, field, &value_to_term(&value));
+    if let Some(scores) = dsl::term_scores(mappings, docs, field, spec, &target, boost) {
+        return scores;
+    }
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
         if meta_tokens(mappings, d, field).contains(&target) {
@@ -625,8 +732,12 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
     else {
         return HashMap::new();
     };
-    let targets: Vec<String> =
-        arr.as_array().map(|a| a.iter().map(value_to_term).collect()).unwrap_or_default();
+    let targets: Vec<String> = arr
+        .as_array()
+        .map(|a| {
+            a.iter().map(|v| analysis::normalize(mappings, field, &value_to_term(v))).collect()
+        })
+        .unwrap_or_default();
     let mut out = HashMap::new();
     for (idx, d) in docs.iter().enumerate() {
         let toks = meta_tokens(mappings, d, field);
@@ -641,9 +752,40 @@ fn eval_terms(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usi
 /// boolean, date) fields take it whole, text fields through `standard`.
 pub(super) fn analyze_for(mappings: &Value, field: &str, text: &str) -> Vec<String> {
     match resolve_field(mappings, field).1.as_deref() {
-        None | Some("text") | Some("match_only_text") => analysis::standard(text),
+        None | Some("text") | Some("match_only_text") => {
+            analysis::field_terms(mappings, field, text, analysis::Mode::Search)
+        }
+        Some("keyword") => vec![analysis::normalize(mappings, field, text)],
         Some(_) => vec![text.to_string()],
     }
+}
+
+/// A query string analyzed with an explicit `analyzer` parameter, or the
+/// way `field` analyzes it.
+fn analyze_with(mappings: &Value, field: &str, text: &str, analyzer: Option<&str>) -> Vec<String> {
+    match analyzer {
+        Some(a) => analysis::analyzer(a).terms(text),
+        None => analyze_for(mappings, field, text),
+    }
+}
+
+/// A phrase query's terms with their positions: the field's search quote
+/// analyzer (or `analyzer`) for text fields, the whole value otherwise.
+pub(super) fn analyze_phrase(
+    mappings: &Value,
+    field: &str,
+    text: &str,
+    analyzer: Option<&str>,
+) -> Vec<(String, i64)> {
+    let toks = match (analyzer, resolve_field(mappings, field).1.as_deref()) {
+        (Some(a), _) => analysis::analyzer(a).tokens(text),
+        (None, None | Some("text") | Some("match_only_text")) => {
+            analysis::field_tokens(mappings, field, text, analysis::Mode::Quote)
+        }
+        _ => return analyze_for(mappings, field, text).into_iter().map(|t| (t, 0)).collect(),
+    };
+    let pos = analysis::positions(&toks);
+    toks.into_iter().zip(pos).map(|(t, p)| (t.term, p)).collect()
 }
 
 /// A query value as text: `"quick"`, `10`, `true`.
@@ -671,7 +813,8 @@ pub(super) fn eval_match(
     } else {
         (query_text(Some(spec)), "or".to_string(), 1.0)
     };
-    let query_terms = analyze_for(mappings, field, &text);
+    let analyzer = spec.get("analyzer").and_then(Value::as_str);
+    let query_terms = analyze_with(mappings, field, &text, analyzer);
     if query_terms.is_empty() {
         return HashMap::new();
     }
@@ -681,80 +824,6 @@ pub(super) fn eval_match(
         scores.values_mut().for_each(|s| *s *= boost);
     }
     scores
-}
-
-/// Damerau-Levenshtein (optimal string alignment) distance.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    let mut d = vec![vec![0usize; b.len() + 1]; a.len() + 1];
-    for (i, row) in d.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in d[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=a.len() {
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            d[i][j] = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
-            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                d[i][j] = d[i][j].min(d[i - 2][j - 2] + 1);
-            }
-        }
-    }
-    d[a.len()][b.len()]
-}
-
-/// `fuzziness` as a maximum edit count for a term (`AUTO` = 0 below 3
-/// characters, 1 below 6, else 2).
-fn max_edits(fuzziness: Option<&Value>, term: &str) -> usize {
-    let len = term.chars().count();
-    match fuzziness {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or(0).min(2) as usize,
-        Some(Value::String(s)) if s.parse::<usize>().is_ok() => s.parse::<usize>().unwrap().min(2),
-        _ => {
-            if len < 3 {
-                0
-            } else if len < 6 {
-                1
-            } else {
-                2
-            }
-        }
-    }
-}
-
-/// `fuzzy`: terms within the edit distance, scored like the terms they
-/// matched.
-fn eval_fuzzy(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
-    let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
-    let (value, fuzziness, prefix_len, boost) = match spec {
-        Value::Object(o) => (
-            query_text(o.get("value")),
-            o.get("fuzziness").cloned(),
-            o.get("prefix_length").and_then(Value::as_u64).unwrap_or(0) as usize,
-            o.get("boost").and_then(Value::as_f64).unwrap_or(1.0) as f32,
-        ),
-        other => (query_text(Some(other)), None, 0, 1.0),
-    };
-    let edits = max_edits(fuzziness.as_ref(), &value);
-    let prefix: String = value.chars().take(prefix_len).collect();
-    let mut candidates: HashSet<String> = HashSet::new();
-    for d in docs {
-        for t in meta_tokens(mappings, d, field) {
-            if t.starts_with(&prefix) && edit_distance(&t, &value) <= edits {
-                candidates.insert(t);
-            }
-        }
-    }
-    let mut out: HashMap<usize, f32> = HashMap::new();
-    for term in candidates {
-        for (i, s) in bm25_scores(mappings, docs, field, std::slice::from_ref(&term), false) {
-            let e = out.entry(i).or_insert(0.0);
-            *e = e.max(s * boost);
-        }
-    }
-    out
 }
 
 /// `dis_max`: a document's best sub-query score, plus `tie_breaker` times
@@ -782,63 +851,8 @@ fn eval_dis_max(
         .collect())
 }
 
-/// Whether `query_terms` occurs in `doc_tokens` as a contiguous run at
-/// consecutive positions — Lucene's default `slop=0` phrase match. Document
-/// term vectors here are already position-ordered with no gaps (nothing
-/// filters tokens out of `tokens_for`), so the vector index *is* the term
-/// position, exactly like a real positional inverted index at slop 0.
-fn phrase_matches(doc_tokens: &[String], query_terms: &[String]) -> bool {
-    let n = query_terms.len();
-    if n == 0 || doc_tokens.len() < n {
-        return false;
-    }
-    (0..=doc_tokens.len() - n).any(|start| doc_tokens[start..start + n] == query_terms[..])
-}
-
-/// A sloppy phrase match: some choice of positions for the query terms
-/// whose total displacement from consecutive order is at most `slop`
-/// (Lucene's edit-distance notion of phrase slop, reordering included).
-pub(super) fn sloppy_phrase_matches(
-    doc_tokens: &[String],
-    query_terms: &[String],
-    slop: usize,
-) -> bool {
-    if slop == 0 {
-        return phrase_matches(doc_tokens, query_terms);
-    }
-    let positions: Vec<Vec<usize>> = query_terms
-        .iter()
-        .map(|t| doc_tokens.iter().enumerate().filter(|(_, d)| *d == t).map(|(i, _)| i).collect())
-        .collect();
-    if positions.iter().any(Vec::is_empty) {
-        return false;
-    }
-    fn search(positions: &[Vec<usize>], k: usize, chosen: &mut Vec<usize>, slop: usize) -> bool {
-        if k == positions.len() {
-            let offsets: Vec<i64> =
-                chosen.iter().enumerate().map(|(i, &p)| p as i64 - i as i64).collect();
-            let (lo, hi) = (offsets.iter().min().unwrap(), offsets.iter().max().unwrap());
-            return (hi - lo) as usize <= slop;
-        }
-        for &p in &positions[k] {
-            if chosen.contains(&p) {
-                continue;
-            }
-            chosen.push(p);
-            if search(positions, k + 1, chosen, slop) {
-                return true;
-            }
-            chosen.pop();
-        }
-        false
-    }
-    search(&positions, 0, &mut Vec::new(), slop)
-}
-
 /// `match_phrase`: like `match`, but the query's analyzed terms must appear
-/// in the document at consecutive positions, in order (slop 0 — the only
-/// slop value implemented; a non-zero `slop` option is accepted but
-/// currently treated as 0).
+/// in the document at the same relative positions (within `slop`).
 fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some((field, spec)) = field_and_spec(v) else { return HashMap::new() };
     let (text, slop) = if let Some(o) = spec.as_object() {
@@ -846,22 +860,38 @@ fn eval_match_phrase(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> Hash
     } else {
         (query_text(Some(spec)), 0)
     };
-    let query_terms = analyze_for(mappings, field, &text);
-    if query_terms.is_empty() {
+    let analyzer = spec.get("analyzer").and_then(Value::as_str);
+    let phrase = analyze_phrase(mappings, field, &text, analyzer);
+    if phrase.is_empty() {
         return HashMap::new();
     }
-    let per_doc = doc_tokens(mappings, docs, field);
-    let matched: HashSet<usize> = per_doc
+    let per_doc = doc_positions(mappings, docs, field);
+    // BM25 over the phrase frequency (exact matches, or Lucene's sloppy
+    // frequency 1/(1+distance) per match), with the terms' idfs summed.
+    let lens = doc_tokens(mappings, docs, field);
+    let doc_count = lens.iter().filter(|t| !t.is_empty()).count() as u64;
+    let total: u64 = lens.iter().map(|t| t.len() as u64).sum();
+    let avg = if doc_count > 0 { total as f32 / doc_count as f32 } else { 1.0 };
+    let mut terms: Vec<&String> = phrase.iter().map(|t| &t.0).collect();
+    terms.sort();
+    terms.dedup();
+    let idf: f32 = terms
         .iter()
-        .enumerate()
-        .filter(|(_, toks)| sloppy_phrase_matches(toks, &query_terms, slop))
-        .map(|(idx, _)| idx)
-        .collect();
-    // Score the same as an AND `match` (every term must be present, which a
-    // phrase match already implies) restricted to documents where the
-    // phrase actually occurs at consecutive positions.
-    let mut scores = bm25_scores(mappings, docs, field, &query_terms, true);
-    scores.retain(|idx, _| matched.contains(idx));
+        .map(|t| {
+            let df = lens.iter().filter(|toks| toks.contains(t)).count() as u64;
+            scoring::idf(df, doc_count.max(1))
+        })
+        .sum();
+    let mut scores = HashMap::new();
+    for (idx, toks) in per_doc.iter().enumerate() {
+        let freq = analysis::phrase_freq(toks, &phrase, slop);
+        if freq <= 0.0 {
+            continue;
+        }
+        let dl = scoring::norm_doc_len(lens[idx].len() as u32).max(1) as f32;
+        let norm = scoring::K1 * ((1.0 - scoring::B) + scoring::B * dl / avg);
+        scores.insert(idx, idf * (freq * (scoring::K1 + 1.0)) / (freq + norm));
+    }
     scores
 }
 
@@ -884,10 +914,7 @@ fn parse_field_boost(spec: &str) -> (&str, f32) {
 fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
     let Some(obj) = v.as_object() else { return HashMap::new() };
     let text = obj.get("query").and_then(Value::as_str).unwrap_or("");
-    let query_terms = analysis::standard(text);
-    if query_terms.is_empty() {
-        return HashMap::new();
-    }
+    let analyzer = obj.get("analyzer").and_then(Value::as_str);
     let fields: Vec<(String, f32)> = obj
         .get("fields")
         .and_then(Value::as_array)
@@ -912,6 +939,9 @@ fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashM
             if let Some(slop) = obj.get("slop") {
                 spec["slop"] = slop.clone();
             }
+            if let Some(a) = analyzer {
+                spec["analyzer"] = json!(a);
+            }
             let q = json!({ field.as_str(): spec });
             let scores = if kind == Some("phrase") {
                 eval_match_phrase(&q, mappings, docs)
@@ -928,6 +958,10 @@ fn eval_multi_match(v: &Value, mappings: &Value, docs: &[CommittedDoc]) -> HashM
 
     let mut best: HashMap<usize, f32> = HashMap::new();
     for (field, boost) in &fields {
+        let query_terms = analyze_with(mappings, field, text, analyzer);
+        if query_terms.is_empty() {
+            continue;
+        }
         for (idx, score) in bm25_scores(mappings, docs, field, &query_terms, require_all) {
             let scaled = score * boost;
             let entry = best.entry(idx).or_insert(scaled);
@@ -1069,6 +1103,8 @@ fn eval_range(
         }
         return Ok(out);
     }
+    let numeric = dsl::numeric_range_bounds(cond, ty.as_deref())?;
+    let cond = numeric.as_ref().unwrap_or(cond);
     for (idx, d) in docs.iter().enumerate() {
         if raw_values(&d.source, &path).into_iter().any(|val| in_range(val, cond)) {
             out.insert(idx, boost);
@@ -1119,7 +1155,12 @@ fn date_bounds(
             continue;
         }
         let round_up = op == "gt" || op == "lte";
+        let explicit_format = cond.get("format").is_some();
         let t = match b {
+            // With a `format`, a number is a date in it (`2023` as `uuuu`).
+            Value::Number(n) if explicit_format => {
+                dates::parse_math(&n.to_string(), now, round_up, format.as_deref(), tz)
+            }
             Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
             Value::String(s) => dates::parse_math(s, now, round_up, format.as_deref(), tz),
             _ => None,
@@ -1172,16 +1213,19 @@ pub(super) fn eval_prefix(
 }
 
 fn eval_ids(v: &Value, docs: &[CommittedDoc]) -> HashMap<usize, f32> {
-    let ids: Vec<&str> = v
+    // Numbers name ids too (`"values": [1]`).
+    let ids: Vec<String> = v
         .get("values")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| {
+                    x.as_str().map(str::to_string).or_else(|| x.as_number().map(|n| n.to_string()))
+                })
+                .collect()
+        })
         .unwrap_or_default();
-    docs.iter()
-        .enumerate()
-        .filter(|(_, d)| ids.contains(&d.id.as_str()))
-        .map(|(i, _)| (i, 1.0))
-        .collect()
+    docs.iter().enumerate().filter(|(_, d)| ids.contains(&d.id)).map(|(i, _)| (i, 1.0)).collect()
 }
 
 pub(super) fn clauses(v: &Value, key: &str) -> Vec<Value> {
@@ -1222,7 +1266,10 @@ fn eval_bool(
     }
     if !should.is_empty() {
         let default_msm = if must.is_empty() && filter.is_empty() { 1 } else { 0 };
-        let msm = v.get("minimum_should_match").and_then(Value::as_i64).unwrap_or(default_msm);
+        let msm = match v.get("minimum_should_match") {
+            Some(spec) => fuzzy::min_should_match(spec, should.len())? as i64,
+            None => default_msm,
+        };
         let mut should_count: HashMap<usize, i64> = HashMap::new();
         for q in &should {
             for (i, s) in eval(q, mappings, docs)? {
@@ -1270,6 +1317,16 @@ pub fn eval(
     if let Some(e) = vectors::unsupported_query(obj, mappings) {
         return Err(e);
     }
+    tsdb::check_query(obj)?;
+    if let Some(r) = super::ranges::eval(obj, mappings, docs) {
+        return r;
+    }
+    if let Some(r) = features::eval(obj, mappings, docs) {
+        return r;
+    }
+    if let Some(r) = dsl::eval_extra(obj, mappings, docs) {
+        return r;
+    }
     if obj.contains_key("match_all") {
         return Ok((0..docs.len()).map(|i| (i, 1.0)).collect());
     }
@@ -1283,6 +1340,13 @@ pub fn eval(
         return Ok(eval_terms(v, mappings, docs));
     }
     if let Some(v) = obj.get("match") {
+        // Metadata fields match their exact value.
+        if let Some((f @ ("_index" | "_id"), spec)) =
+            v.as_object().and_then(|m| m.iter().next()).map(|(f, s)| (f.as_str(), s))
+        {
+            let value = spec.get("query").unwrap_or(spec).clone();
+            return eval(&json!({"term": {f: {"value": value}}}), mappings, docs);
+        }
         return Ok(eval_match(v, mappings, docs));
     }
     if let Some(v) = obj.get("match_phrase") {
@@ -1301,6 +1365,15 @@ pub fn eval(
         return eval_range(v, mappings, docs);
     }
     if let Some(v) = obj.get("exists") {
+        // `_ignored` exists on documents with an ignored value.
+        if v.get("field").and_then(Value::as_str) == Some("_ignored") {
+            return Ok(docs
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| !meta_tokens(mappings, d, "_ignored").is_empty())
+                .map(|(i, _)| (i, 1.0))
+                .collect());
+        }
         return Ok(eval_exists(v, docs));
     }
     if let Some(v) = obj.get("prefix") {
@@ -1318,9 +1391,6 @@ pub fn eval(
     if let Some(v) = obj.get("nested") {
         return eval_nested(v, mappings, docs);
     }
-    if let Some(v) = obj.get("fuzzy") {
-        return Ok(eval_fuzzy(v, mappings, docs));
-    }
     if let Some(v) = obj.get("query_string") {
         let q = query_string::query_string(v, mappings)?;
         return eval(&q, mappings, docs);
@@ -1336,9 +1406,6 @@ pub fn eval(
     }
     if let Some(v) = obj.get("match_phrase_prefix") {
         return Ok(queries::match_phrase_prefix(v, mappings, docs));
-    }
-    if let Some(v) = obj.get("match_bool_prefix") {
-        return Ok(queries::match_bool_prefix(v, mappings, docs));
     }
     if let Some(v) = obj.get("boosting") {
         return queries::boosting(v, mappings, docs);
@@ -1369,7 +1436,7 @@ pub fn eval(
     // unsupported. See `docs/specs/README.md`'s own stated principle:
     // "never silently wrong."
     let clause = obj.keys().next().map(String::as_str).unwrap_or("<empty>");
-    Err(EsError::parsing(&format!("unknown query [{clause}]")))
+    Err(dsl::unknown_query(clause))
 }
 
 fn parse_sort(s: &Value) -> (String, String) {
@@ -1550,9 +1617,15 @@ fn agg_values(mappings: &Value, source: &Value, field: &str) -> Vec<Value> {
         match v {
             Value::String(s) => {
                 if ty == Some("keyword") {
-                    out.push(Value::String(s.clone()));
+                    out.push(Value::String(analysis::normalize(mappings, field, s)));
+                } else if ty == Some("ip") {
+                    out.push(json!(tsdb::format_ip(s).unwrap_or_else(|| s.clone())));
                 } else {
-                    out.extend(analysis::standard(s).into_iter().map(Value::String));
+                    out.extend(
+                        analysis::field_terms(mappings, field, s, analysis::Mode::Index)
+                            .into_iter()
+                            .map(Value::String),
+                    );
                 }
             }
             Value::Number(_) | Value::Bool(_) => out.push(v.clone()),
@@ -1607,7 +1680,12 @@ fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
     let mut buckets: HashMap<String, (Value, Vec<usize>)> = HashMap::new();
     for &idx in bucket {
         let mut seen = HashSet::new();
-        for v in agg_values(mappings, &docs[idx].source, field) {
+        let values = if field == "_tsid" {
+            docs[idx].tsid.iter().map(|t| json!(t)).collect()
+        } else {
+            agg_values(mappings, &docs[idx].source, field)
+        };
+        for v in values {
             let key = value_to_term(&v);
             if seen.insert(key.clone()) {
                 buckets.entry(key).or_insert_with(|| (v, Vec::new())).1.push(idx);
@@ -1615,8 +1693,41 @@ fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
         }
     }
     let mut entries: Vec<(Value, Vec<usize>)> = buckets.into_values().collect();
+    let ip = resolve_field(mappings, field).1.as_deref() == Some("ip");
+    let key_cmp = |a: &Value, b: &Value| -> Ordering {
+        match (a, b) {
+            _ if field == "_tsid" => {
+                tsdb::tsid_sort_key(&value_to_term(a)).cmp(&tsdb::tsid_sort_key(&value_to_term(b)))
+            }
+            (Value::Number(_), Value::Number(_)) => number_cmp(a, b).unwrap_or(Ordering::Equal),
+            (Value::String(x), Value::String(y)) if ip => {
+                let bits = |s: &str| match s.parse::<std::net::IpAddr>() {
+                    Ok(std::net::IpAddr::V4(v4)) => v4.to_ipv6_mapped().octets(),
+                    Ok(std::net::IpAddr::V6(v6)) => v6.octets(),
+                    Err(_) => [0xff; 16],
+                };
+                bits(x).cmp(&bits(y))
+            }
+            _ => value_to_term(a).cmp(&value_to_term(b)),
+        }
+    };
+    // `order`: `{"_key"|"_count": "asc"|"desc"}` or a list of them; the
+    // default is by count, most first.
+    let order: Vec<(bool, bool)> = match inner.get("order") {
+        Some(Value::Array(a)) => a.iter().filter_map(terms_order).collect(),
+        Some(o) => terms_order(o).into_iter().collect(),
+        None => Vec::new(),
+    };
+    let order = if order.is_empty() { vec![(false, false)] } else { order };
     entries.sort_by(|a, b| {
-        b.1.len().cmp(&a.1.len()).then_with(|| value_to_term(&a.0).cmp(&value_to_term(&b.0)))
+        for (by_key, asc) in &order {
+            let o = if *by_key { key_cmp(&a.0, &b.0) } else { a.1.len().cmp(&b.1.len()) };
+            let o = if *asc { o } else { o.reverse() };
+            if o != Ordering::Equal {
+                return o;
+            }
+        }
+        key_cmp(&a.0, &b.0)
     });
     let sum_other: usize = entries.iter().skip(size).map(|(_, idxs)| idxs.len()).sum();
     let out_buckets: Vec<Value> = entries
@@ -1630,6 +1741,18 @@ fn terms_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[us
         })
         .collect();
     json!({"doc_count_error_upper_bound": 0, "sum_other_doc_count": sum_other, "buckets": out_buckets})
+}
+
+/// One `terms` `order` entry: (by key, ascending). Orders on sub-aggs
+/// aren't modelled.
+fn terms_order(o: &Value) -> Option<(bool, bool)> {
+    let (k, dir) = o.as_object()?.iter().next()?;
+    let asc = dir.as_str()? == "asc";
+    match k.as_str() {
+        "_key" | "_term" => Some((true, asc)),
+        "_count" => Some((false, asc)),
+        _ => None,
+    }
 }
 
 fn range_agg(spec: &Value, mappings: &Value, docs: &[CommittedDoc], bucket: &[usize]) -> Value {
@@ -2291,6 +2414,9 @@ pub struct SearchOptions {
     /// The searched index's settings when there is exactly one (the
     /// highlighter reads `index.highlight.*`).
     pub settings: Value,
+    /// Only these documents (positions in `docs`) can match: a collapse
+    /// group's inner hits are a search over its documents alone.
+    pub restrict: Option<HashSet<usize>>,
 }
 
 pub fn search_with(
@@ -2299,6 +2425,9 @@ pub fn search_with(
     body: &Value,
     opts: &SearchOptions,
 ) -> Result<Value, EsError> {
+    if retrievers::applies(body) {
+        return retrievers::search(mappings, docs, body, opts);
+    }
     if let Some(spec) = body.get("suggest") {
         let suggestions = suggest::suggest(spec, mappings, docs)?;
         let mut rest = body.clone();
@@ -2328,7 +2457,7 @@ pub fn search_with(
         return Err(EsError::new(
             400,
             "illegal_argument_exception",
-            &format!("[from] parameter cannot be negative, found [{from}]"),
+            &format!("[from] parameter cannot be negative but was [{from}]"),
         ));
     }
     if body.get("terminate_after").and_then(Value::as_i64).is_some_and(|n| n < 0) {
@@ -2355,14 +2484,15 @@ pub fn search_with(
             "Validation Failed: 1: [from] parameter must be set to 0 when [search_after] is used;",
         ));
     }
-    if from + size > 10_000 && !opts.all_hits {
+    let window = super::limits::setting(&opts.settings, "max_result_window").unwrap_or(10_000);
+    if from + size > window && !opts.all_hits {
         return Err(EsError::shard_failure(
             "illegal_argument_exception",
             &format!(
-                "Result window is too large, from + size must be less than or equal to: [10000] \
-                 but was [{}]. See the scroll api for a more efficient way to request large data \
-                 sets. This limit can be set by changing the [index.max_result_window] index \
-                 level setting.",
+                "Result window is too large, from + size must be less than or equal to: \
+                 [{window}] but was [{}]. See the scroll api for a more efficient way to request \
+                 large data sets. This limit can be set by changing the \
+                 [index.max_result_window] index level setting.",
                 from + size
             ),
         ));
@@ -2380,6 +2510,14 @@ pub fn search_with(
     let after_len = search_after.map(|a| a.as_array().map_or(1, Vec::len));
     if opts.pit && !specs.is_empty() && after_len.is_none_or(|n| n == specs.len() + 1) {
         specs.extend(sorting::parse(&json!("_shard_doc"), mappings, typed)?);
+    }
+    // `_shard_doc` is the order of a point in time.
+    if !opts.pit && body.get("sort").is_some_and(|v| v.to_string().contains("\"_shard_doc\"")) {
+        return Err(EsError::new(
+            400,
+            "action_request_validation_exception",
+            "Validation Failed: 1: [_shard_doc] sort field cannot be used without [point in time];",
+        ));
     }
     if search_after.is_some() && specs.is_empty() {
         return Err(EsError::shard_failure(
@@ -2402,6 +2540,9 @@ pub fn search_with(
     let originals = docs;
     let docs: &[CommittedDoc] = view.as_deref().unwrap_or(docs);
     let mut scores = eval(&query, mappings, docs)?;
+    if let Some(only) = &opts.restrict {
+        scores.retain(|i, _| only.contains(i));
+    }
     apply_indices_boost(body, docs, &mut scores);
     let named = named_queries(&query, mappings, docs)?;
     let mut inner = Vec::new();
@@ -2410,8 +2551,14 @@ pub fn search_with(
         let min_score = min_score as f32;
         scores.retain(|_, s| *s >= min_score);
     }
+    let terminated = retrievers::terminate_after(body, &query, &mut scores);
     let matched: Vec<usize> = scores.keys().copied().collect();
-    let total = scores.len();
+    // `post_filter` narrows the hits after aggregations saw them all.
+    if let Some(pf) = body.get("post_filter") {
+        let keep = eval(pf, mappings, docs)?;
+        scores.retain(|i, _| keep.contains_key(i));
+    }
+    let total = terminated.as_ref().map_or(scores.len(), |t| t.total);
 
     let mut ranked: Vec<(usize, f32, Vec<Value>)> = scores
         .into_iter()
@@ -2425,12 +2572,14 @@ pub fn search_with(
     } else {
         ranked.sort_by(|a, b| sorting::compare_keys(&specs, &a.2, &b.2).then(a.0.cmp(&b.0)));
     }
+    let named_scores =
+        body.get("include_named_queries_score").and_then(Value::as_bool).unwrap_or(false);
     let max_of = |r: &[(usize, f32, Vec<Value>)]| {
         r.iter().map(|h| h.1).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
     };
     let track_scores = body.get("track_scores").and_then(Value::as_bool).unwrap_or(false);
     let shows_scores = specs.is_empty() || track_scores || specs.iter().any(|s| s.is_score());
-    let max_score =
+    let mut max_score =
         if size == 0 || !(specs.is_empty() || track_scores) { None } else { max_of(&ranked) };
     if let Some(after) = search_after {
         let after = after.as_array().cloned().unwrap_or_else(|| vec![after.clone()]);
@@ -2438,11 +2587,28 @@ pub fn search_with(
         ranked.retain(|h| sorting::compare_keys(&specs, &h.2, &after) == Ordering::Greater);
     }
     // Field collapsing: the top hit of each value; inner hits per group.
-    let all_ranked = ranked.clone();
     if let Some(c) = &collapse {
         let mut seen = HashSet::new();
         ranked.retain(|h| seen.insert(collapse_key(&docs[h.0], c).to_string()));
     }
+    // `rescore`: the top hits scored again by a second query.
+    rescore::check_sort(body, specs.is_empty() || (specs.len() == 1 && specs[0].is_score()))?;
+    let mut rescored = HashMap::new();
+    if body.get("rescore").is_some_and(|r| !r.is_null()) {
+        let mut pairs: Vec<(usize, f32)> = ranked.iter().map(|h| (h.0, h.1)).collect();
+        let keep = if opts.all_hits { pairs.len() } else { (from + size) as usize };
+        if let Some(steps) = rescore::apply(body, &mut pairs, mappings, docs, keep)? {
+            rescored = steps;
+            ranked = pairs
+                .into_iter()
+                .map(|(i, sc)| (i, sc, sorting::keys(&specs, &docs[i], i, sc)))
+                .collect();
+            if size != 0 {
+                max_score = ranked.first().map(|h| h.1);
+            }
+        }
+    }
+    let explain = body.get("explain").and_then(Value::as_bool).unwrap_or(false);
 
     let source_filter = body.get("_source");
     let stored = body.get("stored_fields");
@@ -2481,18 +2647,50 @@ pub fn search_with(
                 hit["_primary_term"] = json!(1);
             }
             hit["_score"] = if shows_scores { json!(score) } else { Value::Null };
+            if explain {
+                hit["_shard"] = json!(format!("[{}][0]", d.index));
+                hit["_node"] = json!("noida");
+                hit["_explanation"] = explain::hit_explanation(
+                    &query,
+                    mappings,
+                    docs,
+                    *idx,
+                    *score,
+                    rescored.get(idx),
+                );
+            }
             // `"_source": false` omits the key, as Elasticsearch does.
             let source_enabled = mappings
                 .get("_source")
                 .and_then(|s| s.get("enabled"))
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            // Script fields alone don't bring `_source` along.
+            let scripted_only = body.get("script_fields").is_some() && source_filter.is_none();
             if !matches!(source_filter, Some(Value::Bool(false)))
                 && !stored_none
                 && source_enabled
+                && !scripted_only
                 && (stored_wants_source || source_filter.is_some())
             {
                 hit["_source"] = apply_source_filter(&d.source, source_filter);
+            }
+            // `_ignored`, and with `fields` the values that were ignored.
+            if !stored_none {
+                let ignored = super::docparse::ignored_values(mappings, &opts.settings, d.full());
+                if !ignored.is_empty() {
+                    hit["_ignored"] = json!(ignored.iter().map(|(f, _)| f).collect::<Vec<_>>());
+                    if let Some(spec) = body.get("fields") {
+                        let ifv: Map<String, Value> = ignored
+                            .iter()
+                            .filter(|(f, _)| fields::requested(spec, f))
+                            .map(|(f, v)| (f.clone(), json!(v)))
+                            .collect();
+                        if !ifv.is_empty() {
+                            hit["ignored_field_values"] = Value::Object(ifv);
+                        }
+                    }
+                }
             }
             let mut fetched = Map::new();
             for (key, kind) in [
@@ -2509,6 +2707,9 @@ pub fn search_with(
                     }
                 }
             }
+            for (k, v) in super::script_fields::values(body, mappings, d)? {
+                fetched.entry(k).or_insert(v);
+            }
             if !fetched.is_empty() {
                 hit["fields"] = Value::Object(fetched);
             }
@@ -2524,7 +2725,7 @@ pub fn search_with(
                 }
             }
             if !specs.is_empty() {
-                hit["sort"] = Value::Array(keys.clone());
+                hit["sort"] = Value::Array(sorting::display(&specs, keys));
             }
             for (name, per) in &inner {
                 if let Some(h) = per.get(idx) {
@@ -2534,20 +2735,27 @@ pub fn search_with(
             if let Some(c) = &collapse {
                 let key = collapse_key(&docs[*idx], c);
                 hit["fields"][c.field.as_str()] = json!([key.clone()]);
-                for ih in &c.inner {
-                    let group: Vec<(usize, f32)> = all_ranked
-                        .iter()
-                        .filter(|h| collapse_key(&docs[h.0], c) == key)
-                        .map(|h| (h.0, h.1))
-                        .collect();
-                    hit["inner_hits"][ih.name.as_str()] =
-                        collapse_inner_hits(ih, &group, mappings, docs, originals)?;
+                if !c.inner.is_empty() {
+                    let group: HashSet<usize> =
+                        (0..docs.len()).filter(|i| collapse_key(&docs[*i], c) == key).collect();
+                    for ih in &c.inner {
+                        hit["inner_hits"][ih.name.as_str()] =
+                            collapse_inner_hits(ih, body, &group, mappings, originals, opts)?;
+                    }
                 }
             }
-            let names: Vec<&String> =
-                named.iter().filter(|(_, m)| m.contains(idx)).map(|(n, _)| n).collect();
+            let mut names: Vec<(&String, f32)> =
+                named.iter().filter_map(|(n, m)| m.get(idx).map(|sc| (n, *sc))).collect();
+            let mut order: Vec<&String> = names.iter().map(|(n, _)| *n).collect();
+            dsl::java_hash_order(&mut order);
+            names.sort_by_key(|(n, _)| order.iter().position(|o| o == n));
             if !names.is_empty() {
-                hit["matched_queries"] = json!(names);
+                // `include_named_queries_score`: each name with its score.
+                hit["matched_queries"] = if named_scores {
+                    Value::Object(names.iter().map(|(n, sc)| ((*n).clone(), json!(sc))).collect())
+                } else {
+                    json!(names.iter().map(|(n, _)| n).collect::<Vec<_>>())
+                };
             }
             Ok(hit)
         })
@@ -2564,6 +2772,13 @@ pub fn search_with(
         "_shards": {"total": 1, "successful": 1, "skipped": 0, "failed": 0},
         "hits": hits_obj,
     });
+    if let Some(t) = terminated {
+        resp["terminated_early"] = json!(t.early);
+    }
+    let warnings = features::warnings(body);
+    if !warnings.is_empty() {
+        resp[super::engine::WARNINGS] = json!(warnings);
+    }
     if let Some(agg_spec) = agg_spec {
         resp["aggregations"] = eval_aggs(agg_spec, mappings, docs, &matched);
     }
@@ -2600,19 +2815,19 @@ fn apply_indices_boost(body: &Value, docs: &[CommittedDoc], scores: &mut HashMap
     }
 }
 
+/// Matching documents and their scores.
+type Scores = HashMap<usize, f32>;
+
 /// Every clause of `query` carrying a `_name`, with the documents it
-/// matches (for each hit's `matched_queries`).
+/// matches and their scores (for each hit's `matched_queries`).
 fn named_queries(
     query: &Value,
     mappings: &Value,
     docs: &[CommittedDoc],
-) -> Result<Vec<(String, HashSet<usize>)>, EsError> {
+) -> Result<Vec<(String, Scores)>, EsError> {
     let mut found: Vec<(String, Value)> = vec![];
     collect_named(query, &mut found);
-    found
-        .into_iter()
-        .map(|(n, q)| Ok((n, eval(&q, mappings, docs)?.into_keys().collect())))
-        .collect()
+    found.into_iter().map(|(n, q)| Ok((n, eval(&q, mappings, docs)?))).collect()
 }
 
 fn collect_named(v: &Value, out: &mut Vec<(String, Value)>) {
@@ -2649,13 +2864,13 @@ fn collect_named(v: &Value, out: &mut Vec<(String, Value)>) {
 
 struct CollapseInner {
     name: String,
-    from: usize,
-    size: usize,
-    sort: Option<Value>,
+    spec: Value,
 }
 
 struct CollapseSpec {
     field: String,
+    /// Where the values live: the field, or a field alias's target.
+    path: String,
     ty: Option<String>,
     inner: Vec<CollapseInner>,
 }
@@ -2665,7 +2880,18 @@ fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSp
         .get("field")
         .and_then(Value::as_str)
         .ok_or_else(|| EsError::parsing("Required [field]"))?;
-    let (_, ty) = resolve_field(mappings, field);
+    let (_, mut ty) = resolve_field(mappings, field);
+    let mut path = field.to_string();
+    if ty.as_deref() == Some("alias") {
+        let mut node = mappings;
+        for seg in field.split('.') {
+            node = &node["properties"][seg];
+        }
+        if let Some(p) = node.get("path").and_then(Value::as_str) {
+            path = p.to_string();
+            ty = resolve_field(mappings, p).1;
+        }
+    }
     match ty.as_deref() {
         None => {
             return Err(EsError::shard_failure(
@@ -2688,8 +2914,7 @@ fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSp
             None => false,
         };
         if !same {
-            return Err(EsError::new(
-                400,
+            return Err(EsError::shard_failure(
                 "illegal_argument_exception",
                 "Cannot use [collapse] in conjunction with [search_after] unless the search is \
                  sorted on the same field. Multiple sort fields are not allowed.",
@@ -2701,13 +2926,14 @@ fn collapse_spec(c: &Value, mappings: &Value, body: &Value) -> Result<CollapseSp
         Some(Value::Array(a)) => a.iter().map(inner_spec).collect(),
         Some(o) => vec![inner_spec(o)],
     };
-    Ok(CollapseSpec { field: field.to_string(), ty, inner })
+    Ok(CollapseSpec { field: field.to_string(), path, ty, inner })
 }
 
 fn sort_field_name(v: &Value) -> Option<&str> {
     match v {
         Value::String(s) => Some(s),
-        Value::Object(o) => o.keys().next().map(String::as_str),
+        // `{"a": "asc", "b": "desc"}` sorts on two fields.
+        Value::Object(o) if o.len() == 1 => o.keys().next().map(String::as_str),
         _ => None,
     }
 }
@@ -2715,16 +2941,19 @@ fn sort_field_name(v: &Value) -> Option<&str> {
 fn inner_spec(v: &Value) -> CollapseInner {
     CollapseInner {
         name: v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-        from: v.get("from").and_then(Value::as_u64).unwrap_or(0) as usize,
-        size: v.get("size").and_then(Value::as_u64).unwrap_or(3) as usize,
-        sort: v.get("sort").cloned(),
+        spec: v.clone(),
     }
 }
 
 /// A document's collapse value (`null` for none).
 fn collapse_key(d: &CommittedDoc, c: &CollapseSpec) -> Value {
-    raw_values(&d.source, &c.field)
-        .into_iter()
+    // A search over several indices may reach the field directly in one
+    // and through an alias in another.
+    let mut vals = raw_values(&d.source, &c.path);
+    if vals.is_empty() {
+        vals = raw_values(&d.source, &c.field);
+    }
+    vals.into_iter()
         .next()
         .map(|v| match (c.ty.as_deref(), v) {
             (Some("long" | "integer" | "short" | "byte"), Value::Number(n)) => {
@@ -2735,50 +2964,48 @@ fn collapse_key(d: &CommittedDoc, c: &CollapseSpec) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// A collapse group's inner hits: the original query searched again over
+/// the group's documents alone (as Elasticsearch's expand phase does,
+/// with the group's value as a filter), shaped by the inner hit
+/// definition (`from`, `size`, `sort`, fetch options, a second-level
+/// `collapse`). Without a query the group's hits score 0.
 fn collapse_inner_hits(
     ih: &CollapseInner,
-    group: &[(usize, f32)],
+    body: &Value,
+    group: &HashSet<usize>,
     mappings: &Value,
-    docs: &[CommittedDoc],
     originals: &[CommittedDoc],
+    opts: &SearchOptions,
 ) -> Result<Value, EsError> {
-    let specs = match &ih.sort {
-        Some(s) => sorting::parse(s, mappings, true)?,
-        None => vec![],
-    };
-    let mut ranked: Vec<(usize, f32, Vec<Value>)> =
-        group.iter().map(|(i, s)| (*i, *s, sorting::keys(&specs, &docs[*i], *i, *s))).collect();
-    if specs.is_empty() {
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal).then(a.0.cmp(&b.0)));
-    } else {
-        ranked.sort_by(|a, b| sorting::compare_keys(&specs, &a.2, &b.2).then(a.0.cmp(&b.0)));
-    }
-    let shows_scores = specs.is_empty() || specs.iter().any(|s| s.is_score());
-    let max_score = if shows_scores {
-        ranked.iter().map(|h| h.1).fold(None, |m: Option<f32>, s| Some(m.map_or(s, |m| m.max(s))))
-    } else {
-        None
-    };
-    let hits: Vec<Value> = ranked
-        .iter()
-        .skip(ih.from)
-        .take(ih.size)
-        .map(|(i, sc, keys)| {
-            let d = &originals[*i];
-            let mut h = json!({"_index": d.index, "_id": d.id,
-                "_score": if shows_scores { json!(sc) } else { Value::Null },
-                "_source": d.source});
-            if !specs.is_empty() {
-                h["sort"] = Value::Array(keys.clone());
+    let mut sub = Map::new();
+    sub.insert(
+        "query".into(),
+        body.get("query")
+            .cloned()
+            .unwrap_or_else(|| json!({"bool": {"filter": [{"match_all": {}}]}})),
+    );
+    sub.insert("size".into(), json!(3));
+    if let Some(o) = ih.spec.as_object() {
+        for (k, v) in o {
+            if !matches!(k.as_str(), "name" | "ignore_unmapped") {
+                sub.insert(k.clone(), v.clone());
             }
-            h
-        })
-        .collect();
-    Ok(json!({"hits": {
-        "total": {"value": group.len(), "relation": "eq"},
-        "max_score": max_score,
-        "hits": hits,
-    }}))
+        }
+    }
+    let sub_opts = SearchOptions {
+        typed: opts.typed,
+        settings: opts.settings.clone(),
+        restrict: Some(group.clone()),
+        ..Default::default()
+    };
+    let mut resp = search_with(mappings, originals, &Value::Object(sub), &sub_opts)?;
+    if let Some(h) = resp["hits"].as_object_mut() {
+        // Every inner hit is counted exactly.
+        if h.get("total").is_none() {
+            h.insert("total".into(), json!({"value": group.len(), "relation": "eq"}));
+        }
+    }
+    Ok(json!({"hits": resp["hits"].take()}))
 }
 
 /// Evaluates `query` over the root-level view of `docs` (nested objects
@@ -2820,6 +3047,7 @@ mod tests {
             version: 1,
             seq: 0,
             full_source: None,
+            tsid: None,
         }
     }
 

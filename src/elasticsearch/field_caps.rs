@@ -20,6 +20,9 @@ struct Cap {
     /// A multi-field (`text.keyword`), or a field inside a nested object.
     multifield: bool,
     in_nested: bool,
+    /// In a time-series index: a dimension, or a metric of this kind.
+    dimension: bool,
+    metric: Option<String>,
 }
 
 impl Cap {
@@ -32,6 +35,8 @@ impl Cap {
             meta: Map::new(),
             multifield: false,
             in_nested: false,
+            dimension: false,
+            metric: None,
         }
     }
 }
@@ -110,6 +115,9 @@ fn leaf_caps(
                 cap.meta = meta;
                 cap.multifield = w.multifield;
                 cap.in_nested = w.in_nested;
+                cap.dimension = flag("time_series_dimension").unwrap_or(false);
+                cap.metric =
+                    node.get("time_series_metric").and_then(Value::as_str).map(String::from);
                 out.push((name.clone(), cap));
                 if let Some(subs @ Value::Object(_)) = node.get("fields") {
                     // Multi-fields: `name.sub`.
@@ -129,6 +137,22 @@ fn all_caps(mappings: &Value) -> Vec<(String, Cap)> {
     }
     for (name, ty, s, a) in METADATA {
         out.push((name.to_string(), Cap::new(ty, *s, *a, true)));
+    }
+    // Dimensions and metrics only mean something in a time-series index,
+    // which also has the `_tsid` and `_ts_routing_hash` metadata fields.
+    let time_series = mappings
+        .get("_data_stream_timestamp")
+        .and_then(|d| d.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if time_series {
+        out.push(("_tsid".into(), Cap::new("_tsid", false, true, true)));
+        out.push(("_ts_routing_hash".into(), Cap::new("_ts_routing_hash", false, true, true)));
+    } else {
+        for (_, cap) in out.iter_mut() {
+            cap.dimension = false;
+            cap.metric = None;
+        }
     }
     if has_nested {
         out.push(("_nested_path".into(), Cap::new("_nested_path", true, false, true)));
@@ -185,7 +209,16 @@ pub fn field_caps(
     let mut fields: BTreeMap<String, BTreeMap<String, Vec<(String, Cap)>>> = BTreeMap::new();
     let include_empty = q.get("include_empty_fields").is_none_or(|v| v != "false");
     for (index, mappings, sources) in indices {
-        let caps = all_caps(mappings);
+        let mut caps = all_caps(mappings);
+        // Runtime fields (the index's, then the request's) are searchable
+        // and aggregatable, and shadow a mapped field of the same name.
+        for runtime in [mappings.get("runtime"), body.get("runtime_mappings")] {
+            for (name, def) in runtime.and_then(Value::as_object).into_iter().flatten() {
+                let ty = def.get("type").and_then(Value::as_str).unwrap_or("keyword");
+                caps.retain(|(n, _)| n != name);
+                caps.push((name.clone(), Cap::new(ty, true, true, false)));
+            }
+        }
         // `include_empty_fields=false`: only fields some document has.
         let has_value = |name: &str, cap: &Cap| {
             if include_empty || cap.metadata {
@@ -298,6 +331,26 @@ pub fn field_caps(
                     entries.iter().filter(|(_, c)| !c.aggregatable).map(|(i, _)| i).collect();
                 l.sort();
                 e["non_aggregatable_indices"] = json!(l);
+            }
+            if entries.iter().all(|(_, c)| c.dimension) {
+                e["time_series_dimension"] = json!(true);
+            } else if entries.iter().any(|(_, c)| c.dimension) {
+                e["non_dimension_indices"] = json!(
+                    entries
+                        .iter()
+                        .filter(|(_, c)| !c.dimension)
+                        .map(|(i, _)| i)
+                        .collect::<Vec<_>>()
+                );
+            }
+            match entries.first().map(|(_, c)| &c.metric) {
+                Some(Some(m)) if entries.iter().all(|(_, c)| c.metric.as_ref() == Some(m)) => {
+                    e["time_series_metric"] = json!(m);
+                }
+                _ if entries.iter().any(|(_, c)| c.metric.is_some()) => {
+                    e["metric_conflicts_indices"] = json!(idx);
+                }
+                _ => {}
             }
             let mut meta: BTreeMap<String, Vec<Value>> = BTreeMap::new();
             for (_, c) in &entries {

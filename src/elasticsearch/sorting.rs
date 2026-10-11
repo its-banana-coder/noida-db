@@ -16,13 +16,28 @@ enum Key {
     Field {
         path: String,
         ty: Option<String>,
+        /// Dates: how values are written (the mapping's `format`), how
+        /// sort values are shown (the sort's `format`), and the
+        /// resolution they compare at (`numeric_type`).
+        date: Option<DateSort>,
+        /// A `text` field's index analyzer (its field data are the terms).
+        analyzer: Option<String>,
     },
+    /// A time-series document's `_tsid` (ordered by its bytes).
+    Tsid,
     /// `_geo_distance`: from `origin` (lat, lon), in meters per `unit`.
     Geo {
         path: String,
         origin: (f64, f64),
         unit_m: f64,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+struct DateSort {
+    parse: Option<String>,
+    show: Option<String>,
+    nanos: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -108,6 +123,7 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
             }
             "_score" => Key::Score,
             "_doc" | "_shard_doc" => Key::Doc,
+            "_tsid" => Key::Tsid,
             f => {
                 let (path, ty) = resolve_field(mappings, f);
                 let unmapped = opts.get("unmapped_type").and_then(Value::as_str);
@@ -124,7 +140,7 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
                         &format!("Field [{f}] of type [dense_vector] doesn't support sort"),
                     ));
                 }
-                if ty.as_deref() == Some("text") {
+                if ty.as_deref() == Some("text") && !fielddata_enabled(mappings, f) {
                     return Err(EsError::shard_failure(
                         "illegal_argument_exception",
                         &format!(
@@ -143,7 +159,19 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
                 } else {
                     path
                 };
-                Key::Field { path, ty }
+                let date = matches!(ty.as_deref(), Some("date" | "date_nanos")).then(|| {
+                    let numeric = opts.get("numeric_type").and_then(Value::as_str);
+                    DateSort {
+                        parse: field_format(mappings, &path),
+                        show: opts.get("format").and_then(Value::as_str).map(str::to_string),
+                        nanos: numeric
+                            .map_or(ty.as_deref() == Some("date_nanos"), |n| n == "date_nanos"),
+                    }
+                });
+                let analyzer = (ty.as_deref() == Some("text")).then(|| {
+                    super::analysis::field_analyzer_name(mappings, f, super::analysis::Mode::Index)
+                });
+                Key::Field { path, ty, date, analyzer }
             }
         };
         let desc = match order.as_deref() {
@@ -160,12 +188,69 @@ pub fn parse(spec: &Value, mappings: &Value, typed: bool) -> Result<Vec<SortSpec
     Ok(out)
 }
 
+/// A date field's mapped `format`.
+fn field_format(mappings: &Value, path: &str) -> Option<String> {
+    let mut node = mappings;
+    for seg in path.split('.') {
+        node = node.get("properties")?.get(seg)?;
+    }
+    node.get("format").and_then(Value::as_str).map(str::to_string)
+}
+
+/// A date value as epoch nanoseconds: the millis `format` parses, plus
+/// any sub-millisecond digits of the seconds' fraction.
+fn epoch_nanos(v: &Value, format: Option<&str>) -> Option<i64> {
+    let ms = dates::value_millis(v, format)?;
+    let mut extra = 0;
+    if let Value::String(s) = v
+        && let Some(dot) = s.rfind('.')
+    {
+        let digits: String = s[dot + 1..].chars().take_while(char::is_ascii_digit).collect();
+        if digits.len() > 3 {
+            let padded = format!("{digits:0<9}");
+            extra = padded[3..9].parse::<i64>().unwrap_or(0);
+        }
+    }
+    Some(ms * 1_000_000 + extra)
+}
+
+/// A date sort key: epoch millis, or nanos at `date_nanos` resolution.
+fn date_key(v: &Value, d: &DateSort) -> Option<Value> {
+    if d.nanos {
+        epoch_nanos(v, d.parse.as_deref())
+    } else {
+        dates::value_millis(v, d.parse.as_deref())
+    }
+    .map(|n| json!(n))
+}
+
+/// Whether a text field (multi-fields included) has `fielddata: true`.
+fn fielddata_enabled(mappings: &Value, field: &str) -> bool {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut props = mappings.get("properties");
+    for (i, seg) in segs.iter().enumerate() {
+        let Some(node) = props.and_then(|p| p.get(*seg)) else { return false };
+        let def = if i + 1 == segs.len() {
+            Some(node)
+        } else if i + 2 == segs.len() {
+            node.get("fields").and_then(|f| f.get(segs[i + 1]))
+        } else {
+            None
+        };
+        if let Some(d) = def {
+            return d.get("fielddata").and_then(Value::as_bool) == Some(true);
+        }
+        props = node.get("properties");
+    }
+    false
+}
+
 /// One field value as a sort key of the field's type.
 fn typed_value(v: &Value, ty: Option<&str>) -> Option<Value> {
     match ty {
-        Some(t) if t == "date" || t == "date_nanos" => {
-            dates::value_millis(v, None).map(|m| json!(m))
-        }
+        // `date_nanos` sorts (and reports) nanoseconds.
+        Some("date_nanos") => super::tsdb::date_nanos(v).map(|n| json!(n)),
+        Some("date") => dates::value_millis(v, None).map(|m| json!(m)),
         Some(t) if is_long(t) => match v {
             Value::Number(n) => {
                 n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)).map(|n| json!(n))
@@ -233,6 +318,7 @@ pub fn keys(specs: &[SortSpec], doc: &CommittedDoc, doc_idx: usize, score: f32) 
         .map(|s| match &s.key {
             Key::Score => json!(score),
             Key::Doc => json!(doc_idx),
+            Key::Tsid => doc.tsid.as_ref().map_or(Value::Null, |t| json!(t)),
             Key::Geo { path, origin, unit_m } => {
                 let mode_max = s.mode.as_deref() == Some("max") || (s.mode.is_none() && s.desc);
                 match super::queries::sort_distance(doc, path, *origin, *unit_m, mode_max) {
@@ -240,12 +326,28 @@ pub fn keys(specs: &[SortSpec], doc: &CommittedDoc, doc_idx: usize, score: f32) 
                     None => Value::Null,
                 }
             }
-            Key::Field { path, ty } => {
+            Key::Field { path, ty, date, analyzer } => {
                 let ty = ty.as_deref();
-                let mut vals: Vec<Value> = raw_values(&doc.source, path)
-                    .into_iter()
-                    .filter_map(|v| typed_value(v, ty))
-                    .collect();
+                let mut vals: Vec<Value> = if ty == Some("text") {
+                    // Field data of a text field: its analyzed terms.
+                    raw_values(&doc.source, path)
+                        .into_iter()
+                        .filter_map(Value::as_str)
+                        .flat_map(|s| {
+                            super::analysis::analyzer(analyzer.as_deref().unwrap_or("standard"))
+                                .terms(s)
+                        })
+                        .map(Value::String)
+                        .collect()
+                } else {
+                    raw_values(&doc.source, path)
+                        .into_iter()
+                        .filter_map(|v| match date {
+                            Some(d) => date_key(v, d),
+                            None => typed_value(v, ty),
+                        })
+                        .collect()
+                };
                 if vals.is_empty() {
                     return missing_value(s, ty);
                 }
@@ -281,7 +383,12 @@ pub fn compare_keys(specs: &[SortSpec], a: &[Value], b: &[Value]) -> Ordering {
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
             _ => {
-                let o = compare_values(x, y);
+                let o = match (&s.key, x, y) {
+                    (Key::Tsid, Value::String(a), Value::String(b)) => {
+                        super::tsdb::tsid_sort_key(a).cmp(&super::tsdb::tsid_sort_key(b))
+                    }
+                    _ => compare_values(x, y),
+                };
                 if s.desc { o.reverse() } else { o }
             }
         };
@@ -301,12 +408,72 @@ pub fn after_keys(specs: &[SortSpec], after: &[Value]) -> Result<Vec<Value>, EsE
             &format!("search_after has {} value(s) but sort has {}.", after.len(), specs.len()),
         ));
     }
-    Ok(specs
+    specs
         .iter()
         .zip(after)
         .map(|(s, v)| match &s.key {
-            Key::Field { ty, .. } => typed_value(v, ty.as_deref()).unwrap_or_else(|| v.clone()),
-            _ => v.clone(),
+            Key::Field { ty, .. } if ty.as_deref() == Some("date_nanos") && v.is_number() => {
+                Ok(v.clone())
+            }
+            // A date given as text is read with the sort's `format` (or
+            // the field's).
+            Key::Field { date: Some(d), .. } if v.is_string() => {
+                let fmt = d.show.as_deref().or(d.parse.as_deref()).map(|f| {
+                    if f == "strict_date_optional_time_nanos" {
+                        "strict_date_optional_time"
+                    } else {
+                        f
+                    }
+                });
+                let d2 = DateSort { parse: fmt.map(str::to_string), ..d.clone() };
+                date_key(v, &d2).ok_or_else(|| {
+                    EsError::shard_failure(
+                        "parse_exception",
+                        &format!(
+                            "failed to parse date field [{}] with format [{}]",
+                            v.as_str().unwrap_or(""),
+                            fmt.unwrap_or("strict_date_optional_time||epoch_millis")
+                        ),
+                    )
+                })
+            }
+            Key::Field { ty, .. } => Ok(typed_value(v, ty.as_deref()).unwrap_or_else(|| v.clone())),
+            _ => Ok(v.clone()),
         })
-        .collect())
+        .collect()
+}
+
+/// The sort values a hit shows: its keys, with dates in the sort's
+/// `format` when it has one.
+pub fn display(specs: &[SortSpec], keys: &[Value]) -> Vec<Value> {
+    specs
+        .iter()
+        .zip(keys)
+        .map(|(s, k)| match (&s.key, k.as_i64()) {
+            (Key::Field { date: Some(DateSort { show: Some(f), nanos, .. }), .. }, Some(n))
+                if n != i64::MAX && n != i64::MIN =>
+            {
+                let (ms, sub) = if *nanos {
+                    (n.div_euclid(1_000_000), n.rem_euclid(1_000_000))
+                } else {
+                    (n, 0)
+                };
+                if f == "strict_date_optional_time_nanos" {
+                    let base = dates::format(ms, None, 0);
+                    if sub == 0 {
+                        json!(base)
+                    } else {
+                        let digits = format!("{sub:06}");
+                        let digits = digits.trim_end_matches('0');
+                        json!(format!("{}{digits}Z", base.trim_end_matches('Z')))
+                    }
+                } else if f == "epoch_millis" {
+                    json!(ms.to_string())
+                } else {
+                    json!(dates::format(ms, Some(f), 0))
+                }
+            }
+            _ => k.clone(),
+        })
+        .collect()
 }

@@ -26,6 +26,8 @@ jobs:
         env:
           discovery.type: single-node
           xpack.security.enabled: "false"
+          # Lets the snapshot differentials create fs repositories.
+          path.repo: /tmp
           ES_JAVA_OPTS: -Xms512m -Xmx512m
         options: >-
           --health-cmd "curl -fs http://localhost:9200" --health-interval 10s --health-timeout 5s --health-retries 30
