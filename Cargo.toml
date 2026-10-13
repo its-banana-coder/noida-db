@@ -44,6 +44,8 @@ mongodb = []
 # HTTP interface only; the codec is hand-rolled (see src/clickhouse/http.rs),
 # same as the other services' wire protocols.
 clickhouse = []
+# `noida-db ui`: the interactive terminal panel (ratatui + crossterm).
+ui = ["dep:ratatui"]
 
 [dependencies]
 # SQL hash functions: pgcrypto's digest()/hmac(), sha224..sha512, and
@@ -80,6 +82,8 @@ crc32c = { version = "0.6", optional = true }
 # Elasticsearch: gzip request/response bodies (clients' http_compress).
 flate2 = { version = "1", optional = true }
 bson = { version = "3.1.0", features = ["chrono-0_4", "uuid-1"] }
+# `ui` feature: terminal panel; crossterm backend only (re-exported as ratatui::crossterm).
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
 # Persistence: catching SIGINT/SIGTERM to save a snapshot before exit.
 signal-hook = "0.3"
 

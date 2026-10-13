@@ -16,6 +16,8 @@ commands:
   reset <service...>     delete a service's data (--all: every service;
                          --yes: don't ask first)
   activity [-f]          show recent queries and commands (-f: keep following)
+  ui                     interactive panel: toggle services, copy connection
+                         strings, watch activity
   version                print the version
   help                   print this message
 
@@ -89,6 +91,7 @@ pub enum Command {
         follow: bool,
         data_dir: PathBuf,
     },
+    Ui { data_dir: PathBuf },
     Version,
     Help,
 }
@@ -135,6 +138,11 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             let (services, data_dir, flags) = parse_control(rest, &["-f", "--follow"])?;
             Ok(Command::Activity { services, follow: !flags.is_empty(), data_dir })
         }
+        "ui" => match rest {
+            [] => Ok(Command::Ui { data_dir: Config::default().data_dir }),
+            [flag, dir] if flag == "--data-dir" => Ok(Command::Ui { data_dir: PathBuf::from(dir) }),
+            _ => Err("usage: noida-db ui [--data-dir <path>]".into()),
+        },
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command '{other}'")),
@@ -348,5 +356,15 @@ mod tests {
         assert!(parse(&args("start --redis-port nope")).is_err());
         assert!(parse(&args("start --oracle-port 1521")).is_err());
         assert!(parse(&args("start --data-dir")).is_err());
+    }
+
+    #[test]
+    fn parses_ui() {
+        assert_eq!(parse(&args("ui")), Ok(Command::Ui { data_dir: PathBuf::from(".noida-db") }));
+        assert_eq!(
+            parse(&args("ui --data-dir x")),
+            Ok(Command::Ui { data_dir: PathBuf::from("x") })
+        );
+        assert!(parse(&args("ui --bogus")).is_err());
     }
 }

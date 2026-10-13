@@ -12,6 +12,9 @@ pub mod lifecycle;
 pub mod persistence;
 pub mod services;
 
+#[cfg(feature = "ui")]
+pub mod ui;
+
 #[cfg(feature = "redis")]
 pub mod redis;
 
