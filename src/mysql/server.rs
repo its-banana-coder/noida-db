@@ -11,11 +11,13 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::thread;
 
+use crate::lifecycle::Lifecycle;
+
 /// Binds `addr`, loads a snapshot from `data_dir/mysql.json` if one exists,
-/// and registers a shutdown hook (via `crate::persistence::on_shutdown`) to
-/// save one back on a clean exit.
-pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
-    let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
+/// and registers its saver (via `crate::persistence::on_save`) to save one
+/// back. Runs until `life` is stopped.
+pub fn spawn_persistent(addr: &str, data_dir: &Path, life: &Lifecycle) -> io::Result<SocketAddr> {
+    let (addr, save) = spawn_persistent_with(addr, data_dir, life.clone())?;
     crate::persistence::on_save("mysql", save);
     Ok(addr)
 }
@@ -27,6 +29,14 @@ pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
 pub fn spawn_persistent_for_test(
     addr: &str,
     data_dir: &Path,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    spawn_persistent_with(addr, data_dir, Lifecycle::default())
+}
+
+fn spawn_persistent_with(
+    addr: &str,
+    data_dir: &Path,
+    life: Lifecycle,
 ) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -52,10 +62,12 @@ pub fn spawn_persistent_for_test(
         let _ = crate::persistence::write_snapshot_atomically(&path, &bytes);
     };
 
+    let incoming = life.incoming(listener);
     thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for (stream, conn) in incoming {
             let engine = engine.new_connection();
             let _ = thread::spawn(move || {
+                let _conn = conn;
                 let _ = serve(stream, engine);
             });
         }
@@ -211,6 +223,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
             0x03 => {
                 // Query
                 let q = String::from_utf8_lossy(&payload[1..]);
+                crate::activity::record("mysql", &q);
                 // Several `;`-separated statements, for a client that asked
                 // for CLIENT_MULTI_STATEMENTS: one result each, all but the
                 // last flagged SERVER_MORE_RESULTS_EXISTS; the first error
@@ -395,7 +408,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                 let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
                 let mut pos = 10;
 
-                let Some((_sql, stmt_plan, num_params)) =
+                let Some((sql, stmt_plan, num_params)) =
                     session.prepared_stmts.get(&stmt_id).cloned()
                 else {
                     let _ = send_err(
@@ -407,6 +420,7 @@ fn serve(mut stream: TcpStream, engine: Engine) -> io::Result<()> {
                     );
                     continue;
                 };
+                crate::activity::record("mysql", &sql);
 
                 match decode_execute_params(
                     &payload,

@@ -6,6 +6,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
+use crate::lifecycle::Lifecycle;
+
 /// Like `spawn_persistent`, but also returns a closure that performs
 /// exactly the save `spawn_persistent`'s own shutdown hook would perform,
 /// so a test can trigger a save directly instead of going through
@@ -17,6 +19,14 @@ use std::time::Duration;
 pub fn spawn_persistent_for_test(
     addr: &str,
     data_dir: &Path,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    serve_persistent(addr, data_dir, Lifecycle::default())
+}
+
+fn serve_persistent(
+    addr: &str,
+    data_dir: &Path,
+    life: Lifecycle,
 ) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -35,26 +45,23 @@ pub fn spawn_persistent_for_test(
         let _ = crate::persistence::write_snapshot_atomically(&snapshot_path, &snapshot);
     };
 
+    let incoming = life.incoming(listener);
     thread::Builder::new().name("elasticsearch-listener".into()).spawn(move || {
-        for incoming in listener.incoming() {
-            match incoming {
-                Ok(stream) => {
-                    let engine = engine.clone();
-                    let _ = thread::Builder::new().name("elasticsearch-client".into()).spawn(
-                        move || {
-                            let _ = serve(stream, engine);
-                        },
-                    );
-                }
-                Err(e) => eprintln!("elasticsearch accept: {e}"),
-            }
+        for (stream, conn) in incoming {
+            let engine = engine.clone();
+            let _ = thread::Builder::new().name("elasticsearch-client".into()).spawn(move || {
+                let _conn = conn;
+                let _ = serve(stream, engine);
+            });
         }
     })?;
     Ok((local, save))
 }
 
-pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
-    let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
+/// Serves Elasticsearch with its data persisted under `data_dir`, until
+/// `life` is stopped.
+pub fn spawn_persistent(addr: &str, data_dir: &Path, life: &Lifecycle) -> io::Result<SocketAddr> {
+    let (addr, save) = serve_persistent(addr, data_dir, life.clone())?;
     crate::persistence::on_save("elasticsearch", save);
     Ok(addr)
 }
@@ -154,6 +161,9 @@ fn serve_connection(stream: TcpStream, engine: Engine, client: u64) -> io::Resul
         };
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
         node::http_request(client, &target, body.len(), &headers);
+        if crate::activity::enabled() {
+            crate::activity::record("elasticsearch", &format!("{method} {path}"));
+        }
         let (status, payload) = if method == "OPTIONS" {
             (200, serde_json::json!({}))
         } else {

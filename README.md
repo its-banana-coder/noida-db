@@ -19,9 +19,16 @@ tools don't know the difference.
 
 ```sh
 npm install -g noida-db             # or: pip install noida-db / brew install its-banana-coder/noida-db/noida-db
-noida-db start                      # every built-in service, default ports
-noida-db start --only redis,postgres
-noida-db start --redis-port 6380
+noida-db up                         # every built-in service, in the background
+noida-db status                     # what's running, with connection strings
+noida-db stop redis                 # stop one service (its data is saved)
+noida-db start redis                # ...and bring it back
+noida-db reset redis                # wipe one service's data (--all: everything)
+noida-db activity -f                # watch queries and commands as they arrive
+noida-db down                       # stop everything
+
+noida-db start                      # or run in the foreground; Ctrl-C stops it
+noida-db up --only redis,postgres --redis-port 6380
 ```
 
 See `noida-db help` for the full option list, or jump to
