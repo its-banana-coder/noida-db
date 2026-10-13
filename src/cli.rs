@@ -275,9 +275,7 @@ fn reset(out: &Style, services: &[&'static str], yes: bool, dir: &Path) -> Outco
         crate::config::DEFAULT_SERVICES
             .iter()
             .map(|s| s.name)
-            .filter(|n| {
-                crate::services::available(n) && !crate::services::snapshot_files(n).is_empty()
-            })
+            .filter(|n| crate::services::available(n))
             .collect()
     } else {
         services.to_vec()
@@ -303,7 +301,7 @@ fn reset(out: &Style, services: &[&'static str], yes: bool, dir: &Path) -> Outco
     }
     let Some(client) = client else {
         // Nothing running holds the data in memory: delete the files.
-        for name in &names {
+        for name in names.iter().filter(|n| !crate::services::snapshot_files(n).is_empty()) {
             crate::services::delete_snapshots(name, dir)?;
             say!("{} {} reset {}", out.green("✔"), out.bold(name), out.dim("(saved data deleted)"));
         }

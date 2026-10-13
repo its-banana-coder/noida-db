@@ -2,10 +2,11 @@
 //! registry, and the SIGINT/SIGTERM handler that runs it.
 //!
 //! Each persistent service (see `services::start_persistent`) registers a
-//! hook via `on_shutdown` when it starts, which saves its own snapshot to
-//! its own file under the process's data dir. `install_shutdown_handler`
-//! (called once from `main`) is what actually catches SIGINT/SIGTERM and
-//! runs every registered hook, in registration order, before exiting.
+//! saver via `on_save` when it starts, which saves its own snapshot to its
+//! own file under the process's data dir; stopping the service at runtime
+//! `forget`s it again. `install_shutdown_handler` (called once from `main`)
+//! is what actually catches SIGINT/SIGTERM and runs every registered saver,
+//! then every `on_shutdown` hook, before exiting.
 //!
 //! Saves also happen while running: a service calls `mark` when it
 //! changes data, and an autosave thread saves each marked service about a

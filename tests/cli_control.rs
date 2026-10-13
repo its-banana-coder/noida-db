@@ -3,7 +3,6 @@
 //! through the control API, and `down` ends it. Each test has its own data
 //! dir and free ports, and starts only the services it needs.
 
-use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -224,6 +223,7 @@ fn postgres_survives_stop_and_start() {
 /// One HTTP request to Elasticsearch; the response body.
 #[cfg(feature = "elasticsearch")]
 fn es(port: u16, method: &str, path: &str, body: &str) -> std::io::Result<String> {
+    use std::io::{Read, Write};
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
     write!(
         s,
