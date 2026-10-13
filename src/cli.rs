@@ -40,7 +40,7 @@ pub fn run(command: Command) -> ExitCode {
         Command::Activity { services, follow, data_dir } => {
             activity(&out, &services, follow, &data_dir)
         }
-        Command::Start(_) | Command::Version | Command::Help => Ok(()),
+        Command::Start(_) | Command::Version | Command::Help | Command::Ui { .. } => Ok(()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

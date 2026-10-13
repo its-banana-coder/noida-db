@@ -91,7 +91,9 @@ pub enum Command {
         follow: bool,
         data_dir: PathBuf,
     },
-    Ui { data_dir: PathBuf },
+    Ui {
+        data_dir: PathBuf,
+    },
     Version,
     Help,
 }

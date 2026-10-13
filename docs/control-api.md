@@ -42,3 +42,10 @@ Connection strings (the `connect` field):
   elasticsearch  http://HOST:PORT
   clickhouse     http://HOST:PORT
   mongodb        mongodb://HOST:PORT
+
+## Details pinned down by the implementation
+- `/v1/activity`: with `since` missing or 0 you get the latest `limit` events. Otherwise you get events with seq >= `since`, and `next` is the last seq + 1. A `since` from an earlier server run (beyond the current sequence) starts again from now.
+- A failed action (for example, a port already in use on `start`) answers 409 with `{"error": "...", "service": {...}}`.
+- Service names also accept the aliases `pg`, `postgresql`, `es`, `elastic` and `mongo`.
+- With a wildcard `--host` (0.0.0.0), the `host` field and the connection strings use 127.0.0.1.
+- `rss_bytes` is filled on Linux (from /proc) and is null on other platforms for now.
