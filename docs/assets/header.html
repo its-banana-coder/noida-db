@@ -1,0 +1,77 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>noida-db header</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700;800&family=JetBrains+Mono:wght@400;700&display=swap">
+<style>
+  :root {
+    --bg1: #0d0e14; --bg2: #191233; --ink: #f4f3fb; --ink2: #a7a5c0; --muted: #6f6d88;
+    --card: #12131b; --card-edge: #2b2a44; --grid: rgba(255,255,255,0.035); --glow: rgba(140,100,255,0.28);
+    --pg: #b39dff; --my: #f5c84c; --rd: #ff6b6b; --kf: #ff7ac6; --es: #4fe39a; --ok: #4fe39a; --prompt: #ff7ac6;
+  }
+  body.light {
+    --bg1: #fbfbfe; --bg2: #ece8ff; --ink: #16151f; --ink2: #4c4a63; --muted: #8a88a3;
+    --card: #ffffff; --card-edge: #dcd8ef; --grid: rgba(40,20,120,0.045); --glow: rgba(140,100,255,0.18);
+    --pg: #6f4fe0; --my: #b98500; --rd: #d63a3a; --kf: #c2348b; --es: #12925a; --ok: #12925a; --prompt: #c2348b;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 400px; overflow: hidden; }
+  body {
+    background:
+      radial-gradient(600px 300px at 82% 30%, var(--glow), transparent 70%),
+      linear-gradient(120deg, var(--bg1) 0%, var(--bg1) 45%, var(--bg2) 100%);
+    color: var(--ink); font-family: "Inter", "DejaVu Sans", sans-serif;
+  }
+  .grid { position: absolute; inset: 0;
+    background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 32px 32px; mask-image: linear-gradient(90deg, transparent, #000 30%, #000 70%, transparent); }
+  .wrap { position: relative; height: 400px; padding: 0 64px; display: grid; grid-template-columns: 1fr 520px; gap: 48px; align-items: center; }
+  .mark { font-family: "JetBrains Mono", monospace; font-weight: 700; font-size: 62px; letter-spacing: -0.03em; line-height: 1; }
+  .mark .dash { color: var(--prompt); }
+  .tag { font-size: 25px; font-weight: 500; color: var(--ink); margin-top: 18px; line-height: 1.3; letter-spacing: -0.01em; }
+  .tag em { font-style: normal; color: var(--ok); font-weight: 700; }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+  .chip { font-size: 15.5px; font-weight: 600; padding: 7px 13px 7px 11px; border-radius: 999px;
+    border: 1px solid var(--card-edge); background: color-mix(in srgb, var(--card) 70%, transparent);
+    display: inline-flex; align-items: center; gap: 8px; color: var(--ink); }
+  .chip i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .stats { margin-top: 22px; font-size: 16px; color: var(--ink2); display: flex; gap: 18px; }
+  .stats b { color: var(--ink); font-weight: 700; }
+  .stats .sep { color: var(--muted); }
+  .term { background: var(--card); border: 1px solid var(--card-edge); border-radius: 14px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.02) inset; overflow: hidden; }
+  body.light .term { box-shadow: 0 18px 50px rgba(60,40,140,0.16); }
+  .bar { height: 34px; display: flex; align-items: center; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--card-edge); }
+  .bar i { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+  .bar .t { margin-left: 10px; font-family: "JetBrains Mono", monospace; font-size: 12.5px; color: var(--muted); }
+  pre { font-family: "JetBrains Mono", monospace; font-size: 15px; line-height: 1.62; padding: 16px 20px 18px; color: var(--ink); }
+  .p { color: var(--prompt); font-weight: 700; } .ok { color: var(--ok); } .d { color: var(--ink2); }
+  .pg { color: var(--pg); } .my { color: var(--my); } .rd { color: var(--rd); } .kf { color: var(--kf); } .es { color: var(--es); }
+  .cur { display: inline-block; width: 9px; height: 17px; background: var(--ink); vertical-align: -3px; }
+</style></head>
+<body>
+<div class="grid"></div>
+<div class="wrap">
+  <div>
+    <div class="mark">noida<span class="dash">-</span>db</div>
+    <div class="tag">Every database your app needs.<br><em>One tiny binary.</em></div>
+    <div class="chips">
+      <span class="chip"><i style="background:var(--pg)"></i>Postgres</span>
+      <span class="chip"><i style="background:var(--my)"></i>MySQL</span>
+      <span class="chip"><i style="background:var(--rd)"></i>Redis</span>
+      <span class="chip"><i style="background:var(--kf)"></i>Kafka</span>
+      <span class="chip"><i style="background:var(--es)"></i>Elasticsearch</span>
+    </div>
+    <div class="stats"><span><b>~11 MB</b> binary</span><span class="sep">·</span><span><b>~6 MB</b> idle RAM</span><span class="sep">·</span><span>real wire protocols</span></div>
+  </div>
+  <div class="term">
+    <div class="bar"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i><span class="t">~/my-app</span></div>
+<pre><span class="p">❯</span> noida-db up
+<span class="ok">✔</span> <span class="pg">postgres</span>       <span class="d">postgres://127.0.0.1:5432</span>
+<span class="ok">✔</span> <span class="my">mysql</span>          <span class="d">mysql://root@127.0.0.1:3306</span>
+<span class="ok">✔</span> <span class="rd">redis</span>          <span class="d">redis://127.0.0.1:6379</span>
+<span class="ok">✔</span> <span class="kf">kafka</span>          <span class="d">127.0.0.1:9092</span>
+<span class="ok">✔</span> <span class="es">elasticsearch</span>  <span class="d">http://127.0.0.1:9200</span>
+<span class="p">❯</span> noida-db ui <span class="cur"></span></pre>
+  </div>
+</div>
+<script>if (location.hash === "#light") document.body.className = "light";</script>
+</body></html>

@@ -1,6 +1,9 @@
 <div align="center">
 
-# noida-db
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/header-dark.png">
+  <img alt="noida-db: every database your app needs, one tiny binary. Postgres, MySQL, Redis, Kafka and Elasticsearch." src="docs/assets/header-light.png" width="100%">
+</picture>
 
 **One tiny binary that speaks Postgres, MySQL, Redis, Kafka, and Elasticsearch —**
 **so your existing drivers, ORMs, and CLIs point at it, unchanged.**
