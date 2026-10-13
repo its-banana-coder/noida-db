@@ -1,8 +1,26 @@
 name: ci
 
 on:
+  # Docs, images and other markdown don't affect the build, so changes to
+  # only those skip CI. A change that also touches code still runs everything.
   push:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "**.png"
+      - "**.jpg"
+      - "**.gif"
+      - "**.svg"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "**.png"
+      - "**.jpg"
+      - "**.gif"
+      - "**.svg"
+      - "LICENSE"
 
 jobs:
   build:
