@@ -7,6 +7,7 @@ usage: noida-db <command> [options]
 
 commands:
   start      run the server
+  ui         interactive terminal panel (option: --data-dir <path>)
   version    print the version
   help       print this message
 
@@ -56,6 +57,7 @@ impl Default for Config {
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Start(Config),
+    Ui { data_dir: PathBuf },
     Version,
     Help,
 }
@@ -66,6 +68,11 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     };
     match cmd.as_str() {
         "start" => parse_start(rest).map(Command::Start),
+        "ui" => match rest {
+            [] => Ok(Command::Ui { data_dir: Config::default().data_dir }),
+            [flag, dir] if flag == "--data-dir" => Ok(Command::Ui { data_dir: PathBuf::from(dir) }),
+            _ => Err("usage: noida-db ui [--data-dir <path>]".into()),
+        },
         "version" | "--version" | "-V" => Ok(Command::Version),
         "help" | "--help" | "-h" => Ok(Command::Help),
         other => Err(format!("unknown command '{other}'")),
@@ -152,5 +159,15 @@ mod tests {
         assert!(parse(&args("start --redis-port nope")).is_err());
         assert!(parse(&args("start --oracle-port 1521")).is_err());
         assert!(parse(&args("start --data-dir")).is_err());
+    }
+
+    #[test]
+    fn parses_ui() {
+        assert_eq!(parse(&args("ui")), Ok(Command::Ui { data_dir: PathBuf::from(".noida-db") }));
+        assert_eq!(
+            parse(&args("ui --data-dir x")),
+            Ok(Command::Ui { data_dir: PathBuf::from("x") })
+        );
+        assert!(parse(&args("ui --bogus")).is_err());
     }
 }

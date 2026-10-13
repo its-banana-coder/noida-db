@@ -21,6 +21,18 @@ fn main() -> ExitCode {
     match command {
         Command::Help => println!("{}", config::USAGE),
         Command::Version => println!("noida-db {}", env!("CARGO_PKG_VERSION")),
+        #[cfg(feature = "ui")]
+        Command::Ui { data_dir } => {
+            if let Err(err) = noida::ui::run(data_dir) {
+                eprintln!("error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+        #[cfg(not(feature = "ui"))]
+        Command::Ui { .. } => {
+            eprintln!("error: this build has no terminal panel (rebuild with --features ui)");
+            return ExitCode::FAILURE;
+        }
         Command::Start(cfg) => {
             if let Err(err) = start(&cfg) {
                 eprintln!("error: {err}");
