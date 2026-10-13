@@ -8,8 +8,8 @@
 [![CI](https://github.com/its-banana-coder/noida-db/actions/workflows/ci.yml/badge.svg)](https://github.com/its-banana-coder/noida-db/actions/workflows/ci.yml)
 [![Real apps](https://github.com/its-banana-coder/noida-db/actions/workflows/real-apps.yml/badge.svg)](https://github.com/its-banana-coder/noida-db/actions/workflows/real-apps.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![idle RAM](https://img.shields.io/badge/idle%20RAM-~5MB-brightgreen)
-![binary size](https://img.shields.io/badge/single%20binary-~7MB-blue)
+![idle RAM](https://img.shields.io/badge/idle%20RAM-~6MB-brightgreen)
+![binary size](https://img.shields.io/badge/single%20binary-~11MB-blue)
 
 No Docker Compose stack idling at 2.5–4GB. No five heavy servers to boot
 before `npm run dev` works. One Rust binary, real wire protocols, your
