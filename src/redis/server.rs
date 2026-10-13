@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use super::engine::{ClientConn, Engine, Session};
 use super::resp::{self, ReadError, Value};
+use crate::lifecycle::Lifecycle;
 
 /// Connection threads touch little stack; keep reservations small.
 const STACK_SIZE: usize = 256 * 1024;
@@ -33,8 +34,8 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
 /// Like `spawn_persistent_for_test`, but registers the save closure via
 /// `persistence::on_shutdown` instead of returning it -- the real,
 /// production entry point used by `services::start_persistent`.
-pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
-    let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
+pub fn spawn_persistent(addr: &str, data_dir: &Path, life: &Lifecycle) -> io::Result<SocketAddr> {
+    let (addr, save) = serve_persistent(addr, data_dir, life.clone())?;
     crate::persistence::on_save("redis", save);
     Ok(addr)
 }
@@ -51,6 +52,14 @@ pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
 pub fn spawn_persistent_for_test(
     addr: &str,
     data_dir: &Path,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    serve_persistent(addr, data_dir, Lifecycle::default())
+}
+
+fn serve_persistent(
+    addr: &str,
+    data_dir: &Path,
+    life: Lifecycle,
 ) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -85,17 +94,26 @@ pub fn spawn_persistent_for_test(
     };
 
     let sweeper = Arc::clone(&engine);
+    let sweeping = life.clone();
     thread::Builder::new().name("redis-expire".into()).stack_size(STACK_SIZE).spawn(move || {
-        loop {
+        while !sweeping.is_stopped() {
             thread::sleep(Duration::from_secs(1));
             sweeper.engine.lock().unwrap().purge_expired();
         }
     })?;
 
-    thread::Builder::new()
-        .name("redis-accept".into())
-        .stack_size(STACK_SIZE)
-        .spawn(move || accept_loop(listener, engine))?;
+    let incoming = life.incoming(listener);
+    thread::Builder::new().name("redis-accept".into()).stack_size(STACK_SIZE).spawn(move || {
+        for (stream, conn) in incoming {
+            let engine = Arc::clone(&engine);
+            let _ = thread::Builder::new().name("redis-conn".into()).stack_size(STACK_SIZE).spawn(
+                move || {
+                    let _conn = conn;
+                    let _ = handle(stream, engine);
+                },
+            );
+        }
+    })?;
     Ok((local, save))
 }
 
@@ -137,6 +155,35 @@ pub fn spawn_with(addr: &str, password: Option<&str>) -> io::Result<SocketAddr> 
         .stack_size(STACK_SIZE)
         .spawn(move || accept_loop(listener, engine))?;
     Ok(local)
+}
+
+/// A command for the activity feed: its name and first few arguments,
+/// without the password of AUTH, HELLO ... AUTH, ACL SETUSER and the like.
+fn summary(args: &[Vec<u8>]) -> String {
+    let name = String::from_utf8_lossy(&args[0]).to_ascii_uppercase();
+    let shown = match name.as_str() {
+        "AUTH" | "MIGRATE" => 0,
+        "HELLO" => 1,
+        "ACL" => 1,
+        "CONFIG"
+            if args.get(2).is_some_and(|p| {
+                let p = String::from_utf8_lossy(p).to_ascii_lowercase();
+                p.contains("pass") || p.contains("auth")
+            }) =>
+        {
+            2
+        }
+        _ => 3,
+    };
+    let mut out = name;
+    for arg in args.iter().skip(1).take(shown) {
+        out.push(' ');
+        out.push_str(&String::from_utf8_lossy(&arg[..arg.len().min(100)]));
+    }
+    if args.len() > shown + 1 {
+        out.push_str(" …");
+    }
+    out
 }
 
 fn accept_loop(listener: TcpListener, engine: Arc<Shared>) {
@@ -242,6 +289,9 @@ fn serve(
         };
         if args.is_empty() {
             continue;
+        }
+        if crate::activity::enabled() {
+            crate::activity::record("redis", &summary(&args));
         }
         let mut held = false;
         loop {

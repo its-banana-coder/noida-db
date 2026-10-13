@@ -11,3 +11,5 @@ use std::net::SocketAddr;
 pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     server::spawn(addr)
 }
+
+pub use server::spawn_with;

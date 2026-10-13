@@ -4,9 +4,16 @@
 //!
 //! Each service is a module behind its own Cargo feature.
 
+pub mod activity;
+pub mod cli;
 pub mod config;
+pub mod control;
+pub mod lifecycle;
 pub mod persistence;
 pub mod services;
+
+#[cfg(feature = "ui")]
+pub mod ui;
 
 #[cfg(feature = "redis")]
 pub mod redis;

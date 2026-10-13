@@ -15,6 +15,17 @@ use super::engine::Engine;
 const SECURITY_DISABLED: i16 = 54;
 const NO_AUTHORIZER: &str = "No Authorizer is configured on the broker";
 
+/// Records `api` and its topics in the activity feed, if there are any.
+fn record_topics<'a>(api: &str, topics: impl Iterator<Item = &'a str>) {
+    if !crate::activity::enabled() {
+        return;
+    }
+    let topics: Vec<&str> = topics.collect();
+    if !topics.is_empty() {
+        crate::activity::record("kafka", &format!("{api} {}", topics.join(", ")));
+    }
+}
+
 pub fn handle_connection(stream: TcpStream, engine: Engine) {
     // Best-effort: this connection's own write path already batches a
     // response's length header and payload into one `BufWriter` flush,
@@ -76,6 +87,22 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                 | ApiKey::DescribeConfigs
         ) {
             crate::persistence::mark("kafka");
+        }
+        // The activity feed; the topic-carrying APIs record in their arms,
+        // and the polling ones (an idle client's Metadata/Heartbeat) not at all.
+        if crate::activity::enabled()
+            && !matches!(
+                api_key,
+                ApiKey::ApiVersions
+                    | ApiKey::Metadata
+                    | ApiKey::Heartbeat
+                    | ApiKey::Produce
+                    | ApiKey::Fetch
+                    | ApiKey::CreateTopics
+                    | ApiKey::DeleteTopics
+            )
+        {
+            crate::activity::record("kafka", &format!("{api_key:?}"));
         }
         let response_buf = match api_key {
             ApiKey::ApiVersions => {
@@ -140,6 +167,7 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
+                record_topics("CreateTopics", req.topics.iter().map(|t| t.name.as_str()));
                 let resp = engine.handle_create_topics(&req, header.request_api_version);
                 encode_response(
                     &header,
@@ -167,6 +195,7 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
+                record_topics("Produce", req.topic_data.iter().map(|t| t.name.as_str()));
                 let resp = engine.handle_produce(&req, header.request_api_version);
                 encode_response(
                     &header,
@@ -181,6 +210,18 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     Err(_) => break,
                 };
                 let resp = engine.handle_fetch(&req, header.request_api_version);
+                // Only fetches that returned records: an idle consumer polls.
+                record_topics(
+                    "Fetch",
+                    resp.responses
+                        .iter()
+                        .filter(|t| {
+                            t.partitions
+                                .iter()
+                                .any(|p| p.records.as_ref().is_some_and(|r| !r.is_empty()))
+                        })
+                        .map(|t| t.topic.as_str()),
+                );
                 encode_response(
                     &header,
                     &resp,
@@ -209,6 +250,12 @@ pub fn handle_connection(stream: TcpStream, engine: Engine) {
                     Ok(r) => r,
                     Err(_) => break,
                 };
+                record_topics(
+                    "DeleteTopics",
+                    req.topic_names.iter().map(|t| t.as_str()).chain(
+                        req.topics.iter().filter_map(|t| t.name.as_ref().map(|n| n.as_str())),
+                    ),
+                );
                 let resp = engine.handle_delete_topics(&req, header.request_api_version);
                 encode_response(
                     &header,

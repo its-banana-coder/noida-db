@@ -12,6 +12,7 @@ use super::engine::{self, Engine};
 use super::error::ChError;
 use super::format;
 use super::http::{self, Request, Response};
+use crate::lifecycle::Lifecycle;
 
 /// Connection threads touch little stack; keep reservations small.
 const STACK_SIZE: usize = 256 * 1024;
@@ -21,17 +22,26 @@ static QUERY_ID: AtomicU64 = AtomicU64::new(1);
 /// Binds `addr` and serves ClickHouse's HTTP interface on background
 /// threads.
 pub fn spawn(addr: &str) -> std::io::Result<SocketAddr> {
+    spawn_with(addr, &Lifecycle::default())
+}
+
+/// Like `spawn`, until `life` is stopped.
+pub fn spawn_with(addr: &str, life: &Lifecycle) -> std::io::Result<SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     let engine = Arc::new(Engine::new());
+    let incoming = life.incoming(listener);
     thread::Builder::new().name("clickhouse-accept".into()).stack_size(STACK_SIZE).spawn(
         move || {
-            for stream in listener.incoming().flatten() {
+            for (stream, conn) in incoming {
                 let engine = Arc::clone(&engine);
                 let _ = thread::Builder::new()
                     .name("clickhouse-conn".into())
                     .stack_size(STACK_SIZE)
-                    .spawn(move || handle(stream, &engine));
+                    .spawn(move || {
+                        let _conn = conn;
+                        handle(stream, &engine)
+                    });
             }
         },
     )?;

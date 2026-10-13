@@ -8,6 +8,7 @@ pub mod log;
 #[cfg(test)]
 mod tests;
 
+use crate::lifecycle::Lifecycle;
 use engine::{Engine, Snapshot};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -36,8 +37,8 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
 
 /// Binds `addr`, loads a snapshot from `data_dir/kafka.json` if one exists,
 /// and registers a shutdown hook to save on a clean exit.
-pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
-    let (addr, save) = spawn_persistent_for_test(addr, data_dir)?;
+pub fn spawn_persistent(addr: &str, data_dir: &Path, life: &Lifecycle) -> io::Result<SocketAddr> {
+    let (addr, save) = serve_persistent(addr, data_dir, life.clone())?;
     crate::persistence::on_save("kafka", save);
     Ok(addr)
 }
@@ -47,6 +48,14 @@ pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
 pub fn spawn_persistent_for_test(
     addr: &str,
     data_dir: &Path,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    serve_persistent(addr, data_dir, Lifecycle::default())
+}
+
+fn serve_persistent(
+    addr: &str,
+    data_dir: &Path,
+    life: Lifecycle,
 ) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local_addr = listener.local_addr()?;
@@ -73,10 +82,12 @@ pub fn spawn_persistent_for_test(
         let _ = crate::persistence::write_snapshot_atomically(&path, &bytes);
     };
 
+    let incoming = life.incoming(listener);
     thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+        for (stream, conn) in incoming {
             let engine = engine.clone();
             thread::spawn(move || {
+                let _conn = conn;
                 connection::handle_connection(stream, engine);
             });
         }

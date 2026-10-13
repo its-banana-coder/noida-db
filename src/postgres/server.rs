@@ -30,6 +30,7 @@ use super::engine::{Engine, Portal, Prepared, Session, Snapshot, StmtResult, TxS
 use super::error::{PgError, PgResult, code};
 use super::plan::OutCol;
 use super::types::{self, Type, Value};
+use crate::lifecycle::Lifecycle;
 
 /// Binding and running a query recurses over the expression tree, and
 /// drivers send deeply nested catalog queries. Reserve room for them: only
@@ -64,8 +65,12 @@ pub fn spawn(addr: &str) -> io::Result<SocketAddr> {
     spawn_with(addr, Config::default())
 }
 
-pub fn spawn_persistent(addr: &str, data_dir: &Path) -> io::Result<SocketAddr> {
-    spawn_persistent_with(addr, data_dir, Config::default())
+/// Serves Postgres with its data persisted under `data_dir`, until `life`
+/// is stopped.
+pub fn spawn_persistent(addr: &str, data_dir: &Path, life: &Lifecycle) -> io::Result<SocketAddr> {
+    let (addr, save) = serve_persistent(addr, data_dir, Config::default(), life.clone())?;
+    crate::persistence::on_save("postgres", save);
+    Ok(addr)
 }
 
 pub fn spawn_persistent_with(addr: &str, data_dir: &Path, cfg: Config) -> io::Result<SocketAddr> {
@@ -86,6 +91,15 @@ pub fn spawn_persistent_with_for_test(
     addr: &str,
     data_dir: &Path,
     cfg: Config,
+) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
+    serve_persistent(addr, data_dir, cfg, Lifecycle::default())
+}
+
+fn serve_persistent(
+    addr: &str,
+    data_dir: &Path,
+    cfg: Config,
+    life: Lifecycle,
 ) -> io::Result<(SocketAddr, impl Fn() + Send + Sync + 'static)> {
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -112,15 +126,17 @@ pub fn spawn_persistent_with_for_test(
     };
 
     let cfg = Arc::new(cfg);
+    let incoming = life.incoming(listener);
     std::thread::Builder::new().name("postgres-accept".into()).stack_size(STACK_SIZE).spawn(
         move || {
-            for stream in listener.incoming().flatten() {
+            for (stream, conn) in incoming {
                 let engine = engine.clone();
                 let cfg = cfg.clone();
                 let _ = std::thread::Builder::new()
                     .name("postgres-conn".into())
                     .stack_size(STACK_SIZE)
                     .spawn(move || {
+                        let _conn = conn;
                         let _ = serve(stream, engine, cfg);
                     });
             }
@@ -502,6 +518,7 @@ fn main_loop(conn: &mut Conn, engine: &Engine, session: &mut Session) -> io::Res
         match msg {
             PgWireFrontendMessage::Terminate(_) => return Ok(()),
             PgWireFrontendMessage::Query(q) => {
+                crate::activity::record("postgres", &q.query);
                 simple_query(conn, engine, session, &q.query)?;
                 send_notifications(conn, session)?;
                 ready(conn, session)?;
@@ -1163,6 +1180,7 @@ fn do_execute(
                 format!("prepared statement \"{stmt_name}\" does not exist"),
             )
         })?;
+        crate::activity::record("postgres", &prep.sql);
         let Some(stmt) = prep.stmt.clone() else {
             session.portals.remove(name);
             conn.send(PgWireBackendMessage::EmptyQueryResponse(EmptyQueryResponse::new()))

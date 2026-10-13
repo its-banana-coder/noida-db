@@ -19,9 +19,17 @@ tools don't know the difference.
 
 ```sh
 npm install -g noida-db             # or: pip install noida-db / brew install its-banana-coder/noida-db/noida-db
-noida-db start                      # every built-in service, default ports
-noida-db start --only redis,postgres
-noida-db start --redis-port 6380
+noida-db up                         # every built-in service, in the background
+noida-db status                     # what's running, with connection strings
+noida-db ui                         # interactive panel: toggle services, copy URLs, live activity
+noida-db stop redis                 # stop one service (its data is saved)
+noida-db start redis                # ...and bring it back
+noida-db reset redis                # wipe one service's data (--all: everything)
+noida-db activity -f                # watch queries and commands as they arrive
+noida-db down                       # stop everything
+
+noida-db start                      # or run in the foreground; Ctrl-C stops it
+noida-db up --only redis,postgres --redis-port 6380
 ```
 
 See `noida-db help` for the full option list, or jump to
@@ -35,7 +43,7 @@ See `noida-db help` for the full option list, or jump to
 |---|---|
 | 🚀 **4 real applications**, end to end | Gitea, Miniflux, WordPress, Faust — unmodified, real schemas, real workflows, all green in CI |
 | 📦 **34 real client libraries & ORMs** verified | psycopg, SQLAlchemy, Django, redis-py, ioredis, kafkajs, Sequelize, GORM, JDBC, and more |
-| 🪶 **~7MB binary, ~5MB idle** with all five services running, ~15MB under real app load | vs. the multi-gigabyte real stack |
+| 🪶 **~11MB binary (~5MB download), ~6MB idle** with all five services running, ~15MB under real app load | vs. the multi-gigabyte real stack |
 | ⚡ **Sub-100µs** reads on Redis/Elasticsearch paths | measured, not claimed — see [Benchmarks](#benchmarks) |
 | 💾 **On-disk persistence** for Postgres, Redis, Elasticsearch, MySQL, Kafka | survives a clean restart |
 | 🔍 **Every gap tracked, not hidden** | [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — updated by every PR |

@@ -2,10 +2,11 @@
 //! registry, and the SIGINT/SIGTERM handler that runs it.
 //!
 //! Each persistent service (see `services::start_persistent`) registers a
-//! hook via `on_shutdown` when it starts, which saves its own snapshot to
-//! its own file under the process's data dir. `install_shutdown_handler`
-//! (called once from `main`) is what actually catches SIGINT/SIGTERM and
-//! runs every registered hook, in registration order, before exiting.
+//! saver via `on_save` when it starts, which saves its own snapshot to its
+//! own file under the process's data dir; stopping the service at runtime
+//! `forget`s it again. `install_shutdown_handler` (called once from `main`)
+//! is what actually catches SIGINT/SIGTERM and runs every registered saver,
+//! then every `on_shutdown` hook, before exiting.
 //!
 //! Saves also happen while running: a service calls `mark` when it
 //! changes data, and an autosave thread saves each marked service about a
@@ -51,14 +52,37 @@ fn save_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Registers `save` for `service`: run by the autosave after `mark`, and
-/// once more at shutdown.
+/// Registers `save` for `service` (replacing one registered before): run
+/// by the autosave after `mark`, and once more at shutdown.
 pub fn on_save(service: &'static str, save: impl Fn() + Send + Sync + 'static) {
     let save: Arc<dyn Fn() + Send + Sync> = Arc::new(save);
-    let shutdown = save.clone();
-    on_shutdown(move || shutdown());
-    if let Some(i) = SERVICES.iter().position(|s| *s == service) {
-        savers().lock().unwrap().push((i, save));
+    match SERVICES.iter().position(|s| *s == service) {
+        Some(i) => {
+            let mut savers = savers().lock().unwrap();
+            savers.retain(|(j, _)| *j != i);
+            savers.push((i, save));
+        }
+        None => on_shutdown(move || save()),
+    }
+}
+
+/// Unregisters `service`'s saver (it was stopped), running it one last
+/// time first if `save_first`. Once this returns, neither the autosave nor
+/// the shutdown save writes `service`'s files again with its old state.
+pub fn forget(service: &str, save_first: bool) {
+    let Some(i) = SERVICES.iter().position(|s| *s == service) else { return };
+    let _g = save_lock().lock().unwrap();
+    let mut gone = Vec::new();
+    savers().lock().unwrap().retain(|(j, save)| {
+        if *j == i {
+            gone.push(save.clone());
+        }
+        *j != i
+    });
+    if save_first {
+        for save in &gone {
+            save();
+        }
     }
 }
 
@@ -79,7 +103,13 @@ fn start_autosave() {
                         // marks again and is saved next round.
                         saved[i] = now;
                         let _g = save_lock().lock().unwrap();
-                        save();
+                        // Skip a service stopped (`forget`) since the list
+                        // was taken.
+                        let live =
+                            savers().lock().unwrap().iter().any(|(_, s)| Arc::ptr_eq(s, &save));
+                        if live {
+                            save();
+                        }
                     }
                 }
             }
@@ -108,7 +138,7 @@ pub fn on_shutdown(hook: impl Fn() + Send + Sync + 'static) {
 /// the "hard kill loses the since-last-save window" half of this
 /// project's persistence model, not a gap in this handler.
 pub fn install_shutdown_handler() {
-    let term = Arc::new(AtomicBool::new(false));
+    let term = TERM.get_or_init(|| Arc::new(AtomicBool::new(false))).clone();
     // SIGINT (Ctrl-C) and SIGTERM (`kill`, `docker stop`, ...) both just
     // flip a flag here -- a signal handler has to stay async-signal-safe
     // (no locks, no allocation), so the actual save work happens on the
@@ -120,15 +150,36 @@ pub fn install_shutdown_handler() {
     std::thread::spawn(move || {
         loop {
             if term.load(Ordering::Relaxed) {
-                let _g = save_lock().lock().unwrap();
-                for hook in hooks().lock().unwrap().iter() {
-                    hook();
-                }
-                std::process::exit(0);
+                run_shutdown();
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     });
+}
+
+/// The flag SIGINT/SIGTERM set (and `request_shutdown`).
+static TERM: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+
+/// Saves every running service, runs the shutdown hooks, and exits.
+fn run_shutdown() -> ! {
+    let _g = save_lock().lock().unwrap();
+    let list: Vec<Saver> = savers().lock().unwrap().clone();
+    for (_, save) in list {
+        save();
+    }
+    for hook in hooks().lock().unwrap().iter() {
+        hook();
+    }
+    std::process::exit(0);
+}
+
+/// Shuts the process down as SIGTERM would (the control API's
+/// `/v1/shutdown`).
+pub fn request_shutdown() {
+    match TERM.get() {
+        Some(term) => term.store(true, Ordering::Relaxed),
+        None => run_shutdown(),
+    }
 }
 
 /// Writes `bytes` to `path` by writing to a sibling temp file first and
